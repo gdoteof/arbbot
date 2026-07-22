@@ -1,0 +1,33 @@
+# environments / caches
+.venv/
+.venv313/
+__pycache__/
+*.egg-info/
+.hypothesis/
+.pytest_cache/
+*.duckdb
+
+# local tooling / session state
+.gstack/
+.claude/
+
+# ALL runtime data: market tape, positions, P&L, order ledger, golden files
+data/
+
+# secrets — never in the repo, in any form
+credentials/
+*.pem
+*.key
+.env
+.env.*
+*credentials*
+
+# stray runtime output
+nohup.out
+*.log
+*.output
+
+# the vetted registry (trading pair set) stays private
+config/registry.yaml
+config/registry-rejected.yaml
+config/registry.yaml.bak*

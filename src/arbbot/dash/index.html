@@ -1,0 +1,1394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>arbbot — flight recorder</title>
+<style>
+  /* ------- palette roles (dataviz reference palette; light + dark selected) */
+  :root {
+    color-scheme: light;
+    --page:      #f9f9f7;  --surface:   #fcfcfb;
+    --ink:       #0b0b0b;  --ink-2:     #52514e;  --ink-mut: #898781;
+    --grid:      #e1e0d9;  --baseline:  #c3c2b7;
+    --ring:      rgba(11,11,11,0.10);
+    --series-1:  #2a78d6;  --series-2:  #008300;
+    --st-good:   #0ca30c;  --st-warn:   #fab219;  --st-serious:#ec835a;  --st-crit: #d03b3b;
+    --delta-good:#006300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page:      #0d0d0d;  --surface:   #1a1a19;
+      --ink:       #ffffff;  --ink-2:     #c3c2b7;  --ink-mut: #898781;
+      --grid:      #2c2c2a;  --baseline:  #383835;
+      --ring:      rgba(255,255,255,0.10);
+      --series-1:  #3987e5;  --series-2:  #008300;
+      --delta-good:#0ca30c;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page:      #0d0d0d;  --surface:   #1a1a19;
+    --ink:       #ffffff;  --ink-2:     #c3c2b7;  --ink-mut: #898781;
+    --grid:      #2c2c2a;  --baseline:  #383835;
+    --ring:      rgba(255,255,255,0.10);
+    --series-1:  #3987e5;  --series-2:  #008300;
+    --delta-good:#0ca30c;
+  }
+
+  * { box-sizing: border-box; margin: 0; }
+  html, body { background: var(--page); color: var(--ink); }
+  body {
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 20px clamp(12px, 3vw, 36px) 48px;
+    max-width: min(96vw, 1760px); margin: 0 auto;
+  }
+  .mono { font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, monospace; }
+
+  /* ------- calibration plate masthead (the signature) */
+  .plate {
+    border: 1px solid var(--baseline); background: var(--surface);
+    border-radius: 6px; padding: 14px 18px; margin-bottom: 16px;
+    display: flex; flex-wrap: wrap; gap: 14px 28px; align-items: baseline;
+    box-shadow: inset 0 0 0 1px var(--ring);
+  }
+  .plate h1 { font-size: 15px; letter-spacing: .14em; font-weight: 700; }
+  .plate h1 .sep { color: var(--ink-mut); font-weight: 400; }
+  .plate .spec { display: flex; flex-wrap: wrap; gap: 4px 24px; margin-left: auto; }
+  .spec div { font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+  .spec b { color: var(--ink); font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         margin-right: 5px; vertical-align: baseline; }
+  .st-ok   .dot { background: var(--st-good); }
+  .st-warn .dot { background: var(--st-warn); }
+  .st-bad  .dot { background: var(--st-crit); }
+  .plate .theme { border: 1px solid var(--baseline); background: none; color: var(--ink-2);
+    border-radius: 4px; font-size: 11px; padding: 2px 8px; cursor: pointer; }
+  .plate .theme:focus-visible { outline: 2px solid var(--series-1); outline-offset: 1px; }
+
+  /* ------- filter row */
+  .filters { display: flex; gap: 6px; margin: 0 0 18px 2px; }
+  .filters button {
+    font: 600 12.5px system-ui, sans-serif; color: var(--ink-2);
+    background: none; border: 1px solid transparent; border-radius: 5px;
+    padding: 5px 12px; cursor: pointer;
+  }
+  .filters button:hover { background: var(--surface); }
+  .filters button[aria-pressed="true"] {
+    color: var(--ink); background: var(--surface); border-color: var(--baseline);
+  }
+  .filters button:focus-visible { outline: 2px solid var(--series-1); outline-offset: 1px; }
+
+  /* ------- hero + tiles */
+  .hero-row { display: grid; grid-template-columns: minmax(240px, 1.4fr) repeat(4, minmax(150px, 1fr));
+              gap: 12px; margin-bottom: 14px; }
+  .tile { background: var(--surface); border: 1px solid var(--ring);
+          border-radius: 8px; padding: 14px 16px; min-width: 0; }
+  .tile .lbl { font-size: 12px; color: var(--ink-2); margin-bottom: 4px; }
+  .tile .val { font-size: 22px; font-weight: 650; letter-spacing: -0.01em; }
+  .tile .sub { font-size: 11.5px; color: var(--ink-mut); margin-top: 3px; }
+  .hero .val { font-size: 52px; font-weight: 700; line-height: 1.05; letter-spacing: -0.01em; }
+  .hero .sub { font-size: 12.5px; color: var(--ink-2); }
+
+  /* ------- chart cards */
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .card { background: var(--surface); border: 1px solid var(--ring);
+          border-radius: 8px; padding: 14px 16px 10px; min-width: 0; }
+  .card h2 { font-size: 13px; font-weight: 650; margin-bottom: 2px; }
+  .card .cap { font-size: 11.5px; color: var(--ink-mut); margin-bottom: 8px; }
+  .card svg { display: block; width: 100%; height: auto; }
+  .refreshing .card, .refreshing .tile { opacity: .55; transition: opacity .2s; }
+  svg text { font-family: system-ui, sans-serif; fill: var(--ink-mut); font-size: 10.5px; }
+  svg .tick { font-variant-numeric: tabular-nums; }
+  svg .dl { fill: var(--ink-2); font-size: 10.5px; }
+  svg .cat { font-family: ui-monospace, Menlo, monospace; fill: var(--ink-2); }
+  .bar:focus { outline: none; }
+  .bar:focus-visible rect.mark { stroke: var(--series-1); stroke-width: 2; }
+
+  /* ------- tooltip */
+  #tip { position: fixed; z-index: 9; pointer-events: none; display: none;
+    background: var(--surface); border: 1px solid var(--baseline); border-radius: 6px;
+    padding: 7px 10px; font-size: 12px; box-shadow: 0 3px 14px rgba(0,0,0,.14);
+    max-width: 320px; }
+  #tip .v { font-weight: 700; font-size: 13px; color: var(--ink); }
+  #tip .k { color: var(--ink-2); }
+  #tip .key { display: inline-block; width: 12px; height: 0; border-top: 3px solid var(--series-1);
+    margin-right: 6px; vertical-align: middle; border-radius: 2px; }
+
+  /* ------- table twin */
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin-top: 4px; }
+  th { text-align: left; font-size: 11px; color: var(--ink-mut); font-weight: 600;
+       padding: 6px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  [data-tip] { cursor: help; text-decoration: underline dotted var(--ink-mut);
+               text-underline-offset: 3px; }
+  [data-tip]:focus-visible { outline: 2px solid var(--series-1); outline-offset: 1px; }
+  td { padding: 6px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td .relid { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  .pill { font-size: 10.5px; border: 1px solid var(--baseline); border-radius: 999px;
+          padding: 1px 8px; color: var(--ink-2); }
+  /* ------- arbitrage trades */
+  #trades-section { border: 1px solid var(--series-2); }
+  .tr-strip { display: flex; gap: 26px; flex-wrap: wrap; margin: 6px 0 12px; }
+  .tr-strip .s-lbl { font-size: 10.5px; color: var(--ink-mut); text-transform: uppercase; letter-spacing: .04em; }
+  .tr-strip .s-val { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.15; }
+  .tr-strip .s-val.pos { color: var(--delta-good); }
+  #trades-table td { vertical-align: top; }
+  .legs { display: flex; flex-direction: column; gap: 3px; }
+  .leg { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; white-space: nowrap; }
+  .leg .v { font-weight: 650; }
+  .leg .v.k  { color: var(--series-1); }
+  .leg .v.pm { color: #b06bd6; }
+  .leg .px { font-variant-numeric: tabular-nums; color: var(--ink-2); }
+  .side-tag { font-size: 10px; font-weight: 700; border-radius: 3px; padding: 0 5px; }
+  .side-tag.yes { background: color-mix(in srgb, var(--series-2) 22%, transparent); color: var(--delta-good); }
+  .side-tag.no  { background: color-mix(in srgb, var(--st-crit) 20%, transparent);  color: var(--st-crit); }
+  .role-badge { font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
+                border-radius: 999px; padding: 1px 7px; border: 1px solid transparent; }
+  .role-badge.taker { background: color-mix(in srgb, var(--st-warn) 20%, transparent); color: var(--st-warn);
+                      border-color: color-mix(in srgb, var(--st-warn) 45%, transparent); }
+  .role-badge.maker { background: color-mix(in srgb, var(--series-2) 20%, transparent); color: var(--delta-good);
+                      border-color: color-mix(in srgb, var(--series-2) 45%, transparent); }
+  td.profit { font-weight: 650; color: var(--delta-good); font-variant-numeric: tabular-nums; text-align: right; }
+  .stat-open { font-size: 10px; font-weight: 700; color: var(--st-good); text-transform: uppercase; }
+  .pill.human { border-color: var(--st-good); color: var(--delta-good); }
+  .empty { color: var(--ink-mut); padding: 26px 8px; text-align: center; }
+  .colpick { position: relative; float: right; margin-top: -26px; }
+  .colpick summary { list-style: none; cursor: pointer; font-size: 11.5px;
+    color: var(--ink-2); border: 1px solid var(--baseline); border-radius: 5px;
+    padding: 3px 10px; user-select: none; }
+  .colpick[open] summary { background: var(--page); }
+  .colpick .menu { position: absolute; right: 0; top: 26px; z-index: 8;
+    background: var(--surface); border: 1px solid var(--baseline); border-radius: 6px;
+    padding: 8px 12px; box-shadow: 0 3px 14px rgba(0,0,0,.14);
+    display: grid; grid-template-columns: 1fr 1fr; gap: 3px 16px; min-width: 300px; }
+  .colpick label { font-size: 12px; color: var(--ink-2); white-space: nowrap;
+    display: flex; gap: 6px; align-items: center; cursor: pointer; }
+
+  @media (max-width: 900px) {
+    .hero-row { grid-template-columns: 1fr 1fr; }
+    .hero { grid-column: 1 / -1; }
+    .grid { grid-template-columns: 1fr; }
+    .plate .spec { margin-left: 0; }
+  }
+  /* ------- tabs + order activity view */
+  .tabs { display: flex; gap: 4px; margin-bottom: 14px; border-bottom: 1px solid var(--baseline); }
+  .tab { font: inherit; font-size: 13px; font-weight: 600; color: var(--ink-mut);
+    background: none; border: 0; padding: 8px 15px; cursor: pointer;
+    border-bottom: 2px solid transparent; margin-bottom: -1px; transition: color .12s; }
+  .tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--series-1); }
+  .tab:hover { color: var(--ink-2); }
+  .tab .badge { font-size: 10px; font-weight: 700; color: var(--surface);
+    background: var(--series-1); border-radius: 999px; padding: 1px 6px; margin-left: 6px;
+    font-variant-numeric: tabular-nums; }
+
+  .act-strip { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 14px; }
+  .act-stat { border: 1px solid var(--baseline); border-radius: 6px; padding: 5px 13px;
+    background: var(--surface); box-shadow: inset 0 0 0 1px var(--ring); }
+  .act-stat .n { font-size: 20px; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.12; }
+  .act-stat .k { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink-mut); }
+  .act-stat.place .n { color: var(--delta-good); }
+  .act-stat.move  .n { color: var(--st-warn); }
+  .act-stat.cancel .n { color: var(--ink-2); }
+  .act-stat.fail  .n { color: var(--st-crit); }
+
+  /* sports lines */
+  #sports-table td, #sports-table th { padding: 6px 8px; }
+  #sports-table tr.crossed td { background: color-mix(in srgb, var(--delta-good) 14%, transparent); font-weight: 600; }
+  #sports-table td.edge-pos { color: var(--delta-good); font-weight: 650; }
+  #sports-table td.edge-neg { color: var(--ink-mut); }
+  #sports-table td.dim { color: var(--ink-mut); }
+  .stale-pill { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--surface); background: var(--st-warn); border-radius: 4px; padding: 2px 7px; vertical-align: middle; }
+  .act-stat.crossed .n { color: var(--delta-good); }
+
+  .act-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 11px;
+    color: var(--ink-2); margin: 0 0 12px 40px; }
+  .act-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+    margin-right: 5px; vertical-align: middle; }
+  .feed { display: flex; flex-direction: column; border-top: 1px solid var(--grid); }
+  .evt { display: flex; align-items: center; gap: 10px; padding: 7px 6px;
+    border-bottom: 1px solid var(--grid); font-size: 12.5px; }
+  .evt:hover { background: color-mix(in srgb, var(--series-1) 6%, transparent); }
+  .evt .t { width: 40px; text-align: right; font-variant-numeric: tabular-nums;
+    color: var(--ink-mut); font-size: 11px; flex: none; }
+  .evt .vchip { width: 52px; flex: none; font-weight: 650; font-size: 11.5px; }
+  .evt .vchip.k  { color: var(--series-1); }
+  .evt .vchip.pm { color: #b06bd6; }
+  .evt .mk { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--ink-2); }
+  .evt .pr { flex: none; font-variant-numeric: tabular-nums; text-align: right; min-width: 96px; }
+  .evt .pr .old { color: var(--ink-mut); text-decoration: line-through; margin-right: 3px; }
+  .evt .pr .arw { color: var(--ink-mut); margin: 0 2px; }
+  .evt .qty { flex: none; width: 34px; text-align: right; color: var(--ink-mut);
+    font-variant-numeric: tabular-nums; }
+  .abadge { flex: none; width: 66px; text-align: center; font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .03em; border-radius: 999px; padding: 2px 0; }
+  .abadge.place  { background: color-mix(in srgb, var(--st-good) 18%, transparent); color: var(--delta-good); }
+  .abadge.move   { background: color-mix(in srgb, var(--st-warn) 24%, transparent); color: var(--st-warn); }
+  .abadge.cancel { background: color-mix(in srgb, var(--ink-mut) 20%, transparent); color: var(--ink-2); }
+  .abadge.fill   { background: color-mix(in srgb, var(--series-1) 20%, transparent); color: var(--series-1); }
+  .abadge.fail   { background: color-mix(in srgb, var(--st-crit) 18%, transparent); color: var(--st-crit); }
+  .side-tag.bid { background: color-mix(in srgb, var(--series-2) 16%, transparent); color: var(--delta-good); }
+  .side-tag.ask { background: color-mix(in srgb, var(--st-serious) 22%, transparent); color: var(--st-serious); }
+  @keyframes evtIn {
+    0%   { background: color-mix(in srgb, var(--series-2) 30%, transparent); }
+    100% { background: transparent; } }
+  .evt.fresh { animation: evtIn 2.4s ease-out; }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+
+<header class="plate mono" id="plate">
+  <h1>ARBBOT <span class="sep">·</span> FLIGHT RECORDER</h1>
+  <div class="spec" id="plate-spec" aria-live="polite"></div>
+  <button class="theme mono" id="theme-btn" title="toggle light/dark">◐ theme</button>
+</header>
+
+<nav class="filters" aria-label="filters">
+  <button data-range="today" aria-pressed="true">Today</button>
+  <button data-range="7d" aria-pressed="false">Last 7 days</button>
+  <button data-range="all" aria-pressed="false">All</button>
+  <span style="width:14px"></span>
+  <span style="font-size:11.5px;color:var(--ink-mut);align-self:center">fees:</span>
+  <button data-fees="scanned" aria-pressed="true">as scanned</button>
+  <button data-fees="pm-zero" aria-pressed="false">PM zero</button>
+  <button data-fees="stress-2x" aria-pressed="false">2× stress</button>
+  <button data-fees="kalshi-maker" aria-pressed="false">Kalshi maker</button>
+</nav>
+
+<main id="main">
+  <div class="tabs" role="tablist">
+    <button class="tab" id="tab-overview" role="tab" aria-selected="true">Overview</button>
+    <button class="tab" id="tab-activity" role="tab" aria-selected="false">Order activity
+      <span class="badge" id="tab-activity-n" hidden></span></button>
+    <button class="tab" id="tab-sports" role="tab" aria-selected="false">Sports
+      <span class="badge" id="tab-sports-n" hidden></span></button>
+  </div>
+
+  <div id="view-overview">
+  <section class="hero-row">
+    <div class="tile hero"><div class="lbl" data-tip="Each observation = one scan tick where a basket was buyable at displayed depth for less than its guaranteed minimum payoff, net of fees. One persistent mispricing produces MANY observations (one per book change) — this counts sightings, not distinct opportunities or trades.">Post-fee crossings observed</div>
+      <div class="val" id="hero-val">—</div><div class="sub" id="hero-sub"></div></div>
+    <div class="tile"><div class="lbl" data-tip="Raw market-data events persisted to disk (book snapshots, deltas, trades) across all days — the flight-recorder tape the replay gate will consume.">Events recorded</div>
+      <div class="val" id="t-events">—</div><div class="sub" id="t-events-sub"></div></div>
+    <div class="tile"><div class="lbl" data-tip="Crossings that appeared and then vanished; their lifetime is the capturability signal — how long a non-colocated bot would have had to act.">Closed crossings</div>
+      <div class="val" id="t-closed">—</div><div class="sub" id="t-closed-sub"></div></div>
+    <div class="tile"><div class="lbl" data-tip="Best relationship's median annualized return on locked capital (edge ÷ capital locked until resolution, annualized). Beat the T-bill (~4-5%/yr) or it isn't working.">Best ann. return on locked capital</div>
+      <div class="val" id="t-roc">—</div><div class="sub" id="t-roc-sub">median, best relationship</div></div>
+    <div class="tile"><div class="lbl" data-tip="Relationships in the registry: human-vetted (tradable-eligible after the Stage-3 gate) / total watched. Rejected trap entries are documented but never scanned.">Universe</div>
+      <div class="val" id="t-uni">—</div><div class="sub" id="t-uni-sub">human-vetted / total relationships</div></div>
+  </section>
+
+  <section class="card" id="trades-section" style="margin-top:12px">
+    <h2>Live arbitrage trades</h2>
+    <div class="cap" data-tip="Real executed cross-venue baskets: buy YES on one venue + buy NO on the other for the SAME outcome, locking a guaranteed $1/contract payoff for less than $1 cost. Profit is riskless once both legs fill; capital is locked until the market resolves. Sourced from data/exec/trades.jsonl (the executor appends each fill).">actual money — buy YES one venue + NO the other on the same outcome; pays $1/ct regardless, cost &lt; $1</div>
+    <div class="tr-strip">
+      <div><div class="s-lbl">Locked profit (riskless)</div><div class="s-val pos" id="tr-profit">—</div></div>
+      <div><div class="s-lbl">Capital deployed</div><div class="s-val" id="tr-capital">—</div></div>
+      <div><div class="s-lbl">Open baskets</div><div class="s-val" id="tr-open">—</div></div>
+      <div><div class="s-lbl" data-tip="Raw locked profit ÷ capital deployed — NOT annualized. A basket resolving in 6 months and one in 2 years show the same RoC, so compare it against the annualized figure to its right.">Return on capital</div><div class="s-val" id="tr-roc">—</div></div>
+      <div><div class="s-lbl" data-tip="Portfolio APR: the raw RoC annualized over the capital-weighted average time to resolution across open baskets. This is the comparable yearly rate — the number to judge against the T-bill (~4-5%) and against redeploying capital. Estimated resolution dates (e.g. TIME PotY) feed this, so treat it as approximate.">Blended APR</div><div class="s-val" id="tr-apr">—</div><div class="s-lbl" id="tr-apr-sub"></div></div>
+      <div><div class="s-lbl" data-tip="Mark-to-market if we LIQUIDATED every open basket right now (sell both legs, pay the spread + unwind fees). Starts negative by ~the round-trip spread and CLIMBS toward locked profit as prices converge to resolution. Negative here is NOT a loss — held to resolution each basket pays its locked profit.">Unwind-now P&amp;L</div><div class="s-val" id="tr-mark">—</div></div>
+      <div><div class="s-lbl" data-tip="Median HEDGE LATENCY: time from detecting our maker-leg fill to the cross-venue hedge being confirmed — the window we hold a naked, unhedged leg. Fill detection itself is sub-second (PM US private WS); this number is dominated by the hedge order's venue round-trip. Lower = less legging risk.">Hedge latency</div><div class="s-val" id="tr-latency">—</div><div class="s-lbl" id="tr-latency-n"></div></div>
+    </div>
+    <div id="tr-signals" style="margin:-4px 0 10px; font-size:12px"></div>
+    <div style="overflow-x:auto"><table id="trades-table">
+      <thead><tr>
+        <th data-tip="The vetted cross-venue-equivalent relationship traded.">basket</th>
+        <th data-tip="Both legs of the hedge, with venue · outcome side · execution role. TAKER = we crossed the spread (paid it) to lift resting liquidity; MAKER = we rested a quote and were filled (earned the spread).">legs — side &amp; role</th>
+        <th class="num" data-tip="Contracts in the basket (both legs matched).">qty</th>
+        <th class="num" data-tip="Total capital locked until resolution (both legs' cost + fees).">cost</th>
+        <th class="num" data-tip="Guaranteed payoff at resolution = qty × $1 (exactly one of YES/NO pays).">payoff</th>
+        <th class="num" data-tip="Riskless locked profit = payoff − cost, realized at resolution.">locked profit</th>
+        <th class="num" data-tip="Live mark-to-market: P&L if we unwound THIS basket right now (both legs sold into the current book, net of spread + unwind fees). Converges up to locked profit as resolution nears; a negative here is the spread you'd pay to exit early, not a loss.">unwind now</th>
+        <th class="num" data-tip="How far the live mark has converged toward the locked profit (mark ÷ locked). Climbs toward 100% as the market resolves.">conv.</th>
+        <th class="num" data-tip="Implied APR of HOLDING to resolution: remaining profit (locked − mark) annualized over the capital currently tied up and the time left until the market resolves. This is the go-forward rate of keeping capital in this basket — the hurdle any redeployment must beat.">hold APR</th>
+        <th class="num" data-tip="NATURAL hold APR: the basket's intrinsic riskless yield if simply held to resolution — locked profit ÷ cost ÷ (entry→resolution), IGNORING exit taker fees & slippage (you never pay them if you hold). This is the 'true' arb yield; hold APR to its left is lower because it's measured off the liquidation mark (which pays the round-trip spread).">nat. APR</th>
+        <th class="num" data-tip="Implied APR of UNWINDING NOW: the mark gain on cost, annualized over how long we've held the basket — i.e. the rate you would lock in by exiting today. Noisy for freshly-opened positions (short holding period). If this materially exceeds hold APR, the basket has run ahead of schedule; unwinding banks the higher rate IF the freed capital can be redeployed above the hold APR.">unwind APR</th>
+        <th data-tip="UNWIND &lt;4% (red) = forward APR below the 4%/yr HARD floor — worse than trivially-redeployable yield, exit even into idle capital. UNWIND = below the 12%/yr hurdle — recycle if capital-constrained. REVERSE = the opposite-direction basket is itself profitable now.">signal</th>
+        <th data-tip="When the guaranteed profit is realized (capital unlocks).">resolves</th>
+      </tr></thead><tbody></tbody></table></div>
+    <div id="trades-empty" style="display:none;color:var(--ink-mut);font-size:12px;padding:8px 0">No arbitrage trades executed yet.</div>
+  </section>
+
+  <section class="grid">
+    <div class="card" style="grid-column: 1 / -1">
+      <h2>Crossings per hour</h2>
+      <div class="cap">post-fee opportunity observations, UTC hours</div>
+      <div id="c-hourly"></div>
+    </div>
+    <div class="card"><h2>Crossings by relationship</h2>
+      <div class="cap">top relationships; rest folded into Other</div>
+      <div id="c-byrel"></div></div>
+    <div class="card"><h2>Median edge per contract</h2>
+      <div class="cap">$ per contract, same top relationships</div>
+      <div id="c-edge"></div></div>
+    <div class="card" style="grid-column: 1 / -1"><h2>Crossing lifetimes</h2>
+      <div class="cap">how long closed crossings persisted — the capturability signal</div>
+      <div id="c-life"></div></div>
+  </section>
+
+  <section class="card" style="margin-top:12px">
+    <h2>Make-take viability</h2>
+    <div class="cap">time we could have rested a quote at/inside top of book AND hedged profitably cross-venue —
+      the leading indicator for maker mode. Measured from live books; no fills modeled.</div>
+    <div style="overflow-x:auto"><table id="maker-table">
+      <thead><tr>
+        <th data-tip="The relationship whose maker leg we'd quote on.">relationship</th>
+        <th data-tip="Which leg the resting quote sits on (venue:market).">maker leg</th>
+        <th data-tip="bid = rest a YES bid (hedge by buying NO cross-venue on fill). ask = rest a YES ask (hedge by buying YES cross-venue on fill).">side</th>
+        <th class="num" data-tip="Total time in this range the quote could sit at-or-inside top of book with the hedge still clearing fees. The raw material of maker mode.">viable time</th>
+        <th class="num" data-tip="Number of distinct viability spells (a spell = a continuous stretch of viability).">spells</th>
+        <th class="num" data-tip="Median price improvement available at spell start — how far inside the top our profitable quote could go. Bigger = more queue priority available while staying profitable.">margin p50</th>
+      </tr></thead><tbody></tbody>
+    </table></div>
+    <div class="cap" id="maker-empty" style="display:none;padding:14px 0 4px">
+      No completed viability spells in this range yet — tracking began 2026-07-20 ~12:30 ET.
+      Spells are written when they CLOSE, so a long-running viable state appears here only after it ends.</div>
+  </section>
+
+  <section class="grid" style="margin-top:12px">
+    <div class="card"><h2>Capital velocity — unwind economics (replayed)</h2>
+      <div class="cap" data-tip="For sampled entry crossings, the recorded books were replayed forward 2h pricing a TAKER exit of the exact basket at every book change. Breakeven rate = fraction of entries where selling both legs ever recovered entry cost + all fees. Conservative: exit fees use the schedule (venue-reported free markets over-charged); MAKER exits would beat these numbers.">taker-exit test: can you sell both legs early and keep the edge?</div>
+      <div style="overflow-x:auto"><table id="unwind-table">
+        <thead><tr><th>relationship</th><th class="num">spells</th>
+          <th class="num" data-tip="Fraction of sampled entries with ANY breakeven-or-better taker exit within 2h.">breakeven rate</th>
+          <th class="num" data-tip="Median best exit P&L within 2h as % of entry cost. Negative = every early taker exit gave back more than the edge.">best exit p50</th>
+          <th class="num" data-tip="The guaranteed hold-to-resolution edge as % of entry cost — the floor an unwind must beat.">hold edge p50</th>
+          <th class="num" data-tip="Maker-exit test: resting exits at ENTRY prices, filled only when the tape trades strictly THROUGH them (pessimistic). Both legs must fill within 2h.">maker exit</th>
+          <th data-tip="Whether the crossing has EVER flipped direction (a reverse crossing = a natural unwind at a second profit). One-way = persistent basis, capital locks.">reverse?</th>
+        </tr></thead><tbody></tbody></table></div>
+      <div class="cap" id="unwind-note" style="padding-top:6px"></div>
+    </div>
+    <div class="card"><h2>Make-take simulation (replayed)</h2>
+      <div class="cap" data-tip="Full-tape replay: rest 100 contracts at min(top+tick, max profitable price) whenever viable, fill when the tape prints through (or at, when we improved the book), hedge cross-venue at +500ms books, net of all fees. Optimistic on: instant requoting (pickoff not fully priced) and fixed 100-contract fills regardless of print size. The Stage-4 go/no-go number.">what maker-first entry would have earned on this tape</div>
+      <div style="overflow-x:auto"><table id="mt-table">
+        <thead><tr><th>relationship</th><th>side</th>
+          <th class="num">fills</th><th class="num">contracts</th>
+          <th class="num" data-tip="Realized edge across all fills, net of maker+hedge fees, at +500ms hedge books.">edge $</th>
+          <th class="num" data-tip="Fills where hedge depth was GONE at +500ms — the legging-risk realization count.">unhedged</th>
+        </tr></thead><tbody></tbody></table></div>
+      <div class="cap" id="mt-note" style="padding-top:6px"></div>
+    </div>
+    <div class="card"><h2>Maker incentives — reward pools in our universe</h2>
+      <div class="cap" data-tip="Polymarket pays makers daily just for RESTING orders near the midpoint (quadratic score by closeness x size, two-sided; formula public). Pools below are live venue-reported daily rates for markets we already record. Kalshi's LIP adds small pools ($25-200/period) on long-tail series. Filled makers additionally split 25% of taker fees (politics categories).">Polymarket pays for presence — pools on markets we already watch</div>
+      <div style="overflow-x:auto"><table id="rewards-table">
+        <thead><tr><th>market</th>
+          <th class="num" data-tip="Venue-reported daily reward pool (USD), split pro-rata among makers by the public quadratic score.">pool/day</th>
+          <th class="num" data-tip="Minimum resting size to qualify.">min size</th>
+          <th class="num" data-tip="Max distance from midpoint (cents) for an order to score. Wider = easier to farm safely.">max spread</th>
+          <th data-tip="Whether the venue also reports this market taker-fee-FREE — free hedging + paid quoting is the standout combination.">fee-free</th>
+          <th class="num" data-tip="Simulated daily capture at a MINIMUM config (both sides, min size, half max-spread from mid), scored with the public formula against today's recorded books. Conservative floor: share scales with size and closeness²; excludes fill rebates and adverse selection.">est capture</th>
+        </tr></thead><tbody></tbody></table></div>
+      <div class="cap" id="rewards-note" style="padding-top:6px"></div>
+    </div>
+  </section>
+
+  <section class="card" style="margin-top:12px">
+    <h2>Fee model in force</h2>
+    <div class="cap">what every post-fee number above assumes — and what the scenarios change</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px 22px;font-size:12.5px;line-height:1.55">
+      <div>
+        <b>Kalshi</b> — taker <span class="mono">ceil¢(0.07·n·P·(1−P))</span>,
+        maker <span class="mono">ceil¢(0.0175·n·P·(1−P))</span>. Fixed schedule; no
+        volume tiering on fees (maker programs exist but aren't modeled).
+      </div>
+      <div>
+        <b>Polymarket (international)</b> — taker <span class="mono">k·n·P·(1−P)</span>,
+        k by category (0 geopolitics · 0.04 politics/finance/tech · 0.05 sports/econ ·
+        0.07 crypto), makers free. <b>Venue-reported override:</b> the CLOB marks some
+        markets fee-free (<span class="mono">taker_base_fee=0</span> — NEH, Putin-out
+        class); the scanner honors that per market for new observations.
+      </div>
+      <div>
+        <b>Scenarios</b> — <i>as scanned</i>: fees exactly as charged at observation
+        time. <i>PM zero</i>: every Polymarket taker leg free (upper bound if the
+        fee-free set is wider than reported). <i>2× stress</i>: all fees doubled
+        (schedule-drift stress). <i>Kalshi maker</i>: Kalshi legs at the maker
+        coefficient (the Stage-4 make-take world). Scenarios reprice the recorded
+        baskets; observations counts don't change.
+      </div>
+    </div>
+  </section>
+
+  <section class="card" style="margin-top:12px">
+    <h2>Relationship ledger</h2>
+    <div class="cap">every observed relationship, this range — the table view of everything above</div>
+    <details class="colpick"><summary>columns ▾</summary><div class="menu" id="col-boxes"></div></details>
+    <div style="overflow-x:auto"><table id="ledger">
+      <thead><tr>
+        <th data-col="rel" data-tip="The registry id of a logical relationship between markets — the unit the scanner watches.">relationship</th>
+        <th data-col="type" data-tip="The logical relation: cross-venue-equivalent (same event, both venues) · exclusive (at most one leg can pay — sell-side only) · implies (A true forces B true) · date-ladder (earlier deadline implies later) · partition (exactly one pays) · rollup.">type</th>
+        <th data-col="tranche" data-tip="head = obvious, liquid, heavily-botted pairs. long-tail = obscure structures where the relationship-graph thesis lives. Stage-2 verdicts are reported per tranche.">tranche</th>
+        <th data-col="vetting" data-tip="agent = proposed by the mining agent with rule citations; scannable but can NEVER trade. ✓ human = Geoff-confirmed; tradable-eligible once the Stage-3 gate opens. Nothing trades today either way.">vetting</th>
+        <th data-col="crossings" class="num" data-tip="Post-fee crossing observations: moments the basket could be bought at displayed depth for less than its guaranteed minimum payoff, net of fees under the selected fee scenario. Observed, not traded.">crossings</th>
+        <th data-col="closed" class="num" data-tip="Crossings that appeared and later vanished — the ones whose lifetime is measurable.">closed</th>
+        <th data-col="edge" class="num" data-tip="Median net profit per contract IF the basket had filled at observed prices — after fees, before slippage and latency (the Stage-2 replay gate discounts those). p50 = median over recent observations.">edge/ct p50</th>
+        <th data-col="rolc" class="num" data-tip="Median annualized return on locked capital: edge ÷ capital locked until the market resolves, annualized by time-to-close. The bar to beat is the T-bill (~4-5%/yr) — 'positive' alone is a savings-account number.">ann.RoLC p50</th>
+        <th data-col="life" class="num" data-tip="Median time a crossing persisted before vanishing. The capturability signal: a non-colocated bot needs crossings that live seconds-to-minutes, not milliseconds.">life p50</th>
+        <th data-col="size" class="num" data-tip="Median executable size (contracts) at the displayed depth when the crossing was observed.">size p50</th>
+        <th data-col="scans" class="num" data-tip="How many times the scanner evaluated this relationship (with % of those where all legs' books were synced). 0 scans = no data flowing; many scans = actively watched.">scans</th>
+        <th data-col="bestedge" class="num" data-tip="Best per-contract net edge EVER seen at a small probe size — including negative. A quiet row at −$0.02 is a tight, efficient market (working as intended); a quiet row with no probe value means books weren't ready.">best edge seen</th>
+      </tr></thead><tbody></tbody>
+    </table></div>
+  </section>
+  </div><!-- /view-overview -->
+
+  <div id="view-activity" hidden>
+    <section class="card">
+      <h2>Order activity</h2>
+      <div class="cap" data-tip="Every maker quote our engine creates, moves (reprices), cancels, or fails to place across both venues — the live order-flow tape. A MOVE is a reprice (old price → new). Sourced from the quoters' intent logs.">live order-flow tape — quotes being created, moved, and destroyed across Kalshi + PM US</div>
+      <div class="act-strip" id="act-strip"></div>
+      <div id="act-chart" style="overflow-x:auto;margin:2px 0 4px"></div>
+      <div class="act-legend">
+        <span><i style="background:var(--delta-good)"></i>place</span>
+        <span><i style="background:var(--st-warn)"></i>move</span>
+        <span><i style="background:var(--ink-mut)"></i>cancel</span>
+        <span><i style="background:var(--series-1)"></i>fill</span>
+        <span><i style="background:var(--st-crit)"></i>fail</span>
+      </div>
+      <div class="feed" id="act-feed"></div>
+      <div id="act-empty" style="display:none;color:var(--ink-mut);font-size:12px;padding:20px 4px">No order activity recorded yet.</div>
+    </section>
+  </div><!-- /view-activity -->
+
+  <div id="view-sports" hidden>
+    <section class="card">
+      <h2>Sports lines <span id="sports-stale" class="stale-pill" hidden></span></h2>
+      <div class="cap" data-tip="Live cross-venue lines for today's games, straight from the WS engine's real-time books on BOTH venues (scripts/sports_arb.py) — NOT a REST poll, which invents phantom gaps by comparing a fresh price on one venue to a stale snapshot on the other. Each row: the away team's YES priced on Kalshi vs PM US. Edge = best cross-venue lock (buy cheap YES one side + cheap NO the other) net of ~2c fees. A CROSSED row (edge>0, highlighted) is a genuine dislocation — the net latches on it automatically.">real-time away-team YES on Kalshi vs PM US — edge is net-of-fee; a highlighted row is a genuine crossing the net acts on</div>
+      <div class="act-strip" id="sports-strip"></div>
+      <div class="cap" style="margin-top:6px" data-tip="Best edge across all live games over today, sampled every ~15s. TAKE-TAKE (solid) crosses both spreads — both legs taker, fired together, no adverse selection: this is what we can capture safely, and it's what the net acts on. MAKE-TAKE (dashed) is the ceiling: rest a maker quote on one leg to save that spread, take only the hedge — better by ~a spread, BUT adverse-selection-blind. On fast sports books our resting quote is the stale one informed takers pick off during action, so realized make-take is worse than this line (that's why we quote the slow political book but not sports). The gap between the lines ≈ the adverse-selection tax we'd pay trying to make-take. Dashed amber = 0c crossing threshold.">best edge across live games — today · take-take vs make-take ceiling</div>
+      <div id="sports-chart" style="overflow-x:auto;margin:2px 0 4px"></div>
+      <div class="act-legend" style="margin-left:44px">
+        <span><i style="background:var(--series-1)"></i>take-take (capturable — the net acts on this)</span>
+        <span><i style="background:var(--series-2)"></i>make-take ceiling (theoretical — adverse-selection-blind)</span>
+        <span><i style="background:var(--st-warn)"></i>0c crossing threshold</span>
+      </div>
+      <div style="overflow-x:auto"><table id="sports-table">
+        <thead><tr>
+          <th>game</th>
+          <th class="num" data-tip="Kalshi away-team YES: best bid / best ask.">Kalshi bid/ask</th>
+          <th class="num" data-tip="Polymarket US away-team YES: best bid / best ask.">PM US bid/ask</th>
+          <th class="num" data-tip="TAKE-TAKE edge: cross both spreads, net of ~2c fees — max(PM bid − Kalshi ask, Kalshi bid − PM ask) − fee. Both legs taker, fired together, no adverse selection. Positive (highlighted) = a real, safely-capturable arb the net acts on.">take-take</th>
+          <th class="num" data-tip="MAKE-TAKE ceiling: rest a maker quote on one leg (save that spread), take only the hedge — the venues' quote disagreement less one taker fee. Better than take-take by ~a spread, but adverse-selection-BLIND: on fast sports books our rest gets picked off, so realized is worse. Shown to bound the opportunity, not as capturable.">make-take*</th>
+        </tr></thead><tbody></tbody></table></div>
+      <div id="sports-empty" style="display:none;color:var(--ink-mut);font-size:12px;padding:20px 4px">No live games right now — the engine re-checks the slate every 15 min and latches new games as they go live.</div>
+    </section>
+
+    <section class="card">
+      <h2>Make-take probe <span id="mt-probe-status" class="stale-pill" style="background:var(--series-1)" hidden></span></h2>
+      <div class="cap" data-tip="Live experiment (tiny, capped at 10 contracts): rest a 2-lot Kalshi maker buy on the away-YES at the bid, and the instant it fills, hedge on PM. EXPECTED = the lock the book showed when we quoted; REALIZED = what we actually got after PM moved during the fill wait. The gap is adverse selection. If realized consistently falls below expected (or goes negative), we're getting picked off — theory confirmed, and we stop. If realized ≈ expected, make-take on sports is viable after all.">do we get picked off? — rest a tiny Kalshi maker, hedge on fill, measure expected vs realized lock</div>
+      <div class="act-strip" id="mt-strip"></div>
+      <div style="overflow-x:auto"><table id="mt-table">
+        <thead><tr>
+          <th>game</th>
+          <th class="num">×</th>
+          <th class="num" data-tip="Lock the book showed when we rested the maker.">expected</th>
+          <th class="num" data-tip="Lock we actually captured on the hedged portion (blank if the hedge missed entirely and we held).">captured</th>
+          <th class="num" data-tip="Contracts held naked because the profit-only hedge missed (market moved past breakeven). Held to resolution, not force-closed at a loss.">held naked</th>
+          <th></th>
+        </tr></thead><tbody></tbody></table></div>
+      <div id="mt-empty" style="display:none;color:var(--ink-mut);font-size:12px;padding:20px 4px">No fills yet — we rest at the pure bid, so a fill needs someone to sell into us. Unfilled quotes cost nothing. Results appear here the moment a maker fills.</div>
+    </section>
+  </div><!-- /view-sports -->
+</main>
+
+<div id="tip" role="status"></div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+{ const q = new URLSearchParams(location.search).get("theme");
+  if (q === "light" || q === "dark") document.documentElement.setAttribute("data-theme", q); }
+const SVGNS = "http://www.w3.org/2000/svg";
+let RANGE = "today";
+let FEES = "scanned";
+let LAST = null;
+
+/* ---------- theme toggle (data-theme wins both ways) ---------- */
+$("#theme-btn").addEventListener("click", () => {
+  const cur = document.documentElement.getAttribute("data-theme");
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+  const next = cur ? (cur === "dark" ? "light" : "dark") : (dark ? "light" : "dark");
+  document.documentElement.setAttribute("data-theme", next);
+  if (LAST) render(LAST);   // re-render SVGs against new tokens
+});
+
+/* ---------- tooltip ---------- */
+const tip = $("#tip");
+function showTip(x, y, rows) {
+  tip.replaceChildren();
+  for (const r of rows) {
+    const d = document.createElement("div");
+    if (r.key) { const k = document.createElement("span"); k.className = "key"; d.appendChild(k); }
+    const v = document.createElement("span"); v.className = "v"; v.textContent = r.v;
+    const k2 = document.createElement("span"); k2.className = "k"; k2.textContent = " " + r.k;
+    d.append(v, k2); tip.appendChild(d);
+  }
+  tip.style.display = "block";
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  tip.style.left = Math.min(x + 14, innerWidth - w - 8) + "px";
+  tip.style.top  = Math.max(8, Math.min(y - h - 10, innerHeight - h - 8)) + "px";
+}
+function hideTip() { tip.style.display = "none"; }
+
+/* definition tooltips on [data-tip] labels/headers — hover AND keyboard focus */
+for (const el of document.querySelectorAll("[data-tip]")) {
+  el.setAttribute("tabindex", "0");
+  const show = (ev) => {
+    const r = el.getBoundingClientRect();
+    showTip(ev.clientX ?? r.left, (ev.clientY ?? r.bottom + 30),
+      [{ v: el.textContent.trim(), k: "" }, { v: "", k: el.dataset.tip }]);
+  };
+  el.addEventListener("pointerenter", show);
+  el.addEventListener("pointermove", show);
+  el.addEventListener("pointerleave", hideTip);
+  el.addEventListener("focus", show);
+  el.addEventListener("blur", hideTip);
+}
+
+/* ---------- svg helpers ---------- */
+function el(name, attrs, parent) {
+  const e = document.createElementNS(SVGNS, name);
+  for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function fmt(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e4) return (n / 1e3).toFixed(1) + "K";
+  return n.toLocaleString("en-US");
+}
+function fmtDur(s) {
+  if (s == null) return "—";
+  if (s < 60) return s.toFixed(0) + "s";
+  if (s < 3600) return (s / 60).toFixed(1) + "m";
+  return (s / 3600).toFixed(1) + "h";
+}
+
+/* ---------- charts ---------- */
+function hourlyChart(host, data) {
+  host.replaceChildren();
+  const W = 1080, H = 190, m = { t: 12, r: 14, b: 26, l: 44 };
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "crossings per hour" });
+  host.appendChild(svg);
+  if (!data.length) { emptyNote(host, svg, "No crossings in this range yet — the recorder is listening."); return; }
+  const xs = data.map(d => d.hour), ys = data.map(d => d.observations);
+  const ymax = niceMax(Math.max(...ys));
+  const px = i => m.l + (xs.length === 1 ? (W - m.l - m.r) / 2 : i * (W - m.l - m.r) / (xs.length - 1));
+  const py = v => H - m.b - v / ymax * (H - m.t - m.b);
+  /* pick divisions so tick steps land on clean numbers (25K -> 5K steps) */
+  const pw = Math.pow(10, Math.floor(Math.log10(ymax)));
+  const DIV = (ymax / pw === 2.5 || ymax / pw === 5) ? 5 : 4;
+  for (let g = 0; g <= DIV; g++) {
+    const y = py(ymax * g / DIV);
+    el("line", { x1: m.l, x2: W - m.r, y1: y, y2: y, stroke: css("--grid"), "stroke-width": 1 }, svg);
+    el("text", { x: m.l - 6, y: y + 3.5, "text-anchor": "end", class: "tick" }, svg)
+      .textContent = fmt(ymax * g / DIV);
+  }
+  el("line", { x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b, stroke: css("--baseline") }, svg);
+  const step = Math.max(1, Math.ceil(xs.length / 10));
+  xs.forEach((hr, i) => { if (i % step === 0)
+    el("text", { x: px(i), y: H - m.b + 15, "text-anchor": "middle", class: "tick" }, svg)
+      .textContent = hr.slice(11) + ":00"; });
+  const line = data.map((d, i) => `${i ? "L" : "M"}${px(i)},${py(d.observations)}`).join("");
+  el("path", { d: `${line}L${px(xs.length - 1)},${py(0)}L${px(0)},${py(0)}Z`,
+    fill: css("--series-1"), opacity: 0.1 }, svg);
+  el("path", { d: line, fill: "none", stroke: css("--series-1"), "stroke-width": 2,
+    "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+  const li = xs.length - 1;                                  /* end marker + label */
+  el("circle", { cx: px(li), cy: py(ys[li]), r: 4.5, fill: css("--series-1"),
+    stroke: css("--surface"), "stroke-width": 2 }, svg);
+  el("text", { x: px(li) - 8, y: py(ys[li]) - 9, "text-anchor": "end", class: "dl",
+    "font-weight": 600 }, svg).textContent = fmt(ys[li]);
+  /* crosshair + tooltip: aim at the hour, not the 2px line */
+  const hair = el("line", { y1: m.t, y2: H - m.b, stroke: css("--baseline"),
+    "stroke-width": 1, visibility: "hidden" }, svg);
+  const hot = el("rect", { x: m.l, y: 0, width: W - m.l - m.r, height: H,
+    fill: "transparent" }, svg);
+  hot.addEventListener("pointermove", ev => {
+    const r = svg.getBoundingClientRect();
+    const fx = (ev.clientX - r.left) / r.width * W;
+    let i = Math.round((fx - m.l) / ((W - m.l - m.r) / Math.max(xs.length - 1, 1)));
+    i = Math.max(0, Math.min(xs.length - 1, i));
+    hair.setAttribute("x1", px(i)); hair.setAttribute("x2", px(i));
+    hair.setAttribute("visibility", "visible");
+    showTip(ev.clientX, ev.clientY,
+      [{ v: fmt(ys[i]), k: "crossings", key: true }, { v: "", k: xs[i].replace("T", " ") + ":00 UTC" }]);
+  });
+  hot.addEventListener("pointerleave", () => { hair.setAttribute("visibility", "hidden"); hideTip(); });
+}
+
+/* order activity: stacked bars per time-bin, one colour per action type */
+const ACT_COLORS = [["place", "--delta-good"], ["move", "--st-warn"],
+  ["cancel", "--ink-mut"], ["fill", "--series-1"], ["fail", "--st-crit"]];
+function activityChart(host, events) {
+  host.replaceChildren();
+  const W = 1080, H = 200, m = { t: 12, r: 14, b: 26, l: 40 };
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "order activity over time" });
+  host.appendChild(svg);
+  if (!events.length) { emptyNote(host, svg, "No order activity yet — quotes will appear as the engine works."); return; }
+  const ts = events.map(e => e.ts || 0);
+  let tmin = Math.min(...ts), tmax = Math.max(...ts);
+  if (tmax <= tmin) tmax = tmin + 1;
+  const NB = 32, bw = (tmax - tmin) / NB;
+  const bins = Array.from({ length: NB }, () => ({ place: 0, move: 0, cancel: 0, fill: 0, fail: 0 }));
+  for (const e of events) {
+    let i = Math.floor(((e.ts || tmin) - tmin) / bw);
+    i = Math.max(0, Math.min(NB - 1, i));
+    if (bins[i][e.action] != null) bins[i][e.action]++;
+  }
+  const totals = bins.map(b => ACT_COLORS.reduce((a, [k]) => a + b[k], 0));
+  const ymax = niceMax(Math.max(1, ...totals));
+  const bwpx = (W - m.l - m.r) / NB;
+  const px = i => m.l + i * bwpx;
+  const py = v => H - m.b - v / ymax * (H - m.t - m.b);
+  const DIV = 4;
+  for (let g = 0; g <= DIV; g++) {
+    const y = py(ymax * g / DIV);
+    el("line", { x1: m.l, x2: W - m.r, y1: y, y2: y, stroke: css("--grid"), "stroke-width": 1 }, svg);
+    el("text", { x: m.l - 6, y: y + 3.5, "text-anchor": "end", class: "tick" }, svg)
+      .textContent = fmt(Math.round(ymax * g / DIV));
+  }
+  el("line", { x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b, stroke: css("--baseline") }, svg);
+  const clock = t => { const d = new Date(t * 1000); return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"); };
+  const step = Math.ceil(NB / 8);
+  for (let i = 0; i < NB; i += step)
+    el("text", { x: px(i) + bwpx / 2, y: H - m.b + 15, "text-anchor": "middle", class: "tick" }, svg)
+      .textContent = clock(tmin + i * bw);
+  for (let i = 0; i < NB; i++) {
+    let yb = H - m.b;
+    for (const [k, cv] of ACT_COLORS) {
+      const c = bins[i][k];
+      if (!c) continue;
+      const h = c / ymax * (H - m.t - m.b);
+      el("rect", { x: px(i) + 1, y: yb - h, width: Math.max(1, bwpx - 2), height: h,
+        fill: css(cv), opacity: 0.9, rx: 1 }, svg);
+      yb -= h;
+    }
+    if (totals[i]) {
+      const b = bins[i], t0 = tmin + i * bw;
+      const hot = el("rect", { x: px(i), y: m.t, width: bwpx, height: H - m.t - m.b, fill: "transparent" }, svg);
+      hot.addEventListener("pointermove", ev => showTip(ev.clientX, ev.clientY,
+        [{ v: String(totals[i]), k: "events", key: true },
+        ...ACT_COLORS.filter(([k]) => b[k]).map(([k]) => ({ v: String(b[k]), k })),
+        { v: "", k: clock(t0) }]));
+      hot.addEventListener("pointerleave", hideTip);
+    }
+  }
+}
+
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const k of [1, 2, 2.5, 5, 10]) if (v <= k * p) return k * p;
+  return 10 * p;
+}
+
+/* horizontal bars: ≤24px thick, 4px rounded data-end, square baseline, 2px gaps */
+function barChart(host, rows, opts) {
+  host.replaceChildren();
+  const BAR = 20, GAP = 8, LBLW = 232;
+  /* W tracks the card's real width so viewBox scale ≈ 1 and bars stay ≤24px */
+  const W = Math.max(360, Math.round(host.getBoundingClientRect().width || 520));
+  const m = { t: 6, r: 62, b: 8, l: Math.min(LBLW, W * 0.44) };
+  const H = m.t + m.b + rows.length * (BAR + GAP);
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": opts.label });
+  host.appendChild(svg);
+  if (!rows.length) { emptyNote(host, svg, "Nothing in this range yet."); return; }
+  const vmax = Math.max(...rows.map(r => r.v), 1e-9);
+  el("line", { x1: m.l, x2: m.l, y1: m.t, y2: H - m.b, stroke: css("--baseline") }, svg);
+  rows.forEach((r, i) => {
+    const y = m.t + i * (BAR + GAP);
+    const w = Math.max(2, (r.v / vmax) * (W - m.l - m.r));
+    const g = el("g", { class: "bar", tabindex: 0, role: "img",
+      "aria-label": `${r.name}: ${opts.fmt(r.v)}` }, svg);
+    /* data-end rounded, baseline square: rounded rect + square patch */
+    el("rect", { class: "mark", x: m.l, y, width: w, height: BAR, rx: 4,
+      fill: r.muted ? css("--ink-mut") : css("--series-1") }, g);
+    el("rect", { x: m.l, y, width: Math.min(4, w / 2), height: BAR,
+      fill: r.muted ? css("--ink-mut") : css("--series-1") }, g);
+    const nm = el("text", { x: m.l - 8, y: y + BAR / 2 + 3.5, "text-anchor": "end",
+      class: "cat" }, g);
+    nm.textContent = r.name.length > 30 ? r.name.slice(0, 29) + "…" : r.name;
+    el("text", { x: m.l + w + 6, y: y + BAR / 2 + 3.5, class: "dl",
+      "font-weight": 600 }, g).textContent = opts.fmt(r.v);
+    const hot = el("rect", { x: 0, y: y - GAP / 2, width: W, height: BAR + GAP,
+      fill: "transparent" }, g);
+    const tipFor = (ev) => showTip(ev.clientX ?? innerWidth / 2, ev.clientY ?? 120,
+      [{ v: opts.fmt(r.v), k: opts.unit, key: true }, { v: "", k: r.name }]
+        .concat(r.extra ? [{ v: "", k: r.extra }] : []));
+    hot.addEventListener("pointermove", tipFor);
+    hot.addEventListener("pointerleave", hideTip);
+    g.addEventListener("focus", tipFor);
+    g.addEventListener("blur", hideTip);
+  });
+}
+
+function emptyNote(host, svg, msg) {
+  svg.remove();
+  const d = document.createElement("div"); d.className = "empty"; d.textContent = msg;
+  host.appendChild(d);
+}
+
+/* ---------- render ---------- */
+function statusSpan(cls, label) {
+  const s = document.createElement("span"); s.className = "st-" + cls;
+  const dot = document.createElement("span"); dot.className = "dot";
+  s.append(dot, document.createTextNode(label));
+  return s;
+}
+
+function renderPlate(d) {
+  const spec = $("#plate-spec"); spec.replaceChildren();
+  const rec = d.health.recorder;
+  const recDiv = document.createElement("div");
+  recDiv.append("recorder ", statusSpan(rec === "ok" ? "ok" : "bad",
+    rec === "ok" ? "recording" : rec.toUpperCase()));
+  spec.appendChild(recDiv);
+  for (const [feed, st] of Object.entries(d.health.feeds)) {
+    const div = document.createElement("div");
+    div.append(feed.replace("-", " ") + " ", statusSpan(st === "ok" ? "ok" : "warn",
+      st === "ok" ? "live" : "STALE"));
+    spec.appendChild(div);
+  }
+  const first = d.hourly[0];
+  const since = document.createElement("div");
+  since.append("measuring since ");
+  const b = document.createElement("b");
+  b.textContent = first ? first.hour.slice(0, 10) : "—";
+  since.appendChild(b);
+  spec.appendChild(since);
+}
+
+function render(d) {
+  LAST = d;
+  renderPlate(d);
+  renderActivity(d);
+  renderSports(d);
+  /* accumulating counters get FULL digits — the tick is the signal that
+     the instrument is alive; compact notation hides it */
+  $("#hero-val").textContent = d.hero.observations.toLocaleString("en-US");
+  const scTag = d.fee_scenario !== "scanned" ? ` · fees: ${d.fee_scenario}` : "";
+  $("#hero-sub").textContent = (d.hero.observations
+    ? `across ${d.hero.distinct_relationships} relationships — observed, not traded`
+    : "none observed in this range") + scTag;
+  const ev = d.tiles.events_recorded;
+  const evTotal = Object.values(ev).reduce((a, b) => a + b, 0);
+  $("#t-events").textContent = evTotal.toLocaleString("en-US");
+  $("#t-events-sub").textContent = Object.entries(ev)
+    .map(([v, n]) => `${v} ${n.toLocaleString("en-US")}`).join(" · ")
+    || "book deltas + trades, all days";
+  $("#t-closed").textContent = fmt(d.tiles.closed_crossings);
+  $("#t-closed-sub").textContent = "median lifetime " + fmtDur(d.tiles.lifetime_p50_s);
+  $("#t-roc").textContent = (d.tiles.best_roc_p50 * 100).toFixed(1) + "%";
+  $("#t-uni").textContent = `${d.tiles.universe.vetted} / ${d.tiles.universe.total}`;
+
+  hourlyChart($("#c-hourly"), d.hourly);
+
+  const TOP = 7;
+  const observed = d.relationships.filter(r => r.observations > 0);
+  const byrel = observed.slice(0, TOP)
+    .map(r => ({ name: r.id, v: r.observations, extra: `${r.type} · ${r.tranche}` }));
+  const rest = observed.slice(TOP);
+  if (rest.length) byrel.push({ name: `Other (${rest.length})`,
+    v: rest.reduce((a, r) => a + r.observations, 0), muted: true });
+  barChart($("#c-byrel"), byrel, { label: "crossings by relationship",
+    unit: "crossings", fmt });
+
+  barChart($("#c-edge"),
+    observed.slice(0, TOP).map(r => ({ name: r.id, v: r.edge_p50,
+      extra: `ann.RoLC p50 ${(r.roc_p50 * 100).toFixed(1)}%` })),
+    { label: "median edge per contract", unit: "$ / contract p50",
+      fmt: v => "$" + v.toFixed(4) });
+
+  const buckets = [["<10s", 0, 10], ["10–60s", 10, 60], ["1–10m", 60, 600],
+                   ["10–60m", 600, 3600], [">1h", 3600, Infinity]];
+  const lifeRows = buckets.map(([name, lo, hi]) => ({ name,
+    v: d.relationships.reduce((a, r) =>
+      a + (r.lifetime_p50_s >= lo && r.lifetime_p50_s < hi && r.closed ? r.closed : 0), 0) }));
+  barChart($("#c-life"), lifeRows.every(r => !r.v) ? [] : lifeRows,
+    { label: "crossing lifetimes", unit: "closed crossings", fmt });
+
+  const mtb = $("#maker-table tbody"); mtb.replaceChildren();
+  $("#maker-empty").style.display = (d.maker || []).length ? "none" : "block";
+  for (const m of (d.maker || []).slice(0, 20)) {
+    const tr = document.createElement("tr");
+    const cells = [
+      { html: td => { const s = document.createElement("span"); s.className = "relid";
+          s.textContent = m.relationship_id; td.appendChild(s); } },
+      { html: td => { const s = document.createElement("span"); s.className = "relid";
+          const leg = m.maker_leg.length > 34 ? m.maker_leg.slice(0, 33) + "…" : m.maker_leg;
+          s.textContent = leg; s.title = m.maker_leg; td.appendChild(s); } },
+      { text: m.quote_side },
+      { text: fmtDur(m.viable_s), num: true },
+      { text: fmt(m.spells), num: true },
+      { text: "$" + m.margin_p50.toFixed(4), num: true },
+    ];
+    for (const c of cells) {
+      const td = document.createElement("td");
+      if (c.num) td.className = "num";
+      if (c.html) c.html(td); else td.textContent = c.text;
+      tr.appendChild(td);
+    }
+    mtb.appendChild(tr);
+  }
+
+  // ---- live arbitrage trades
+  const tr_ = d.trades || { rows: [], n: 0, n_open: 0, capital_locked: 0, profit_locked: 0 };
+  const roc = tr_.capital_locked ? (tr_.profit_locked / tr_.capital_locked * 100) : 0;
+  const mk = tr_.marks || {};
+  $("#tr-profit").textContent = "$" + tr_.profit_locked.toFixed(2);
+  $("#tr-capital").textContent = "$" + tr_.capital_locked.toFixed(2);
+  $("#tr-open").textContent = tr_.n_open;
+  $("#tr-roc").textContent = roc ? "+" + roc.toFixed(1) + "%" : "—";
+  $("#tr-roc").className = "s-val" + (roc ? " pos" : "");
+  const papr = tr_.portfolio_apr;
+  $("#tr-apr").textContent = papr == null ? "—" : "+" + papr.toFixed(1) + "%/yr";
+  $("#tr-apr").className = "s-val" + (papr ? " pos" : "");
+  $("#tr-apr-sub").textContent = tr_.wavg_years ? `~${tr_.wavg_years}yr avg to resolve` : "";
+  const mpnl = mk.mark_pnl_usd;
+  $("#tr-mark").textContent = mpnl == null ? "—" : (mpnl >= 0 ? "+$" : "−$") + Math.abs(mpnl).toFixed(2);
+  $("#tr-mark").className = "s-val" + (mpnl > 0 ? " pos" : "");
+  const lat = tr_.hedge_latency_p50;
+  $("#tr-latency").textContent = lat == null ? "—" : (lat >= 1000 ? (lat / 1000).toFixed(1) + "s" : Math.round(lat) + "ms");
+  $("#tr-latency-n").textContent = tr_.hedge_latency_n ? `median of ${tr_.hedge_latency_n} hedges` : "";
+  const sig = $("#tr-signals");
+  const nu = mk.unwind_signals || 0, nr = mk.reverse_signals || 0;
+  sig.innerHTML = (nu || nr)
+    ? (nu ? `<span class="role-badge maker">${nu} unwind</span> ` : "")
+      + (nr ? `<span class="role-badge taker">${nr} reverse</span> ` : "")
+      + `<span style="color:var(--ink-mut)">— exit/reverse opportunity live</span>`
+    : `<span style="color:var(--ink-mut)">no exit/reverse signals · marks ${tr_.marks_at ? tr_.marks_at.slice(11,16)+"Z" : "—"}</span>`;
+  const VEN = { kalshi: ["Kalshi", "k"], polymarket_us: ["PM US", "pm"], polymarket: ["PM intl", "pm"] };
+  const legChip = (l) => {
+    const [name, cls] = VEN[l.venue] || [l.venue, ""];
+    // per-contract COST BASIS of this leg (so both legs sum to total cost/ct):
+    // a YES buy costs its fill price; a NO buy (opened by selling YES at
+    // yes_price) costs 1 − yes_price.
+    let cost = null, hint = "";
+    if (l.side === "no") {
+      // NO legs record a YES-axis price: maker legs as yes_price, taker hedges
+      // as avg_price (the price the hedge SOLD YES at). Either way the leg's
+      // cost basis is 1 − that price.
+      const yesPx = l.yes_price != null ? l.yes_price : l.avg_price;
+      cost = l.cost != null && l.qty ? Number(l.cost) / l.qty
+           : (yesPx != null ? 1 - Number(yesPx) : null);
+      if (yesPx != null) hint = `opened by selling YES @ $${Number(yesPx).toFixed(2)}`;
+    } else if (l.avg_price != null) {
+      cost = Number(l.avg_price);
+    }
+    const wrap = document.createElement("span"); wrap.className = "leg";
+    if (hint) wrap.title = hint;
+    wrap.innerHTML =
+      `<span class="v ${cls}">${name}</span>` +
+      `<span class="side-tag ${l.side || ""}">${(l.side || "?").toUpperCase()}</span>` +
+      `<span class="role-badge ${l.role || ""}">${l.role || "?"}</span>` +
+      (cost != null ? `<span class="px">cost $${cost.toFixed(2)}/ct</span>` : "");
+    return wrap;
+  };
+  const ttb = $("#trades-table tbody"); ttb.replaceChildren();
+  $("#trades-empty").style.display = tr_.n ? "none" : "block";
+  for (const t of tr_.rows) {
+    const tr = document.createElement("tr");
+    const cells = [
+      { html: td => { const s = document.createElement("span"); s.className = "relid";
+          s.textContent = t.title && t.title !== t.relationship_id ? t.title : t.relationship_id;
+          s.title = t.relationship_id; td.appendChild(s); } },
+      { html: td => { const box = document.createElement("div"); box.className = "legs";
+          for (const l of (t.legs || [])) box.appendChild(legChip(l)); td.appendChild(box); } },
+      { text: fmt(t.qty), num: true },
+      { text: "$" + Number(t.cost_usd || 0).toFixed(2), num: true },
+      { text: "$" + Number(t.payoff_usd || 0).toFixed(2), num: true },
+      { cls: "profit", text: "+$" + Number(t.profit_usd || 0).toFixed(2) },
+      { html: td => { const m = t.mark || {}; td.className = "num";
+          const v = m.mark_pnl_usd;
+          if (v == null) { td.textContent = "—"; return; }
+          const s = document.createElement("span");
+          s.style.color = v >= 0 ? "var(--delta-good)" : "var(--st-crit)";
+          s.style.fontVariantNumeric = "tabular-nums";
+          s.textContent = (v >= 0 ? "+$" : "−$") + Math.abs(v).toFixed(2);
+          td.appendChild(s); } },
+      { html: td => { const m = t.mark || {}; td.className = "num";
+          td.textContent = m.converged_pct == null ? "—" : Math.round(m.converged_pct) + "%"; } },
+      { html: td => { const m = t.mark || {}; td.className = "num"; td.style.fontVariantNumeric = "tabular-nums";
+          if (m.forward_hold_apr == null) { td.textContent = "—"; return; }
+          td.textContent = (m.resolves_estimated ? "~" : "") + m.forward_hold_apr.toFixed(1) + "%";
+          if (m.resolves_estimated) td.title = "based on an estimated resolution date — speculative"; } },
+      { html: td => { const m = t.mark || {}; td.className = "num"; td.style.fontVariantNumeric = "tabular-nums";
+          if (m.natural_hold_apr == null) { td.textContent = "—"; return; }
+          td.textContent = (m.resolves_estimated ? "~" : "") + m.natural_hold_apr.toFixed(1) + "%";
+          td.style.color = "var(--delta-good)"; td.title = "intrinsic riskless yield if held (ignores exit fees/slippage)"; } },
+      { html: td => { const m = t.mark || {}; td.className = "num"; td.style.fontVariantNumeric = "tabular-nums";
+          const v = m.unwind_apr;
+          if (v == null) { td.textContent = "—"; return; }
+          // cap the display — a fresh position annualizes to absurd numbers
+          const disp = Math.abs(v) > 999 ? (v > 0 ? "999%+" : "<−999%") : v.toFixed(1) + "%";
+          td.textContent = disp;
+          // green when unwinding locks a materially higher rate than holding
+          if (m.forward_hold_apr != null && v > m.forward_hold_apr) td.style.color = "var(--delta-good)";
+          else if (v < 0) td.style.color = "var(--st-crit)"; } },
+      { html: td => { const m = t.mark || {};
+          if (m.unwind_hard) { const s=document.createElement("span"); s.className="role-badge";
+            s.style.cssText="background:var(--st-crit);color:var(--surface)";
+            s.textContent="UNWIND <4%"; s.title="forward hold APR below the 4% hard floor — exit even into idle capital";
+            td.appendChild(s); }
+          else if (m.unwind_signal) { const s=document.createElement("span"); s.className="role-badge maker"; s.textContent="UNWIND"; td.appendChild(s); }
+          else if (m.reverse_signal) { const s=document.createElement("span"); s.className="role-badge taker"; s.textContent="REVERSE "+(m.reverse_edge_c!=null?m.reverse_edge_c.toFixed(1)+"c":""); td.appendChild(s); }
+          else { td.textContent = "—"; td.style.color = "var(--ink-mut)"; } } },
+      { html: td => { const m = t.mark || {};
+          if (!t.resolves_by) { td.textContent = "—"; td.style.color = "var(--ink-mut)"; return; }
+          td.style.fontVariantNumeric = "tabular-nums";
+          if (m.resolves_estimated) {
+            td.textContent = "~" + t.resolves_by;
+            td.title = "estimated — event not officially scheduled (e.g. TIME PotY announced ~2nd week of Dec)";
+            const e = document.createElement("span"); e.textContent = " est";
+            e.style.cssText = "font-size:9px;color:var(--ink-mut);text-transform:uppercase;letter-spacing:.04em";
+            td.appendChild(e);
+          } else { td.textContent = t.resolves_by; } } },
+    ];
+    for (const c of cells) {
+      const td = document.createElement("td");
+      if (c.num) td.className = "num";
+      if (c.cls) td.className = c.cls;
+      if (c.html) c.html(td); else td.textContent = c.text;
+      tr.appendChild(td);
+    }
+    ttb.appendChild(tr);
+  }
+
+  const utb = $("#unwind-table tbody"); utb.replaceChildren();
+  const uw = d.unwind;
+  if (uw && uw.relationships) {
+    for (const [rid, g] of Object.entries(uw.relationships)) {
+      const tr = document.createElement("tr");
+      const mk = ((uw.maker_exit || {}).relationships || {})[rid] || {};
+      for (const [txt, num] of [
+        [rid, false], [String(g.spells), true],
+        [(g.breakeven_rate * 100).toFixed(0) + "%", true],
+        [g.best_exit_pct_p50 == null ? "—" : g.best_exit_pct_p50.toFixed(2) + "%", true],
+        [g.hold_edge_pct_p50 == null ? "—" : "+" + g.hold_edge_pct_p50.toFixed(2) + "%", true],
+        [mk.both_legs_exit_rate == null ? "—" : (mk.both_legs_exit_rate * 100).toFixed(0) + "%", true],
+        [mk.reverse_direction_seen == null ? "—" : (mk.reverse_direction_seen ? "✓ flips" : "one-way"), false],
+      ]) {
+        const td = document.createElement("td");
+        if (num) td.className = "num";
+        if (!num) { const s = document.createElement("span"); s.className = "relid";
+          s.textContent = txt; td.appendChild(s); } else td.textContent = txt;
+        tr.appendChild(td);
+      }
+      utb.appendChild(tr);
+    }
+    $("#unwind-note").textContent =
+      `Replayed ${uw.spells} entry spells (${uw.day}, ${uw.horizon_h}h horizon). ` + uw.note;
+  } else { $("#unwind-note").textContent = "No unwind replay for this day yet (runs with the 07:30 report)."; }
+
+  const mtt = $("#mt-table tbody"); mtt.replaceChildren();
+  const mt = d.maketake;
+  if (mt && mt.tracks && mt.tracks.length) {
+    for (const t of mt.tracks.slice(0, 8)) {
+      const tr = document.createElement("tr");
+      for (const [txt, num, mono] of [
+        [t.relationship_id, false, true], [t.quote_side + " leg" + t.maker_leg_index, false, false],
+        [String(t.fills), true], [fmt(t.contracts), true],
+        ["$" + t.edge_usd.toFixed(2), true], [String(t.unhedged), true],
+      ]) {
+        const td = document.createElement("td");
+        if (num) td.className = "num";
+        if (mono) { const sp = document.createElement("span"); sp.className = "relid";
+          sp.textContent = txt; td.appendChild(sp); } else td.textContent = txt;
+        tr.appendChild(td);
+      }
+      mtt.appendChild(tr);
+    }
+    $("#mt-note").textContent = `Total $${mt.total_edge_usd} from ${mt.total_fills} fills ` +
+      `(${mt.day}). ` + mt.note;
+  } else { $("#mt-note").textContent = "No make-take simulation yet (runs with the 07:30 report)."; }
+
+  const rtb = $("#rewards-table tbody"); rtb.replaceChildren();
+  const rw = d.rewards;
+  if (rw && rw.pools) {
+    for (const p of rw.pools.slice(0, 10)) {
+      const tr = document.createElement("tr");
+      const cells = [
+        { html: td => { const s = document.createElement("span");
+            s.textContent = p.title.length > 46 ? p.title.slice(0, 45) + "…" : p.title;
+            s.title = p.title; td.appendChild(s); } },
+        { text: "$" + p.daily_pool_usd.toLocaleString("en-US"), num: true },
+        { text: String(p.min_size ?? "—"), num: true },
+        { text: (p.max_spread_c ?? "—") + "¢", num: true },
+        { text: p.taker_fee_free ? "✓ free" : "fee'd" },
+        { text: p.est_capture_usd_day == null ? "—"
+            : "$" + p.est_capture_usd_day.toFixed(2) + "/d", num: true },
+      ];
+      for (const c of cells) {
+        const td = document.createElement("td");
+        if (c.num) td.className = "num";
+        if (c.html) c.html(td); else td.textContent = c.text;
+        tr.appendChild(td);
+      }
+      rtb.appendChild(tr);
+    }
+    $("#rewards-note").textContent =
+      `${rw.markets_with_pools} of ${rw.universe_pm_markets} watched PM markets carry pools ` +
+      `(snapshot ${rw.generated_at.slice(0, 16)}Z; refreshed daily). Filled makers also split 25% of taker fees.` +
+      ((rw.sim && rw.sim.est_total_usd_day != null)
+        ? ` Sim total at min-size config: $${rw.sim.est_total_usd_day}/day (floor — scales with size×closeness²).` : "");
+  } else { $("#rewards-note").textContent = "No rewards snapshot yet."; }
+
+  const LCOLS = ["rel","type","tranche","vetting","crossings","closed",
+                 "edge","rolc","life","size","scans","bestedge"];
+  const tb = $("#ledger tbody"); tb.replaceChildren();
+  for (const r of d.relationships) {
+    const q = r.observations > 0;
+    const tr = document.createElement("tr");
+    if (!q) tr.style.opacity = "0.62";
+    tr.dataset.cols = "1";
+    const cells = [
+      { html: (td) => { const s = document.createElement("span"); s.className = "relid";
+          s.textContent = r.id; td.appendChild(s); } },
+      { text: r.type }, { text: r.tranche },
+      { html: (td) => { const p = document.createElement("span");
+          p.className = "pill" + (r.vetted === "human" ? " human" : "");
+          p.textContent = r.vetted === "human" ? "✓ human" : "agent";
+          td.appendChild(p); } },
+      { text: fmt(r.observations), num: true }, { text: fmt(r.closed), num: true },
+      { text: q ? "$" + r.edge_p50.toFixed(4) : "—", num: true },
+      { text: q ? (r.roc_p50 * 100).toFixed(1) + "%" : "—", num: true },
+      { text: r.closed ? fmtDur(r.lifetime_p50_s) : "—", num: true },
+      { text: q ? fmt(Math.round(r.size_p50)) : "—", num: true },
+      { html: td => { td.className = "num";
+          const pb = (d.probe || {})[r.id];
+          if (!pb) { td.textContent = "—"; return; }
+          const readyPct = pb.scans ? Math.round(100*pb.ready/pb.scans) : 0;
+          td.textContent = fmt(pb.scans) + ` (${readyPct}%)`;
+          if (pb.scans > 50 && readyPct < 50) {
+            td.title = "book often unsynced — a leg's book is missing/crossed, not a tight market";
+            td.style.color = "var(--st-warn)"; }
+        } },
+      { html: td => { td.className = "num";
+          const pb = (d.probe || {})[r.id];
+          td.textContent = (pb && pb.best_edge != null)
+            ? (pb.best_edge >= 0 ? "+" : "") + "$" + pb.best_edge.toFixed(4) : "—"; } },
+    ];
+    cells.forEach((c, i) => {
+      const td = document.createElement("td");
+      td.dataset.col = LCOLS[i];
+      if (c.num) td.className = "num";
+      if (c.html) c.html(td); else td.textContent = c.text;
+      tr.appendChild(td);
+    });
+    tb.appendChild(tr);
+  }
+  applyLedgerCols();
+  if (!d.relationships.length) {
+    const tr = document.createElement("tr"); const td = document.createElement("td");
+    td.colSpan = 10; td.className = "empty";
+    td.textContent = "No crossings in this range. The instrument is measuring; a quiet day is data.";
+    tr.appendChild(td); tb.appendChild(tr);
+  }
+}
+
+/* ---------- ledger column picker (persisted) ---------- */
+const LEDGER_COL_DEFS = [
+  ["rel","relationship"],["type","type"],["tranche","tranche"],["vetting","vetting"],
+  ["crossings","crossings"],["closed","closed"],["edge","edge/ct p50"],
+  ["rolc","ann.RoLC p50"],["life","life p50"],["size","size p50"],
+  ["scans","scans"],["bestedge","best edge seen"]];
+let HIDDEN_COLS = new Set(JSON.parse(localStorage.getItem("ledgerHiddenCols") || "[]"));
+function applyLedgerCols() {
+  for (const [key] of LEDGER_COL_DEFS) {
+    const show = !HIDDEN_COLS.has(key);
+    for (const el of document.querySelectorAll(`#ledger [data-col="${key}"]`))
+      el.style.display = show ? "" : "none";
+  }
+}
+{
+  const box = $("#col-boxes");
+  for (const [key, label] of LEDGER_COL_DEFS) {
+    const l = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = !HIDDEN_COLS.has(key);
+    cb.addEventListener("change", () => {
+      cb.checked ? HIDDEN_COLS.delete(key) : HIDDEN_COLS.add(key);
+      localStorage.setItem("ledgerHiddenCols", JSON.stringify([...HIDDEN_COLS]));
+      applyLedgerCols();
+    });
+    l.append(cb, document.createTextNode(label));
+    box.appendChild(l);
+  }
+}
+
+/* ---------- order activity feed ---------- */
+const SEEN_EVT = new Set();
+const ACT_VENUE = { kalshi: ["Kalshi", "k"], polymarket_us: ["PM US", "pm"], polymarket: ["PM", "pm"] };
+function relTime(ts) {
+  const s = Math.max(0, Date.now() / 1000 - (ts || 0));
+  if (s < 60) return Math.floor(s) + "s";
+  if (s < 3600) return Math.floor(s / 60) + "m";
+  if (s < 86400) return Math.floor(s / 3600) + "h";
+  return Math.floor(s / 86400) + "d";
+}
+function renderActivity(d) {
+  const oa = d.order_activity || { events: [], counts: {}, n: 0 };
+  const strip = $("#act-strip"); strip.replaceChildren();
+  for (const [k, label] of [["place", "placed"], ["move", "moved"], ["cancel", "cancelled"], ["fail", "failed"]]) {
+    const el = document.createElement("div"); el.className = "act-stat " + k;
+    el.innerHTML = `<div class="n">${(oa.counts[k] || 0).toLocaleString("en-US")}</div><div class="k">${label}</div>`;
+    strip.appendChild(el);
+  }
+  const nBadge = $("#tab-activity-n");
+  if (oa.n) { nBadge.textContent = oa.n > 999 ? "999+" : oa.n; nBadge.hidden = false; }
+  else nBadge.hidden = true;
+
+  activityChart($("#act-chart"), oa.events);
+
+  const feed = $("#act-feed"); feed.replaceChildren();
+  $("#act-empty").style.display = oa.events.length ? "none" : "block";
+  const firstPaint = SEEN_EVT.size === 0;  // don't flash-animate the whole list on load
+  for (const e of oa.events) {
+    const [vn, vc] = ACT_VENUE[e.venue] || [e.venue || "?", ""];
+    const row = document.createElement("div"); row.className = "evt";
+    const id = `${e.order_id || e.market}:${e.action}:${e.ts}`;
+    if (!firstPaint && !SEEN_EVT.has(id)) row.classList.add("fresh");
+    SEEN_EVT.add(id);
+    let price = "";
+    if (e.action === "move" && e.old_price != null)
+      price = `<span class="old">${(+e.old_price).toFixed(2)}</span><span class="arw">→</span>${(+e.price).toFixed(2)}`;
+    else if (e.price != null) price = (+e.price).toFixed(2);
+    const parts = [
+      `<span class="t">${relTime(e.ts)}</span>`,
+      `<span class="abadge ${e.action}">${e.action}</span>`,
+      `<span class="vchip ${vc}">${vn}</span>`,
+      e.side ? `<span class="side-tag ${e.side}">${e.side.toUpperCase()}</span>` : `<span class="side-tag" style="visibility:hidden">—</span>`,
+      `<span class="mk" title="${e.market} · ${e.rel || ""}">${e.market}</span>`,
+      `<span class="pr">${price}</span>`,
+      `<span class="qty">${e.count ? "×" + e.count : ""}</span>`,
+    ];
+    row.innerHTML = parts.join("");
+    feed.appendChild(row);
+  }
+  if (SEEN_EVT.size > 4000) SEEN_EVT.clear();  // bound memory on long sessions
+}
+
+function renderSports(d) {
+  const s = d.sports || { games: [], n_live: 0, n_crossed: 0, stale_s: null };
+  const badge = $("#tab-sports-n");
+  if (s.n_crossed) { badge.textContent = s.n_crossed; badge.hidden = false;
+                     badge.style.background = "var(--delta-good)"; }
+  else if (s.n_live) { badge.textContent = s.n_live; badge.hidden = false;
+                       badge.style.background = "var(--series-1)"; }
+  else badge.hidden = true;
+
+  // stale pill: WS engine self-restarts every 15 min; a >30s gap means it's
+  // mid-restart (or down) — mark the feed so a stale line isn't read as truth.
+  const pill = $("#sports-stale");
+  if (s.stale_s == null && !(s.games || []).length) { pill.hidden = true; }
+  else if (s.stale_s != null && s.stale_s > 30) {
+    pill.hidden = false; pill.textContent = `stale ${Math.round(s.stale_s)}s`;
+  } else pill.hidden = true;
+
+  const strip = $("#sports-strip"); strip.replaceChildren();
+  for (const [n, k, cls] of [[s.n_live || 0, "live games", ""],
+                             [s.n_crossed || 0, "crossed now", "crossed"]]) {
+    const el = document.createElement("div"); el.className = "act-stat " + cls;
+    el.innerHTML = `<div class="n">${n}</div><div class="k">${k}</div>`;
+    strip.appendChild(el);
+  }
+
+  sportsChart($("#sports-chart"), s.history || []);
+
+  const tb = $("#sports-table tbody"); tb.replaceChildren();
+  const games = s.games || [];
+  $("#sports-empty").style.display = games.length ? "none" : "block";
+  const px = (v) => v == null ? "—" : (+v).toFixed(3).replace(/0$/, "");
+  for (const g of games) {
+    const tr = document.createElement("tr");
+    if (g.crossed) tr.classList.add("crossed");
+    const live = g.edge_c != null;
+    const edgeCls = !live ? "dim" : (g.edge_c > 0 ? "edge-pos" : "edge-neg");
+    const edgeTxt = !live ? "—" : (g.edge_c > 0 ? "+" : "") + g.edge_c.toFixed(1) + "c";
+    const mtLive = g.mt_edge_c != null;
+    const mtCls = !mtLive ? "dim" : (g.mt_edge_c > 0 ? "edge-pos" : "edge-neg");
+    const mtTxt = !mtLive ? "—" : (g.mt_edge_c > 0 ? "+" : "") + g.mt_edge_c.toFixed(1) + "c";
+    tr.innerHTML =
+      `<td>${g.game}</td>` +
+      `<td class="num${"k_bid" in g ? "" : " dim"}">${px(g.k_bid)} / ${px(g.k_ask)}</td>` +
+      `<td class="num${"pm_bid" in g ? "" : " dim"}">${px(g.pm_bid)} / ${px(g.pm_ask)}</td>` +
+      `<td class="num ${edgeCls}">${edgeTxt}</td>` +
+      `<td class="num ${mtCls}">${mtTxt}</td>`;
+    tb.appendChild(tr);
+  }
+  renderMtProbe(d.sports && d.sports.mt_probe);
+}
+
+function renderMtProbe(mp) {
+  mp = mp || { fills: [], n: 0, contracts: 0, cap: 10 };
+  const status = $("#mt-probe-status");
+  if (mp.contracts >= mp.cap) { status.hidden = false; status.style.background = "var(--ink-mut)";
+    status.textContent = "cap reached — done"; }
+  else if (mp.n) { status.hidden = false; status.style.background = "var(--series-1)";
+    status.textContent = `${mp.contracts}/${mp.cap} contracts`; }
+  else { status.hidden = false; status.style.background = "var(--st-warn)"; status.textContent = "listening"; }
+
+  const strip = $("#mt-strip"); strip.replaceChildren();
+  const cents = (v) => v == null ? "—" : (v > 0 ? "+" : "") + v.toFixed(1) + "c";
+  const stats = [
+    [mp.n || 0, "fills"],
+    [mp.picked_off_pct == null ? "—" : mp.picked_off_pct.toFixed(0) + "%", "picked off",
+     (mp.picked_off_pct || 0) >= 50 ? "fail" : ""],
+    [mp.captured || 0, "captured", (mp.captured || 0) > 0 ? "place" : ""],
+    [mp.naked_held || 0, "naked held", (mp.naked_held || 0) > 0 ? "move" : ""],
+    [cents(mp.mean_captured_c), "mean captured"],
+  ];
+  for (const [n, k, cls] of stats) {
+    const el = document.createElement("div"); el.className = "act-stat " + (cls || "");
+    el.innerHTML = `<div class="n">${n}</div><div class="k">${k}</div>`;
+    strip.appendChild(el);
+  }
+
+  const tb = $("#mt-table tbody"); tb.replaceChildren();
+  const fills = mp.fills || [];
+  $("#mt-empty").style.display = fills.length ? "none" : "block";
+  for (const f of fills) {
+    const tr = document.createElement("tr");
+    const hedged = f.hedged || 0;
+    const naked = f.naked != null ? f.naked : (f.qty - hedged);
+    const cap = f.captured_lock_c != null ? f.captured_lock_c : (hedged ? f.realized_lock_c : null);
+    tr.innerHTML =
+      `<td>${f.game}${f.side ? ` <span class="dim">${f.side}</span>` : ""}</td>` +
+      `<td class="num">${f.qty}</td>` +
+      `<td class="num">${cents(f.exp_lock_c)}</td>` +
+      `<td class="num ${cap == null ? "dim" : (cap < 0 ? "edge-neg" : "edge-pos")}">${cap == null ? "—" : cents(cap)}</td>` +
+      `<td class="num ${naked > 0 ? "edge-neg" : "dim"}">${naked || "—"}</td>` +
+      `<td>${f.picked_off ? "picked off — held" : "captured"}</td>`;
+    tb.appendChild(tr);
+  }
+}
+
+function sportsChart(host, data) {
+  host.replaceChildren();
+  const W = 1080, H = 200, m = { t: 12, r: 46, b: 26, l: 44 };
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "best cross-venue sports edge over time" });
+  host.appendChild(svg);
+  if (data.length < 2) {
+    emptyNote(host, svg, "Collecting samples — the series fills in every ~15s while games are live.");
+    return;
+  }
+  const ys = data.map(d => +d.best), ts = data.map(d => d.t);
+  const mts = data.map(d => d.best_mt == null ? null : +d.best_mt);  // make-take ceiling
+  const mtDef = mts.filter(v => v != null);
+  // keep the 0c threshold always in frame; pad both ends
+  let lo = Math.min(...ys, ...mtDef, 0), hi = Math.max(...ys, ...mtDef, 0);
+  const span = (hi - lo) || 1;
+  lo -= span * 0.12; hi += span * 0.12;
+  const px = i => m.l + i * (W - m.l - m.r) / (ys.length - 1);
+  const py = v => H - m.b - (v - lo) / (hi - lo) * (H - m.t - m.b);
+  // gridlines + edge (¢) axis
+  for (let g = 0; g <= 4; g++) {
+    const val = lo + (hi - lo) * g / 4, y = py(val);
+    el("line", { x1: m.l, x2: W - m.r, y1: y, y2: y, stroke: css("--grid"), "stroke-width": 1 }, svg);
+    el("text", { x: m.l - 6, y: y + 3.5, "text-anchor": "end", class: "tick" }, svg)
+      .textContent = val.toFixed(1) + "c";
+  }
+  // crossing threshold (0c) — dashed, prominent
+  const yz = py(0);
+  el("line", { x1: m.l, x2: W - m.r, y1: yz, y2: yz, stroke: css("--st-warn"),
+    "stroke-width": 1.5, "stroke-dasharray": "5 4" }, svg);
+  el("text", { x: W - m.r + 4, y: yz + 3.5, "text-anchor": "start", class: "tick",
+    fill: css("--st-warn") }, svg).textContent = "cross";
+  // x time labels (local HH:MM)
+  const step = Math.max(1, Math.ceil(ys.length / 9));
+  ts.forEach((t, i) => { if (i % step === 0)
+    el("text", { x: px(i), y: H - m.b + 15, "text-anchor": "middle", class: "tick" }, svg)
+      .textContent = new Date(t * 1000).toLocaleTimeString("en-US",
+        { hour: "2-digit", minute: "2-digit", hour12: false }); });
+  el("line", { x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b, stroke: css("--baseline") }, svg);
+  // make-take ceiling (dashed, secondary) — theoretical, adverse-selection-blind.
+  // drawn first so the capturable take-take line sits on top.
+  let mtPath = "", pen = false;
+  mts.forEach((v, i) => { if (v == null) { pen = false; return; }
+    mtPath += `${pen ? "L" : "M"}${px(i)},${py(v)}`; pen = true; });
+  if (mtPath) el("path", { d: mtPath, fill: "none", stroke: css("--series-2"),
+    "stroke-width": 1.5, "stroke-dasharray": "4 3", "stroke-linejoin": "round" }, svg);
+  // the take-take edge line (solid — what we can actually capture safely)
+  const path = ys.map((v, i) => `${i ? "L" : "M"}${px(i)},${py(v)}`).join("");
+  el("path", { d: path, fill: "none", stroke: css("--series-1"), "stroke-width": 2,
+    "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+  // green dots on any sample at/above the crossing threshold
+  ys.forEach((v, i) => { if (v >= 0)
+    el("circle", { cx: px(i), cy: py(v), r: 3.5, fill: css("--delta-good"),
+      stroke: css("--surface"), "stroke-width": 1.5 }, svg); });
+  // end marker + latest-value label
+  const li = ys.length - 1;
+  el("circle", { cx: px(li), cy: py(ys[li]), r: 4.5,
+    fill: ys[li] >= 0 ? css("--delta-good") : css("--series-1"),
+    stroke: css("--surface"), "stroke-width": 2 }, svg);
+  el("text", { x: px(li) - 8, y: py(ys[li]) - 9, "text-anchor": "end", class: "dl",
+    "font-weight": 600 }, svg).textContent = (ys[li] > 0 ? "+" : "") + ys[li].toFixed(1) + "c";
+  if (mts[li] != null)
+    el("text", { x: px(li) - 8, y: py(mts[li]) + 14, "text-anchor": "end", class: "dl",
+      fill: css("--series-2"), "font-weight": 600 }, svg)
+      .textContent = (mts[li] > 0 ? "+" : "") + mts[li].toFixed(1) + "c";
+  // crosshair + tooltip
+  const hair = el("line", { y1: m.t, y2: H - m.b, stroke: css("--baseline"),
+    "stroke-width": 1, visibility: "hidden" }, svg);
+  const hot = el("rect", { x: m.l, y: 0, width: W - m.l - m.r, height: H, fill: "transparent" }, svg);
+  hot.addEventListener("pointermove", ev => {
+    const r = svg.getBoundingClientRect();
+    const fx = (ev.clientX - r.left) / r.width * W;
+    let i = Math.round((fx - m.l) / ((W - m.l - m.r) / Math.max(ys.length - 1, 1)));
+    i = Math.max(0, Math.min(ys.length - 1, i));
+    hair.setAttribute("x1", px(i)); hair.setAttribute("x2", px(i));
+    hair.setAttribute("visibility", "visible");
+    showTip(ev.clientX, ev.clientY, [
+      { v: (ys[i] > 0 ? "+" : "") + ys[i].toFixed(1) + "c", k: "take-take (capturable)", key: true },
+      ...(mts[i] != null ? [{ v: (mts[i] > 0 ? "+" : "") + mts[i].toFixed(1) + "c", k: "make-take (ceiling)" }] : []),
+      { v: "", k: `${data[i].game} · ${new Date(ts[i] * 1000).toLocaleTimeString("en-US", { hour12: false })}` }]);
+  });
+  hot.addEventListener("pointerleave", () => { hair.setAttribute("visibility", "hidden"); hideTip(); });
+}
+
+/* ---------- fetch loop: hold the frame, no skeleton flash ---------- */
+async function load() {
+  document.body.classList.add("refreshing");
+  try {
+    const r = await fetch(`/api/summary?range=${RANGE}&fees=${FEES}`);
+    render(await r.json());
+  } catch (e) { /* keep previous frame */ }
+  document.body.classList.remove("refreshing");
+}
+for (const b of document.querySelectorAll(".filters button[data-range]")) {
+  b.addEventListener("click", () => {
+    for (const x of document.querySelectorAll(".filters button[data-range]"))
+      x.setAttribute("aria-pressed", String(x === b));
+    RANGE = b.dataset.range; load();
+  });
+}
+for (const b of document.querySelectorAll(".filters button[data-fees]")) {
+  b.addEventListener("click", () => {
+    for (const x of document.querySelectorAll(".filters button[data-fees]"))
+      x.setAttribute("aria-pressed", String(x === b));
+    FEES = b.dataset.fees; load();
+  });
+}
+for (const tab of document.querySelectorAll(".tab")) {
+  tab.addEventListener("click", () => {
+    for (const t of document.querySelectorAll(".tab")) t.setAttribute("aria-selected", String(t === tab));
+    $("#view-overview").hidden = tab.id !== "tab-overview";
+    $("#view-activity").hidden = tab.id !== "tab-activity";
+    $("#view-sports").hidden = tab.id !== "tab-sports";
+  });
+}
+load();
+setInterval(load, 10_000);
+</script>
+</body>
+</html>

@@ -1,0 +1,27 @@
+# systemd USER unit: systemctl --user enable --now arbbot-recorder
+# (loginctl enable-linger <user>  # so it survives logout)
+# Credential-free by design — the recorder never receives trading keys.
+[Unit]
+Description=arbbot market-data recorder + scanner (Stage 1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+CPUAffinity=0-7 10-31
+Type=simple
+WorkingDirectory=%h/claude/arbbot
+Environment=PYTHONFAULTHANDLER=1
+LoadCredential=kalshi_recorder_api_key_id:%h/.arbbot-credentials/kalshi_recorder_api_key_id
+LoadCredential=kalshi_recorder_private_key.pem:%h/.arbbot-credentials/kalshi_recorder_private_key.pem
+# PM US market-data WS needs auth and PM US has no read-only key, so the
+# recorder gets the (trade-capable) PM US key — used only to sign the WS
+# handshake; the recorder has no order-placement code path.
+LoadCredential=polymarket_usa_key_id:%h/.arbbot-credentials/polymarket_usa_key_id
+LoadCredential=polymarket_usa_private_key:%h/.arbbot-credentials/polymarket_usa_private_key
+ExecStart=%h/claude/arbbot/.venv313/bin/python -m arbbot.record.main --config config/recorder.yaml
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

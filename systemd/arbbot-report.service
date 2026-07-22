@@ -1,0 +1,7 @@
+[Unit]
+Description=arbbot daily report generator
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/claude/arbbot
+ExecStart=/bin/sh -c 'mkdir -p data/reports && .venv313/bin/python scripts/archive_to_parquet.py >/dev/null 2>&1; .venv313/bin/python -m arbbot.report.daily > data/reports/report-$(date -u +%%Y-%%m-%%d).txt 2>&1; .venv313/bin/python scripts/snapshot_rewards.py >/dev/null 2>&1; .venv313/bin/python scripts/unwind_analysis.py --day $(date -u -d yesterday +%%Y-%%m-%%d) >/dev/null 2>&1; .venv313/bin/python scripts/velocity_analysis.py --day $(date -u -d yesterday +%%Y-%%m-%%d) >/dev/null 2>&1; .venv313/bin/python scripts/reward_sim.py >/dev/null 2>&1; .venv313/bin/python scripts/maketake_sim.py --day $(date -u -d yesterday +%%Y-%%m-%%d) >/dev/null 2>&1'

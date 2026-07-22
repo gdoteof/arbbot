@@ -1,0 +1,16 @@
+[Unit]
+Description=arbbot scanner daemon (out-of-process, subscribes to recorder socket)
+After=arbbot-recorder.service
+
+[Service]
+CPUAffinity=0-7 10-31
+Type=simple
+WorkingDirectory=%h/claude/arbbot
+Environment=PYTHONFAULTHANDLER=1
+ExecStart=%h/claude/arbbot/.venv313/bin/python -m arbbot.scan.daemon --config config/recorder.yaml
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

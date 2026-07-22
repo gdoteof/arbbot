@@ -1,0 +1,20 @@
+# arbbot proving-grounds trader. Starts DRY-RUN by default; to go LIVE edit
+# ExecStart to add --live (or run the runner manually with --live).
+# Kill switch:  touch ~/claude/arbbot/data/KILL   (cancels everything, stops quoting)
+[Unit]
+Description=arbbot proving-grounds trader (maker-quoter, DeSantis)
+After=arbbot-recorder.service
+Requires=arbbot-recorder.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude/arbbot
+Environment=ARBBOT_CREDENTIALS_DIR=%h/.arbbot-credentials
+ExecStart=%h/claude/arbbot/.venv313/bin/python -m arbbot.exec.main \
+  --relationship xv-rep-nom-2028-desantis --clip 5
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

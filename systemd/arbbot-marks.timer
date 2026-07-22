@@ -1,0 +1,8 @@
+[Unit]
+Description=arbbot mark open positions every 2 min
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+Persistent=true
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=arbbot freshness watchdog (scanner/recorder output staleness -> ntfy)
+[Service]
+Type=oneshot
+WorkingDirectory=%h/claude/arbbot
+ExecStart=%h/claude/arbbot/scripts/freshness_check.sh

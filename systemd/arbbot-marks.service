@@ -1,0 +1,6 @@
+[Unit]
+Description=arbbot open-position mark-to-market + unwind/reverse signals
+[Service]
+Type=oneshot
+WorkingDirectory=%h/claude/arbbot
+ExecStart=%h/claude/arbbot/.venv313/bin/python scripts/mark_positions.py

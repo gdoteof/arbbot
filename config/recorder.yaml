@@ -1,0 +1,23 @@
+registry_path: config/registry.yaml
+data_dir: data/raw
+scan_dir: data/scan
+health_path: data/health.jsonl
+socket_path: data/arbbot.sock
+kalshi_poll_interval_s: 30.0
+ntfy_topic: ''  # capability secret — lives in ~/.arbbot-credentials/ntfy_topic, never here
+min_edge_per_contract: '0'
+polymarket_mode: intl
+# Polymarket US (regulated DCM) feed: record all markets under these tag_slugs
+# (authenticated WS when creds present, else REST polling). Tag set covers the
+# Kalshi-overlapping families in the registry (fed, cpi, nobel/time/aliens in
+# culture, gpt6/best-ai in tech, btc in crypto, tesla/gdp in economics,
+# brazil/france in elections) plus politics for coverage.
+polymarket_us_tags:
+  - fed-decision
+  - cpi
+  - economics
+  - crypto
+  - tech
+  - culture
+  - elections
+  - politics

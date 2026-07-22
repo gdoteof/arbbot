@@ -1,0 +1,9 @@
+[Unit]
+Description=arbbot daily report at 07:30 local
+
+[Timer]
+OnCalendar=*-*-* 07:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

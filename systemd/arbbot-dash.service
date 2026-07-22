@@ -1,0 +1,13 @@
+[Unit]
+Description=arbbot dashboard (instrument panel, 127.0.0.1:4748)
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude/arbbot
+ExecStart=%h/claude/arbbot/.venv313/bin/python -m arbbot.dash.server --port 4748
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
