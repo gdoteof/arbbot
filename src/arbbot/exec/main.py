@@ -617,10 +617,17 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                         print("[LIVE] feeds healthy — quoting resumes", flush=True)
 
                 while True:
-                    line = await q_lines.get()
+                    # timeout so the periodic tasks below (2s fill-poll
+                    # fallback, TT refresh, pause/feed checks, intent flush)
+                    # keep running on a QUIET book — without it a resting fill
+                    # could sit undetected until the next book event arrives
+                    # (card ad08160c: quiet book + WS gap + fill = naked leg).
+                    try:
+                        line = await asyncio.wait_for(q_lines.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        line = b""          # no event — periodic tasks only
                     if line is None:
                         break
-                    hb_events += 1
                     _check_pause_requests()
                     _check_feed_health()
                     # liveness heartbeat: quiet-vs-stuck is unanswerable without
@@ -631,18 +638,22 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                               f"resting={n_rest}", flush=True)
                         last_hb = time.monotonic()
                         hb_events = hb_onbook = 0
-                    try:
-                        ev = parse_event(json.loads(line))
-                    except ValueError:
-                        continue  # truncated line at recorder cut-over
+                    ev = None
+                    if line:
+                        hb_events += 1
+                        try:
+                            ev = parse_event(json.loads(line))
+                        except ValueError:
+                            ev = None  # truncated line at recorder cut-over
                     if isinstance(ev, BookSnapshot):
                         books.apply_snapshot(ev)
                     elif isinstance(ev, BookDelta):
                         with contextlib.suppress(GapDetected, NotSynced):
                             books.apply_delta(ev)
                     else:
-                        continue
-                    for rid in leg_to_rels.get((ev.venue.value, ev.market_id), ()):
+                        ev = None  # non-book event — still run periodic tasks
+                    for rid in (leg_to_rels.get((ev.venue.value, ev.market_id), ())
+                                if ev is not None else ()):
                         q = quoters[rid]
                         hb_onbook += 1
                         if feed_paused[0]:
