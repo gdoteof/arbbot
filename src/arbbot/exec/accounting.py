@@ -54,6 +54,7 @@ def fold(records: list[dict], marks: Optional[dict] = None) -> dict:
             "relationship_id": rel, "ts": ts,
             "title": r.get("title"), "strategy": r.get("strategy"),
             "qty": _d(r.get("qty")),
+            "resolves_by": r.get("resolves_by"),
             "cost": Decimal(0), "payoff": Decimal(0),
             "locked_at_open": Decimal(0),
             "closed_qty": Decimal(0), "proceeds": Decimal(0),
@@ -105,6 +106,7 @@ def fold(records: list[dict], marks: Optional[dict] = None) -> dict:
         row["remaining_qty"] = (qty - row["closed_qty"]) if qty else Decimal(0)
         row["remaining_locked"] = (row["locked_at_open"] * remaining_frac
                                    ).quantize(CENT4)
+        row["remaining_cost"] = (row["cost"] * remaining_frac).quantize(CENT4)
         expected = row["locked_at_open"] - row["remaining_locked"]
         row["slippage"] = expected - row["realized"]
         m = mark_by_key.get(key)
@@ -117,6 +119,7 @@ def fold(records: list[dict], marks: Optional[dict] = None) -> dict:
         "locked_at_open": sum((r["locked_at_open"] for r in rows), Decimal(0)),
         "realized": sum((r["realized"] for r in rows), Decimal(0)),
         "remaining_locked": sum((r["remaining_locked"] for r in rows), Decimal(0)),
+        "remaining_cost": sum((r["remaining_cost"] for r in rows), Decimal(0)),
         "slippage": sum((r["slippage"] for r in rows), Decimal(0)),
         "unrealized_mark": sum((r["unrealized_mark"] for r in rows
                                 if r["unrealized_mark"] is not None), Decimal(0)),

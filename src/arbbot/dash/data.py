@@ -576,25 +576,32 @@ class DashboardData:
                 if m.get("resolves_by"):
                     r["resolves_by"] = m["resolves_by"]
         lats = [float(r["hedge_latency_ms"]) for r in rows if r.get("hedge_latency_ms") is not None]
+        # ALL P&L numbers below come from the accounting fold (card a6ad626d):
+        # one definition, identity-checked — the view layer only renders.
+        accounting = self._accounting(raw, marks)
+        acc_rows = accounting.get("rows", [])
+        acc_totals = accounting.get("totals", {})
+        mark_resolves = {(m["relationship_id"], m.get("ts")): m["resolves_by"]
+                         for m in marks.get("positions", []) if m.get("resolves_by")}
         # portfolio APR: raw RoC annualized over the capital-weighted time to
         # resolution — the "7% locked" expressed as a comparable yearly rate.
         today = datetime.now(timezone.utc).date()
         num = den = 0.0
-        for r in open_rows:
-            rb = (r.get("mark") or {}).get("resolves_by") or r.get("resolves_by")
-            if rb and r.get("cost_usd"):
+        for r in acc_rows:
+            # prefer the resolver's (authoritative) date over the record's
+            rb = mark_resolves.get((r["relationship_id"], r["ts"])) or r.get("resolves_by")
+            if rb and r["remaining_cost"]:
                 try:
                     yrs = max((date.fromisoformat(str(rb)[:10]) - today).days, 1) / 365.25
                 except ValueError:
                     continue
-                num += r["cost_usd"] * yrs
-                den += r["cost_usd"]
-        cap = sum(r.get("cost_usd", 0) for r in open_rows)
-        prof = sum(r.get("profit_usd", 0) for r in open_rows)
+                num += r["remaining_cost"] * yrs
+                den += r["remaining_cost"]
+        cap = float(acc_totals.get("remaining_cost") or 0)
+        prof = float(acc_totals.get("remaining_locked") or 0)
         wavg_yrs = (num / den) if den else None
         portfolio_apr = round(prof / cap / wavg_yrs * 100, 1) if (cap and wavg_yrs) else None
-        realized = round(sum(float(r.get("realized_pnl_usd") or 0)
-                             for r in raw if r.get("status") in ("unwound", "realized")), 2)
+        realized = round(float(acc_totals.get("realized") or 0), 2)
 
         # per-category breakdown: open capital/locked + realized (incl losses)
         FAMILIES = ("france-pres-27", "time-poty-26", "nobel-peace-26",
@@ -624,24 +631,19 @@ class DashboardData:
                     return f2
             return "other"
 
+        # rollups from the fold rows — same numbers every other view sees
         cats: dict[str, dict] = {}
-        for r in netted:
+        for r in acc_rows:
             cat = cats.setdefault(_category(r.get("relationship_id")),
                                   {"open": 0, "capital": 0.0, "locked": 0.0,
                                    "realized": 0.0, "losses": 0.0})
-            cat["open"] += 1
-            cat["capital"] += float(r.get("cost_usd") or 0)
-            cat["locked"] += float(r.get("profit_usd") or 0)
-        for r in raw:
-            if r.get("status") not in ("unwound", "realized"):
-                continue
-            v = float(r.get("realized_pnl_usd") or 0)
-            cat = cats.setdefault(_category(r.get("relationship_id")),
-                                  {"open": 0, "capital": 0.0, "locked": 0.0,
-                                   "realized": 0.0, "losses": 0.0})
-            cat["realized"] += v
-            if v < 0:
-                cat["losses"] += v
+            if r["remaining_qty"] > 0:
+                cat["open"] += 1
+                cat["capital"] += r["remaining_cost"]
+                cat["locked"] += r["remaining_locked"]
+            cat["realized"] += r["realized"]
+            if r["realized"] < 0:
+                cat["losses"] += r["realized"]  # per-basket net loss
         categories = [{"category": k, "open": v["open"],
                        "capital": round(v["capital"], 2), "locked": round(v["locked"], 2),
                        "realized": round(v["realized"], 2), "losses": round(v["losses"], 2)}
@@ -698,15 +700,15 @@ class DashboardData:
             "realized_usd": realized,
             "categories": categories,
             "funnel": funnel,
-            "capital_locked": round(sum(r.get("cost_usd", 0) for r in open_rows), 2),
-            "profit_locked": round(sum(r.get("profit_usd", 0) for r in open_rows), 2),
+            "capital_locked": round(cap, 2),
+            "profit_locked": round(prof, 2),
             "marks": marks.get("totals", {}),
             "marks_at": marks.get("generated_at"),
             "hedge_latency_p50": round(_median(lats), 0) if lats else None,
             "hedge_latency_n": len(lats),
             "portfolio_apr": portfolio_apr,
             "wavg_years": round(wavg_yrs, 2) if wavg_yrs else None,
-            "accounting": self._accounting(raw, marks),
+            "accounting": accounting,
         }
 
     @staticmethod
