@@ -324,7 +324,9 @@ class Quoter:
         px = book.best_ask().price if hedge_side == "bid" else book.best_bid().price
         res = hedge_gw.place_yes(hedge_leg.market_id, hedge_side, px, qty, post_only=False)
         self.risk.record_open(self.rel, Decimal(qty))
-        return {"hedged": True, "hedge_order": res}
+        # px rides along so the recorder has an honest fallback price if the
+        # venue's fill report is delayed/unreachable (429) at record time
+        return {"hedged": True, "px": str(px), "hedge_order": res}
 
     def on_fill(self, i: int, side: str, books: BookBuilder,
                 filled_count: int | None = None) -> dict:

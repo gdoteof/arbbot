@@ -82,7 +82,16 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
     rdate, rest = resolve_date(t["relationship_id"])
     resolves = rdate or t.get("resolves_by")
     estimated = rest if rdate else bool(t.get("resolves_estimated"))
-    row = {"relationship_id": t["relationship_id"], "title": t.get("title"),
+    if not resolves and str(t.get("relationship_id", "")).startswith("sports-"):
+        # sports baskets resolve the same day the game ends — model as
+        # entry + 1 day so APR columns populate (Geoff 2026-07-22). The
+        # resulting APRs are huge by construction; that IS the point of
+        # fast-settling arb (capital recycles daily).
+        import datetime as _dt2
+        resolves = (_dt2.date.fromtimestamp(float(t.get("ts", now)))
+                    + _dt2.timedelta(days=1)).isoformat()
+        estimated = True
+    row = {"relationship_id": t["relationship_id"], "ts": t.get("ts"), "title": t.get("title"),
            "qty": int(qty), "cost_usd": float(cost), "locked_profit_usd": float(locked),
            "resolves_by": resolves, "resolves_estimated": estimated}
     # basket direction: standard = long Kalshi YES + long PM NO; Kalshi-maker
@@ -121,13 +130,21 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
         # unwind when we've banked the full locked profit OR we're in profit
         # and the remaining hold has become a low-APR use of capital (early
         # convergence on a long-dated position — the time-value case).
+        is_sports = str(t.get("relationship_id", "")).startswith("sports-")
         unwind = bool(mark >= locked) or bool(
             mark > 0 and fwd_apr is not None and fwd_apr < HURDLE_APR)
+        if is_sports:
+            # sports baskets resolve in HOURS and their books move/freeze fast:
+            # hold to settlement (the sweeper realizes them). APR-based
+            # unwind/reverse machinery is for the slow political book — a
+            # marks-snapshot signal here nearly churned a converged basket for
+            # +2c against frozen-book and fill-lag risk (2026-07-22 Preston).
+            unwind = False
         # hard unwind: forward APR below the floor — worse than trivially
         # redeployable yield, exit regardless of utilization. (fwd_apr is
         # naturally high when mark is deeply negative — the remaining gain
         # is large — so this only fires on near-converged positions.)
-        unwind_hard = bool(fwd_apr is not None and fwd_apr < HARD_FLOOR_APR)
+        unwind_hard = bool(fwd_apr is not None and fwd_apr < HARD_FLOOR_APR) and not is_sports
         row.update(liq_value_usd=float(liq), mark_pnl_usd=float(mark),
                    converged_pct=float(mark / locked * 100) if locked else 0.0,
                    forward_hold_apr=(round(fwd_apr, 1) if fwd_apr is not None else None),
@@ -142,7 +159,10 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
         else:
             rev = (k_bid - p_ask) if (k_bid is not None and p_ask is not None) else None
         row["reverse_edge_c"] = float(rev * 100) if rev is not None else None
-        row["reverse_signal"] = bool(rev is not None and rev >= Decimal("0.03"))
+        # sports reverse signals stay dark too: the WS engine owns sports
+        # crossings at sub-second resolution — a 2-min marks snapshot of a
+        # fast book is noise, not an actionable re-entry.
+        row["reverse_signal"] = bool(rev is not None and rev >= Decimal("0.03")) and not is_sports
     else:
         row.update(liq_value_usd=None, mark_pnl_usd=None, converged_pct=None,
                    forward_hold_apr=None, natural_hold_apr=None, unwind_apr=None,
@@ -152,14 +172,18 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
 
 
 def main():
-    trades = [json.loads(l) for l in LEDGER.read_text().splitlines() if l.strip()] if LEDGER.exists() else []
-    open_t = [t for t in trades if t.get("status") == "open"]
+    from arbbot.exec.ledger import open_baskets, parse_lines
+    trades = parse_lines(LEDGER.read_text().splitlines()) if LEDGER.exists() else []
+    open_t = open_baskets(trades)  # open records net of appended unwind records
     c = httpx.Client(timeout=20)
-    ktickers = [next(l["market_id"] for l in t["legs"] if l["venue"] == "kalshi") for t in open_t]
+    ktickers = [next(l["market_id"] for l in t["legs"] if l["venue"] == "kalshi")
+                for t in open_t if len(t.get("legs", [])) >= 2]
     kb = kalshi_books(c, ktickers) if ktickers else {}
 
     positions, tot_cost, tot_mark, tot_locked = [], 0.0, 0.0, 0.0
     for t in open_t:
+        if len(t.get("legs", [])) < 2:
+            continue  # single-leg records (pm-lean riders) are directional — no basket mark
         kleg = next(l for l in t["legs"] if l["venue"] == "kalshi")
         pleg = next(l for l in t["legs"] if l["venue"] == "polymarket_us")
         k_bid, k_ask = kb.get(kleg["market_id"], (None, None))

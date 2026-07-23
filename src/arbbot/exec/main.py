@@ -41,6 +41,13 @@ TT_FEE = Decimal("0.02")     # ~both-leg taker fees per contract (conservative)
 TT_MAX_CLIP = 10             # max contracts per single take-take execution
 TT_CAP = 50                  # per-relationship concentration cap (contracts)
 TT_COOLDOWN = 30.0           # s between fires on the same relationship
+# floating APR bar (Geoff 2026-07-22): scales with capital utilization of the
+# class budget — near-idle capital should grab modest APRs (floor ~= the
+# trivially-redeployable yield), while a full book demands fresh take-take
+# beat what maker capital earns before crowding it out. Linear in utilization;
+# Geoff's 8% reference sits at ~1/3 utilization.
+TT_APR_FLOOR = 4.0
+TT_APR_CEIL = 16.0
 
 
 def _record_maker_fill(cfg, rel, i, side, filled, maker_px, hedge_res, latency_ms=None,
@@ -57,17 +64,30 @@ def _record_maker_fill(cfg, rel, i, side, filled, maker_px, hedge_res, latency_m
     # avgPx=0), so retry briefly until cumQuantity reflects the fill.
     if not ho.get("average_fill_price") and ho.get("id") and hedge_gw is not None \
             and hasattr(hedge_gw, "get_order"):
-        with contextlib.suppress(Exception):
-            for _ in range(5):
+        # per-attempt try/except: one 429/timeout must not abandon the refetch
+        # (2026-07-22: a suppressed first-attempt 429 left avg_price=0 /
+        # order_id=null in the ledger and a -$1 phantom loss on the dash)
+        o = None
+        for _ in range(8):
+            try:
                 o = hedge_gw.get_order(ho["id"])
                 if float(o.get("cumQuantity") or 0) >= 1 and (o.get("avgPx") or {}).get("value"):
                     break
-                time.sleep(0.3)
+            except Exception:
+                pass
+            time.sleep(0.6)
+        if o is not None and (o.get("avgPx") or {}).get("value"):
             ho = {"order_id": o.get("id"),
                   "average_fill_price": (o.get("avgPx") or {}).get("value"),
                   # PM commission is a TOTAL — pre-divide so the ×filled below holds
                   "average_fee_paid": (Decimal(str((o.get("commissionNotionalTotalCollected") or {}).get("value") or 0))
                                        / filled if filled else 0)}
+        else:
+            # venue unreachable: fall back to the book price the hedge was
+            # placed at (close to truth, never a fabricated 0) and flag it
+            ho = {"order_id": ho.get("id"),
+                  "average_fill_price": hedge_res.get("px"),
+                  "average_fee_paid": 0, "price_estimated": True}
     h_px = Decimal(str(ho.get("average_fill_price") or 0))
     h_fee = Decimal(str(ho.get("average_fee_paid") or 0)) * filled
     maker_px = Decimal(str(maker_px))
@@ -89,7 +109,8 @@ def _record_maker_fill(cfg, rel, i, side, filled, maker_px, hedge_res, latency_m
                {"venue": hedge_leg.venue.value, "market_id": hedge_leg.market_id,
                 "side": "yes" if side == "ask" else "no", "role": "taker",
                 "qty": int(filled), "avg_price": str(h_px), "fees": str(h_fee),
-                "order_id": ho.get("order_id")},
+                "order_id": ho.get("order_id"),
+                **({"price_estimated": True} if ho.get("price_estimated") else {})},
            ],
            "cost_usd": cost, "payoff_usd": float(filled),
            "profit_usd": float(filled) - cost, "status": "open",
@@ -151,9 +172,18 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
         if missing:
             print(f"WARNING: no PM US metadata for {missing} — check polymarket_us_tags", flush=True)
 
+    # topic budgets: config/topics.yaml (untracked — reveals family strategy)
+    topics_cfg = {}
+    tf = Path("config/topics.yaml")
+    if tf.exists():
+        import yaml as _yaml
+        topics_cfg = _yaml.safe_load(tf.read_text()) or {}
     risk = RiskManager(config=RiskConfig(
         bankroll=Decimal("980"),            # actual capital (~$800 idle + ~$180 locked)
         per_rel_cap=Decimal("150"),         # Geoff-approved max per name (oracle-scaled)
+        topics=topics_cfg.get("topics", []),
+        default_topic_budget=topics_cfg.get("default_topic_budget"),
+        default_only_below_util=topics_cfg.get("default_only_below_util"),
         kill_switch_file="data/KILL"))
     import httpx
     risk.balances = {}
@@ -194,19 +224,21 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
     # seed exposure from the trades ledger so per-name caps survive restarts —
     # without this, exposure resets to zero every restart and the cap becomes
     # "per session" (Mamdani reached $78 against a $10 design cap that way).
+    from arbbot.exec.ledger import open_baskets, parse_lines
     ledger = Path("data/exec/trades.jsonl")
+    tt_fired_seed: dict[str, int] = {}  # PM slug -> open take-take qty (cap floor)
     if ledger.exists():
-        for line in ledger.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                t = json.loads(line)
-            except ValueError:
-                continue
+        # net of appended unwind records — an unwound basket frees exposure/cap
+        for t in open_baskets(parse_lines(ledger.read_text().splitlines())):
             rel = rel_by_id.get(t.get("relationship_id"))
-            if rel is not None and t.get("status") == "open":
-                risk.record_open(rel, Decimal(str(t.get("qty", 0))))
+            if rel is None:
+                continue
+            risk.record_open(rel, Decimal(str(t.get("qty", 0))))
+            if t.get("strategy") == "take-take":
+                for l in t.get("legs", []):
+                    if l.get("venue") == "polymarket_us":
+                        tt_fired_seed[l["market_id"]] = (
+                            tt_fired_seed.get(l["market_id"], 0) + int(t.get("qty", 0)))
         seeded = {k: str(v) for k, v in risk.exposure.by_relationship.items()}
         if seeded:
             print(f"seeded open exposure from ledger: {seeded}", flush=True)
@@ -229,7 +261,32 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
             if gw is None or not hasattr(gw, "rehearse"):
                 continue
             done.add(l.venue)
-            reh = gw.rehearse(l.market_id)
+            # a 429 here is throttling from our own restart churn, not a broken
+            # order path — back off and retry instead of dying at startup
+            reh = None
+            throttled = False
+            for attempt in range(3):
+                try:
+                    reh = gw.rehearse(l.market_id)
+                    break
+                except Exception as e:
+                    throttled = "429" in str(e)
+                    wait = 60 * (attempt + 1)
+                    print(f"[LIVE] rehearsal {l.venue.value} attempt {attempt+1} failed "
+                          f"({type(e).__name__}: {e}) — retrying in {wait}s", flush=True)
+                    await asyncio.sleep(wait)
+            if reh is None:
+                if throttled:
+                    # a 429 PROVES the signed path works (authenticated,
+                    # understood, throttled) — venue rate limiting must not
+                    # keep the trader down (2026-07-23: shared API budget with
+                    # the research probes caused persistent 429s at startup)
+                    print(f"[LIVE] rehearsal {l.venue.value} rate-limited — order path "
+                          f"auth verified by the 429 itself; proceeding", flush=True)
+                    continue
+                print(f"[LIVE] rehearsal {l.venue.value} unreachable after retries — ABORTING", flush=True)
+                alerter.alert(f"arbbot trader: rehearsal unreachable {l.venue.value}")
+                return
             print(f"[LIVE] rehearsal {l.venue.value}: {reh}", flush=True)
             if not reh.get("rested"):
                 print(f"[LIVE] rehearsal FAILED on {l.venue.value} — ABORTING", flush=True)
@@ -275,28 +332,20 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
     # ---- trigger-based take-take: on EVERY book tick, check the riskless
     # cross-venue crossing; fire if its net-of-fee APR beats our blended APR.
     import datetime as _dt
-    tt = {"bar": 12.0, "pos": {}, "last_fire": {}, "last_refresh": 0.0}
+    # "fired" = cumulative PM take-take qty per slug, never overwritten by
+    # refresh and seeded from the ledger at startup: the PM positions API
+    # transiently returns empty (seen 2026-07-22) and a glitched-empty ppos
+    # must not free phantom cap headroom — not even in a fresh session.
+    tt = {"bar": 12.0, "pos": {}, "ppos": {}, "fired": dict(tt_fired_seed),
+          "last_fire": {}, "last_refresh": 0.0}
     tt_rel_ids = {r.id for r in rels if any(r.id.startswith(v) for v in TT_VETTED)}
 
     def _tt_refresh():
-        # bar = blended portfolio APR (marks.json); pos = live Kalshi positions (caps)
-        try:
-            m = json.loads((Path("data/exec/marks.json")).read_text())
-            today = _dt.date.today()
-            num = den = cost = prof = 0.0
-            for p in m.get("positions", []):
-                cc, pr, rb = p.get("cost_usd", 0), p.get("locked_profit_usd", 0), p.get("resolves_by")
-                cost += cc; prof += pr
-                if rb and cc:
-                    try:
-                        yy = max((_dt.date.fromisoformat(str(rb)[:10]) - today).days, 1) / 365.25
-                    except ValueError:
-                        continue
-                    num += cc * yy; den += cc
-            if cost and den:
-                tt["bar"] = prof / cost / (num / den) * 100
-        except Exception:
-            pass
+        # bar floats with utilization of the class budget (see TT_APR_FLOOR);
+        # pos = live venue positions (caps)
+        cap = float(risk.config.bankroll * risk.config.per_class_cap)
+        util = min(max(float(risk.exposure.total) / cap if cap else 1.0, 0.0), 1.0)
+        tt["bar"] = TT_APR_FLOOR + (TT_APR_CEIL - TT_APR_FLOOR) * util
         kgw = gateways.get(Venue.KALSHI)
         if kgw is not None:
             with contextlib.suppress(Exception):
@@ -305,6 +354,24 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                 pj = _h.get(REST_BASE + "/portfolio/positions", headers=hdr, timeout=10).json()
                 tt["pos"] = {p["ticker"]: abs(float(p.get("position_fp") or 0))
                              for p in pj.get("market_positions", [])}
+        # PM-side net positions too: the cap must see a PM leg whose Kalshi
+        # hedge never landed (2026-07-22: wrong "unfilled" abort left naked PM
+        # shorts invisible to a Kalshi-only cap, which then kept re-firing).
+        pmgw = gateways.get(Venue.POLYMARKET_US)
+        if pmgw is not None and hasattr(pmgw, "_headers"):
+            with contextlib.suppress(Exception):
+                pj = pmgw.client.get(pmgw.base + "/v1/portfolio/positions",
+                                     headers=pmgw._headers("GET", "/v1/portfolio/positions")).json()
+                newp = {k: abs(float(v.get("netPosition") or 0))
+                        for k, v in pj.get("positions", {}).items()}
+                # the PM positions API transiently returns EMPTY (seen 4x on
+                # 2026-07-22, let a capped rel re-fire) — an empty read while we
+                # hold prior state is a glitch, never a real flat portfolio
+                if newp or not tt["ppos"]:
+                    tt["ppos"] = newp
+                else:
+                    print("[LIVE] PM positions read empty — keeping previous (glitch guard)",
+                          flush=True)
 
     def _take_take(rid: str) -> None:
         rel = rel_by_id[rid]
@@ -332,9 +399,18 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
             return
         if time.monotonic() - tt["last_fire"].get(rid, 0.0) < TT_COOLDOWN:
             return
-        pos = tt["pos"].get(kleg.market_id, 0)
+        pos = max(tt["pos"].get(kleg.market_id, 0), tt["ppos"].get(pleg.market_id, 0),
+                  tt["fired"].get(pleg.market_id, 0))
         size = min(TT_CAP - int(pos), int(min(ka.size, pb.size)), TT_MAX_CLIP)
         if size < 1:
+            return
+        # topic budget / utilization gate (same risk dimensions the maker
+        # obeys) — take-take passes its APR so a GREAT opportunity may use the
+        # bounded class-cap overflow (idle cash shouldn't watch a 25%+ APR go by)
+        rd_check = risk.check_order(rel, Decimal(size), {}, opportunity_apr=apr)
+        if not rd_check.allowed:
+            tt["last_fire"][rid] = time.monotonic()  # throttle re-checks to the cooldown
+            print(f"[LIVE] TAKE-TAKE {rid} blocked by risk: {rd_check.reasons}", flush=True)
             return
         tt["last_fire"][rid] = time.monotonic()
         pgw, kgw = gateways.get(Venue.POLYMARKET_US), gateways.get(Venue.KALSHI)
@@ -345,12 +421,24 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
         try:  # legging-safe: constrained PM leg IOC first, then EXACT-qty Kalshi
             r1 = pgw.place_short(pleg.market_id, pb.price, size, post_only=False)
             oid1 = r1.get("id") or r1.get("order_id")
-            filled = pgw.filled_qty(oid1) if oid1 else 0
+            # PM fill reporting can lag the IOC by seconds — a single immediate
+            # read said "unfilled" on orders that HAD filled (2026-07-22),
+            # leaving naked PM shorts. Poll before concluding.
+            filled = 0
+            for _ in range(6):
+                filled = pgw.filled_qty(oid1) if oid1 else 0
+                if filled >= 1:
+                    break
+                time.sleep(0.5)
             if filled < 1:
-                print(f"[LIVE] TAKE-TAKE {rid} PM leg unfilled — abort (nothing naked)", flush=True)
+                tt["fired"][pleg.market_id] = tt["fired"].get(pleg.market_id, 0) + size
+                print(f"[LIVE] TAKE-TAKE {rid} PM leg reports unfilled after 3s — abort; "
+                      f"counting attempted size against cap until recon verifies", flush=True)
                 return
             kgw.place_yes(kleg.market_id, "bid", ka.price + _tick_k(kleg), filled, post_only=False)
             tt["pos"][kleg.market_id] = int(pos) + filled  # local until next refresh
+            tt["fired"][pleg.market_id] = tt["fired"].get(pleg.market_id, 0) + filled
+            risk.record_open(rel, Decimal(filled))  # keep the utilization bar honest in-session
             alerter.alert(f"arbbot TAKE-TAKE {rid} x{filled} edge={edge*100:.0f}c apr={apr:.0f}%")
             rec = {"ts": time.time(), "relationship_id": rid, "title": f"{rid} (auto take-take)",
                    "qty": int(filled), "strategy": "take-take",

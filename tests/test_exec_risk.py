@@ -206,3 +206,101 @@ def test_fee_reconciler_detects_schedule_drift():
     assert not ok
     assert "FEE MISMATCH" in alerts[0]
     assert len(fr.mismatches) == 1
+
+
+# ---- topic budgets (config/topics.yaml, 2026-07-22) ----
+
+def _mk_rel(rid):
+    return Relationship(
+        id=rid, type=RelationshipType.CROSS_VENUE_EQUIVALENT,
+        legs=[Leg(venue=Venue.KALSHI, market_id="A"),
+              Leg(venue=Venue.POLYMARKET, market_id="B")],
+        verdict=Verdict.EQUIVALENT,
+        vetted_by=VettedBy.HUMAN,
+        oracle_risk=OracleRisk.LOW,
+    )
+
+
+def _topic_mgr(**over):
+    from arbbot.risk.manager import TopicBudget
+    cfg = RiskConfig(
+        bankroll=Decimal("1000"), per_rel_cap=Decimal("500"),
+        topics=[TopicBudget(family="france-pres-27", budget_usd=Decimal("60"),
+                            only_below_util=Decimal("0.5")),
+                TopicBudget(family="nobel-peace-26", budget_usd=Decimal("80"))],
+        default_topic_budget=Decimal("30"),
+        default_only_below_util=Decimal("0.5"),
+        kill_switch_file="/tmp/nonexistent-kill", **over)
+    return RiskManager(config=cfg)
+
+
+def test_topic_of_matches_family():
+    m = _topic_mgr()
+    assert m.topic_of("xvus-france-pres-27-brunoretailleau") == "france-pres-27"
+    assert m.topic_of("xvus-nobel-peace-26-unrwa") == "nobel-peace-26"
+    assert m.topic_of("xvus-unknown-family-x") == "other"
+
+
+def test_topic_budget_blocks_over_budget():
+    m = _topic_mgr()
+    rel = _mk_rel("xvus-nobel-peace-26-unrwa")
+    m.record_open(rel, Decimal("75"))
+    d = m.check_order(rel, Decimal("10"), {})
+    assert not d.allowed
+    assert any("topic budget [nobel-peace-26]" in r for r in d.reasons)
+
+
+def test_topic_budget_allows_within_budget():
+    m = _topic_mgr()
+    rel = _mk_rel("xvus-nobel-peace-26-unrwa")
+    m.record_open(rel, Decimal("50"))
+    d = m.check_order(rel, Decimal("10"), {})
+    assert d.allowed, d.reasons
+
+
+def test_util_gate_blocks_low_apr_topic_when_hot():
+    m = _topic_mgr()
+    # fill the book with an ungated topic to push utilization past 0.5
+    m.record_open(_mk_rel("xvus-nobel-peace-26-unrwa"), Decimal("80"))
+    m.record_open(_mk_rel("xvus-time-poty-26-zohranmamdani"), Decimal("120"))
+    # class budget = 1000*0.35 = 350; util = 200/350 = 0.57 >= 0.5 gate
+    d = m.check_order(_mk_rel("xvus-france-pres-27-francoishollande"), Decimal("5"), {})
+    assert not d.allowed
+    assert any("gated to util<" in r for r in d.reasons)
+
+
+def test_util_gate_allows_low_apr_topic_when_cold():
+    m = _topic_mgr()
+    m.record_open(_mk_rel("xvus-nobel-peace-26-unrwa"), Decimal("50"))
+    # util = 50/350 = 0.14 < 0.5 -> gate passes; budget 60 has headroom
+    d = m.check_order(_mk_rel("xvus-france-pres-27-francoishollande"), Decimal("5"), {})
+    assert d.allowed, d.reasons
+
+
+def test_record_close_frees_topic_budget():
+    m = _topic_mgr()
+    rel = _mk_rel("xvus-nobel-peace-26-unrwa")
+    m.record_open(rel, Decimal("80"))
+    m.record_close(rel, Decimal("40"))
+    d = m.check_order(rel, Decimal("10"), {})
+    assert d.allowed, d.reasons
+
+
+def test_class_cap_overflow_for_great_apr():
+    # overflow applies to the CLASS cap only — use a topic-uncapped config so
+    # the topic dimension doesn't mask the class behavior under test
+    cfg = RiskConfig(bankroll=Decimal("1000"), per_rel_cap=Decimal("500"),
+                     kill_switch_file="/tmp/nonexistent-kill")
+    m = RiskManager(config=cfg)
+    rel = _mk_rel("xvus-nobel-peace-26-unrwa")
+    m.record_open(rel, Decimal("340"))  # class cap = 1000*0.35 = 350
+    # ordinary order over cap: blocked
+    assert not m.check_order(rel, Decimal("20"), {}).allowed
+    # great-APR order within overflow ceiling (350+100): allowed
+    d = m.check_order(rel, Decimal("20"), {}, opportunity_apr=30.0)
+    assert d.allowed, d.reasons
+    # great APR but beyond the overflow ceiling: still blocked
+    m.record_open(rel, Decimal("100"))
+    assert not m.check_order(rel, Decimal("20"), {}, opportunity_apr=99.0).allowed
+    # mediocre APR never overflows
+    assert not m.check_order(rel, Decimal("5"), {}, opportunity_apr=10.0).allowed

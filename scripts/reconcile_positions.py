@@ -36,12 +36,22 @@ def main():
     kid = (D / "kalshi_api_key_id").read_text().strip()
     kkey = load_private_key((D / "kalshi_private_key.pem").read_bytes())
 
+    k_info, pm_info = {}, {}
+
     def kalshi_pos():
         r = c.get(REST_BASE + "/portfolio/positions",
                   headers=sign_headers(kid, kkey, "GET", "/trade-api/v2/portfolio/positions"))
         r.raise_for_status()
-        return {p["ticker"]: float(p.get("position_fp") or 0)
-                for p in r.json().get("market_positions", [])}
+        out = {}
+        for p in r.json().get("market_positions", []):
+            q = float(p.get("position_fp") or 0)
+            out[p["ticker"]] = q
+            if q:
+                k_info[p["ticker"]] = {
+                    "basis_ct": float(p.get("market_exposure_dollars") or 0) / abs(q),
+                    "realized": float(p.get("realized_pnl_dollars") or 0),
+                    "fees": float(p.get("fees_paid_dollars") or 0)}
+        return out
 
     def pmus_pos():
         KID = (D / "polymarket_usa_key_id").read_text().strip()
@@ -53,55 +63,363 @@ def main():
         r = c.get("https://api.polymarket.us" + pth,
                   headers={"X-PM-Access-Key": KID, "X-PM-Timestamp": ts, "X-PM-Signature": sig})
         r.raise_for_status()
-        return {k: float(v.get("netPosition") or 0)
-                for k, v in r.json().get("positions", {}).items()}
+        out = {}
+        for k2, v in r.json().get("positions", {}).items():
+            out[k2] = float(v.get("netPosition") or 0)
+            if out[k2]:
+                pm_info[k2] = {"basis_ct": float((v.get("costPerShare") or {}).get("value") or 0)}
+        if not out:
+            # the endpoint transiently serves EMPTY (and hours-stale) snapshots
+            # (2026-07-22) — we always hold PM positions, so empty = glitch;
+            # raising lets _retry re-fetch instead of emitting a false NAKED.
+            raise RuntimeError("PM positions empty — glitch read")
+        return out
 
     try:
         kpos, ppos = _retry(kalshi_pos), _retry(pmus_pos)
     except Exception as e:
         print(f"RECON error {type(e).__name__} — could not fetch positions")
         return
+    # PM platform outages serve PARTIAL position sets (n=1-4 of ~10) that pass
+    # the empty-read guard and paint pm+0 under every pair. Track last-known-
+    # good count; a collapsed read means DEGRADED, not naked.
+    import json as _jg
+    good_f = pathlib.Path("data/exec/.recon_pm_n.json")
+    try:
+        last_good = int(_jg.loads(good_f.read_text()).get("n", 0))
+    except Exception:
+        last_good = 0
+    # the LEDGER defines every PM leg that MUST exist (open baskets with a
+    # polymarket_us leg). A read missing any of them is partial/broken —
+    # generalizes the canary idea to the full expected set. (Legs from failed
+    # captures never reach the ledger, so genuine sports nakedness still
+    # evaluates normally.)
+    expected = set()
+    try:
+        import sys as _sys
+        _sys.path.insert(0, "src")
+        from arbbot.exec.ledger import open_baskets as _ob, parse_lines as _pl
+        led = pathlib.Path("data/exec/trades.jsonl")
+        for t2 in _ob(_pl(led.read_text().splitlines())):
+            for l2 in t2.get("legs", []):
+                if l2.get("venue") == "polymarket_us" and float(t2.get("qty") or 0) >= 1:
+                    expected.add(l2.get("market_id"))
+    except Exception as _ge:
+        print(f"RECON guard error: {type(_ge).__name__}: {_ge}")
+    def _degraded(pp):
+        return (sorted(m2 for m2 in expected if not pp.get(m2)),
+                bool(last_good and len(pp) < 0.6 * last_good))
+
+    missing, collapsed = _degraded(ppos)
+    if missing or collapsed:
+        # STABLE message (no counts) so the alert monitor's consecutive-dedupe
+        # suppresses repeats during a long outage; details go to a state file.
+        with __import__("contextlib").suppress(Exception):
+            pathlib.Path("data/exec/.recon_degraded.json").write_text(_jg.dumps(
+                {"ts": time.time(), "pm_n": len(ppos), "baseline": last_good,
+                 "missing": missing}))
+        print("RECON degraded — PM positions API partial (platform incident); skipping naked evaluation")
+        return
+    with __import__("contextlib").suppress(Exception):
+        # ratchet-up only: a healthy read raises the baseline; genuine
+        # portfolio shrinkage requires a manual reset of .recon_pm_n.json
+        good_f.write_text(_jg.dumps({"n": max(len(ppos), last_good)}))
 
     # --- SPORTS: cross-venue MLB game legs must net to zero per game ---
     # Kalshi KXMLBGAME-<date><time><away+home>-<TEAM> vs PM aec-mlb-<away>-<home>-<date>.
     # A take-take holds short-away one venue + long-away the other => sum 0.
     import re as _re
     _MON = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,"JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-    naked = []
-    for kt, kq in ((t, q) for t, q in kpos.items() if t.startswith("KXMLBGAME") and q != 0):
-        m = _re.match(r"KXMLBGAME-(\d{2})([A-Z]{3})(\d{2})\d{4}([A-Z]+)-([A-Z]+)", kt)
-        if not m:
-            continue
-        yy, mon, dd, concat, team = m.groups()
-        if not concat.startswith(team):
-            continue  # only reconcile the AWAY leg (it covers the game); home leg would double-count
-        away, home = team, concat[len(team):]
-        try:
-            date = f"20{yy}-{_MON[mon]:02d}-{int(dd):02d}"
-        except (KeyError, ValueError):
-            continue
-        pq = ppos.get(f"aec-mlb-{away.lower()}-{home.lower()}-{date}", 0)
-        if abs(kq + pq) >= 1:  # short-away one venue + long-away other must net 0
-            naked.append(f"MLB {away}@{home}:kAWAY{kq:+.0f}/pmAWAY{pq:+.0f}/imb{kq+pq:+.0f}")
 
     reg = Registry.load("config/registry.yaml")
-    balanced, seen = 0, set()
-    for r in reg.relationships:
-        kt = next((l.market_id for l in r.legs if l.venue is Venue.KALSHI), None)
-        ps = next((l.market_id for l in r.legs if l.venue is Venue.POLYMARKET_US), None)
-        if not kt or not ps or (kt, ps) in seen:
-            continue
-        seen.add((kt, ps))
-        kq, pq = kpos.get(kt, 0), ppos.get(ps, 0)
-        if kq == 0 and pq == 0:
-            continue
-        imb = kq + pq  # hedged basket => kq == -pq => 0
-        if abs(imb) >= 1:
-            naked.append(f"{r.id}:kYES{kq:+.0f}/pmNet{pq:+.0f}/imb{imb:+.0f}")
-        else:
-            balanced += 1
+
+    def _find_naked(kpos, ppos, rows=None):
+        naked = []
+        naked_kt = {}
+        def _row(**kw):
+            if rows is not None:
+                rows.append(kw)
+        for kt, kq in ((t, q) for t, q in kpos.items() if t.startswith("KXMLBGAME") and q != 0):
+            m = _re.match(r"KXMLBGAME-(\d{2})([A-Z]{3})(\d{2})\d{4}([A-Z]+)-([A-Z]+)", kt)
+            if not m:
+                continue
+            yy, mon, dd, concat, team = m.groups()
+            if not concat.startswith(team):
+                continue  # only reconcile the AWAY leg (it covers the game); home leg would double-count
+            away, home = team, concat[len(team):]
+            try:
+                date = f"20{yy}-{_MON[mon]:02d}-{int(dd):02d}"
+            except (KeyError, ValueError):
+                continue
+            pq = ppos.get(f"aec-mlb-{away.lower()}-{home.lower()}-{date}", 0)
+            _row(name=f"MLB {away}@{home}", type="sports-mlb", kt=kt,
+                 pm=f"aec-mlb-{away.lower()}-{home.lower()}-{date}", kq=kq, pq=pq, imb=kq + pq)
+            if abs(kq + pq) >= 1:  # short-away one venue + long-away other must net 0
+                e = f"MLB {away}@{home}:kAWAY{kq:+.0f}/pmAWAY{pq:+.0f}/imb{kq+pq:+.0f}"
+                naked.append(e); naked_kt[e] = kt
+        # generic sports pairings (sports_equiv_map): kalshi long-team YES must
+        # net 1:1 against the PM moneyline position (take-take holds opposite
+        # sides). MLB is excluded — the KXMLBGAME block above covers it.
+        try:
+            smap = __import__("json").loads(
+                pathlib.Path("data/scan/sports_equiv_map.json").read_text())
+            for m in smap.get("matches", []):
+                if m.get("league") == "mlb":
+                    continue
+                kt, ps = m.get("kalshi_long_ticker"), m.get("pm_moneyline")
+                if not kt or not ps:
+                    continue
+                kq, pq = kpos.get(kt, 0), ppos.get(ps, 0)
+                if kq == 0 and pq == 0:
+                    continue
+                _row(name=m["teams"][:40], type=f"sports-{m['league']}", kt=kt, pm=ps,
+                     kq=kq, pq=pq, imb=kq + pq)
+                if abs(kq + pq) >= 1:
+                    e = (f"sports-{m['league']} {m['teams'][:30]}:"
+                         f"k{kq:+.0f}/pm{pq:+.0f}/imb{kq+pq:+.0f}")
+                    naked.append(e); naked_kt[e] = kt
+        except Exception:
+            pass
+
+        balanced, seen = 0, set()
+        for r in reg.relationships:
+            kt = next((l.market_id for l in r.legs if l.venue is Venue.KALSHI), None)
+            ps = next((l.market_id for l in r.legs if l.venue is Venue.POLYMARKET_US), None)
+            if not kt or not ps or (kt, ps) in seen:
+                continue
+            seen.add((kt, ps))
+            kq, pq = kpos.get(kt, 0), ppos.get(ps, 0)
+            if kq == 0 and pq == 0:
+                continue
+            imb = kq + pq  # hedged basket => kq == -pq => 0
+            _row(name=r.id, type="political", kt=kt, pm=ps, kq=kq, pq=pq, imb=imb)
+            if abs(imb) >= 1:
+                e = f"{r.id}:kYES{kq:+.0f}/pmNet{pq:+.0f}/imb{imb:+.0f}"
+                naked.append(e); naked_kt[e] = kt
+            else:
+                balanced += 1
+        # orphans: venue positions no pair explains (visibility, not alerting)
+        if rows is not None:
+            seen_kt = {row.get("kt") for row in rows}
+            seen_pm = {row.get("pm") for row in rows}
+            for t2, q2 in kpos.items():
+                if q2 != 0 and t2 not in seen_kt:
+                    _row(name=t2, type="orphan-kalshi", kt=t2, pm=None, kq=q2, pq=None, imb=None)
+            for s2, q2 in ppos.items():
+                if q2 != 0 and s2 not in seen_pm:
+                    _row(name=s2, type="orphan-pm", kt=None, pm=s2, kq=None, pq=q2, imb=None)
+        _find_naked.kt_map = naked_kt
+        return naked, balanced
+
+    naked, balanced = _find_naked(kpos, ppos)
     if naked:
-        print("RECON NAKED " + " ".join(naked))
+        # PM's positions API serves transient EMPTY and hours-STALE snapshots,
+        # and the staleness is STICKY (a server-side cache survives back-to-back
+        # reads — 2026-07-22 false alarms) — so a same-run confirm fetch is not
+        # enough. Only alert an imbalance seen on TWO CONSECUTIVE RUNS (~60s
+        # apart); the cache expires between runs, real nakedness persists.
+        time.sleep(2)
+        try:
+            kpos2, ppos2 = _retry(kalshi_pos), _retry(pmus_pos)
+            m2_, c2_ = _degraded(ppos2)
+            if m2_ or c2_:
+                # the CONFIRM read is partial — recomputing from it would paint
+                # false nakedness (the hole behind the Mamdani ghost pages).
+                # A first-read-naked that can't be confirmed on clean data
+                # stays UNCONFIRMED this run.
+                print("RECON degraded — PM positions API partial (platform incident); skipping naked evaluation")
+                return
+            kpos, ppos = kpos2, ppos2
+            naked, balanced = _find_naked(kpos, ppos)
+        except Exception:
+            pass  # keep first-read result if the confirm fetch fails
+    # positions snapshot for the dashboard Positions tab (venue truth)
+    try:
+        import json as _json
+        pos_f = pathlib.Path("data/exec/positions.json")
+        prev_doc = {}
+        with __import__("contextlib").suppress(Exception):
+            prev_doc = _json.loads(pos_f.read_text())
+        # PM's positions API serves partial/stale snapshots: if this run's PM
+        # position count collapsed vs the previous snapshot, the read is
+        # degraded — keep the previous snapshot rather than painting false
+        # NAKED rows on the dashboard.
+        if prev_doc.get("pm_n") and len(ppos) < 0.6 * prev_doc["pm_n"]:
+            raise RuntimeError("degraded PM read — keeping previous snapshot")
+        rows = []
+        _find_naked(kpos, ppos, rows)
+        holds = []
+        with __import__("contextlib").suppress(Exception):
+            holds = _json.loads(pathlib.Path("data/exec/sports_naked.json").read_text())
+        watched_kt = {h.get("kt"): h.get("qty") for h in holds if h.get("qty", 0) > 0}
+        # venue finalization skew: an imbalanced row whose Kalshi market is no
+        # longer active is SETTLING (the sweeper's job), not naked
+        imb_kts = [r.get("kt") for r in rows
+                   if r.get("kt") and r.get("imb") is not None and abs(r["imb"]) >= 1]
+        kstat = {}
+        for i in range(0, len(imb_kts), 50):
+            with __import__("contextlib").suppress(Exception):
+                for m in c.get(REST_BASE + "/markets",
+                               params={"tickers": ",".join(imb_kts[i:i+50])}).json().get("markets", []):
+                    kstat[m["ticker"]] = m.get("status")
+        # live books for every positioned row (kalshi batched; pm per slug)
+        all_kts = [r2.get("kt") for r2 in rows if r2.get("kt")]
+        kbooks = {}
+        for i in range(0, len(all_kts), 50):
+            with __import__("contextlib").suppress(Exception):
+                for m in c.get(REST_BASE + "/markets",
+                               params={"tickers": ",".join(all_kts[i:i+50])}).json().get("markets", []):
+                    kbooks[m["ticker"]] = (m.get("yes_bid_dollars"), m.get("yes_ask_dollars"),
+                                           m.get("status"))
+        hold_ref = {}
+        for h in holds:
+            if h.get("qty", 0) > 0:
+                hold_ref[(h.get("kt"), h.get("side"))] = h.get("ref_px")
+        for row in rows:
+            row["watched_qty"] = watched_kt.get(row.get("kt"), 0)
+            kb = kbooks.get(row.get("kt"), (None, None, None))
+            st = kstat.get(row.get("kt")) or kb[2]
+            row["settling"] = bool(st and st != "active")
+            row["k_bid"], row["k_ask"] = kb[0], kb[1]
+            ki = k_info.get(row.get("kt")) or {}
+            pi = pm_info.get(row.get("pm")) or {}
+            row["k_basis_ct"] = round(ki.get("basis_ct"), 4) if ki.get("basis_ct") is not None else None
+            row["pm_basis_ct"] = pi.get("basis_ct")
+            pmq = row.get("pq")
+            with __import__("contextlib").suppress(Exception):
+                b = c.get(f"https://gateway.polymarket.us/v1/markets/{row['pm']}/bbo",
+                          timeout=8).json().get("marketData", {})
+                row["pm_bid"] = (b.get("bestBid") or {}).get("value")
+                row["pm_ask"] = (b.get("bestAsk") or {}).get("value")
+            # locked/ct for hedged pairs: $1 payoff minus both held-side bases
+            kq2 = row.get("kq") or 0
+            if row.get("imb") is not None and abs(row["imb"]) < 1 and kq2 and                     row.get("k_basis_ct") is not None and row.get("pm_basis_ct") is not None:
+                row["locked_ct"] = round(1.0 - row["k_basis_ct"] - row["pm_basis_ct"], 4)
+            # hedge/flatten distance for watched holds (positive = cents away,
+            # <=0 = available right now)
+            side = "bid" if (row.get("imb") or 0) > 0 else "ask"
+            ref = hold_ref.get((row.get("kt"), side))
+            if ref is not None and row.get("imb") is not None and abs(row["imb"]) >= 1:
+                margin = 0.015  # fee + min lock
+                try:
+                    if side == "bid":
+                        if row.get("pm_bid") is not None:
+                            row["hedge_away_c"] = round(((ref + margin) - float(row["pm_bid"])) * 100, 1)
+                        if row.get("k_bid") is not None:
+                            row["flatten_away_c"] = round(((ref + margin) - float(row["k_bid"])) * 100, 1)
+                    else:
+                        if row.get("pm_ask") is not None:
+                            row["hedge_away_c"] = round((float(row["pm_ask"]) - (ref - margin)) * 100, 1)
+                        if row.get("k_ask") is not None:
+                            row["flatten_away_c"] = round((float(row["k_ask"]) - (ref - margin)) * 100, 1)
+                except (TypeError, ValueError):
+                    pass
+        pos_f.write_text(_json.dumps(
+            {"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+             "pm_n": len(ppos), "rows": rows}, indent=1))
+    except Exception:
+        pass
+
+    state_f = pathlib.Path("data/exec/.recon_state.json")
+    prev = set()
+    try:
+        import json as _json
+        prev = set(_json.loads(state_f.read_text()))
+    except Exception:
+        pass
+    cur = set(naked)
+    try:
+        import json as _json
+        state_f.write_text(_json.dumps(sorted(cur)))
+    except Exception:
+        pass
+    confirmed = sorted(cur & prev)
+    # settlement skew: an imbalance whose Kalshi market is FINALIZED is the
+    # settlement sweeper's domain (one venue settles before the other) — not
+    # a directional risk. Suppress those.
+    try:
+        kt_map = getattr(_find_naked, "kt_map", {})
+        cks = sorted({kt_map[e] for e in confirmed if kt_map.get(e)})
+        fin = set()
+        for i in range(0, len(cks), 50):
+            for m in c.get(REST_BASE + "/markets",
+                           params={"tickers": ",".join(cks[i:i+50])}).json().get("markets", []):
+                if m.get("status") != "active":
+                    fin.add(m["ticker"])
+        confirmed = [e for e in confirmed if kt_map.get(e) not in fin]
+    except Exception:
+        pass
+    # probe-owned positions: the overnight research probes (pmus maker probe,
+    # toxicity probe — separate workstream, board-approved) hold intentional
+    # single-leg PM positions logged in their own files. Not naked — theirs.
+    try:
+        import json as _jp
+        owned = set()
+        for pf in ("data/exec/pmus_maker_probe.jsonl", "data/exec/toxicity_probe.jsonl",
+                   "data/exec/leadlag_probe.jsonl"):
+            with __import__("contextlib").suppress(Exception):
+                for ln in pathlib.Path(pf).read_text().splitlines()[-800:]:
+                    try:
+                        r2 = _jp.loads(ln)
+                    except ValueError:
+                        continue
+                    slug = r2.get("pm") or r2.get("pair")
+                    if slug and r2.get("action") not in ("dry_quote", "dry_run_would_trade"):
+                        owned.add(slug)
+        smap2 = _jp.loads(pathlib.Path("data/scan/sports_equiv_map.json").read_text())
+        slug_team = {m3["pm_moneyline"]: m3["teams"][:30] for m3 in smap2.get("matches", [])
+                     if m3.get("pm_moneyline")}
+        owned_frags = {slug_team[sl] for sl in owned if sl in slug_team}
+        confirmed = [e for e in confirmed
+                     if not (("k+0/" in e or "kYES+0/" in e)
+                             and any(fr[:16] in e for fr in owned_frags))]
+    except Exception:
+        pass
+    # scoped ignores: known tolerated dust (fragment + max size + expiry) —
+    # growth beyond max_imb still pages
+    try:
+        import json as _json
+        import re as _re4
+        ig = [i for i in _json.loads(pathlib.Path("data/exec/.recon_ignore.json").read_text())
+              if i.get("expires", 0) > time.time()]
+        def _ignored(e):
+            m4 = _re4.search(r"imb([+-]?\d+)", e)
+            sz = abs(int(m4.group(1))) if m4 else 99
+            return any(i["fragment"][:16] in e and sz <= i.get("max_imb", 0) for i in ig)
+        confirmed = [e for e in confirmed if not _ignored(e)]
+    except Exception:
+        pass
+    # suppress imbalances already REGISTERED as watched naked holds (the sports
+    # rehedge watcher owns them; alerting every minute on a known hold is
+    # noise) — only page when the imbalance EXCEEDS the watched quantity.
+    try:
+        import json as _json
+        holds = _json.loads(pathlib.Path("data/exec/sports_naked.json").read_text())
+        watched = {}
+        for h in holds:
+            watched[h.get("kt", "")] = watched.get(h.get("kt", ""), 0) + abs(float(h.get("qty", 0)))
+        # simpler: rebuild suppression from the map — an entry is watched if a
+        # hold's game name prefix appears in it and |imb| <= watched qty
+        sup = []
+        for e in confirmed:
+            keep = True
+            for h in holds:
+                g0 = h.get("game", "")[:20]
+                if g0 and (g0.replace("@", " vs ")[:14] in e or g0[:14] in e):
+                    import re as _re3
+                    m3 = _re3.search(r"imb([+-]?\d+)", e)
+                    if m3 and abs(int(m3.group(1))) <= abs(float(h.get("qty", 0))):
+                        keep = False
+                        break
+            if keep:
+                sup.append(e)
+        confirmed = sup
+    except Exception:
+        pass
+    if confirmed:
+        print("RECON NAKED " + " ".join(confirmed))
+    elif cur:
+        pass  # 1st sighting — stay silent; alert only if it persists next run
     else:
         print(f"RECON ok — {balanced} baskets balanced")
 

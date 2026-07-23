@@ -38,15 +38,39 @@ class RiskConfig(BaseModel):
     # tail_fraction formula (still oracle-risk scaled). Geoff-approved at $150
     # for the low-oracle-risk cross-venue book (2026-07-21).
     per_rel_cap: Optional[Decimal] = None
-    per_class_cap: Decimal = Decimal("0.25")  # of bankroll, summed per rel type
+    # of bankroll, summed per rel type. 0.25 -> 0.35 (2026-07-22): the whole
+    # book is one class (cross-venue-equivalent), so this is effectively the
+    # global throttle; at 0.25 the France take-takes ($292 open) starved the
+    # maker of quote headroom entirely.
+    per_class_cap: Decimal = Decimal("0.35")
     global_cap: Decimal = Decimal("0.50")  # of bankroll, all open notional
     balance_band: Decimal = Decimal("0.30")  # alert when venue share drifts past
     kill_switch_file: str = "data/KILL"
+    # topic-level budgets (config/topics.yaml, Geoff 2026-07-22): capital per
+    # id-family, sized by the family's APR — high-APR families get more; a
+    # low-APR family may also be gated to open new baskets only while overall
+    # class utilization is below its only_below_util.
+    topics: list["TopicBudget"] = Field(default_factory=list)
+    default_topic_budget: Optional[Decimal] = None  # None = unlisted topics uncapped
+    default_only_below_util: Optional[Decimal] = None
+    # opportunity overflow (Geoff 2026-07-23): "sitting on $600 idle, don't
+    # miss a great opportunity for $50" — an order whose APR clears the bar
+    # may breach the CLASS cap by up to overflow_frac of bankroll. Cash checks
+    # still apply; per-relationship and topic caps are NOT overridable.
+    overflow_min_apr: Decimal = Decimal("25.0")   # %/yr that counts as "great"
+    overflow_frac: Decimal = Decimal("0.10")      # of bankroll, max breach
+
+
+class TopicBudget(BaseModel):
+    family: str  # substring key matched against relationship ids
+    budget_usd: Decimal
+    only_below_util: Optional[Decimal] = None
 
 
 class OpenExposure(BaseModel):
     by_relationship: dict[str, Decimal] = Field(default_factory=dict)
     by_class: dict[str, Decimal] = Field(default_factory=dict)
+    by_topic: dict[str, Decimal] = Field(default_factory=dict)
 
     @property
     def total(self) -> Decimal:
@@ -78,11 +102,29 @@ class RiskManager(BaseModel):
                 else self.config.bankroll * self.config.tail_fraction)
         return base * ORACLE_RISK_SCALER[rel.oracle_risk]
 
+    def topic_of(self, rel_id: str) -> str:
+        """Longest configured family whose key appears in the id; else 'other'."""
+        hay = f"-{rel_id}-"
+        best = ""
+        for t in self.config.topics:
+            if f"-{t.family}-" in hay and len(t.family) > len(best):
+                best = t.family
+        return best or "other"
+
+    def _topic_budget(self, topic: str) -> tuple[Optional[Decimal], Optional[Decimal]]:
+        for t in self.config.topics:
+            if t.family == topic:
+                return t.budget_usd, (t.only_below_util
+                                      if t.only_below_util is not None
+                                      else None)
+        return self.config.default_topic_budget, self.config.default_only_below_util
+
     def check_order(
         self,
         rel: Relationship,
         notional: Decimal,
         venue_costs: dict[Venue, Decimal],
+        opportunity_apr: Optional[float] = None,
     ) -> RiskDecision:
         """Gate every new basket. venue_costs: cash needed per venue."""
         reasons: list[str] = []
@@ -101,11 +143,30 @@ class RiskManager(BaseModel):
         class_cap = self.config.bankroll * self.config.per_class_cap
         open_class = self.exposure.by_class.get(rel.type.value, ZERO)
         if open_class + notional > class_cap:
-            reasons.append(f"class cap: {open_class}+{notional} > {class_cap}")
+            hard_ceiling = class_cap + self.config.bankroll * self.config.overflow_frac
+            if (opportunity_apr is not None
+                    and Decimal(str(opportunity_apr)) >= self.config.overflow_min_apr
+                    and open_class + notional <= hard_ceiling):
+                pass  # great-opportunity overflow: cap breached knowingly, bounded
+            else:
+                reasons.append(f"class cap: {open_class}+{notional} > {class_cap}"
+                               + (f" (overflow needs apr>={self.config.overflow_min_apr})"
+                                  if opportunity_apr is not None else ""))
 
         global_cap = self.config.bankroll * self.config.global_cap
         if self.exposure.total + notional > global_cap:
             reasons.append(f"global cap: {self.exposure.total}+{notional} > {global_cap}")
+
+        topic = self.topic_of(rel.id)
+        budget, gate = self._topic_budget(topic)
+        if budget is not None:
+            open_topic = self.exposure.by_topic.get(topic, ZERO)
+            if open_topic + notional > budget:
+                reasons.append(f"topic budget [{topic}]: {open_topic}+{notional} > {budget}")
+        if gate is not None:
+            util = self.exposure.total / class_cap if class_cap else Decimal(1)
+            if util >= gate:
+                reasons.append(f"topic [{topic}] gated to util<{gate}: at {util:.2f}")
 
         for venue, cost in venue_costs.items():
             avail = self.balances.get(venue, ZERO)
@@ -123,6 +184,8 @@ class RiskManager(BaseModel):
         self.exposure.by_class[rel.type.value] = (
             self.exposure.by_class.get(rel.type.value, ZERO) + notional
         )
+        topic = self.topic_of(rel.id)
+        self.exposure.by_topic[topic] = self.exposure.by_topic.get(topic, ZERO) + notional
 
     def record_close(self, rel: Relationship, notional: Decimal) -> None:
         self.exposure.by_relationship[rel.id] = max(
@@ -130,6 +193,10 @@ class RiskManager(BaseModel):
         )
         self.exposure.by_class[rel.type.value] = max(
             self.exposure.by_class.get(rel.type.value, ZERO) - notional, ZERO
+        )
+        topic = self.topic_of(rel.id)
+        self.exposure.by_topic[topic] = max(
+            self.exposure.by_topic.get(topic, ZERO) - notional, ZERO
         )
 
     def balance_imbalance_alert(self) -> Optional[str]:
