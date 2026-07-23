@@ -260,8 +260,9 @@ class ToxProbe:
             self.log(rec)
             return
         try:
-            r = self.gw.place_yes(m.ticker, "bid", Decimal(str(px)), a.clip,
-                                  post_only=True)
+            r = await asyncio.to_thread(
+                self.gw.place_yes, m.ticker, "bid", Decimal(str(px)), a.clip,
+                post_only=True)
             oid = (r.get("order") or {}).get("order_id") or r.get("order_id")
             m.order_id, m.order_px, m.order_qty = oid, px, a.clip
             rec["order_id"] = oid
@@ -279,14 +280,14 @@ class ToxProbe:
             return
         oid = m.order_id
         try:
-            self.gw.cancel(oid)
+            await asyncio.to_thread(self.gw.cancel, oid)
             self.intents({"cancel": m.ticker, "side": "bid",
                           "price": str(m.order_px), "order_id": oid})
         except Exception:
             pass
         # catch a race: partial fill before the cancel landed
         with contextlib.suppress(Exception):
-            got = self.gw.filled_qty(oid)
+            got = await asyncio.to_thread(self.gw.filled_qty, oid)
             if got:
                 await self.on_fill(m, f, got, m.order_px, now_ns)
         m.order_id = None
@@ -295,7 +296,7 @@ class ToxProbe:
         if not self.args.live:
             return False  # dry-run: no simulated fills, gate/quote logging only
         try:
-            got = self.gw.filled_qty(m.order_id)
+            got = await asyncio.to_thread(self.gw.filled_qty, m.order_id)
         except Exception:
             return False
         if got and got >= m.order_qty:
@@ -350,8 +351,9 @@ class ToxProbe:
                "reason": reason, "qty": qty, "px": px}
         if self.args.live:
             try:
-                r = self.gw.place_yes(m.ticker, "ask", Decimal(str(px)), qty,
-                                      post_only=False)
+                r = await asyncio.to_thread(
+                    self.gw.place_yes, m.ticker, "ask", Decimal(str(px)), qty,
+                    post_only=False)
                 oid = (r.get("order") or {}).get("order_id") or r.get("order_id")
                 rec["order_id"] = oid
                 self.intents({"place": m.ticker, "side": "ask", "price": str(px),
@@ -359,7 +361,7 @@ class ToxProbe:
                 await asyncio.sleep(1.5)
                 sold = 0
                 with contextlib.suppress(Exception):
-                    sold = self.gw.filled_qty(oid)
+                    sold = await asyncio.to_thread(self.gw.filled_qty, oid)
                 rec["sold"] = sold
                 if sold and sold >= qty:
                     pnl = (px - m.avg_entry) * sold
@@ -389,7 +391,7 @@ class ToxProbe:
         for m in self.ms.values():
             if self.args.live and m.order_id and m.order_id != "dry":
                 with contextlib.suppress(Exception):
-                    self.gw.cancel(m.order_id)
+                    await asyncio.to_thread(self.gw.cancel, m.order_id)
             m.order_id = None
             if m.inventory > 0:
                 await self.exit_now(m, reason)

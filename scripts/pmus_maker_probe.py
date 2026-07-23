@@ -292,8 +292,9 @@ class MakerProbe:
             if not self.args.live:
                 continue
             try:
-                r = self.pm_gw.client.get(self.pm_gw.base + pth,
-                                          headers=self.pm_gw._headers("GET", pth))
+                r = await asyncio.to_thread(
+                    self.pm_gw.client.get, self.pm_gw.base + pth,
+                    headers=self.pm_gw._headers("GET", pth))
                 r.raise_for_status()
                 positions = r.json().get("positions", {})
             except Exception as e:
@@ -320,7 +321,7 @@ class MakerProbe:
                     if ost.pair["pm"] != slug:
                         continue
                     with contextlib.suppress(Exception):
-                        o = self.pm_gw.get_order(oid)
+                        o = await asyncio.to_thread(self.pm_gw.get_order, oid)
                         cum = int(float(o.get("cumQuantity", 0) or 0))
                         new = cum - ocur["cum"]
                         if new > 0:  # late-recognized fill: hedge it now
@@ -348,12 +349,14 @@ class MakerProbe:
         try:
             if qty < 0:
                 px = min(0.99, round(t[1] + 0.02, 2))
-                r = self.pm_gw.place_yes(st.pair["pm"], "bid",
-                                         Decimal(str(px)), -qty, post_only=False)
+                r = await asyncio.to_thread(
+                    self.pm_gw.place_yes, st.pair["pm"], "bid",
+                    Decimal(str(px)), -qty, post_only=False)
             else:
                 px = max(0.01, round(t[0] - 0.02, 2))
-                r = self.pm_gw.place_yes(st.pair["pm"], "ask",
-                                         Decimal(str(px)), qty, post_only=False)
+                r = await asyncio.to_thread(
+                    self.pm_gw.place_yes, st.pair["pm"], "ask",
+                    Decimal(str(px)), qty, post_only=False)
             self.log({"ts": time.time(), "action": "recon_flatten",
                       "pm": st.pair["pm"], "qty": qty,
                       "order_id": r.get("id") or r.get("order_id")})
@@ -434,13 +437,13 @@ class MakerProbe:
             return
         try:
             if side == "buy":
-                r = self.pm_gw.place_yes(st.pair["pm"], "bid",
-                                         Decimal(str(px)), a.clip,
-                                         post_only=True)
+                r = await asyncio.to_thread(
+                    self.pm_gw.place_yes, st.pair["pm"], "bid",
+                    Decimal(str(px)), a.clip, post_only=True)
             else:
-                r = self.pm_gw.place_yes(st.pair["pm"], "ask",
-                                         Decimal(str(px)), a.clip,
-                                         post_only=True)
+                r = await asyncio.to_thread(
+                    self.pm_gw.place_yes, st.pair["pm"], "ask",
+                    Decimal(str(px)), a.clip, post_only=True)
             oid = r.get("id") or r.get("order_id")
             cur = {"id": oid, "px": px, "qty": a.clip, "cum": 0,
                    "last_poll": time.time(),
@@ -471,7 +474,8 @@ class MakerProbe:
         ok = False
         for attempt in range(2):
             try:
-                self.pm_gw.cancel(cur["id"], market_slug=st.pair["pm"])
+                await asyncio.to_thread(self.pm_gw.cancel, cur["id"],
+                                        market_slug=st.pair["pm"])
                 self.intents({"cancel": st.pair["pm"],
                               "side": "bid" if side == "buy" else "ask",
                               "price": str(cur["px"]), "order_id": cur["id"]})
@@ -513,9 +517,9 @@ class MakerProbe:
     async def settle_fill_delta(self, st, side, cur):
         got = 0
         with contextlib.suppress(Exception):
-            got = self.pm_gw.filled_qty(cur["id"])
+            got = await asyncio.to_thread(self.pm_gw.filled_qty, cur["id"])
         with contextlib.suppress(Exception):
-            o = self.pm_gw.get_order(cur["id"])
+            o = await asyncio.to_thread(self.pm_gw.get_order, cur["id"])
             got = max(got, int(float(o.get("cumQuantity", 0) or 0)))
         new = got - cur["cum"]
         if new > 0:
@@ -572,8 +576,9 @@ class MakerProbe:
                 else max(0.01, min(0.99, round(px + 0.01 * attempt, 2)))
             need = qty - hedged
             try:
-                r = self.k_gw.place_yes(kt, "ask" if side == "buy" else "bid",
-                                        Decimal(str(px)), need, post_only=False)
+                r = await asyncio.to_thread(
+                    self.k_gw.place_yes, kt, "ask" if side == "buy" else "bid",
+                    Decimal(str(px)), need, post_only=False)
                 oid = (r.get("order") or {}).get("order_id") or r.get("order_id")
                 self.intents({"place": kt, "venue": "kalshi",
                               "side": "ask" if side == "buy" else "bid",
@@ -581,7 +586,7 @@ class MakerProbe:
                 await asyncio.sleep(1.0)
                 f = 0
                 with contextlib.suppress(Exception):
-                    f = self.k_gw.filled_qty(oid)
+                    f = await asyncio.to_thread(self.k_gw.filled_qty, oid)
                 if f:
                     hpx_avg = (hpx_avg * hedged + px * f) / (hedged + f)
                     hedged += f
@@ -649,13 +654,13 @@ class MakerProbe:
                 t = top(kb) if kb else None
                 if t and self.args.live:
                     if side == "buy":
-                        r = self.pm_gw.place_yes(st.pair["pm"], "ask",
-                                                 Decimal(str(t[0])), naked,
-                                                 post_only=False)
+                        r = await asyncio.to_thread(
+                            self.pm_gw.place_yes, st.pair["pm"], "ask",
+                            Decimal(str(t[0])), naked, post_only=False)
                     else:
-                        r = self.pm_gw.place_yes(st.pair["pm"], "bid",
-                                                 Decimal(str(t[1])), naked,
-                                                 post_only=False)
+                        r = await asyncio.to_thread(
+                            self.pm_gw.place_yes, st.pair["pm"], "bid",
+                            Decimal(str(t[1])), naked, post_only=False)
                     rec2["unwind_order"] = r.get("id") or r.get("order_id")
                 print(f"[UNWIND] naked {naked} on {st.pair['pm']}", flush=True)
             except Exception as e:
