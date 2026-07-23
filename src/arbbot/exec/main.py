@@ -519,11 +519,110 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
             writer = None
             try:
                 reader, writer = await asyncio.open_unix_connection(cfg.socket_path)
+                # READER/PROCESSOR DECOUPLE (rust-rewrite bench finding, card
+                # 23d15e3f): the recorder disconnects a subscriber at ~1MB of
+                # queued backlog (~2.2s at burst peak), and our inline venue
+                # I/O (hedge REST + confirmed-fill polls, 3-5s) exceeds that
+                # during exactly the bursts that produce fills. The reader
+                # task ONLY drains the socket into a bounded in-memory queue;
+                # processing (which may block) consumes from the queue, so
+                # stalls grow OUR buffer instead of the recorder's.
+                q_lines: asyncio.Queue = asyncio.Queue(maxsize=200_000)
+
+                async def _drain():
+                    while True:
+                        ln = await reader.readline()
+                        if not ln:
+                            await q_lines.put(None)
+                            return
+                        try:
+                            q_lines.put_nowait(ln)
+                        except asyncio.QueueFull:
+                            # shed oldest by draining one — never block the reader
+                            with contextlib.suppress(Exception):
+                                q_lines.get_nowait()
+                            with contextlib.suppress(Exception):
+                                q_lines.put_nowait(ln)
+
+                drain_task = asyncio.create_task(_drain())
+                pause_until: dict[str, float] = {}
+                pause_mtime = [0.0]
+                pause_f = Path("data/exec/.quote_pause_requests.json")
+                last_pause_check = [0.0]
+
+                def _check_pause_requests():
+                    now2 = time.time()
+                    if now2 - last_pause_check[0] < 5:
+                        return
+                    last_pause_check[0] = now2
+                    try:
+                        mt = pause_f.stat().st_mtime
+                    except OSError:
+                        return
+                    if mt == pause_mtime[0]:
+                        return
+                    pause_mtime[0] = mt
+                    try:
+                        reqs = json.loads(pause_f.read_text())
+                    except (OSError, ValueError):
+                        return
+                    for rid2, until in reqs.items():
+                        if until > now2 and pause_until.get(rid2, 0) < until:
+                            pause_until[rid2] = until
+                            q2 = quoters.get(rid2)
+                            if q2 is not None:
+                                with contextlib.suppress(Exception):
+                                    q2.cancel_all()
+                                print(f"[LIVE] quote PAUSE {rid2} until "
+                                      f"+{until - now2:.0f}s (unwinder handshake)", flush=True)
+
+                # FEED-HEALTH QUOTE PULL (Geoff ask, card 0a7e5478): a stale
+                # venue feed invalidates CROSS-VENUE pricing on both sides (each
+                # venue's quote is hedge-priced against the other's book), so
+                # any critical-feed staleness cancels ALL resting quotes until
+                # the recorder reports the feeds healthy again. Signal source =
+                # the recorder's health.jsonl (venue-heartbeat-aware — mere
+                # event silence on sleepy political books does NOT trip it).
+                feed_paused = [False]
+                last_health_check = [0.0]
+                health_f = Path("data/health.jsonl")
+
+                def _check_feed_health():
+                    now3 = time.time()
+                    if now3 - last_health_check[0] < 10:
+                        return
+                    last_health_check[0] = now3
+                    try:
+                        with open(health_f, "rb") as hf:
+                            hf.seek(max(hf.seek(0, 2) - 2048, 0))
+                            tail_lines = hf.read().decode(errors="ignore").strip().splitlines()
+                        h = json.loads(tail_lines[-1])
+                    except Exception:
+                        return
+                    if now3 - h.get("ts", 0) > 30:
+                        stale_now = True   # health writer itself silent = recorder down
+                    else:
+                        st = h.get("stale", {})
+                        stale_now = bool(st.get("kalshi-ws") or st.get("polymarket_us-ws"))
+                    if stale_now and not feed_paused[0]:
+                        feed_paused[0] = True
+                        for q3 in quoters.values():
+                            with contextlib.suppress(Exception):
+                                q3.cancel_all()
+                        print("[LIVE] FEED STALE — all quotes PULLED until feeds recover",
+                              flush=True)
+                        alerter.alert("arbbot trader: feed stale — quotes pulled")
+                    elif not stale_now and feed_paused[0]:
+                        feed_paused[0] = False
+                        print("[LIVE] feeds healthy — quoting resumes", flush=True)
+
                 while True:
-                    line = await reader.readline()
-                    if not line:
+                    line = await q_lines.get()
+                    if line is None:
                         break
                     hb_events += 1
+                    _check_pause_requests()
+                    _check_feed_health()
                     # liveness heartbeat: quiet-vs-stuck is unanswerable without
                     # this — books can legitimately sleep for long stretches.
                     if time.monotonic() - last_hb > 60:
@@ -546,6 +645,10 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                     for rid in leg_to_rels.get((ev.venue.value, ev.market_id), ()):
                         q = quoters[rid]
                         hb_onbook += 1
+                        if feed_paused[0]:
+                            continue  # stale feed — cross-venue pricing invalid
+                        if pause_until.get(rid, 0) > time.time():
+                            continue  # unwinder is closing this basket — stay out of the book
                         try:
                             q.on_book(books)
                         except Exception as e:  # never let one quote error kill the loop; SURFACE it
@@ -587,6 +690,8 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
             except (ConnectionError, FileNotFoundError, OSError):
                 pass
             finally:
+                with contextlib.suppress(Exception):
+                    drain_task.cancel()
                 # close the old connection before reconnecting — leaking it
                 # leaves a zombie the recorder keeps writing into (Send-Q grows
                 # until it notices and drops the client).

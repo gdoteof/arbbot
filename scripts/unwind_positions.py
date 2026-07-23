@@ -39,6 +39,23 @@ LEDGER = Path("data/exec/trades.jsonl")
 KTICK = Decimal("0.01")   # sweep one level past the touch on the Kalshi close
 
 
+PAUSE_REQ = Path("data/exec/.quote_pause_requests.json")
+
+
+def request_quote_pause(rid: str, seconds: float = 120.0) -> None:
+    """Ask the runner to pull its maker quotes on this relationship before we
+    close the basket — our own resting quotes are often the touch on these
+    thin books, and self-trade prevention deadlocks the unwind IOC otherwise
+    (card ed6a5910: 14 soft unwinds blocked)."""
+    try:
+        reqs = json.loads(PAUSE_REQ.read_text())
+    except (OSError, ValueError):
+        reqs = {}
+    reqs[rid] = time.time() + seconds
+    reqs = {k: v for k, v in reqs.items() if v > time.time()}
+    PAUSE_REQ.write_text(json.dumps(reqs))
+
+
 def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
                  k_ask=None, p_bid=None) -> None:
     qty = int(t["qty"])
@@ -58,6 +75,29 @@ def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
     if not live:
         print("[UNWIND] dry-run — no orders placed", flush=True)
         return
+    request_quote_pause(rid)
+    time.sleep(8)  # runner checks the request file every ~5s and pulls quotes
+    # RE-PRICE against the book WITHOUT our own quotes (card ed6a5910 pt.2):
+    # on thin books our maker quotes ARE the touch, so pre-pause prices — and
+    # marks' liq values generally — are flattered by ourselves. Only unwind if
+    # it is still profitable against the real residual book.
+    import httpx as _hx
+    _c2 = _hx.Client(timeout=15)
+    kb2 = kalshi_books(_c2, [kleg["market_id"]]).get(kleg["market_id"], (None, None))
+    pb2 = pmus_topbook(_c2, pleg["market_id"])
+    k_bid2, p_ask2 = kb2[0], pb2[1]
+    if k_bid2 is None or p_ask2 is None:
+        print(f"[UNWIND] {rid} book empty after quote pause — skip", flush=True)
+        return
+    liq2 = (Decimal(str(k_bid2)) + (Decimal(1) - Decimal(str(p_ask2)))) * qty \
+           - Decimal("0.01") * qty
+    mark2 = float(liq2) - float(t["cost_usd"])
+    if mark2 <= 0:
+        print(f"[UNWIND] {rid} not profitable against the residual book "
+              f"(mark {mark2:+.2f} vs {row['mark_pnl_usd']:+.2f} with our quotes) — skip",
+              flush=True)
+        return
+    k_bid, p_ask = k_bid2, p_ask2
     if inverted:
         # PM leg first (thin): close held YES via BUY_SHORT offset, IOC at bid
         r1 = pgw.place_short(pleg["market_id"], Decimal(str(p_bid)), qty,
@@ -77,13 +117,30 @@ def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
         return
     if inverted:
         # Kalshi leg: close held NO by buying YES, one tick through the ask
-        kgw.place_yes(kleg["market_id"], "bid",
-                      min(Decimal(str(k_ask)) + KTICK, Decimal("0.99")),
-                      filled, post_only=False)
+        kr = kgw.place_yes(kleg["market_id"], "bid",
+                           min(Decimal(str(k_ask)) + KTICK, Decimal("0.99")),
+                           filled, post_only=False)
     else:
         # Kalshi leg: sell YES, one tick through the bid, exact filled qty
-        kgw.place_yes(kleg["market_id"], "ask", max(Decimal(str(k_bid)) - KTICK, KTICK),
-                      filled, post_only=False)
+        kr = kgw.place_yes(kleg["market_id"], "ask", max(Decimal(str(k_bid)) - KTICK, KTICK),
+                           filled, post_only=False)
+    # CONFIRM the Kalshi close (2026-07-23: fire-and-forget sells silently
+    # failed during venue 429s, stranding longs mid-unwind after the PM close)
+    koid = (kr.get("order") or {}).get("order_id") or kr.get("order_id") or ""
+    kf = 0
+    for _ in range(8):
+        try:
+            kf = kgw.filled_qty(koid)
+        except Exception:
+            pass
+        if kf >= filled:
+            break
+        time.sleep(0.5)
+    if kf < filled:
+        print(f"[UNWIND] {rid} KALSHI close underfilled {kf}/{filled} — stranded "
+              f"position; recon flags it, completion can be retried", flush=True)
+        Alerter(load_recorder_config().ntfy_topic).alert(
+            f"arbbot UNWIND {rid}: Kalshi close underfilled {kf}/{filled}")
     frac = filled / qty
     if inverted:
         proceeds = (Decimal(str(p_bid)) + (Decimal(1) - Decimal(str(k_ask)))) * filled
