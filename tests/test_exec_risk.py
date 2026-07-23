@@ -306,31 +306,42 @@ def test_class_cap_overflow_for_great_apr():
     assert not m.check_order(rel, Decimal("5"), {}, opportunity_apr=10.0).allowed
 
 
-def test_topic_overflow_when_beating_latest_natural_apr(tmp_path, monkeypatch):
-    """Geoff 2026-07-23: a category may exceed its budget when the new
-    opportunity's APR beats the topic's LATEST natural hold APR (marginal
-    return of capital already deployed there)."""
+def test_topic_overflow_bar_weakest_fwd_capped_at_overflow_min(tmp_path, monkeypatch):
+    """Geoff 2026-07-23 (v2): the topic-budget overflow bar is
+    min(weakest deployed forward APR, overflow_min_apr) — a spectacular
+    recent fill must never become an unbeatable bar, and a great opportunity
+    (>= overflow_min_apr) is never budget-blocked even without marks."""
     import json as _json
     import arbbot.risk.manager as rm
     mf = tmp_path / "marks.json"
     mf.write_text(_json.dumps({"positions": [
         {"relationship_id": "xvus-nobel-peace-26-unrwa", "ts": 100.0,
-         "natural_hold_apr": 8.0},
+         "forward_hold_apr": 8.0},            # weakest -> the bar
         {"relationship_id": "xvus-nobel-peace-26-djt", "ts": 200.0,
-         "natural_hold_apr": 11.0},          # newest -> the bar
+         "forward_hold_apr": 39.0},           # newest + best — must NOT be the bar
         {"relationship_id": "xvus-france-pres-27-x", "ts": 300.0,
-         "natural_hold_apr": 99.0},          # other topic — ignored
+         "forward_hold_apr": 1.0},            # other topic — ignored
     ]}))
     monkeypatch.setattr(rm, "MARKS_FILE", mf)
     rm._marks_cache["mtime"] = 0.0
     m = _topic_mgr()
     rel = _mk_rel("xvus-nobel-peace-26-unrwa")
     m.record_open(rel, Decimal("75"))        # over the 80 budget with +10
-    assert m.check_order(rel, Decimal("10"), {}, opportunity_apr=12.0).allowed
-    d = m.check_order(rel, Decimal("10"), {}, opportunity_apr=10.0)
-    assert not d.allowed and any("overflow needs apr>11" in r for r in d.reasons)
-    # no APR passed (maker path) or no marks -> cap stays hard
+    assert m.check_order(rel, Decimal("10"), {}, opportunity_apr=10.0).allowed  # > 8
+    d = m.check_order(rel, Decimal("10"), {}, opportunity_apr=7.0)             # < 8
+    assert not d.allowed and any("overflow needs apr>=8" in r for r in d.reasons)
+    # no APR passed (maker path) -> cap stays hard
     assert not m.check_order(rel, Decimal("10"), {}).allowed
+    # no marks at all: a great opportunity (>= overflow_min_apr 25) still passes
     rm._marks_cache["mtime"] = 0.0
     monkeypatch.setattr(rm, "MARKS_FILE", tmp_path / "absent.json")
+    assert m.check_order(rel, Decimal("10"), {}, opportunity_apr=39.0).allowed
     assert not m.check_order(rel, Decimal("10"), {}, opportunity_apr=12.0).allowed
+    # weakest fwd very high (all money working hard): bar capped at 25
+    mf2 = tmp_path / "marks2.json"
+    mf2.write_text(_json.dumps({"positions": [
+        {"relationship_id": "xvus-nobel-peace-26-unrwa", "ts": 100.0,
+         "forward_hold_apr": 60.0}]}))
+    rm._marks_cache["mtime"] = 0.0
+    monkeypatch.setattr(rm, "MARKS_FILE", mf2)
+    assert m.check_order(rel, Decimal("10"), {}, opportunity_apr=30.0).allowed  # >= 25 cap

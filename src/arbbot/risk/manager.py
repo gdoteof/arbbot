@@ -114,12 +114,14 @@ class RiskManager(BaseModel):
                 best = t.family
         return best or "other"
 
-    def topic_latest_apr(self, topic: str) -> Optional[float]:
-        """natural_hold_apr of the NEWEST marked position in this topic — the
-        category's marginal return on capital. A new basket beating it may
-        overflow the topic budget (Geoff 2026-07-23: capital efficiency —
-        money that out-earns the money already deployed shouldn't be blocked
-        by the cap sized for average opportunities)."""
+    def topic_weakest_fwd_apr(self, topic: str) -> Optional[float]:
+        """MIN forward_hold_apr across this topic's marked positions — the
+        weakest money deployed there. A new basket beating it may overflow
+        the topic budget (Geoff 2026-07-23: capital efficiency): new capital
+        that out-earns the worst deployed position is a strict improvement,
+        and displacement can free exactly that position. NOT the newest/best
+        position — one spectacular fill must never become an unbeatable bar
+        that blocks the next good capture."""
         import json
         try:
             mt = MARKS_FILE.stat().st_mtime
@@ -129,15 +131,10 @@ class RiskManager(BaseModel):
                 _marks_cache["mtime"] = mt
         except (OSError, ValueError):
             return None
-        best = None
-        for m in _marks_cache["rows"]:
-            if m.get("natural_hold_apr") is None:
-                continue
-            if self.topic_of(str(m.get("relationship_id"))) != topic:
-                continue
-            if best is None or (m.get("ts") or 0) > best[0]:
-                best = ((m.get("ts") or 0), m["natural_hold_apr"])
-        return best[1] if best else None
+        aprs = [m["forward_hold_apr"] for m in _marks_cache["rows"]
+                if m.get("forward_hold_apr") is not None
+                and self.topic_of(str(m.get("relationship_id"))) == topic]
+        return min(aprs) if aprs else None
 
     def _topic_budget(self, topic: str) -> tuple[Optional[Decimal], Optional[Decimal]]:
         for t in self.config.topics:
@@ -190,16 +187,21 @@ class RiskManager(BaseModel):
         if budget is not None:
             open_topic = self.exposure.by_topic.get(topic, ZERO)
             if open_topic + notional > budget:
-                latest = self.topic_latest_apr(topic)
-                if (opportunity_apr is not None and latest is not None
-                        and Decimal(str(opportunity_apr)) > Decimal(str(latest))):
-                    pass  # capital-efficiency overflow: out-earns the topic's
-                    # marginal hold; class/global caps still bind above this
+                weakest = self.topic_weakest_fwd_apr(topic)
+                # overflow bar = min(weakest deployed fwd APR, overflow_min_apr):
+                # a great opportunity (>= overflow_min_apr) is NEVER budget-
+                # blocked, even with no marks; lesser ones must out-earn the
+                # topic's weakest money. Class/global caps still bind above.
+                bar = (min(Decimal(str(weakest)), self.config.overflow_min_apr)
+                       if weakest is not None else self.config.overflow_min_apr)
+                if (opportunity_apr is not None
+                        and Decimal(str(opportunity_apr)) >= bar):
+                    pass  # capital-efficiency overflow
                 else:
                     reasons.append(
                         f"topic budget [{topic}]: {open_topic}+{notional} > {budget}"
-                        + (f" (overflow needs apr>{latest})" if latest is not None
-                           and opportunity_apr is not None else ""))
+                        + (f" (overflow needs apr>={bar})"
+                           if opportunity_apr is not None else ""))
         if gate is not None:
             util = self.exposure.total / class_cap if class_cap else Decimal(1)
             if util >= gate:
