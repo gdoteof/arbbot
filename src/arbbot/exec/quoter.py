@@ -88,6 +88,11 @@ class Quoter:
     quote_venue: Optional[Venue] = None  # restrict maker quoting to one venue
     safety_ticks: int = 0  # extra ticks inside p_max as slippage buffer
     min_requote_s: float = 15.0  # keep a profitable resting quote this long before repricing (cut API churn)
+    # APR hurdle (card 80ff7987: clip-25 fill locked 23ct at 2.5% APR — capital
+    # deployed to resolution must clear the same floating bar as take-take).
+    # The runner propagates min_apr = tt bar on every refresh; 0 disables.
+    min_apr: float = 0.0         # %/yr the locked edge must annualize to
+    resolve_years: Optional[float] = None  # time to resolution (from resolve_date)
     # anti-fingerprint jitter (0 => disabled, exact original behavior):
     price_jitter_ticks: int = 0  # rest 0..N ticks MORE PASSIVE than the aggressive cap
     size_jitter: int = 0         # rest clip - random(0..N) contracts (varies size, never exceeds clip)
@@ -152,6 +157,15 @@ class Quoter:
                 return lvl.price
         return None
 
+    def _apr_margin(self) -> Decimal:
+        """Extra per-contract lock required so a fill annualizes >= min_apr
+        over the hold: lock/(1-lock)/yrs >= apr  =>  lock >= a/(1+a) with
+        a = apr*yrs. Tightens the maker price cap by this amount."""
+        if self.min_apr <= 0 or not self.resolve_years:
+            return Decimal(0)
+        a = Decimal(str(self.min_apr)) / 100 * Decimal(str(self.resolve_years))
+        return (a / (1 + a)).quantize(Decimal("0.0001"))
+
     def _target(self, books: BookBuilder, i: int, side: str) -> Optional[Decimal]:
         leg = self.rel.legs[i]
         book = books.get(leg.venue.value, leg.market_id)
@@ -166,6 +180,7 @@ class Quoter:
                                 Decimal(self.clip))
             if p_max is None:
                 return None
+            p_max -= self._apr_margin()  # fill must annualize >= min_apr
             # no competitor on our side: hold a still-profitable quote, don't
             # invent a more aggressive price to chase a fill
             if comp is None:
@@ -190,6 +205,7 @@ class Quoter:
                                     Decimal(self.clip))
             if p_min is None:
                 return None
+            p_min += self._apr_margin()  # fill must annualize >= min_apr
             if comp is None:
                 return cur.price if (cur and cur.price >= p_min + buf) else None
             if p_min + buf > comp:

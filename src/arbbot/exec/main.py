@@ -222,6 +222,15 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                             fees=FeeSchedule(), clip=clip, safety_ticks=0,
                             quote_venue=None, size_jitter=2) for r in rels}
     rel_by_id = {r.id: r for r in rels}
+    # maker APR hurdle (card 80ff7987): each quoter knows its time-to-resolve
+    # so _target can require the locked edge to annualize above the floating
+    # bar (propagated in _tt_refresh). No date => no hurdle (edge-only gating).
+    for rid2, q2 in quoters.items():
+        rd2, _ = resolve_date(rid2)
+        if rd2:
+            import datetime as _dt2
+            q2.resolve_years = max(
+                (_dt2.date.fromisoformat(rd2) - _dt2.date.today()).days, 1) / 365.25
     alerter = Alerter(cfg.ntfy_topic)
 
     # seed exposure from the trades ledger so per-name caps survive restarts —
@@ -349,6 +358,8 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
         cap = float(risk.config.bankroll * risk.config.per_class_cap)
         util = min(max(float(risk.exposure.total) / cap if cap else 1.0, 0.0), 1.0)
         tt["bar"] = TT_APR_FLOOR + (TT_APR_CEIL - TT_APR_FLOOR) * util
+        for q4 in quoters.values():  # makers clear the same bar (card 80ff7987)
+            q4.min_apr = tt["bar"]
         kgw = gateways.get(Venue.KALSHI)
         if kgw is not None:
             with contextlib.suppress(Exception):

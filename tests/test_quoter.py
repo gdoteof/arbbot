@@ -257,3 +257,35 @@ def test_cross_venue_quote_on_pm_hedge_on_kalshi(tmp_path):
     res = q.on_fill(1, "bid", bb)
     assert res["hedged"] is True and res["state"] == "hedged"
     assert any(r.get("body", {}).get("ticker") == "KX" for r in kgw.sent)
+
+
+def test_apr_hurdle_tightens_and_blocks(tmp_path):
+    """card 80ff7987: with min_apr set, the maker price cap tightens by the
+    per-contract lock needed to annualize >= min_apr over the hold; a thin
+    edge on a long-dated market stops quoting entirely."""
+    base = mk(tmp_path)
+    bb = BookBuilder()
+    bb.apply_snapshot(snap("T375", [("0.70", "500")], [("0.99", "1")]))
+    bb.apply_snapshot(snap("T350", [("0.55", "500")], [("0.99", "1")]))
+    base.on_book(bb)
+    base_px = D([i for i in base.intents if "place" in i][0]["price"])
+
+    # hurdle on but not binding (edge >> margin): price unchanged — the
+    # margin tightens the CAP, it never walks a joining quote lower
+    q = mk(tmp_path)
+    q.min_apr, q.resolve_years = 12.0, 1.0
+    assert q._apr_margin() > 0
+    q.on_book(bb)
+    placed = [i for i in q.intents if "place" in i]
+    assert placed and D(placed[0]["price"]) == base_px
+
+    # extreme hurdle: nothing rests
+    q2 = mk(tmp_path)
+    q2.min_apr, q2.resolve_years = 500.0, 1.0
+    q2.on_book(bb)
+    assert not [i for i in q2.intents if "place" in i]
+
+    # no resolve date => hurdle disabled, identical to base behavior
+    q3 = mk(tmp_path)
+    q3.min_apr, q3.resolve_years = 12.0, None
+    assert q3._apr_margin() == 0
