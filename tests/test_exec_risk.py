@@ -304,3 +304,33 @@ def test_class_cap_overflow_for_great_apr():
     assert not m.check_order(rel, Decimal("20"), {}, opportunity_apr=99.0).allowed
     # mediocre APR never overflows
     assert not m.check_order(rel, Decimal("5"), {}, opportunity_apr=10.0).allowed
+
+
+def test_topic_overflow_when_beating_latest_natural_apr(tmp_path, monkeypatch):
+    """Geoff 2026-07-23: a category may exceed its budget when the new
+    opportunity's APR beats the topic's LATEST natural hold APR (marginal
+    return of capital already deployed there)."""
+    import json as _json
+    import arbbot.risk.manager as rm
+    mf = tmp_path / "marks.json"
+    mf.write_text(_json.dumps({"positions": [
+        {"relationship_id": "xvus-nobel-peace-26-unrwa", "ts": 100.0,
+         "natural_hold_apr": 8.0},
+        {"relationship_id": "xvus-nobel-peace-26-djt", "ts": 200.0,
+         "natural_hold_apr": 11.0},          # newest -> the bar
+        {"relationship_id": "xvus-france-pres-27-x", "ts": 300.0,
+         "natural_hold_apr": 99.0},          # other topic — ignored
+    ]}))
+    monkeypatch.setattr(rm, "MARKS_FILE", mf)
+    rm._marks_cache["mtime"] = 0.0
+    m = _topic_mgr()
+    rel = _mk_rel("xvus-nobel-peace-26-unrwa")
+    m.record_open(rel, Decimal("75"))        # over the 80 budget with +10
+    assert m.check_order(rel, Decimal("10"), {}, opportunity_apr=12.0).allowed
+    d = m.check_order(rel, Decimal("10"), {}, opportunity_apr=10.0)
+    assert not d.allowed and any("overflow needs apr>11" in r for r in d.reasons)
+    # no APR passed (maker path) or no marks -> cap stays hard
+    assert not m.check_order(rel, Decimal("10"), {}).allowed
+    rm._marks_cache["mtime"] = 0.0
+    monkeypatch.setattr(rm, "MARKS_FILE", tmp_path / "absent.json")
+    assert not m.check_order(rel, Decimal("10"), {}, opportunity_apr=12.0).allowed

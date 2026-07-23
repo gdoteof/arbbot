@@ -23,6 +23,9 @@ from arbbot.registry.model import OracleRisk, Relationship
 
 ZERO = Decimal("0")
 
+MARKS_FILE = Path("data/exec/marks.json")
+_marks_cache: dict = {"mtime": 0.0, "rows": []}  # mtime-keyed marks rows
+
 # Higher settlement-process risk => smaller fraction of the tail budget.
 ORACLE_RISK_SCALER = {
     OracleRisk.LOW: Decimal("1.0"),
@@ -111,6 +114,31 @@ class RiskManager(BaseModel):
                 best = t.family
         return best or "other"
 
+    def topic_latest_apr(self, topic: str) -> Optional[float]:
+        """natural_hold_apr of the NEWEST marked position in this topic — the
+        category's marginal return on capital. A new basket beating it may
+        overflow the topic budget (Geoff 2026-07-23: capital efficiency —
+        money that out-earns the money already deployed shouldn't be blocked
+        by the cap sized for average opportunities)."""
+        import json
+        try:
+            mt = MARKS_FILE.stat().st_mtime
+            if mt != _marks_cache["mtime"]:
+                _marks_cache["rows"] = json.loads(
+                    MARKS_FILE.read_text()).get("positions", [])
+                _marks_cache["mtime"] = mt
+        except (OSError, ValueError):
+            return None
+        best = None
+        for m in _marks_cache["rows"]:
+            if m.get("natural_hold_apr") is None:
+                continue
+            if self.topic_of(str(m.get("relationship_id"))) != topic:
+                continue
+            if best is None or (m.get("ts") or 0) > best[0]:
+                best = ((m.get("ts") or 0), m["natural_hold_apr"])
+        return best[1] if best else None
+
     def _topic_budget(self, topic: str) -> tuple[Optional[Decimal], Optional[Decimal]]:
         for t in self.config.topics:
             if t.family == topic:
@@ -162,7 +190,16 @@ class RiskManager(BaseModel):
         if budget is not None:
             open_topic = self.exposure.by_topic.get(topic, ZERO)
             if open_topic + notional > budget:
-                reasons.append(f"topic budget [{topic}]: {open_topic}+{notional} > {budget}")
+                latest = self.topic_latest_apr(topic)
+                if (opportunity_apr is not None and latest is not None
+                        and Decimal(str(opportunity_apr)) > Decimal(str(latest))):
+                    pass  # capital-efficiency overflow: out-earns the topic's
+                    # marginal hold; class/global caps still bind above this
+                else:
+                    reasons.append(
+                        f"topic budget [{topic}]: {open_topic}+{notional} > {budget}"
+                        + (f" (overflow needs apr>{latest})" if latest is not None
+                           and opportunity_apr is not None else ""))
         if gate is not None:
             util = self.exposure.total / class_cap if class_cap else Decimal(1)
             if util >= gate:
