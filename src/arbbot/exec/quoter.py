@@ -19,8 +19,10 @@ TradeStateMachine so leg risk is a tracked state with a max-age alarm.
 from __future__ import annotations
 
 import contextlib
+import json
 import random
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Optional
@@ -52,6 +54,27 @@ class RestingQuote:
     price: Decimal
     count: int
     machine: TradeStateMachine
+
+
+TOXGATE_FILE = Path("data/exec/toxgate.json")
+TOXGATE_MAX = 0.03          # expected adverse cost/ct above this -> don't rest
+TOXGATE_MAX_AGE = 120.0     # feed older than this is ignored (fail-open)
+_toxgate_cache = {"mtime": 0.0, "doc": None}
+
+
+def _toxgate(market_id: str, side: str):
+    """Score from the research toxicity shadow feed, or None (fail-open)."""
+    try:
+        mt = TOXGATE_FILE.stat().st_mtime
+        if mt != _toxgate_cache["mtime"]:
+            _toxgate_cache["doc"] = json.loads(TOXGATE_FILE.read_text())
+            _toxgate_cache["mtime"] = mt
+        doc = _toxgate_cache["doc"]
+        if not doc or time.time() - doc.get("ts", 0) > TOXGATE_MAX_AGE:
+            return None
+        return (doc.get("markets", {}).get(market_id) or {}).get(side)
+    except Exception:
+        return None
 
 
 @dataclass
@@ -205,6 +228,16 @@ class Quoter:
                 # rest a quote that could leave an unhedged leg.
                 if target is not None and not self._hedge_has_depth(books, i, side):
                     target = None
+                # toxgate (card 059ce700): the research toxicity model's live
+                # shadow feed scores expected adverse cost per (market, side).
+                # A toxic side is unviable — cancel any resting quote, rest
+                # nothing. Advisory + fail-open: stale/missing feed never blocks.
+                if target is not None:
+                    tox = _toxgate(leg.market_id, side)
+                    if tox is not None and tox > TOXGATE_MAX:
+                        self.intents.append({"ts": time.time(),
+                                             "skip": [f"toxgate {side} {tox:.3f} > {TOXGATE_MAX}"]})
+                        target = None
                 if target is None:
                     if cur:
                         gw.cancel(cur.order_id, market_slug=leg.market_id)
