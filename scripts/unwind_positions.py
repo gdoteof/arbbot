@@ -137,23 +137,56 @@ def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
             break
         time.sleep(0.5)
     if kf < filled:
+        # one repriced retry at the FRESH touch before giving up (2026-07-23:
+        # a fedcut sell missed, yet the record booked full proceeds — 4 YES
+        # stranded 2h until a recon page)
+        with __import__("contextlib").suppress(Exception):
+            kb3 = kalshi_books(httpx.Client(timeout=15),
+                               [kleg["market_id"]]).get(kleg["market_id"], (None, None))
+            if inverted and kb3[1] is not None:
+                kr2 = kgw.place_yes(kleg["market_id"], "bid",
+                                    min(Decimal(str(kb3[1])) + KTICK, Decimal("0.99")),
+                                    filled - kf, post_only=False)
+            elif not inverted and kb3[0] is not None:
+                kr2 = kgw.place_yes(kleg["market_id"], "ask",
+                                    max(Decimal(str(kb3[0])) - KTICK, KTICK),
+                                    filled - kf, post_only=False)
+            else:
+                kr2 = {}
+            koid2 = (kr2.get("order") or {}).get("order_id") or kr2.get("order_id") or ""
+            for _ in range(8):
+                try:
+                    kf += kgw.filled_qty(koid2) if koid2 else 0
+                except Exception:
+                    pass
+                if kf >= filled:
+                    break
+                time.sleep(0.5)
+    if kf < filled:
         print(f"[UNWIND] {rid} KALSHI close underfilled {kf}/{filled} — stranded "
-              f"position; recon flags it, completion can be retried", flush=True)
+              f"position; proceeds recorded for the FILLED portion only; recon "
+              f"flags the remainder, completion appends a correction", flush=True)
         Alerter(load_recorder_config().ntfy_topic).alert(
-            f"arbbot UNWIND {rid}: Kalshi close underfilled {kf}/{filled}")
+            f"arbbot UNWIND {rid}: Kalshi close underfilled {kf}/{filled} — "
+            f"{filled - kf} stranded, ledger records actuals only")
     frac = filled / qty
+    # proceeds count ONLY what each leg actually closed — an unfilled Kalshi
+    # remainder is stranded inventory, not proceeds; recon + a later
+    # completion (with a correction record) recover it at the real price
     if inverted:
-        proceeds = (Decimal(str(p_bid)) + (Decimal(1) - Decimal(str(k_ask)))) * filled
+        proceeds = (Decimal(str(p_bid)) * filled
+                    + (Decimal(1) - Decimal(str(k_ask))) * kf)
         legs = [{"venue": "kalshi", "market_id": kleg["market_id"],
-                 "side": "no", "action": "close_via_buy_yes", "qty": filled,
+                 "side": "no", "action": "close_via_buy_yes", "qty": kf,
                  "yes_price": str(k_ask)},
                 {"venue": "polymarket_us", "market_id": pleg["market_id"],
                  "side": "yes", "action": "close_via_buy_short", "qty": filled,
                  "yes_price": str(p_bid)}]
     else:
-        proceeds = (Decimal(str(k_bid)) + (Decimal(1) - Decimal(str(p_ask)))) * filled
+        proceeds = (Decimal(str(k_bid)) * kf
+                    + (Decimal(1) - Decimal(str(p_ask))) * filled)
         legs = [{"venue": "kalshi", "market_id": kleg["market_id"],
-                 "side": "yes", "action": "sell", "qty": filled, "yes_price": str(k_bid)},
+                 "side": "yes", "action": "sell", "qty": kf, "yes_price": str(k_bid)},
                 {"venue": "polymarket_us", "market_id": pleg["market_id"],
                  "side": "no", "action": "sell", "qty": filled, "yes_price": str(p_ask)}]
     rec = {"ts": time.time(), "relationship_id": rid, "title": t.get("title"),
@@ -162,6 +195,8 @@ def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
            "legs": legs,
            "proceeds_usd": float(proceeds),
            "realized_pnl_usd": float(proceeds) - float(t["cost_usd"]) * frac}
+    if kf < filled:
+        rec["stranded_kalshi_qty"] = filled - kf
     with open(LEDGER, "a") as f:
         f.write(json.dumps(rec) + "\n")
     print(f"[UNWIND] {rid} closed x{filled}/{qty} proceeds=${float(proceeds):.2f} "
