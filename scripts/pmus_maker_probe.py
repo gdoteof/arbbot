@@ -273,7 +273,7 @@ class MakerProbe:
                         if new > 0:
                             cur["cum"] = cum
                             st.last_fill[side] = time.time()
-                            await self.hedge(st, side, new, cur["px"])
+                            await self.hedge(st, side, new, cur["px"], cur)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -325,7 +325,7 @@ class MakerProbe:
                         new = cum - ocur["cum"]
                         if new > 0:  # late-recognized fill: hedge it now
                             ocur["cum"] = cum
-                            await self.hedge(ost, oside, new, ocur["px"])
+                            await self.hedge(ost, oside, new, ocur["px"], ocur)
                             own = self.hedged_net[slug]
                 unexpected = net - own
                 if unexpected != 0 and not getattr(st, "recon_latched", False):
@@ -404,6 +404,7 @@ class MakerProbe:
                          if s["pm_ask"] is not None and s["our_bid"] is not None else None)
         s["dist_sell"] = (round(s["our_ask"] - s["pm_bid"], 4)
                           if s["pm_bid"] is not None and s["our_ask"] is not None else None)
+        anchor = g  # (kbid, kask, kmid) at quote time, persisted with the order
         for side in ("buy", "sell"):
             cur = st.orders.get(side)
             tgt = want.get(side)
@@ -417,9 +418,9 @@ class MakerProbe:
             if tgt is not None and not cur \
                     and time.time() - st.last_reprice[side] > 2.0 \
                     and time.time() - st.last_fill[side] > 30.0:
-                await self.place(st, side, tgt)
+                await self.place(st, side, tgt, anchor)
 
-    async def place(self, st, side, px):
+    async def place(self, st, side, px, anchor=None):
         a = self.args
         st.last_reprice[side] = time.time()
         if not st.orders:  # pair becomes active: count against the 10-pair cap
@@ -442,7 +443,12 @@ class MakerProbe:
                                          post_only=True)
             oid = r.get("id") or r.get("order_id")
             cur = {"id": oid, "px": px, "qty": a.clip, "cum": 0,
-                   "last_poll": time.time()}
+                   "last_poll": time.time(),
+                   # rung-1 hedge anchor (rust-bot postmortem review): the
+                   # quote-time Kalshi top survives book gaps AND REST 429s
+                   "anchor_bid": anchor[0] if anchor else None,
+                   "anchor_ask": anchor[1] if anchor else None,
+                   "anchor_ts": time.time()}
             st.orders[side] = cur
             if oid:
                 self.by_oid[oid] = (st, side, cur)
@@ -515,10 +521,10 @@ class MakerProbe:
         if new > 0:
             cur["cum"] = got
             st.last_fill[side] = time.time()
-            await self.hedge(st, side, new, cur["px"])
+            await self.hedge(st, side, new, cur["px"], cur)
 
     # ---------- hedge ----------
-    async def hedge(self, st, side, qty, fill_px):
+    async def hedge(self, st, side, qty, fill_px, cur=None):
         self.session_fills += 1
         kt = st.pair["kalshi"]
         rec = {"ts": time.time(), "pm": st.pair["pm"], "action": "fill",
@@ -547,6 +553,14 @@ class MakerProbe:
                 except Exception as e:
                     self.log({"ts": time.time(), "action": "hedge_rest_fallback_err",
                               "pm": st.pair["pm"], "err": str(e)[:100]})
+            if t is None and attempt >= 3 and cur \
+                    and cur.get("anchor_bid") is not None:
+                # rung 1: quote-time anchor — stale but always available;
+                # IOC limits bound the damage (no fill -> unwind rung)
+                t = (cur["anchor_bid"], cur["anchor_ask"])
+                self.log({"ts": time.time(), "action": "hedge_anchor_rung",
+                          "pm": st.pair["pm"],
+                          "anchor_age_s": round(time.time() - cur.get("anchor_ts", 0), 1)})
             if t is None:
                 await asyncio.sleep(1.0)
                 continue
