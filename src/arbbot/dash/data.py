@@ -392,6 +392,7 @@ class DashboardData:
             "order_activity": self._order_activity(),
             "sports": self._sports(),
             "maker_probe": self._maker_probe(),
+            "unwind_gate": self._unwind_gate(),
             "capacity": self._read_json(self.raw_dir.parent / "reports" / "capacity.json"),
             "positions": self._read_json(self.raw_dir.parent / "exec" / "positions.json"),
         }
@@ -412,6 +413,31 @@ class DashboardData:
         doc["history"] = self._sports_history()
         doc["mt_probe"] = self._mt_probe()
         return doc
+
+    def _unwind_gate(self) -> dict:
+        """Capital-displacement gate state: soft UNWIND flags (fwd APR < 12%)
+        only EXECUTE while the class budget is >=95% used. Shown on the
+        positions tab so 'UNWIND but holding' is self-explanatory."""
+        try:
+            from arbbot.exec.ledger import open_baskets, parse_lines
+            ledger = self.raw_dir.parent / "exec" / "trades.jsonl"
+            baskets = open_baskets(parse_lines(ledger.read_text().splitlines()))
+            notional = sum(float(b.get("qty") or 0) for b in baskets)
+        except Exception:
+            return {"open_notional": None}
+        budget = 980 * 0.35  # keep in sync with RiskConfig / unwind_positions
+        marks = self._read_json(self.raw_dir.parent / "exec" / "marks.json")
+        rows = marks if isinstance(marks, list) else (
+            marks.get("rows", marks.get("positions", [])) if marks else [])
+        return {
+            "open_notional": round(notional, 2),
+            "class_budget": round(budget, 2),
+            "util_pct": round(100 * notional / budget, 1),
+            "constrained": notional >= 0.95 * budget,
+            "soft_signals": sum(1 for r in rows if r.get("unwind_signal")
+                                and not r.get("unwind_hard")),
+            "hard_signals": sum(1 for r in rows if r.get("unwind_hard")),
+        }
 
     def _maker_probe(self) -> dict:
         """Candidate-pair status written by the PM-US maker probe
