@@ -763,7 +763,8 @@ class DashboardData:
                 venue = e.get("venue")
                 if not venue:  # older logs pre-date venue tagging — infer from id
                     venue = "kalshi" if str(ev.get("market", "")).startswith("KX") else "polymarket_us"
-                ev.update(ts=e.get("ts"), rel=rel_id, venue=venue, side=e.get("side"))
+                ev.update(ts=e.get("ts"), rel=rel_id, venue=venue, side=e.get("side"),
+                          tag=e.get("tag"))
                 events.append(ev)
         # maker fills — the "destroyed by fill" outcome — from the trade log,
         # so the graph shows the full lifecycle (place -> move -> cancel|fill).

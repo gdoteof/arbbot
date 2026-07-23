@@ -1320,6 +1320,7 @@ function renderActivity(d) {
     const parts = [
       `<span class="t">${relTime(e.ts)}</span>`,
       `<span class="abadge ${e.action}">${e.action}</span>`,
+      e.tag ? `<span class="abadge" style="background:#7c3aed26;color:#a78bfa">${e.tag}</span>` : "",
       `<span class="vchip ${vc}">${vn}</span>`,
       e.side ? `<span class="side-tag ${e.side}">${e.side.toUpperCase()}</span>` : `<span class="side-tag" style="visibility:hidden">—</span>`,
       `<span class="mk" title="${e.market} · ${e.rel || ""}">${e.market}</span>`,

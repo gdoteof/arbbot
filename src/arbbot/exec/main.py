@@ -540,6 +540,10 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
         if cancel and kgw is not None:
             with contextlib.suppress(Exception):
                 kgw.cancel(st["order_id"])
+            quoters[rid].intents.append(
+                {"ts": time.time(), "cancel": st["kt"], "venue": "kalshi",
+                 "side": "ask", "price": str(st["price"]),
+                 "order_id": st["order_id"], "tag": "exit"})
         quoters[rid].suppress.discard((st["kt"], "ask"))
         exit_q.pop(rid, None)
 
@@ -619,6 +623,10 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                 continue
             exit_q[rid] = {**w, "order_id": oid, "price": target, "qty": qty, "filled": 0}
             quoters[rid].suppress.add((w["kt"], "ask"))
+            quoters[rid].intents.append(
+                {"ts": time.time(), "place": w["kt"], "venue": "kalshi",
+                 "side": "ask", "price": str(target), "count": qty,
+                 "order_id": oid, "tag": "exit"})
             print(f"[EXIT] {rid} resting ask x{qty} @ {target} (basis {w['cost_ct']:.3f}, "
                   f"locks >= {EXIT_LOCK}/ct after PM close)", flush=True)
 
@@ -636,6 +644,10 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
         try:  # close the PM NO leg taker-side, exact delta, confirmed (fill-lag LAW)
             r1 = pgw.place_yes(st["ps"], "bid", px, delta, post_only=False)
             oid1 = r1.get("id") or r1.get("order_id")
+            quoters[rid].intents.append(
+                {"ts": time.time(), "place": st["ps"], "venue": "polymarket_us",
+                 "side": "bid", "price": str(px), "count": delta,
+                 "order_id": oid1, "tag": "exit-close"})
             for _ in range(6):
                 pf = pgw.filled_qty(oid1) if oid1 else 0
                 if pf >= delta:
