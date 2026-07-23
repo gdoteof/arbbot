@@ -616,8 +616,21 @@ async def detector(games, books, pm_bbo, stop, live, kg, pg, alerter, state):
                     print(f"[{time.strftime('%H:%M:%S')}] SPORTS-DISLOCATION {key}: "
                           f"K={kbid:.2f}/{kask:.2f} PM={pbid:.2f}/{pask:.2f} edge={edge*100:+.1f}c ({side})"
                           + (" -> EXECUTE" if live else ""), flush=True)
-                    if live and not circuit_open() and not probe_owned(g["slug"]):
-                        execute(g, kbid, kask, pbid, pask, kg, pg, alerter, state)
+                    if live and not circuit_open() and not probe_owned(g["slug"]) \
+                            and key not in state.setdefault("inflight", set()):
+                        # run in a thread: execute() blocks up to ~5s on
+                        # confirmed fills — inline it would stall BOTH WS
+                        # readers (card 23d15e3f finding, sports analogue)
+                        state["inflight"].add(key)
+
+                        async def _bg(g=g, kbid=kbid, kask=kask, pbid=pbid, pask=pask, key=key):
+                            try:
+                                await asyncio.to_thread(execute, g, kbid, kask, pbid, pask,
+                                                        kg, pg, alerter, state)
+                            finally:
+                                state["inflight"].discard(key)
+
+                        asyncio.create_task(_bg())
 
 
 def _mt_candidates(games, books, pm_bbo):
@@ -881,15 +894,15 @@ async def rehedge_watcher(pm_bbo, books, stop, live, pg, kg, alerter):
                 try:
                     if h["side"] == "bid":
                         px = Decimal(str(round(h["ref_px"] + MT_FEE + MIN_REHEDGE_LOCK, 2)))
-                        r2 = kg.place_yes(h["kt"], "ask", px, qty, post_only=False)
+                        r2 = await asyncio.to_thread(kg.place_yes, h["kt"], "ask", px, qty, post_only=False)
                     else:
                         px = Decimal(str(round(h["ref_px"] - MT_FEE - MIN_REHEDGE_LOCK, 2)))
-                        r2 = kg.place_yes(h["kt"], "bid", px, qty, post_only=False)
+                        r2 = await asyncio.to_thread(kg.place_yes, h["kt"], "bid", px, qty, post_only=False)
                     oid2 = (r2.get("order") or {}).get("order_id") or r2.get("order_id") or ""
                     _intent(place=h["kt"], venue="kalshi",
                             side="ask" if h["side"] == "bid" else "bid",
                             price=str(px), count=qty, order_id=oid2)
-                    ff = _confirm_ioc_fill(kg, oid2, qty)
+                    ff = await asyncio.to_thread(_confirm_ioc_fill, kg, oid2, qty)
                 except Exception as e:
                     print(f"  *** FLATTEN ERROR {h['game']}: {type(e).__name__}: {e} ***", flush=True)
                     h["next_try"] = now + 60; changed = True
@@ -925,11 +938,11 @@ async def rehedge_watcher(pm_bbo, books, stop, live, pg, kg, alerter):
                     limit = round(h["ref_px"] + MT_FEE + MIN_REHEDGE_LOCK, 2)
                     if not live:
                         continue
-                    hr = pg.place_short(h["slug"], Decimal(str(limit)), qty, post_only=False)
+                    hr = await asyncio.to_thread(pg.place_short, h["slug"], Decimal(str(limit)), qty, post_only=False)
                     oid = hr.get("id") or hr.get("order_id") or ""
                     _intent(place=h["slug"], venue="polymarket_us", side="ask",
                             price=str(limit), count=qty, order_id=oid)
-                    hf = _confirm_ioc_fill(pg, oid, qty)
+                    hf = await asyncio.to_thread(_confirm_ioc_fill, pg, oid, qty)
                 else:                       # short Kalshi YES -> need to BUY PM YES
                     lock = h["ref_px"] - pask - MT_FEE
                     if lock < MIN_REHEDGE_LOCK:
@@ -937,11 +950,11 @@ async def rehedge_watcher(pm_bbo, books, stop, live, pg, kg, alerter):
                     limit = round(h["ref_px"] - MT_FEE - MIN_REHEDGE_LOCK, 2)
                     if not live:
                         continue
-                    hr = pg.place_yes(h["slug"], "bid", Decimal(str(limit)), qty, post_only=False)
+                    hr = await asyncio.to_thread(pg.place_yes, h["slug"], "bid", Decimal(str(limit)), qty, post_only=False)
                     oid = hr.get("id") or hr.get("order_id") or ""
                     _intent(place=h["slug"], venue="polymarket_us", side="bid",
                             price=str(limit), count=qty, order_id=oid)
-                    hf = _confirm_ioc_fill(pg, oid, qty)
+                    hf = await asyncio.to_thread(_confirm_ioc_fill, pg, oid, qty)
             except Exception as e:
                 print(f"  *** REHEDGE ERROR {h['game']}: {type(e).__name__}: {e} ***", flush=True)
                 h["next_try"] = now + 60; changed = True
