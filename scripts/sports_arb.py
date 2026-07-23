@@ -374,6 +374,13 @@ def execute(g, kbid, kask, pbid, pask, kg, pg, alerter, state):
 MAP_FILE = pathlib.Path("data/scan/sports_equiv_map.json")
 MAP_LEAGUES = {"itfme", "itfwo", "wta", "atp", "kbo", "npb", "mlb"}  # 2-way only
 
+# Geoff 2026-07-23: sports de-vetted — mlb and itfwo explicitly removed, and
+# "everything else sports should just give up". NEW entries (take-take + lean
+# riders) require a league in TRADE_LEAGUES; detection/scan, the rehedge and
+# naked-hold watchers, and settlement handling stay live for existing
+# positions. Re-vet a league by adding it back here.
+TRADE_LEAGUES: set = set()
+
 
 def map_games():
     """Trade-ready pairings from the generic equivalence map
@@ -616,7 +623,8 @@ async def detector(games, books, pm_bbo, stop, live, kg, pg, alerter, state):
                     print(f"[{time.strftime('%H:%M:%S')}] SPORTS-DISLOCATION {key}: "
                           f"K={kbid:.2f}/{kask:.2f} PM={pbid:.2f}/{pask:.2f} edge={edge*100:+.1f}c ({side})"
                           + (" -> EXECUTE" if live else ""), flush=True)
-                    if live and not circuit_open() and not probe_owned(g["slug"]) \
+                    if live and g.get("league", "mlb") in TRADE_LEAGUES \
+                            and not circuit_open() and not probe_owned(g["slug"]) \
                             and key not in state.setdefault("inflight", set()):
                         # run in a thread: execute() blocks up to ~5s on
                         # confirmed fills — inline it would stall BOTH WS
