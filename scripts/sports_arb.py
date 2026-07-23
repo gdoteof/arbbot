@@ -371,6 +371,8 @@ def execute(g, kbid, kask, pbid, pask, kg, pg, alerter, state):
         print(f"  *** SPORTS EXEC ERROR {key}: {type(e).__name__}: {e} — 60s recon net will flag any naked leg ***", flush=True)
 
 
+KILL_FILE = pathlib.Path("data/KILL")   # global kill switch (card d821411a)
+
 MAP_FILE = pathlib.Path("data/scan/sports_equiv_map.json")
 MAP_LEAGUES = {"itfme", "itfwo", "wta", "atp", "kbo", "npb", "mlb"}  # 2-way only
 
@@ -624,6 +626,7 @@ async def detector(games, books, pm_bbo, stop, live, kg, pg, alerter, state):
                           f"K={kbid:.2f}/{kask:.2f} PM={pbid:.2f}/{pask:.2f} edge={edge*100:+.1f}c ({side})"
                           + (" -> EXECUTE" if live else ""), flush=True)
                     if live and g.get("league", "mlb") in TRADE_LEAGUES \
+                            and not KILL_FILE.exists() \
                             and not circuit_open() and not probe_owned(g["slug"]) \
                             and key not in state.setdefault("inflight", set()):
                         # run in a thread: execute() blocks up to ~5s on
@@ -860,6 +863,8 @@ async def rehedge_watcher(pm_bbo, books, stop, live, pg, kg, alerter):
     State survives restarts via data/exec/sports_naked.json."""
     while not stop.is_set():
         await asyncio.sleep(2)
+        if KILL_FILE.exists():
+            continue  # global kill switch halts rehedge/flatten orders too
         holds = load_naked()
         if not holds:
             continue
