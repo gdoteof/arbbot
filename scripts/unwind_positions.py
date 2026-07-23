@@ -211,6 +211,10 @@ def main() -> None:
     ap.add_argument("--live", action="store_true")
     args = ap.parse_args()
 
+    if Path("data/KILL").exists():  # global kill switch (card 39140c2e)
+        print("data/KILL present — unwinder halted")
+        return
+
     records = parse_lines(LEDGER.read_text().splitlines()) if LEDGER.exists() else []
     baskets = open_baskets(records)
     if not baskets:

@@ -134,6 +134,10 @@ def main() -> None:
     ap.add_argument("--live", action="store_true")
     args = ap.parse_args()
 
+    if pathlib.Path("data/KILL").exists():  # global kill switch (card 39140c2e)
+        print("data/KILL present — hedger halted")
+        return
+
     c = httpx.Client(timeout=20)
     kid = (D / "kalshi_api_key_id").read_text().strip()
     kkey = load_private_key((D / "kalshi_private_key.pem").read_bytes())
