@@ -24,5 +24,9 @@ RELS=(
   xvus-nobel-peace-26-francescaalbanese
 )
 setsid nohup .venv313/bin/python -m "arbbot.exec.main" \
-  --relationship "${RELS[@]}" --clip 5 --live >> data/runner.log 2>&1 &
+  --relationship "${RELS[@]}" --clip 25 --live >> data/runner.log 2>&1 &
+  # clip 5 -> 25: phase 1 of the capacity scale-up, Geoff-approved card
+  # 938df47b (2026-07-23). Capacity backtest measures $162-852/day capturable
+  # vs clip-5 bites; 25 is still tiny vs measured episode depth (1250-5000
+  # contracts). Phase 2 (depth-aware sizing) after 24h of clean fills/recon.
 echo "runner launched pid $!"
