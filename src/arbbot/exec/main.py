@@ -18,7 +18,7 @@ import contextlib
 import json
 import time
 from collections import defaultdict
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal
 from pathlib import Path
 
 from arbbot.book.builder import BookBuilder, GapDetected, NotSynced
@@ -522,6 +522,156 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                       flush=True)
                 await asyncio.sleep(2)
 
+    # ---- maker-unwind (card 1ed32918): rest passive EXIT asks on held ----
+    # standard-direction baskets the unwind policy flags (soft or hard, from
+    # marks.json) — capture maker spread on the way out instead of paying
+    # taker. The 5-min taker unwinder stays the backstop for hard signals.
+    # One basket per rel per cycle (oldest flagged); exit ask on the Kalshi
+    # leg, on fill the PM NO closes taker-side; recon + hedge timer backstop
+    # any legging miss. Entry quoter's ask side is suppressed while an exit
+    # quote is resting (two order-owners on one side both react to fills).
+    EXIT_LOCK = Decimal("0.005")    # min locked profit/ct vs basis
+    EXIT_SLIP = Decimal("0.01")     # assume PM close 1 tick through the ask
+    exit_q: dict[str, dict] = {}    # rid -> resting exit order state
+    exit_last = {"ts": 0.0}
+
+    def _exit_drop(rid: str, st: dict, cancel: bool) -> None:
+        kgw = gateways.get(Venue.KALSHI)
+        if cancel and kgw is not None:
+            with contextlib.suppress(Exception):
+                kgw.cancel(st["order_id"])
+        quoters[rid].suppress.discard((st["kt"], "ask"))
+        exit_q.pop(rid, None)
+
+    def _exit_refresh() -> None:
+        if not live or time.monotonic() - exit_last["ts"] < 15:
+            return
+        exit_last["ts"] = time.monotonic()
+        kgw = gateways.get(Venue.KALSHI)
+        if kgw is None:
+            return
+        try:
+            mdoc = json.loads(Path("data/exec/marks.json").read_text())
+            recs = parse_lines(Path("data/exec/trades.jsonl").read_text().splitlines())
+        except (OSError, ValueError):
+            return
+        flagged = {(m["relationship_id"], m.get("ts")): m
+                   for m in mdoc.get("positions", [])
+                   if (m.get("unwind_signal") or m.get("unwind_hard"))
+                   and (m.get("mark_pnl_usd") or 0) > 0}
+        want: dict[str, dict] = {}
+        for b in open_baskets(recs):
+            rid = b.get("relationship_id")
+            if (rid, b.get("ts")) not in flagged or rid not in quoters or rid in want:
+                continue
+            kleg = next((l for l in b["legs"] if l["venue"] == "kalshi"), None)
+            pleg = next((l for l in b["legs"] if l["venue"] == "polymarket_us"), None)
+            if not kleg or not pleg or kleg.get("side") != "yes":
+                continue  # standard direction only (v1)
+            qty = int(b["qty"])
+            if qty < 1:
+                continue
+            want[rid] = {"kt": kleg["market_id"], "ps": pleg["market_id"],
+                         "qty": qty, "basket_ts": b["ts"],
+                         "cost_ct": Decimal(str(b["cost_usd"])) / qty,
+                         "title": b.get("title")}
+        for rid, st in list(exit_q.items()):
+            if rid not in want or want[rid]["basket_ts"] != st["basket_ts"]:
+                _exit_drop(rid, st, cancel=True)
+        for rid, w in want.items():
+            st = exit_q.get(rid)
+            kbook = books.get("kalshi", w["kt"])
+            pbook = books.get("polymarket_us", w["ps"])
+            if kbook is None or pbook is None:
+                continue
+            kb, pa = kbook.best_bid(), pbook.best_ask()
+            if kb is None or pa is None or int(pa.size) < 1:
+                continue
+            qty = min(w["qty"], int(pa.size))  # only what the PM close absorbs
+            # profitable floor: fill px + (1 - pm close px) - basis >= EXIT_LOCK
+            min_px = w["cost_ct"] - (Decimal(1) - pa.price) + EXIT_LOCK + EXIT_SLIP
+            # competing ask, our own resting exit subtracted out (self-exclusion)
+            comp = None
+            for lvl in kbook.asks:
+                size = lvl.size - (Decimal(st["qty"]) if st and lvl.price == st["price"] else 0)
+                if size > 0:
+                    comp = lvl.price
+                    break
+            tick = Decimal("0.01")
+            target = max(min_px, (comp - tick) if comp is not None else min_px)
+            target = max(target, kb.price + tick)  # post-only: never cross the bid
+            target = target.quantize(tick, rounding=ROUND_UP)
+            if target > Decimal("0.99"):
+                if st:
+                    _exit_drop(rid, st, cancel=True)
+                continue
+            if st and st["price"] == target and st["qty"] == qty:
+                continue  # already resting there
+            if st:
+                _exit_drop(rid, st, cancel=True)
+            try:
+                r = kgw.place_yes(w["kt"], "ask", target, qty, post_only=True)
+                oid = (r.get("order") or {}).get("order_id") or r.get("order_id")
+            except Exception as e:
+                print(f"[EXIT] {rid} place failed: {type(e).__name__}: {e}", flush=True)
+                continue
+            if not oid:
+                continue
+            exit_q[rid] = {**w, "order_id": oid, "price": target, "qty": qty, "filled": 0}
+            quoters[rid].suppress.add((w["kt"], "ask"))
+            print(f"[EXIT] {rid} resting ask x{qty} @ {target} (basis {w['cost_ct']:.3f}, "
+                  f"locks >= {EXIT_LOCK}/ct after PM close)", flush=True)
+
+    def _exit_fill(rid: str, st: dict, cum: int) -> None:
+        delta = cum - st["filled"]
+        st["filled"] = cum
+        if delta < 1:
+            return
+        pgw = gateways.get(Venue.POLYMARKET_US)
+        pbook = books.get("polymarket_us", st["ps"])
+        pa = pbook.best_ask() if pbook is not None else None
+        px = min((pa.price if pa is not None else Decimal("0.99")) + Decimal("0.01"),
+                 Decimal("0.99"))
+        pf = 0
+        try:  # close the PM NO leg taker-side, exact delta, confirmed (fill-lag LAW)
+            r1 = pgw.place_yes(st["ps"], "bid", px, delta, post_only=False)
+            oid1 = r1.get("id") or r1.get("order_id")
+            for _ in range(6):
+                pf = pgw.filled_qty(oid1) if oid1 else 0
+                if pf >= delta:
+                    break
+                time.sleep(0.5)
+        except Exception as e:
+            print(f"[EXIT] {rid} PM close error: {type(e).__name__}: {e}", flush=True)
+        m = min(delta, pf)
+        if pf < delta:
+            alerter.alert(f"arbbot EXIT {rid}: PM close {pf}/{delta} — naked PM NO "
+                          f"remainder, hedge timer/recon will complete it")
+        if m < 1:
+            return
+        proceeds = (st["price"] + Decimal(1) - px) * m
+        realized = float(proceeds - st["cost_ct"] * m)
+        rec = {"ts": time.time(), "relationship_id": rid, "title": st.get("title"),
+               "strategy": "unwind", "status": "unwound", "closes_ts": st["basket_ts"],
+               "qty": int(m),
+               "legs": [{"venue": "kalshi", "market_id": st["kt"], "side": "yes",
+                         "action": "sell", "qty": int(m), "yes_price": str(st["price"]),
+                         "role": "maker"},
+                        {"venue": "polymarket_us", "market_id": st["ps"], "side": "no",
+                         "action": "sell", "qty": int(m), "yes_price": str(px)}],
+               "proceeds_usd": float(proceeds),
+               "realized_pnl_usd": realized,
+               "note": "maker-unwind exit (card 1ed32918)"}
+        with open(Path("data/exec/trades.jsonl"), "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        risk.record_close(rel_by_id[rid], Decimal(m))
+        alerter.alert(f"arbbot MAKER-UNWIND {rid} x{m} @ {st['price']} "
+                      f"realized ${realized:.2f}")
+        print(f"[EXIT] {rid} filled x{m} @ {st['price']}, PM closed @ {px}, "
+              f"realized ${realized:.2f}", flush=True)
+        if st["filled"] >= st["qty"]:
+            _exit_drop(rid, st, cancel=False)
+
     async def socket_loop() -> None:
         last_flush = 0.0
         last_fill_check = 0.0
@@ -690,10 +840,17 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                     if live and now - tt["last_refresh"] > 60:
                         tt["last_refresh"] = now
                         _tt_refresh()
+                    _exit_refresh()  # maker-unwind exits (self-throttled, 15s)
                     # fallback fill detection (WS is primary): poll each resting
                     # order every 2s; _process_fill dedupes vs the WS path.
                     if live and now - last_fill_check > 2.0:
                         last_fill_check = now
+                        kgw_x = gateways.get(Venue.KALSHI)
+                        for rid_x, st_x in list(exit_q.items()):  # maker-unwind fills
+                            with contextlib.suppress(Exception):
+                                fx = kgw_x.filled_qty(st_x["order_id"]) if kgw_x else 0
+                                if fx > st_x["filled"]:
+                                    _exit_fill(rid_x, st_x, fx)
                         for rid, q in quoters.items():
                             r = rel_by_id[rid]
                             for (i, side), rq in list(q._resting.items()):
@@ -753,6 +910,8 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
         # graceful shutdown: cancel every resting quote + sweep both venues so a
         # restart never orphans a live untracked order (naked-fill risk).
         if live:
+            for rid_s, st_s in list(exit_q.items()):  # maker-unwind exit asks
+                _exit_drop(rid_s, st_s, cancel=True)
             for q in quoters.values():
                 with contextlib.suppress(Exception):
                     q.cancel_all()

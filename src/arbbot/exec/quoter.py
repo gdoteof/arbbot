@@ -97,6 +97,11 @@ class Quoter:
     price_jitter_ticks: int = 0  # rest 0..N ticks MORE PASSIVE than the aggressive cap
     size_jitter: int = 0         # rest clip - random(0..N) contracts (varies size, never exceeds clip)
     deadband_ticks: int = 0      # hold a still-profitable quote until available improvement exceeds a randomized 1..N-tick deadband
+    # (market_id, side) pairs another subsystem owns right now (maker-unwind
+    # exit asks, card 1ed32918) — _target returns None so any entry quote on
+    # that side cancels and none rests; two order-owners on one side would
+    # both react to fills (the runaway-bug shape).
+    suppress: set = field(default_factory=set)
     _resting: dict[tuple[int, str], RestingQuote] = field(default_factory=dict)
     _last_quote_ts: dict[tuple[int, str], float] = field(default_factory=dict)
     _place_failed: set = field(default_factory=set)  # (i,side) backed off after a failed place
@@ -168,6 +173,8 @@ class Quoter:
 
     def _target(self, books: BookBuilder, i: int, side: str) -> Optional[Decimal]:
         leg = self.rel.legs[i]
+        if (leg.market_id, side) in self.suppress:
+            return None  # side owned by maker-unwind — cancel/stay out
         book = books.get(leg.venue.value, leg.market_id)
         if book is None:
             return None
