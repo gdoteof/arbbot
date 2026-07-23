@@ -91,6 +91,24 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
         resolves = (_dt2.date.fromtimestamp(float(t.get("ts", now)))
                     + _dt2.timedelta(days=1)).isoformat()
         estimated = True
+    if not resolves:
+        # probe-originated baskets (card e5696107) stamp no resolves_by, but
+        # their event slugs embed the date (aec-...-2026-07-23): event date
+        # + 1 day, same fast-settle model. Records with no date anywhere stay
+        # None (a wrong entry+1d guess on a long-dated market would fire
+        # false hard-unwind signals).
+        import datetime as _dt2
+        import re as _re2
+        hay = str(t.get("relationship_id", "")) + " " + " ".join(
+            str(l.get("market_id") or "") for l in t.get("legs", []))
+        m2 = _re2.search(r"(20\d{2}-\d{2}-\d{2})", hay)
+        if m2:
+            try:
+                resolves = (_dt2.date.fromisoformat(m2.group(1))
+                            + _dt2.timedelta(days=1)).isoformat()
+                estimated = True
+            except ValueError:
+                pass
     row = {"relationship_id": t["relationship_id"], "ts": t.get("ts"), "title": t.get("title"),
            "qty": int(qty), "cost_usd": float(cost), "locked_profit_usd": float(locked),
            "resolves_by": resolves, "resolves_estimated": estimated}

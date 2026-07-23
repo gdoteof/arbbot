@@ -204,6 +204,16 @@ def main() -> None:
         eligible = row.get("unwind_hard") or (constrained and row.get("unwind_signal"))
         if not eligible:
             continue
+        # probe-owned baskets (coordination contract: research manages its own
+        # positions) — surface the signal, never auto-execute against them
+        if t.get("strategy") in ("pmus-maker-probe", "ml-leadlag-probe"):
+            print(f"[UNWIND] {t['relationship_id']} signal on PROBE basket "
+                  f"({t.get('strategy')}) — alerting, not acting (ownership)", flush=True)
+            Alerter(load_recorder_config().ntfy_topic).alert(
+                f"arbbot: unwind signal on probe basket {t['relationship_id']} "
+                f"({t.get('strategy')}, fwd_apr={row.get('forward_hold_apr')}) — "
+                f"research side to action")
+            continue
         hard += 1
         # v2 (2026-07-23): inverted baskets (Kalshi NO + PM YES) are handled
         # by close_basket's inverted branch — no more v1 skip.
