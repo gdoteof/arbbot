@@ -706,6 +706,24 @@ class DashboardData:
             "hedge_latency_n": len(lats),
             "portfolio_apr": portfolio_apr,
             "wavg_years": round(wavg_yrs, 2) if wavg_yrs else None,
+            "accounting": self._accounting(raw, marks),
+        }
+
+    @staticmethod
+    def _accounting(records: list, marks: dict) -> dict:
+        """The single-fold accounting view (card 988c18d8): per-basket rows
+        from arbbot.exec.accounting plus its identity-pinned digest. New
+        views should read THIS, not re-derive P&L at render time."""
+        from arbbot.exec.accounting import fold, row_floats
+        try:
+            res = fold(records, marks)
+        except Exception as e:  # surface, never blank the dash
+            return {"error": f"{type(e).__name__}: {e}"}
+        return {
+            "totals": {k: (float(v) if not isinstance(v, int) else v)
+                       for k, v in res["totals"].items()},
+            "digest": res["digest"],
+            "rows": [row_floats(r) for r in res["rows"]],
         }
 
     def _order_activity(self, limit: int = 250) -> dict:
