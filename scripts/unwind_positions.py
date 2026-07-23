@@ -39,19 +39,32 @@ LEDGER = Path("data/exec/trades.jsonl")
 KTICK = Decimal("0.01")   # sweep one level past the touch on the Kalshi close
 
 
-def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool) -> None:
+def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
+                 k_ask=None, p_bid=None) -> None:
     qty = int(t["qty"])
     rid = t["relationship_id"]
     kleg = next(l for l in t["legs"] if l["venue"] == "kalshi")
     pleg = next(l for l in t["legs"] if l["venue"] == "polymarket_us")
-    print(f"[UNWIND] {rid} x{qty}: buy PM YES @ {p_ask} (close NO) then "
-          f"sell Kalshi YES @ {k_bid} | fwd_apr={row['forward_hold_apr']} "
-          f"mark=${row['mark_pnl_usd']:.2f}", flush=True)
+    inverted = kleg.get("side") == "no"  # Kalshi NO + PM YES basket (v2)
+    if inverted:
+        print(f"[UNWIND] {rid} x{qty} (inverted): close PM YES @ bid {p_bid} "
+              f"then close Kalshi NO via buy YES @ {k_ask} | "
+              f"fwd_apr={row['forward_hold_apr']} mark=${row['mark_pnl_usd']:.2f}",
+              flush=True)
+    else:
+        print(f"[UNWIND] {rid} x{qty}: buy PM YES @ {p_ask} (close NO) then "
+              f"sell Kalshi YES @ {k_bid} | fwd_apr={row['forward_hold_apr']} "
+              f"mark=${row['mark_pnl_usd']:.2f}", flush=True)
     if not live:
         print("[UNWIND] dry-run — no orders placed", flush=True)
         return
-    # PM leg: buy back YES (closes the NO) — IOC at the ask
-    r1 = pgw.place_yes(pleg["market_id"], "bid", Decimal(str(p_ask)), qty, post_only=False)
+    if inverted:
+        # PM leg first (thin): close held YES via BUY_SHORT offset, IOC at bid
+        r1 = pgw.place_short(pleg["market_id"], Decimal(str(p_bid)), qty,
+                             post_only=False)
+    else:
+        # PM leg: buy back YES (closes the NO) — IOC at the ask
+        r1 = pgw.place_yes(pleg["market_id"], "bid", Decimal(str(p_ask)), qty, post_only=False)
     oid1 = r1.get("id") or r1.get("order_id")
     filled = 0
     for _ in range(6):  # PM fill reporting lags the IOC (2026-07-22 lesson)
@@ -62,18 +75,34 @@ def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool) -> None
     if filled < 1:
         print(f"[UNWIND] {rid} PM close reports unfilled — abort, recon verifies", flush=True)
         return
-    # Kalshi leg: sell YES, one tick through the bid, exact filled qty
-    kgw.place_yes(kleg["market_id"], "ask", max(Decimal(str(k_bid)) - KTICK, KTICK),
-                  filled, post_only=False)
+    if inverted:
+        # Kalshi leg: close held NO by buying YES, one tick through the ask
+        kgw.place_yes(kleg["market_id"], "bid",
+                      min(Decimal(str(k_ask)) + KTICK, Decimal("0.99")),
+                      filled, post_only=False)
+    else:
+        # Kalshi leg: sell YES, one tick through the bid, exact filled qty
+        kgw.place_yes(kleg["market_id"], "ask", max(Decimal(str(k_bid)) - KTICK, KTICK),
+                      filled, post_only=False)
     frac = filled / qty
-    proceeds = (Decimal(str(k_bid)) + (Decimal(1) - Decimal(str(p_ask)))) * filled
+    if inverted:
+        proceeds = (Decimal(str(p_bid)) + (Decimal(1) - Decimal(str(k_ask)))) * filled
+        legs = [{"venue": "kalshi", "market_id": kleg["market_id"],
+                 "side": "no", "action": "close_via_buy_yes", "qty": filled,
+                 "yes_price": str(k_ask)},
+                {"venue": "polymarket_us", "market_id": pleg["market_id"],
+                 "side": "yes", "action": "close_via_buy_short", "qty": filled,
+                 "yes_price": str(p_bid)}]
+    else:
+        proceeds = (Decimal(str(k_bid)) + (Decimal(1) - Decimal(str(p_ask)))) * filled
+        legs = [{"venue": "kalshi", "market_id": kleg["market_id"],
+                 "side": "yes", "action": "sell", "qty": filled, "yes_price": str(k_bid)},
+                {"venue": "polymarket_us", "market_id": pleg["market_id"],
+                 "side": "no", "action": "sell", "qty": filled, "yes_price": str(p_ask)}]
     rec = {"ts": time.time(), "relationship_id": rid, "title": t.get("title"),
            "strategy": "unwind", "status": "unwound", "closes_ts": t["ts"],
            "qty": filled,
-           "legs": [{"venue": "kalshi", "market_id": kleg["market_id"],
-                     "side": "yes", "action": "sell", "qty": filled, "yes_price": str(k_bid)},
-                    {"venue": "polymarket_us", "market_id": pleg["market_id"],
-                     "side": "no", "action": "sell", "qty": filled, "yes_price": str(p_ask)}],
+           "legs": legs,
            "proceeds_usd": float(proceeds),
            "realized_pnl_usd": float(proceeds) - float(t["cost_usd"]) * frac}
     with open(LEDGER, "a") as f:
@@ -119,10 +148,8 @@ def main() -> None:
         if not eligible:
             continue
         hard += 1
-        if kleg.get("side") == "no":
-            print(f"[UNWIND] {t['relationship_id']} is an inverted basket — "
-                  f"skipping (v1 handles standard direction only)", flush=True)
-            continue
+        # v2 (2026-07-23): inverted baskets (Kalshi NO + PM YES) are handled
+        # by close_basket's inverted branch — no more v1 skip.
         if not row.get("mark_pnl_usd") or row["mark_pnl_usd"] <= 0:
             print(f"[UNWIND] {t['relationship_id']} hard but mark "
                   f"{row.get('mark_pnl_usd')} <= 0 — not unwinding at a loss", flush=True)
@@ -134,7 +161,8 @@ def main() -> None:
             us_id = load_credential("polymarket_usa_key_id").decode().strip()
             us_key = load_credential("polymarket_usa_private_key").decode().strip()
             pgw = PolymarketUsOrderGateway(us_id, us_key, live=True)
-        close_basket(t, row, k_bid, p_ask, pgw, kgw, args.live)
+        close_basket(t, row, k_bid, p_ask, pgw, kgw, args.live,
+                     k_ask=k_ask, p_bid=p_bid)
     print(f"checked {len(baskets)} open baskets, {hard} hard-unwind")
 
 
