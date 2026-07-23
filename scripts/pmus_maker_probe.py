@@ -123,11 +123,26 @@ class MakerProbe:
         """No orphans: cancel every open order of OURS (this probe's slug
         universe) left by a previous run — a dead process's resting orders
         produced incident #2. By order id, slug-scoped (contract rule 4)."""
-        try:
-            oo = self.pm_gw.open_orders()
-            orders = oo if isinstance(oo, list) else oo.get("orders", [])
-        except Exception as e:
-            raise SystemExit(f"startup sweep failed (refusing to quote blind): {e}")
+        import random
+        orders = None
+        for attempt in range(6):
+            try:
+                oo = self.pm_gw.open_orders()
+                orders = oo if isinstance(oo, list) else oo.get("orders", [])
+                break
+            except Exception as e:
+                if "429" in str(e) and attempt < 5:
+                    # shared API budget (coordination contract): back off with
+                    # jitter — MUST eventually sweep, or prior-run quotes stay
+                    # orphaned on the book
+                    wait = 20 + random.uniform(0, 20)
+                    print(f"[SWEEP] 429 — retry in {wait:.0f}s", flush=True)
+                    time.sleep(wait)
+                else:
+                    raise SystemExit(
+                        f"startup sweep failed (refusing to quote blind): {e}")
+        if orders is None:
+            raise SystemExit("startup sweep failed after retries")
         mine = [o for o in orders
                 if (o.get("marketSlug") or o.get("market_slug")) in self.pairs]
         for o in mine:
@@ -513,11 +528,27 @@ class MakerProbe:
               flush=True)
         hedged = 0
         hpx_avg = 0.0
-        for attempt in range(3):
+        for attempt in range(6):
             kb = self.books.get("kalshi", kt)
             t = top(kb) if kb else None
+            if t is None and attempt >= 1:
+                # local book gapped (bursts kill it exactly when fills come —
+                # first live fill 2026-07-23 lost its hedge this way): fall
+                # back to one REST snapshot for the hedge anchor
+                try:
+                    from arbbot.record.kalshi import KalshiCatalog
+                    if not hasattr(self, "_kcat"):
+                        self._kcat = KalshiCatalog()
+                    snap = await self._kcat.orderbook(kt, 0)
+                    bid = max(snap.bids, key=lambda l: l.price, default=None)
+                    ask = min(snap.asks, key=lambda l: l.price, default=None)
+                    if bid and ask and ask.price > bid.price:
+                        t = (float(bid.price), float(ask.price))
+                except Exception as e:
+                    self.log({"ts": time.time(), "action": "hedge_rest_fallback_err",
+                              "pm": st.pair["pm"], "err": str(e)[:100]})
             if t is None:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(1.0)
                 continue
             kbid, kask = t
             # buy fill: we are long PM YES -> sell Kalshi YES at bid
