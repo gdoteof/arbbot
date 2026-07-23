@@ -38,7 +38,10 @@ from arbbot.risk.manager import RiskConfig, RiskManager
 # --- trigger-based take-take auto-execution (riskless cross-venue arb) ---
 TT_VETTED = ("xvus-time-poty-26", "xvus-france-pres-27", "xvus-brazil-pres-26", "xvus-fedcut-26")
 TT_FEE = Decimal("0.02")     # ~both-leg taker fees per contract (conservative)
-TT_MAX_CLIP = 10             # max contracts per single take-take execution
+TT_MAX_CLIP = 100            # safety ceiling only (card 938df47b: depth-aware
+                             # sizing) — effective size is bounded by displayed
+                             # depth min(ka.size, pb.size), TT_CAP, and the
+                             # risk manager's per-rel/topic/class caps
 TT_CAP = 50                  # per-relationship concentration cap (contracts)
 TT_COOLDOWN = 30.0           # s between fires on the same relationship
 # floating APR bar (Geoff 2026-07-22): scales with capital utilization of the
