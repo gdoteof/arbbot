@@ -71,6 +71,34 @@ def top(book):
     return float(bid.price), float(ask.price)
 
 
+_health_cache: dict = {}
+
+
+def stale_feeds(health_path, ttl=3.0):
+    """Feed names currently flagged stale by the recorder's 1s heartbeat.
+    Returns {'__health__'} when the heartbeat itself is dead/unreadable —
+    treat that as everything-stale (recorder down = quoting blind)."""
+    now = time.time()
+    c = _health_cache.get(health_path)
+    if c and now - c[0] < ttl:
+        return c[1]
+    try:
+        with open(health_path, "rb") as f:
+            try:
+                f.seek(-4096, 2)
+            except OSError:
+                f.seek(0)
+            last = f.read().splitlines()[-1]
+        d = json.loads(last)
+        out = {k for k, v in d.get("stale", {}).items() if v}
+        if now - d.get("ts", 0) > 15:
+            out = {"__health__"}
+    except Exception:
+        out = {"__health__"}
+    _health_cache[health_path] = (now, out)
+    return out
+
+
 class PairState:
     def __init__(self, pair):
         self.pair = pair
@@ -171,6 +199,16 @@ class MakerProbe:
     # ---------- quoting ----------
     def guards(self, st, now_ns):
         """(kbid, kask, kmid) when quotable, else (None, reason)."""
+        # feed-level staleness (Geoff 2026-07-23): if the recorder says a
+        # dependent feed is giving bad data, pull quotes and wait for restore
+        # — venue-side stale bursts measured at 1.1-1.6 s/min (rust A/B)
+        bad = stale_feeds("data/raw-sports/health.jsonl")
+        if "__health__" in bad:
+            return None, "sports recorder heartbeat dead"
+        if "kalshi-ws" in bad:
+            return None, "kalshi FEED stale"
+        if "polymarket_us-ws" in bad:
+            return None, "pm-us FEED stale"
         kt = st.pair["kalshi"]
         kb = self.books.get("kalshi", kt)
         if kb is None:

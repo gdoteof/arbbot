@@ -71,6 +71,33 @@ def top(book):
     return bid, ask
 
 
+_health_cache: dict = {}
+
+
+def stale_feeds(health_path="data/health.jsonl", ttl=3.0):
+    """Feeds the main recorder flags stale (1s heartbeat). '__health__' =
+    heartbeat itself dead — treat as everything-stale."""
+    now = time.time()
+    c = _health_cache.get(health_path)
+    if c and now - c[0] < ttl:
+        return c[1]
+    try:
+        with open(health_path, "rb") as f:
+            try:
+                f.seek(-4096, 2)
+            except OSError:
+                f.seek(0)
+            last = f.read().splitlines()[-1]
+        d = json.loads(last)
+        out = {k for k, v in d.get("stale", {}).items() if v}
+        if now - d.get("ts", 0) > 15:
+            out = {"__health__"}
+    except Exception:
+        out = {"__health__"}
+    _health_cache[health_path] = (now, out)
+    return out
+
+
 class MarketState:
     def __init__(self, ticker, pm_token):
         self.ticker = ticker
@@ -233,7 +260,13 @@ class ToxProbe:
         if m.inventory > 0:
             await self.manage_exit(m, f, now_ns)
 
-        want_quote = (p_gate < a.gate_cut and m.inventory == 0
+        # hard feed-staleness gate (Geoff 2026-07-23): our Kalshi bids lean on
+        # the PM-intl basis signal — if the recorder flags either feed stale,
+        # pull quotes and wait for restore instead of trusting the model to
+        # infer it from pm_stale_s
+        bad = stale_feeds()
+        feed_ok = not ({"kalshi-ws", "polymarket-ws", "__health__"} & bad)
+        want_quote = (feed_ok and p_gate < a.gate_cut and m.inventory == 0
                       and not self.stopped
                       and 0.03 <= f["bid"] <= 0.90)
         if m.order_id is not None:
