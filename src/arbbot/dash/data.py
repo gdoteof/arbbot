@@ -391,6 +391,9 @@ class DashboardData:
             "trades": self._trades(),
             "order_activity": self._order_activity(),
             "sports": self._sports(),
+            "maker_probe": self._maker_probe(),
+            "capacity": self._read_json(self.raw_dir.parent / "reports" / "capacity.json"),
+            "positions": self._read_json(self.raw_dir.parent / "exec" / "positions.json"),
         }
 
     def _sports(self) -> dict:
@@ -408,6 +411,22 @@ class DashboardData:
             doc["stale_s"] = None
         doc["history"] = self._sports_history()
         doc["mt_probe"] = self._mt_probe()
+        return doc
+
+    def _maker_probe(self) -> dict:
+        """Candidate-pair status written by the PM-US maker probe
+        (scripts/pmus_maker_probe.py) every 5s: per-pair books, our quote
+        targets, guard blocks and distance-to-fill. stale_s marks the feed
+        dim when the probe is down."""
+        doc = self._read_json(self.raw_dir.parent / "exec" / "pmus_maker_status.json")
+        if not doc:
+            return {"pairs": [], "session": None, "stale_s": None}
+        try:
+            gen = datetime.strptime(doc.get("generated_at", ""),
+                                    "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            doc["stale_s"] = round(time.time() - gen.timestamp(), 0)
+        except (ValueError, TypeError):
+            doc["stale_s"] = None
         return doc
 
     def _mt_probe(self) -> dict:
@@ -478,24 +497,50 @@ class DashboardData:
         return out[-cap:]
 
     def _trades(self) -> dict:
-        """Executed cross-venue arbitrage baskets from data/exec/trades.jsonl."""
+        """Executed cross-venue arbitrage baskets from data/exec/trades.jsonl,
+        netted against appended unwind records (arbbot.exec.ledger convention):
+        a fully-unwound basket renders as CLOSED with its realized P&L."""
+        from arbbot.exec.ledger import apply_corrections, open_baskets, parse_lines
         p = self.raw_dir.parent / "exec" / "trades.jsonl"
+        raw = apply_corrections(parse_lines(p.read_text().splitlines())) if p.exists() else []
+        netted = open_baskets(raw)  # open baskets net of unwinds (aggregates)
+        netted_keys = {(r.get("relationship_id"), r.get("ts")) for r in netted}
+        unwound_by_key: dict[tuple, dict] = {}
+        for r in raw:
+            if r.get("status") == "unwound" and r.get("closes_ts") is not None:
+                k = (r.get("relationship_id"), r["closes_ts"])
+                agg = unwound_by_key.setdefault(k, {"qty": 0, "realized_usd": 0.0, "ts": 0})
+                agg["qty"] += float(r.get("qty", 0))
+                agg["realized_usd"] += float(r.get("realized_pnl_usd") or 0)
+                agg["ts"] = max(agg["ts"], r.get("ts", 0))
         rows = []
-        if p.exists():
-            for line in p.read_text().splitlines():
-                line = line.strip()
-                if line:
-                    try:
-                        rows.append(json.loads(line))
-                    except ValueError:
-                        pass
+        for r in raw:
+            if r.get("status") == "unwound":
+                continue  # folded into the parent basket's row below
+            if r.get("status") == "open":
+                u = unwound_by_key.get((r.get("relationship_id"), r.get("ts")))
+                if u is None:
+                    r["_status"] = "open"
+                else:
+                    r["closed_qty"] = u["qty"]
+                    r["realized_usd"] = round(u["realized_usd"], 2)
+                    r["closed_ts"] = u["ts"]
+                    r["_status"] = ("partial" if (r.get("relationship_id"), r.get("ts"))
+                                    in netted_keys else "closed")
+            else:
+                r["_status"] = r.get("status") or "?"
+            rows.append(r)
         rows.sort(key=lambda r: -r.get("ts", 0))
-        open_rows = [r for r in rows if r.get("status") == "open"]
+        open_rows = netted
         # merge live mark-to-market (scripts/mark_positions.py, on a 2-min timer)
         marks = self._read_json(self.raw_dir.parent / "exec" / "marks.json") or {}
+        # key by (rel, ts) so multiple records of the same relationship (e.g.
+        # several sports rehedge baskets) each get THEIR OWN mark row — a
+        # rel-only key pasted one basket's marks onto every sibling
+        by_key = {(m["relationship_id"], m.get("ts")): m for m in marks.get("positions", [])}
         by_rel = {m["relationship_id"]: m for m in marks.get("positions", [])}
         for r in rows:
-            m = by_rel.get(r.get("relationship_id"))
+            m = by_key.get((r.get("relationship_id"), r.get("ts"))) or by_rel.get(r.get("relationship_id"))
             if m:
                 r["mark"] = {k: m.get(k) for k in
                              ("mark_pnl_usd", "liq_value_usd", "converged_pct",
@@ -522,12 +567,113 @@ class DashboardData:
         prof = sum(r.get("profit_usd", 0) for r in open_rows)
         wavg_yrs = (num / den) if den else None
         portfolio_apr = round(prof / cap / wavg_yrs * 100, 1) if (cap and wavg_yrs) else None
+        realized = round(sum(float(r.get("realized_pnl_usd") or 0)
+                             for r in raw if r.get("status") in ("unwound", "realized")), 2)
+
+        # per-category breakdown: open capital/locked + realized (incl losses)
+        FAMILIES = ("france-pres-27", "time-poty-26", "nobel-peace-26",
+                    "brazil-pres-26", "fedcut-26", "bestai-26dec")
+
+        # game-name -> league map so rehedge/flatten records (whose ids carry
+        # the game, not the league) still land in their real category
+        game_league = {}
+        with __import__("contextlib").suppress(Exception):
+            smap = json.loads((self.scan_dir / "sports_equiv_map.json").read_text())
+            for sm in smap.get("matches", []):
+                game_league[sm["teams"].replace(" vs ", "@")[:30]] = sm["league"]
+
+        def _category(rid: str) -> str:
+            rid = str(rid or "")
+            if rid.startswith("sports-"):
+                seg = rid.split("-", 2)[1] if "-" in rid[7:] else "misc"
+                if seg in ("mlb", "itfme", "itfwo", "wta", "atp", "kbo", "npb"):
+                    return f"sports-{seg}"
+                if seg in ("rehedge", "flatten"):
+                    game = rid.split("-", 2)[2] if rid.count("-") >= 2 else ""
+                    lg = game_league.get(game[:30])
+                    return f"sports-{lg}" if lg else "sports-misc"
+                return "sports-misc"
+            for f2 in FAMILIES:
+                if f2 in rid:
+                    return f2
+            return "other"
+
+        cats: dict[str, dict] = {}
+        for r in netted:
+            cat = cats.setdefault(_category(r.get("relationship_id")),
+                                  {"open": 0, "capital": 0.0, "locked": 0.0,
+                                   "realized": 0.0, "losses": 0.0})
+            cat["open"] += 1
+            cat["capital"] += float(r.get("cost_usd") or 0)
+            cat["locked"] += float(r.get("profit_usd") or 0)
+        for r in raw:
+            if r.get("status") not in ("unwound", "realized"):
+                continue
+            v = float(r.get("realized_pnl_usd") or 0)
+            cat = cats.setdefault(_category(r.get("relationship_id")),
+                                  {"open": 0, "capital": 0.0, "locked": 0.0,
+                                   "realized": 0.0, "losses": 0.0})
+            cat["realized"] += v
+            if v < 0:
+                cat["losses"] += v
+        categories = [{"category": k, "open": v["open"],
+                       "capital": round(v["capital"], 2), "locked": round(v["locked"], 2),
+                       "realized": round(v["realized"], 2), "losses": round(v["losses"], 2)}
+                      for k, v in sorted(cats.items(), key=lambda kv: -kv[1]["capital"])]
+
+        # pickoff -> salvage funnel (sports probe lifecycle)
+        funnel = {}
+        mp_path = self.raw_dir.parent / "exec" / "sports_mt_probe.jsonl"
+        if mp_path.exists():
+            import json as _json2
+            fills = clean = picked = 0
+            qty = clean_q = picked_q = 0
+            for line in mp_path.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    m = _json2.loads(line)
+                except ValueError:
+                    continue
+                fills += 1
+                qty += int(m.get("qty") or 0)
+                if m.get("picked_off"):
+                    picked += 1
+                    picked_q += int(m.get("naked") or m.get("qty") or 0)
+                else:
+                    clean += 1
+                    clean_q += int(m.get("qty") or 0)
+            salv_n = salv_q = 0
+            salv_locked = 0.0
+            for r in raw:
+                ti = str(r.get("title") or "")
+                if ("naked rehedge" in ti or r.get("strategy") == "flatten")                         and r.get("status") in ("open", "realized"):
+                    salv_n += 1
+                    salv_q += int(r.get("qty") or 0)
+                    salv_locked += float(r.get("profit_usd") or r.get("realized_pnl_usd") or 0)
+            naked_losses = round(sum(float(r.get("realized_pnl_usd") or 0)
+                                     for r in raw if r.get("strategy") == "naked-settlement"), 2)
+            outstanding = 0
+            with __import__("contextlib").suppress(Exception):
+                outstanding = sum(int(h.get("qty") or 0) for h in _json2.loads(
+                    (self.raw_dir.parent / "exec" / "sports_naked.json").read_text()))
+            funnel = {"fills": fills, "contracts": qty,
+                      "clean_captures": clean, "clean_contracts": clean_q,
+                      "picked_off": picked, "picked_contracts": picked_q,
+                      "salvaged_baskets": salv_n, "salvaged_contracts": salv_q,
+                      "salvaged_locked_usd": round(salv_locked, 2),
+                      "naked_losses_usd": naked_losses,
+                      "outstanding_naked": outstanding}
         return {
             "rows": rows,
             "n": len(rows),
             "n_open": len(open_rows),
+            "n_closed": sum(1 for r in rows if r["_status"] == "closed"),
+            "realized_usd": realized,
+            "categories": categories,
+            "funnel": funnel,
             "capital_locked": round(sum(r.get("cost_usd", 0) for r in open_rows), 2),
-            "profit_locked": round(sum(r.get("profit_usd", 0) for r in rows), 2),
+            "profit_locked": round(sum(r.get("profit_usd", 0) for r in open_rows), 2),
             "marks": marks.get("totals", {}),
             "marks_at": marks.get("generated_at"),
             "hedge_latency_p50": round(_median(lats), 0) if lats else None,

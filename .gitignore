@@ -1,6 +1,7 @@
 # environments / caches
 .venv/
 .venv313/
+.venv-research/
 __pycache__/
 *.egg-info/
 .hypothesis/
@@ -31,3 +32,5 @@ nohup.out
 config/registry.yaml
 config/registry-rejected.yaml
 config/registry.yaml.bak*
+# topic capital budgets reveal the trading-family strategy — same treatment
+config/topics.yaml

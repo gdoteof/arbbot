@@ -194,11 +194,11 @@
   .act-stat.fail  .n { color: var(--st-crit); }
 
   /* sports lines */
-  #sports-table td, #sports-table th { padding: 6px 8px; }
-  #sports-table tr.crossed td { background: color-mix(in srgb, var(--delta-good) 14%, transparent); font-weight: 600; }
-  #sports-table td.edge-pos { color: var(--delta-good); font-weight: 650; }
-  #sports-table td.edge-neg { color: var(--ink-mut); }
-  #sports-table td.dim { color: var(--ink-mut); }
+  #sports-table td, #sports-table th, #probe-pairs-table td, #probe-pairs-table th { padding: 6px 8px; }
+  #sports-table tr.crossed td, #probe-pairs-table tr.crossed td { background: color-mix(in srgb, var(--delta-good) 14%, transparent); font-weight: 600; }
+  #sports-table td.edge-pos, #probe-pairs-table td.edge-pos { color: var(--delta-good); font-weight: 650; }
+  #sports-table td.edge-neg, #probe-pairs-table td.edge-neg { color: var(--ink-mut); }
+  #sports-table td.dim, #probe-pairs-table td.dim { color: var(--ink-mut); }
   .stale-pill { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
     color: var(--surface); background: var(--st-warn); border-radius: 4px; padding: 2px 7px; vertical-align: middle; }
   .act-stat.crossed .n { color: var(--delta-good); }
@@ -267,6 +267,11 @@
       <span class="badge" id="tab-activity-n" hidden></span></button>
     <button class="tab" id="tab-sports" role="tab" aria-selected="false">Sports
       <span class="badge" id="tab-sports-n" hidden></span></button>
+    <button class="tab" id="tab-maker" role="tab" aria-selected="false">Maker probe
+      <span class="badge" id="tab-maker-n" hidden></span></button>
+    <button class="tab" id="tab-capacity" role="tab" aria-selected="false">Capacity</button>
+    <button class="tab" id="tab-positions" role="tab" aria-selected="false">Positions
+      <span class="badge" id="tab-positions-n" hidden></span></button>
   </div>
 
   <div id="view-overview">
@@ -289,13 +294,22 @@
     <div class="tr-strip">
       <div><div class="s-lbl">Locked profit (riskless)</div><div class="s-val pos" id="tr-profit">—</div></div>
       <div><div class="s-lbl">Capital deployed</div><div class="s-val" id="tr-capital">—</div></div>
-      <div><div class="s-lbl">Open baskets</div><div class="s-val" id="tr-open">—</div></div>
+      <div><div class="s-lbl">Open baskets</div><div class="s-val" id="tr-open">—</div><div class="s-lbl" id="tr-open-sub"></div></div>
+      <div><div class="s-lbl" data-tip="Profit BANKED by closing baskets early (auto-unwind or manual): proceeds minus cost, already realized — no longer at risk and the capital is redeployed. Separate from locked profit, which waits on resolution.">Realized (closed)</div><div class="s-val" id="tr-realized">—</div></div>
       <div><div class="s-lbl" data-tip="Raw locked profit ÷ capital deployed — NOT annualized. A basket resolving in 6 months and one in 2 years show the same RoC, so compare it against the annualized figure to its right.">Return on capital</div><div class="s-val" id="tr-roc">—</div></div>
       <div><div class="s-lbl" data-tip="Portfolio APR: the raw RoC annualized over the capital-weighted average time to resolution across open baskets. This is the comparable yearly rate — the number to judge against the T-bill (~4-5%) and against redeploying capital. Estimated resolution dates (e.g. TIME PotY) feed this, so treat it as approximate.">Blended APR</div><div class="s-val" id="tr-apr">—</div><div class="s-lbl" id="tr-apr-sub"></div></div>
       <div><div class="s-lbl" data-tip="Mark-to-market if we LIQUIDATED every open basket right now (sell both legs, pay the spread + unwind fees). Starts negative by ~the round-trip spread and CLIMBS toward locked profit as prices converge to resolution. Negative here is NOT a loss — held to resolution each basket pays its locked profit.">Unwind-now P&amp;L</div><div class="s-val" id="tr-mark">—</div></div>
       <div><div class="s-lbl" data-tip="Median HEDGE LATENCY: time from detecting our maker-leg fill to the cross-venue hedge being confirmed — the window we hold a naked, unhedged leg. Fill detection itself is sub-second (PM US private WS); this number is dominated by the hedge order's venue round-trip. Lower = less legging risk.">Hedge latency</div><div class="s-val" id="tr-latency">—</div><div class="s-lbl" id="tr-latency-n"></div></div>
     </div>
     <div id="tr-signals" style="margin:-4px 0 10px; font-size:12px"></div>
+    <div class="cap" data-tip="Open capital, locked profit, and realized P&L (including losses) grouped by family/league. Realized includes unwinds, settlements, flattens, and naked-hold outcomes — losses shown separately so they are never netted out of sight.">by category</div>
+    <div style="overflow-x:auto;margin-bottom:10px"><table id="tr-cat-table">
+      <thead><tr><th>category</th><th class="num">open</th><th class="num">capital</th>
+        <th class="num">locked</th><th class="num">realized</th>
+        <th class="num" data-tip="Sum of negative realized outcomes only (naked-hold settlements etc.) — included in realized, broken out here.">losses</th></tr></thead>
+      <tbody></tbody></table></div>
+    <div class="cap" data-tip="The sports make-take probe lifecycle: fills at our resting quotes -> hedged instantly (clean capture) or picked off -> the dual-exit watcher salvages (rehedge/flatten) -> unsalvageable holds settle as losses. This funnel is the honest cost accounting of quoting into informed flow.">pickoff → salvage funnel (sports probe)</div>
+    <div class="act-strip" id="tr-funnel" style="margin-bottom:10px"></div>
     <div style="overflow-x:auto"><table id="trades-table">
       <thead><tr>
         <th data-tip="The vetted cross-venue-equivalent relationship traded.">basket</th>
@@ -464,9 +478,9 @@
       <div class="cap" style="margin-top:6px" data-tip="Best edge across all live games over today, sampled every ~15s. TAKE-TAKE (solid) crosses both spreads — both legs taker, fired together, no adverse selection: this is what we can capture safely, and it's what the net acts on. MAKE-TAKE (dashed) is the ceiling: rest a maker quote on one leg to save that spread, take only the hedge — better by ~a spread, BUT adverse-selection-blind. On fast sports books our resting quote is the stale one informed takers pick off during action, so realized make-take is worse than this line (that's why we quote the slow political book but not sports). The gap between the lines ≈ the adverse-selection tax we'd pay trying to make-take. Dashed amber = 0c crossing threshold.">best edge across live games — today · take-take vs make-take ceiling</div>
       <div id="sports-chart" style="overflow-x:auto;margin:2px 0 4px"></div>
       <div class="act-legend" style="margin-left:44px">
-        <span><i style="background:var(--series-1)"></i>take-take (capturable — the net acts on this)</span>
-        <span><i style="background:var(--series-2)"></i>make-take ceiling (theoretical — adverse-selection-blind)</span>
-        <span><i style="background:var(--st-warn)"></i>0c crossing threshold</span>
+        <span><i style="background:var(--series-1)"></i>take-take top-5 edges, best bold (left axis — the net acts on these)</span>
+        <span><i style="background:var(--series-2)"></i>make-take ceiling (RIGHT axis — theoretical, adverse-selection-blind)</span>
+        <span><i style="background:var(--st-warn)"></i>0c crossing threshold (left axis)</span>
       </div>
       <div style="overflow-x:auto"><table id="sports-table">
         <thead><tr>
@@ -495,6 +509,88 @@
       <div id="mt-empty" style="display:none;color:var(--ink-mut);font-size:12px;padding:20px 4px">No fills yet — we rest at the pure bid, so a fill needs someone to sell into us. Unfilled quotes cost nothing. Results appear here the moment a maker fills.</div>
     </section>
   </div><!-- /view-sports -->
+
+  <div id="view-maker" hidden>
+    <section class="card">
+      <h2>PM-US maker probe — candidate pairs <span id="maker-stale" class="stale-pill" hidden></span></h2>
+      <div class="cap" data-tip="The probe rests post-only PM-US quotes at kalshi_mid ± margin on mapped moneylines (PM-US makers pay zero fee) and hedges every fill on Kalshi IOC, locking the spread. This table shows every candidate pair and how close each side is to a fill: DIST = how far the PM-US touch must move to cross our quote (0c = we are the touch). A guard reason means the pair is watched but not quoted. Live quotes are marked ●.">every mapped pair, our would-be quotes, and the distance from PM-US flow to a fill — guard reasons explain non-quoting pairs</div>
+      <div class="act-strip" id="maker-strip"></div>
+      <div style="overflow-x:auto"><table id="probe-pairs-table">
+        <thead><tr>
+          <th>match</th>
+          <th>lg</th>
+          <th class="num" data-tip="Kalshi long-team YES best bid / ask — the fair-value anchor.">Kalshi bid/ask</th>
+          <th class="num" data-tip="PM US moneyline best bid / ask.">PM bid/ask</th>
+          <th class="num" data-tip="Our resting/target buy quote (kalshi_mid − margin). ● = order live on the book.">our bid</th>
+          <th class="num" data-tip="PM ask − our bid: how far the offer side must fall to fill our buy. Smaller = closer to acting.">dist</th>
+          <th class="num" data-tip="Our resting/target sell quote (kalshi_mid + margin). ● = order live on the book.">our ask</th>
+          <th class="num" data-tip="Our ask − PM bid: how far the bid side must rise to fill our sell. Smaller = closer to acting.">dist</th>
+          <th data-tip="Why this pair is not being quoted right now (guards: wide/stale/jumping Kalshi book, price bounds, caps, per-pair stop). Blank = quoting.">guard</th>
+          <th class="num" data-tip="Locked P&L realized on this pair this session (hedged fills).">P&L</th>
+        </tr></thead><tbody></tbody></table></div>
+      <div id="probe-pairs-empty" style="display:none;color:var(--ink-mut);font-size:12px;padding:20px 4px">Probe not running or no candidate pairs — the status feed refreshes every 5s while the probe is up.</div>
+    </section>
+  </div>
+
+  <div id="view-capacity" hidden>
+    <section class="card">
+      <h2>Strategy capacity backtest <span id="cap-window" class="stale-pill" style="background:var(--series-1)" hidden></span></h2>
+      <div class="cap" data-tip="Replay of the scanner's opportunity tape (VWAP-walked, edge-positive book depth, net of both venues' fees) restricted to live-tradeable xvus pairs. EPISODES: ticks with gaps > 2 min split — one standing dislocation each. CONSERVATIVE: one take per episode at its best moment; standing depth counted ONCE. FLOW-BOUNDED: conservative + edge on contracts that ACTUALLY traded on the Kalshi leg per 15-min window — replenishment grounded in the venue trade tape, no imaginary refills. Bankroll curves: chronological greedy; the per-relationship cap SCALES with bankroll (max($150, 15%)) — a $25k book would not keep a $150 cap; capital locked once used (resolutions are months out, nothing recycles in-window). Maker/make-take capacity NOT included — this is the taker-only floor.">how much money take-take could have absorbed — from recorded book depth + real trade flow, not theory · refreshes daily 07:40 (arbbot-capacity.timer, after the parquet ETL) · refresh now: <code>systemctl --user start arbbot-capacity</code></div>
+      <div class="tr-strip">
+        <div><div class="s-lbl">Episodes</div><div class="s-val" id="cap-episodes">—</div></div>
+        <div><div class="s-lbl" data-tip="One take per episode at its single best moment — the floor. Standing depth counted once.">Capturable (conservative)</div><div class="s-val pos" id="cap-cons">—</div></div>
+        <div><div class="s-lbl" data-tip="Conservative + edge on real replenishment: contracts that actually traded on the Kalshi leg during the episode, per 15-min window.">Capturable (flow-bounded)</div><div class="s-val pos" id="cap-repl">—</div></div>
+        <div><div class="s-lbl" data-tip="Smallest bankroll achieving >=95% of the saturated profit at the 2c edge floor.">Saturation bankroll @2c</div><div class="s-val" id="cap-knee">—</div></div>
+        <div><div class="s-lbl" data-tip="Profit our actual $980 bankroll could have captured at the 2c floor.">@ $980 (2c floor)</div><div class="s-val" id="cap-980">—</div></div>
+      </div>
+      <div class="cap" style="margin-top:8px" data-tip="Chronological greedy under scaled constraints. ROC = profit / capital used over the window. APR = ROC annualized over the capital-weighted time from take to each relationship's resolution — the number to compare against the live book's blended APR and the T-bill.">2c edge floor — profit, return on capital, and annualized rate by bankroll</div>
+      <div style="overflow-x:auto"><table id="cap-detail-table">
+        <thead><tr>
+          <th class="num">bankroll</th><th class="num" data-tip="Per-relationship cap at this bankroll: max($150, 15% of bankroll).">rel cap</th>
+          <th class="num">profit</th><th class="num">capital used</th><th class="num">takes</th>
+          <th class="num" data-tip="profit / capital used (window return, not annualized).">ROC</th>
+          <th class="num" data-tip="ROC annualized over capital-weighted years to resolution.">APR</th>
+          <th class="num" data-tip="Capital-weighted years to resolution of what was taken.">avg hold</th>
+        </tr></thead><tbody></tbody></table></div>
+      <div class="cap" style="margin-top:8px">profit matrix across edge floors (hover a cell for ROC/APR)</div>
+      <div style="overflow-x:auto"><table id="cap-curve-table">
+        <thead><tr id="cap-curve-head"><th>edge floor</th></tr></thead><tbody></tbody></table></div>
+      <div class="cap" style="margin-top:14px">per relationship — where the capacity lives</div>
+      <div style="overflow-x:auto"><table id="cap-rel-table">
+        <thead><tr>
+          <th>relationship</th><th class="num">episodes</th>
+          <th class="num" data-tip="One take per episode at its best moment.">conservative $</th>
+          <th class="num" data-tip="Conservative + edge on actually-traded flow.">flow-bounded $</th>
+          <th class="num" data-tip="Best per-contract net edge seen.">best edge</th>
+          <th class="num" data-tip="Deepest edge-positive size seen in one moment.">max depth (ct)</th>
+          <th class="num" data-tip="Cost of the largest single take.">max take $</th>
+          <th class="num" data-tip="Kalshi-leg contracts that actually traded during episodes — the replenishment bound.">traded (ct)</th>
+        </tr></thead><tbody></tbody></table></div>
+      <div class="cap" style="margin-top:14px">per day</div>
+      <div style="overflow-x:auto"><table id="cap-day-table">
+        <thead><tr><th>day</th><th class="num">episodes</th><th class="num">conservative $</th><th class="num">flow-bounded $</th></tr></thead>
+        <tbody></tbody></table></div>
+      <div id="cap-empty" style="display:none;color:var(--ink-mut);font-size:12px;padding:20px 4px">No capacity analysis yet — run <code>scripts/capacity_backtest.py</code>.</div>
+    </section>
+  </div><!-- /view-capacity -->
+
+  <div id="view-positions" hidden>
+    <section class="card">
+      <h2>Open positions — venue truth <span id="pos-stale" class="stale-pill" hidden></span></h2>
+      <div class="cap" data-tip="What we ACTUALLY hold on each venue right now (reconciliation snapshot, refreshed ~60s): Kalshi position + PM US net per pair, joined via the registry and the sports equivalence map. HEDGED = legs net to zero (a complete basket). NAKED = a directional imbalance. WATCHED = the imbalance is registered with the profit-only rehedge/flatten watcher. Orphans are venue positions no known pair explains.">every open position, hedged and unhedged — from venue APIs, not the ledger</div>
+      <div class="act-strip" id="pos-strip"></div>
+      <div style="overflow-x:auto"><table id="pos-table">
+        <thead><tr>
+          <th>position</th><th>book</th>
+          <th class="num" data-tip="Kalshi contracts (YES axis; negative = short) · cost/ct at entry → the book NOW (bid/ask).">Kalshi qty · entry → now</th>
+          <th class="num" data-tip="PM US net (negative = short YES = holding NO) · held-side cost/ct at entry → the book NOW.">PM US qty · entry → now</th>
+          <th class="num" data-tip="Net directional exposure in contracts (Kalshi + PM). Zero = market-neutral basket; nonzero = we win/lose |Δ| × price move.">Δ</th>
+          <th data-tip="HEDGED pairs: profit/ct locked at entry ($1 payoff − both bases). WATCHED holds: how many cents each profit-only exit is from firing (≤0 = available now, watcher is on it).">lock</th>
+          <th>status</th>
+        </tr></thead><tbody></tbody></table></div>
+      <div id="pos-empty" style="display:none;color:var(--ink-mut);font-size:12px;padding:20px 4px">No open positions.</div>
+    </section>
+  </div><!-- /view-positions -->
 </main>
 
 <div id="tip" role="status"></div>
@@ -772,6 +868,9 @@ function render(d) {
   renderPlate(d);
   renderActivity(d);
   renderSports(d);
+  renderMakerProbe(d);
+  renderCapacity(d.capacity);
+  renderPositions(d.positions);
   /* accumulating counters get FULL digits — the tick is the signal that
      the instrument is alive; compact notation hides it */
   $("#hero-val").textContent = d.hero.observations.toLocaleString("en-US");
@@ -847,6 +946,10 @@ function render(d) {
   $("#tr-profit").textContent = "$" + tr_.profit_locked.toFixed(2);
   $("#tr-capital").textContent = "$" + tr_.capital_locked.toFixed(2);
   $("#tr-open").textContent = tr_.n_open;
+  $("#tr-open-sub").textContent = tr_.n_closed ? `+ ${tr_.n_closed} closed` : "";
+  const rz = tr_.realized_usd || 0;
+  $("#tr-realized").textContent = rz ? (rz >= 0 ? "+$" : "−$") + Math.abs(rz).toFixed(2) : "—";
+  $("#tr-realized").className = "s-val" + (rz > 0 ? " pos" : "");
   $("#tr-roc").textContent = roc ? "+" + roc.toFixed(1) + "%" : "—";
   $("#tr-roc").className = "s-val" + (roc ? " pos" : "");
   const papr = tr_.portfolio_apr;
@@ -866,6 +969,34 @@ function render(d) {
       + (nr ? `<span class="role-badge taker">${nr} reverse</span> ` : "")
       + `<span style="color:var(--ink-mut)">— exit/reverse opportunity live</span>`
     : `<span style="color:var(--ink-mut)">no exit/reverse signals · marks ${tr_.marks_at ? tr_.marks_at.slice(11,16)+"Z" : "—"}</span>`;
+  const ctb2 = $("#tr-cat-table tbody"); ctb2.replaceChildren();
+  for (const c2 of (tr_.categories || [])) {
+    const tr2 = document.createElement("tr");
+    [c2.category, c2.open, "$" + c2.capital.toFixed(2), "$" + c2.locked.toFixed(2),
+     (c2.realized >= 0 ? "+$" : "−$") + Math.abs(c2.realized).toFixed(2),
+     c2.losses ? "−$" + Math.abs(c2.losses).toFixed(2) : "—"]
+      .forEach((v, i) => { const td2 = document.createElement("td"); if (i) td2.className = "num";
+        td2.style.fontVariantNumeric = "tabular-nums"; td2.textContent = v;
+        if (i === 4) td2.style.color = c2.realized >= 0 ? "var(--delta-good)" : "var(--st-crit)";
+        if (i === 5 && c2.losses) td2.style.color = "var(--st-crit)";
+        tr2.appendChild(td2); });
+    ctb2.appendChild(tr2);
+  }
+  const fu = tr_.funnel || {};
+  const fstrip = $("#tr-funnel"); fstrip.replaceChildren();
+  if (fu.fills) {
+    for (const [n, k, cls] of [
+        [fu.fills + " (" + fu.contracts + "ct)", "probe fills", ""],
+        [fu.clean_captures, "clean captures", "place"],
+        [fu.picked_off, "picked off", "fail"],
+        [fu.salvaged_baskets + " (+$" + (fu.salvaged_locked_usd || 0).toFixed(2) + ")", "salvaged", "move"],
+        [fu.outstanding_naked + "ct", "naked now", fu.outstanding_naked ? "fail" : ""],
+        [(fu.naked_losses_usd < 0 ? "−$" + Math.abs(fu.naked_losses_usd).toFixed(2) : "$0"), "naked losses", fu.naked_losses_usd < 0 ? "fail" : ""]]) {
+      const el3 = document.createElement("div"); el3.className = "act-stat " + cls;
+      el3.innerHTML = `<div class="n">${n}</div><div class="k">${k}</div>`;
+      fstrip.appendChild(el3);
+    }
+  }
   const VEN = { kalshi: ["Kalshi", "k"], polymarket_us: ["PM US", "pm"], polymarket: ["PM intl", "pm"] };
   const legChip = (l) => {
     const [name, cls] = VEN[l.venue] || [l.venue, ""];
@@ -881,8 +1012,10 @@ function render(d) {
       cost = l.cost != null && l.qty ? Number(l.cost) / l.qty
            : (yesPx != null ? 1 - Number(yesPx) : null);
       if (yesPx != null) hint = `opened by selling YES @ $${Number(yesPx).toFixed(2)}`;
-    } else if (l.avg_price != null) {
-      cost = Number(l.avg_price);
+    } else {
+      // YES legs: maker hedges record avg_price, take-take legs yes_price
+      const px = l.avg_price != null ? l.avg_price : l.yes_price;
+      if (px != null) cost = Number(px);
     }
     const wrap = document.createElement("span"); wrap.className = "leg";
     if (hint) wrap.title = hint;
@@ -897,6 +1030,8 @@ function render(d) {
   $("#trades-empty").style.display = tr_.n ? "none" : "block";
   for (const t of tr_.rows) {
     const tr = document.createElement("tr");
+    const isClosed = t._status === "closed", isPartial = t._status === "partial";
+    if (isClosed) tr.style.opacity = ".55";
     const cells = [
       { html: td => { const s = document.createElement("span"); s.className = "relid";
           s.textContent = t.title && t.title !== t.relationship_id ? t.title : t.relationship_id;
@@ -908,8 +1043,18 @@ function render(d) {
       { text: "$" + Number(t.payoff_usd || 0).toFixed(2), num: true },
       { cls: "profit", text: "+$" + Number(t.profit_usd || 0).toFixed(2) },
       { html: td => { const m = t.mark || {}; td.className = "num";
+          if (isClosed || isPartial) {
+            const r = t.realized_usd;
+            if (r != null) { const s = document.createElement("span");
+              s.style.color = r >= 0 ? "var(--delta-good)" : "var(--st-crit)";
+              s.style.fontVariantNumeric = "tabular-nums";
+              s.textContent = (r >= 0 ? "+$" : "−$") + Math.abs(r).toFixed(2) + " banked";
+              s.title = `realized by unwinding ${isPartial ? t.closed_qty + " of " + t.qty + " contracts" : "the full basket"} early`;
+              td.appendChild(s); if (isClosed) return; td.append(" · "); }
+            if (isClosed) return;
+          }
           const v = m.mark_pnl_usd;
-          if (v == null) { td.textContent = "—"; return; }
+          if (v == null) { if (!td.childNodes.length) td.textContent = "—"; return; }
           const s = document.createElement("span");
           s.style.color = v >= 0 ? "var(--delta-good)" : "var(--st-crit)";
           s.style.fontVariantNumeric = "tabular-nums";
@@ -935,6 +1080,14 @@ function render(d) {
           if (m.forward_hold_apr != null && v > m.forward_hold_apr) td.style.color = "var(--delta-good)";
           else if (v < 0) td.style.color = "var(--st-crit)"; } },
       { html: td => { const m = t.mark || {};
+          if (isClosed) { const s=document.createElement("span"); s.className="role-badge";
+            s.style.cssText="background:var(--ink-mut);color:var(--surface)";
+            s.textContent="CLOSED"; s.title="fully unwound — profit realized, capital freed";
+            td.appendChild(s); return; }
+          if (isPartial) { const s=document.createElement("span"); s.className="role-badge";
+            s.style.cssText="background:var(--st-warn);color:var(--surface)";
+            s.textContent=`PARTIAL ${t.closed_qty}/${t.qty}`;
+            s.title="partially unwound — remainder still open"; td.appendChild(s); }
           if (m.unwind_hard) { const s=document.createElement("span"); s.className="role-badge";
             s.style.cssText="background:var(--st-crit);color:var(--surface)";
             s.textContent="UNWIND <4%"; s.title="forward hold APR below the 4% hard floor — exit even into idle capital";
@@ -1177,7 +1330,82 @@ function renderActivity(d) {
   if (SEEN_EVT.size > 4000) SEEN_EVT.clear();  // bound memory on long sessions
 }
 
+// sports table sort state: default = engine order (best take-take first)
+let SPORTS_SORT = { key: "edge_c", dir: -1 };
+const SPORTS_COLS = ["game", "k_bid", "pm_bid", "edge_c", "mt_edge_c"];
+function wireSportsSort() {
+  const ths = document.querySelectorAll("#sports-table thead th");
+  ths.forEach((th, i) => {
+    th.style.cursor = "pointer";
+    th.addEventListener("click", () => {
+      const key = SPORTS_COLS[i];
+      if (SPORTS_SORT.key === key) SPORTS_SORT.dir *= -1;
+      else SPORTS_SORT = { key, dir: key === "game" ? 1 : -1 };
+      ths.forEach((t, j) => {
+        t.textContent = t.textContent.replace(/ [▲▼]$/, "");
+        if (j === i) t.textContent += SPORTS_SORT.dir === 1 ? " ▲" : " ▼";
+      });
+      if (window.__lastData) renderSports(window.__lastData);
+    });
+  });
+}
+wireSportsSort();
+
+function renderMakerProbe(d) {
+  const m = d.maker_probe || { pairs: [], session: null, stale_s: null };
+  const sess = m.session || {};
+  const badge = $("#tab-maker-n");
+  if (sess.quoting) { badge.textContent = sess.quoting; badge.hidden = false;
+                      badge.style.background = "var(--series-1)"; }
+  else badge.hidden = true;
+
+  const pill = $("#maker-stale");
+  if (m.stale_s == null && !(m.pairs || []).length) pill.hidden = true;
+  else if (m.stale_s != null && m.stale_s > 15) {
+    pill.hidden = false; pill.textContent = `probe down ${Math.round(m.stale_s)}s`;
+  } else pill.hidden = true;
+
+  const strip = $("#maker-strip"); strip.replaceChildren();
+  const fmt$ = (v) => v == null ? "—" : (v < 0 ? "−$" : "+$") + Math.abs(v).toFixed(2);
+  for (const [n, k] of [[sess.quoting ?? 0, "quoting now"],
+                        [sess.candidates ?? 0, "candidates"],
+                        [sess.fills ?? 0, "fills"],
+                        [sess.open_baskets ?? 0, "locked baskets"],
+                        [fmt$(sess.realized), "locked P&L"],
+                        [sess.margin != null ? Math.round(sess.margin * 100) + "c" : "—", "margin"]]) {
+    const el = document.createElement("div"); el.className = "act-stat";
+    el.innerHTML = `<div class="n">${n}</div><div class="k">${k}</div>`;
+    strip.appendChild(el);
+  }
+
+  const tb = $("#probe-pairs-table tbody"); tb.replaceChildren();
+  let pairs = (m.pairs || []).slice();
+  const near = (p) => Math.min(p.dist_buy ?? 99, p.dist_sell ?? 99);
+  pairs.sort((a, b) => near(a) - near(b));
+  $("#probe-pairs-empty").style.display = pairs.length ? "none" : "block";
+  const px = (v) => v == null ? "—" : (+v).toFixed(2);
+  const dc = (v) => v == null ? "—" : Math.round(v * 100) + "c";
+  for (const p of pairs) {
+    const tr = document.createElement("tr");
+    const close = near(p) <= 0.01;
+    if (close) tr.className = "crossed";
+    const dot = (live) => live ? " ●" : "";
+    tr.innerHTML =
+      `<td>${p.teams || p.pm}</td><td class="dim">${p.league || ""}</td>` +
+      `<td class="num">${px(p.k_bid)}/${px(p.k_ask)}</td>` +
+      `<td class="num">${px(p.pm_bid)}/${px(p.pm_ask)}</td>` +
+      `<td class="num">${px(p.our_bid)}${dot(p.bid_live)}</td>` +
+      `<td class="num ${p.dist_buy != null && p.dist_buy <= 0.01 ? "edge-pos" : ""}">${dc(p.dist_buy)}</td>` +
+      `<td class="num">${px(p.our_ask)}${dot(p.ask_live)}</td>` +
+      `<td class="num ${p.dist_sell != null && p.dist_sell <= 0.01 ? "edge-pos" : ""}">${dc(p.dist_sell)}</td>` +
+      `<td class="dim">${p.guard || ""}</td>` +
+      `<td class="num ${p.pnl > 0 ? "edge-pos" : p.pnl < 0 ? "edge-neg" : "dim"}">${p.pnl ? fmt$(p.pnl) : "—"}</td>`;
+    tb.appendChild(tr);
+  }
+}
+
 function renderSports(d) {
+  window.__lastData = d;
   const s = d.sports || { games: [], n_live: 0, n_crossed: 0, stale_s: null };
   const badge = $("#tab-sports-n");
   if (s.n_crossed) { badge.textContent = s.n_crossed; badge.hidden = false;
@@ -1205,7 +1433,18 @@ function renderSports(d) {
   sportsChart($("#sports-chart"), s.history || []);
 
   const tb = $("#sports-table tbody"); tb.replaceChildren();
-  const games = s.games || [];
+  let games = (s.games || []).slice();
+  // column sort (click a header): key + direction from SPORTS_SORT
+  if (SPORTS_SORT.key) {
+    const k = SPORTS_SORT.key, dir = SPORTS_SORT.dir;
+    games.sort((a, b) => {
+      const av = a[k], bv = b[k];
+      if (av == null && bv == null) return 0;
+      if (av == null) return 1;             // missing values sink regardless of dir
+      if (bv == null) return -1;
+      return (typeof av === "string" ? av.localeCompare(bv) : av - bv) * dir;
+    });
+  }
   $("#sports-empty").style.display = games.length ? "none" : "block";
   const px = (v) => v == null ? "—" : (+v).toFixed(3).replace(/0$/, "");
   for (const g of games) {
@@ -1226,6 +1465,138 @@ function renderSports(d) {
     tb.appendChild(tr);
   }
   renderMtProbe(d.sports && d.sports.mt_probe);
+}
+
+function renderPositions(px) {
+  const empty = $("#pos-empty");
+  const rows = (px && px.rows) || [];
+  const badge = $("#tab-positions-n");
+  const naked = rows.filter(r => r.imb != null && Math.abs(r.imb) >= 1 && !r.settling && (r.watched_qty || 0) < Math.abs(r.imb));
+  const watched = rows.filter(r => (r.watched_qty || 0) > 0);
+  if (naked.length) { badge.hidden = false; badge.textContent = naked.length; badge.style.background = "var(--st-crit)"; }
+  else if (watched.length) { badge.hidden = false; badge.textContent = watched.length; badge.style.background = "var(--st-warn)"; }
+  else badge.hidden = true;
+  const pill = $("#pos-stale");
+  if (px && px.generated_at) { pill.hidden = false; pill.textContent = px.generated_at.slice(11, 16) + "Z"; }
+  $("#pos-empty").style.display = rows.length ? "none" : "block";
+  const strip = $("#pos-strip"); strip.replaceChildren();
+  const hedged = rows.filter(r => r.imb != null && Math.abs(r.imb) < 1).length;
+  for (const [n, k, cls] of [[rows.length, "positions", ""], [hedged, "hedged", "place"],
+                             [watched.length, "watched", "move"], [naked.length, "naked", "fail"]]) {
+    const el2 = document.createElement("div"); el2.className = "act-stat " + cls;
+    el2.innerHTML = `<div class="n">${n}</div><div class="k">${k}</div>`;
+    strip.appendChild(el2);
+  }
+  const tb = $("#pos-table tbody"); tb.replaceChildren();
+  const order = r => r.imb == null ? 2 : (Math.abs(r.imb) >= 1 ? 0 : 1);
+  for (const r of rows.slice().sort((a, b) => order(a) - order(b))) {
+    const tr = document.createElement("tr");
+    const status = document.createElement("span"); status.className = "role-badge";
+    if (r.imb == null) { status.textContent = "ORPHAN"; status.style.cssText = "background:var(--ink-mut);color:var(--surface)"; }
+    else if (Math.abs(r.imb) < 1) { status.textContent = "HEDGED"; status.className = "role-badge maker"; }
+    else if (r.settling) { status.textContent = "SETTLING"; status.style.cssText = "background:var(--series-2);color:var(--surface)"; status.title = "one venue has finalized, the other hasn't — the settlement sweeper realizes this basket"; }
+    else if ((r.watched_qty || 0) >= Math.abs(r.imb)) { status.textContent = `WATCHED ${r.watched_qty}`; status.style.cssText = "background:var(--st-warn);color:var(--surface)"; }
+    else { status.textContent = `NAKED ${r.imb > 0 ? "+" : ""}${Math.round(r.imb)}`; status.style.cssText = "background:var(--st-crit);color:var(--surface)"; }
+    const qf = q => q == null ? "—" : (q > 0 ? "+" : "") + (+q).toFixed(Math.abs(q % 1) > 0.001 ? 2 : 0);
+    const cf = v => v == null ? "?" : (100 * +v).toFixed(1) + "c";
+    const kCell = r.kq == null ? "—"
+      : `${qf(r.kq)} · ${cf(r.k_basis_ct)} → ${r.k_bid != null ? cf(r.k_bid) + "/" + cf(r.k_ask) : "?"}`;
+    const pCell = r.pq == null ? "—"
+      : `${qf(r.pq)} · ${cf(r.pm_basis_ct)} → ${r.pm_bid != null ? cf(r.pm_bid) + "/" + cf(r.pm_ask) : "?"}`;
+    let lockCell = "—", lockColor = null;
+    if (r.locked_ct != null) {
+      lockCell = `locked ${(100 * r.locked_ct).toFixed(1)}c/ct`;
+      lockColor = r.locked_ct > 0 ? "var(--delta-good)" : "var(--st-crit)";
+    } else if (r.hedge_away_c != null || r.flatten_away_c != null) {
+      const bits = [];
+      if (r.hedge_away_c != null) bits.push(`hedge ${r.hedge_away_c <= 0 ? "AVAILABLE" : r.hedge_away_c + "c away"}`);
+      if (r.flatten_away_c != null) bits.push(`flat ${r.flatten_away_c <= 0 ? "AVAILABLE" : r.flatten_away_c + "c away"}`);
+      lockCell = bits.join(" · ");
+      if ((r.hedge_away_c != null && r.hedge_away_c <= 0) || (r.flatten_away_c != null && r.flatten_away_c <= 0))
+        lockColor = "var(--delta-good)";
+    }
+    const cells = [r.name, r.type, kCell, pCell, qf(r.imb)];
+    cells.forEach((v, i) => { const td = document.createElement("td"); if (i >= 2 && i <= 4) td.className = "num";
+      td.style.fontVariantNumeric = "tabular-nums"; td.textContent = v; tr.appendChild(td); });
+    const tdl = document.createElement("td"); tdl.style.fontVariantNumeric = "tabular-nums";
+    tdl.textContent = lockCell; if (lockColor) tdl.style.color = lockColor; tr.appendChild(tdl);
+    const td = document.createElement("td"); td.appendChild(status); tr.appendChild(td);
+    tb.appendChild(tr);
+  }
+}
+
+function renderCapacity(c) {
+  const empty = $("#cap-empty");
+  if (!c || !c.bankroll_curve) { empty.style.display = "block"; return; }
+  empty.style.display = "none";
+  const pill = $("#cap-window");
+  pill.hidden = false;
+  pill.textContent = (c.window_days || []).join(" → ") + " · " + (c.generated_at || "").slice(0, 16) + "Z";
+  $("#cap-episodes").textContent = c.n_episodes ?? "—";
+  const consT = (c.daily || []).reduce((a, d) => a + (d.conservative || 0), 0);
+  const replT = (c.daily || []).reduce((a, d) => a + (d.flow_bounded || 0), 0);
+  $("#cap-cons").textContent = "$" + consT.toFixed(2);
+  $("#cap-repl").textContent = "$" + replT.toFixed(2);
+  // detailed 2c-floor table with ROC/APR
+  const fc2d = c.bankroll_curve.find(f => Math.abs(f.edge_floor_pc - 0.02) < 1e-9) || c.bankroll_curve[0];
+  const dtb2 = $("#cap-detail-table tbody"); dtb2.replaceChildren();
+  for (const r of (fc2d?.curve || [])) {
+    const tr = document.createElement("tr");
+    ["$" + r.bankroll.toLocaleString(), "$" + (r.per_rel_cap || 0).toLocaleString(),
+     "$" + r.profit.toFixed(2), "$" + r.capital_used.toFixed(0), r.takes,
+     r.roc_pct != null ? r.roc_pct.toFixed(2) + "%" : "—",
+     r.apr_pct != null ? r.apr_pct.toFixed(1) + "%" : "—",
+     r.wavg_years != null ? r.wavg_years + "yr" : "—"]
+      .forEach(v => { const td = document.createElement("td"); td.className = "num";
+        td.style.fontVariantNumeric = "tabular-nums"; td.textContent = v; tr.appendChild(td); });
+    dtb2.appendChild(tr);
+  }
+  const fc2 = c.bankroll_curve.find(f => Math.abs(f.edge_floor_pc - 0.02) < 1e-9) || c.bankroll_curve[0];
+  if (fc2) {
+    const sat = Math.max(...fc2.curve.map(r => r.profit));
+    const knee = fc2.curve.find(r => r.profit >= sat * 0.95);
+    $("#cap-knee").textContent = knee ? "$" + knee.bankroll.toLocaleString() : "—";
+    const at980 = fc2.curve.find(r => r.bankroll === 980);
+    $("#cap-980").textContent = at980 ? "$" + at980.profit.toFixed(2) : "—";
+  }
+  // curve table: rows = edge floors, cols = bankrolls
+  const head = $("#cap-curve-head");
+  while (head.children.length > 1) head.removeChild(head.lastChild);
+  const banks = (c.bankroll_curve[0]?.curve || []).map(r => r.bankroll);
+  for (const b of banks) { const th = document.createElement("th"); th.className = "num"; th.textContent = "$" + b.toLocaleString(); head.appendChild(th); }
+  const ctb = $("#cap-curve-table tbody"); ctb.replaceChildren();
+  for (const fc of c.bankroll_curve) {
+    const tr = document.createElement("tr");
+    const td0 = document.createElement("td"); td0.textContent = (fc.edge_floor_pc * 100).toFixed(1) + "c"; tr.appendChild(td0);
+    const sat = Math.max(...fc.curve.map(r => r.profit));
+    for (const r of fc.curve) {
+      const td = document.createElement("td"); td.className = "num";
+      td.style.fontVariantNumeric = "tabular-nums";
+      td.textContent = "$" + r.profit.toFixed(0);
+      td.title = `capital used $${r.capital_used} · ${r.takes} takes · ROC ${r.roc_pct}% · APR ${r.apr_pct ?? "—"}% · rel cap $${r.per_rel_cap}`;
+      if (r.profit >= sat * 0.999 && sat > 0) td.style.color = "var(--delta-good)";
+      tr.appendChild(td);
+    }
+    ctb.appendChild(tr);
+  }
+  const rtb = $("#cap-rel-table tbody"); rtb.replaceChildren();
+  for (const r of (c.per_relationship || []).slice(0, 20)) {
+    const tr = document.createElement("tr");
+    const cells = [r.rel, r.episodes, "$" + r.conservative.toFixed(2), "$" + r.flow_bounded.toFixed(2),
+                   (r.best_edge_pc * 100).toFixed(1) + "c", r.max_depth_contracts.toLocaleString(),
+                   "$" + r.max_single_take_usd.toFixed(0), (r.traded_contracts || 0).toLocaleString()];
+    cells.forEach((v, i) => { const td = document.createElement("td"); if (i) td.className = "num";
+      td.style.fontVariantNumeric = "tabular-nums"; td.textContent = v; tr.appendChild(td); });
+    rtb.appendChild(tr);
+  }
+  const dtb = $("#cap-day-table tbody"); dtb.replaceChildren();
+  for (const d of (c.daily || [])) {
+    const tr = document.createElement("tr");
+    [d.day, d.episodes, "$" + d.conservative.toFixed(2), "$" + d.flow_bounded.toFixed(2)]
+      .forEach((v, i) => { const td = document.createElement("td"); if (i) td.className = "num";
+        td.style.fontVariantNumeric = "tabular-nums"; td.textContent = v; tr.appendChild(td); });
+    dtb.appendChild(tr);
+  }
 }
 
 function renderMtProbe(mp) {
@@ -1274,84 +1645,112 @@ function renderMtProbe(mp) {
 
 function sportsChart(host, data) {
   host.replaceChildren();
-  const W = 1080, H = 200, m = { t: 12, r: 46, b: 26, l: 44 };
+  const W = 1080, H = 220, m = { t: 12, r: 52, b: 26, l: 44 };
   const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
-    "aria-label": "best cross-venue sports edge over time" });
+    "aria-label": "top cross-venue sports edges over time (take-take left axis, make-take ceiling right axis)" });
   host.appendChild(svg);
   if (data.length < 2) {
     emptyNote(host, svg, "Collecting samples — the series fills in every ~15s while games are live.");
     return;
   }
-  const ys = data.map(d => +d.best), ts = data.map(d => d.t);
-  const mts = data.map(d => d.best_mt == null ? null : +d.best_mt);  // make-take ceiling
+  const ts = data.map(d => d.t);
+  const N = 5;
+  // rank series: tops[k] per sample (older rows lack tops -> best only at rank 0)
+  const ranks = [];
+  for (let k = 0; k < N; k++)
+    ranks.push(data.map(d => (d.tops && d.tops[k]) ? +d.tops[k].e : (k === 0 ? +d.best : null)));
+  const mts = data.map(d => d.best_mt == null ? null : +d.best_mt);
   const mtDef = mts.filter(v => v != null);
-  // keep the 0c threshold always in frame; pad both ends
-  let lo = Math.min(...ys, ...mtDef, 0), hi = Math.max(...ys, ...mtDef, 0);
-  const span = (hi - lo) || 1;
-  lo -= span * 0.12; hi += span * 0.12;
-  const px = i => m.l + i * (W - m.l - m.r) / (ys.length - 1);
+  // LEFT axis: take-take only (make-take no longer smooshes the scale)
+  const ttVals = ranks.flat().filter(v => v != null);
+  let lo = Math.min(...ttVals, 0), hi = Math.max(...ttVals, 0);
+  const span = (hi - lo) || 1; lo -= span * 0.12; hi += span * 0.12;
+  // RIGHT axis: make-take ceiling, own scale
+  let mlo = Math.min(...(mtDef.length ? mtDef : [0]), 0), mhi = Math.max(...(mtDef.length ? mtDef : [1]), 1);
+  const mspan = (mhi - mlo) || 1; mlo -= mspan * 0.08; mhi += mspan * 0.08;
+  const px = i => m.l + i * (W - m.l - m.r) / (ts.length - 1);
   const py = v => H - m.b - (v - lo) / (hi - lo) * (H - m.t - m.b);
-  // gridlines + edge (¢) axis
+  const pyR = v => H - m.b - (v - mlo) / (mhi - mlo) * (H - m.t - m.b);
+  // gridlines + LEFT edge (¢) axis
   for (let g = 0; g <= 4; g++) {
     const val = lo + (hi - lo) * g / 4, y = py(val);
     el("line", { x1: m.l, x2: W - m.r, y1: y, y2: y, stroke: css("--grid"), "stroke-width": 1 }, svg);
     el("text", { x: m.l - 6, y: y + 3.5, "text-anchor": "end", class: "tick" }, svg)
       .textContent = val.toFixed(1) + "c";
   }
-  // crossing threshold (0c) — dashed, prominent
+  // RIGHT make-take axis ticks (no gridlines — right scale labels only)
+  for (let g = 0; g <= 4; g++) {
+    const val = mlo + (mhi - mlo) * g / 4;
+    el("text", { x: W - m.r + 6, y: pyR(val) + 3.5, "text-anchor": "start", class: "tick",
+      fill: css("--series-2") }, svg).textContent = val.toFixed(0) + "c";
+  }
+  // crossing threshold (0c, LEFT axis) — dashed, prominent
   const yz = py(0);
   el("line", { x1: m.l, x2: W - m.r, y1: yz, y2: yz, stroke: css("--st-warn"),
     "stroke-width": 1.5, "stroke-dasharray": "5 4" }, svg);
-  el("text", { x: W - m.r + 4, y: yz + 3.5, "text-anchor": "start", class: "tick",
+  el("text", { x: m.l + 4, y: yz - 4, "text-anchor": "start", class: "tick",
     fill: css("--st-warn") }, svg).textContent = "cross";
   // x time labels (local HH:MM)
-  const step = Math.max(1, Math.ceil(ys.length / 9));
+  const step = Math.max(1, Math.ceil(ts.length / 9));
   ts.forEach((t, i) => { if (i % step === 0)
     el("text", { x: px(i), y: H - m.b + 15, "text-anchor": "middle", class: "tick" }, svg)
       .textContent = new Date(t * 1000).toLocaleTimeString("en-US",
         { hour: "2-digit", minute: "2-digit", hour12: false }); });
   el("line", { x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b, stroke: css("--baseline") }, svg);
-  // make-take ceiling (dashed, secondary) — theoretical, adverse-selection-blind.
-  // drawn first so the capturable take-take line sits on top.
+  // make-take ceiling (dashed, RIGHT axis) — theoretical, adverse-selection-blind
   let mtPath = "", pen = false;
   mts.forEach((v, i) => { if (v == null) { pen = false; return; }
-    mtPath += `${pen ? "L" : "M"}${px(i)},${py(v)}`; pen = true; });
+    mtPath += `${pen ? "L" : "M"}${px(i)},${pyR(v)}`; pen = true; });
   if (mtPath) el("path", { d: mtPath, fill: "none", stroke: css("--series-2"),
-    "stroke-width": 1.5, "stroke-dasharray": "4 3", "stroke-linejoin": "round" }, svg);
-  // the take-take edge line (solid — what we can actually capture safely)
-  const path = ys.map((v, i) => `${i ? "L" : "M"}${px(i)},${py(v)}`).join("");
+    "stroke-width": 1.5, "stroke-dasharray": "4 3", "stroke-linejoin": "round", opacity: 0.85 }, svg);
+  // rank lines 5..2 (faint), then best (bold) on top
+  for (let k = N - 1; k >= 1; k--) {
+    let d = "", on = false;
+    ranks[k].forEach((v, i) => { if (v == null) { on = false; return; }
+      d += `${on ? "L" : "M"}${px(i)},${py(v)}`; on = true; });
+    if (d) el("path", { d, fill: "none", stroke: css("--series-1"),
+      "stroke-width": 1, opacity: 0.16 + 0.09 * (N - 1 - k), "stroke-linejoin": "round" }, svg);
+  }
+  const ys = ranks[0];
+  const path = ys.map((v, i) => v == null ? "" : `${i && ys[i-1] != null ? "L" : "M"}${px(i)},${py(v)}`).join("");
   el("path", { d: path, fill: "none", stroke: css("--series-1"), "stroke-width": 2,
     "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
-  // green dots on any sample at/above the crossing threshold
-  ys.forEach((v, i) => { if (v >= 0)
+  // green dots on any best sample at/above the crossing threshold
+  ys.forEach((v, i) => { if (v != null && v >= 0)
     el("circle", { cx: px(i), cy: py(v), r: 3.5, fill: css("--delta-good"),
       stroke: css("--surface"), "stroke-width": 1.5 }, svg); });
-  // end marker + latest-value label
+  // end marker + latest-value labels
   const li = ys.length - 1;
-  el("circle", { cx: px(li), cy: py(ys[li]), r: 4.5,
-    fill: ys[li] >= 0 ? css("--delta-good") : css("--series-1"),
-    stroke: css("--surface"), "stroke-width": 2 }, svg);
-  el("text", { x: px(li) - 8, y: py(ys[li]) - 9, "text-anchor": "end", class: "dl",
-    "font-weight": 600 }, svg).textContent = (ys[li] > 0 ? "+" : "") + ys[li].toFixed(1) + "c";
-  if (mts[li] != null)
-    el("text", { x: px(li) - 8, y: py(mts[li]) + 14, "text-anchor": "end", class: "dl",
-      fill: css("--series-2"), "font-weight": 600 }, svg)
-      .textContent = (mts[li] > 0 ? "+" : "") + mts[li].toFixed(1) + "c";
-  // crosshair + tooltip
+  if (ys[li] != null) {
+    el("circle", { cx: px(li), cy: py(ys[li]), r: 4.5,
+      fill: ys[li] >= 0 ? css("--delta-good") : css("--series-1"),
+      stroke: css("--surface"), "stroke-width": 2 }, svg);
+    el("text", { x: px(li) - 8, y: py(ys[li]) - 9, "text-anchor": "end", class: "dl",
+      "font-weight": 600 }, svg).textContent = (ys[li] > 0 ? "+" : "") + ys[li].toFixed(1) + "c";
+  }
+  // crosshair + tooltip: top-N games at the hovered sample
   const hair = el("line", { y1: m.t, y2: H - m.b, stroke: css("--baseline"),
     "stroke-width": 1, visibility: "hidden" }, svg);
   const hot = el("rect", { x: m.l, y: 0, width: W - m.l - m.r, height: H, fill: "transparent" }, svg);
   hot.addEventListener("pointermove", ev => {
     const r = svg.getBoundingClientRect();
     const fx = (ev.clientX - r.left) / r.width * W;
-    let i = Math.round((fx - m.l) / ((W - m.l - m.r) / Math.max(ys.length - 1, 1)));
-    i = Math.max(0, Math.min(ys.length - 1, i));
+    let i = Math.round((fx - m.l) / ((W - m.l - m.r) / Math.max(ts.length - 1, 1)));
+    i = Math.max(0, Math.min(ts.length - 1, i));
     hair.setAttribute("x1", px(i)); hair.setAttribute("x2", px(i));
     hair.setAttribute("visibility", "visible");
-    showTip(ev.clientX, ev.clientY, [
-      { v: (ys[i] > 0 ? "+" : "") + ys[i].toFixed(1) + "c", k: "take-take (capturable)", key: true },
-      ...(mts[i] != null ? [{ v: (mts[i] > 0 ? "+" : "") + mts[i].toFixed(1) + "c", k: "make-take (ceiling)" }] : []),
-      { v: "", k: `${data[i].game} · ${new Date(ts[i] * 1000).toLocaleTimeString("en-US", { hour12: false })}` }]);
+    const rows = [];
+    if (data[i].tops && data[i].tops.length) {
+      data[i].tops.forEach((tp, k) => rows.push(
+        { v: (tp.e > 0 ? "+" : "") + (+tp.e).toFixed(1) + "c", k: `#${k + 1} ${tp.g}`, key: k === 0 }));
+    } else if (ys[i] != null) {
+      rows.push({ v: (ys[i] > 0 ? "+" : "") + ys[i].toFixed(1) + "c",
+                  k: `take-take · ${data[i].game || ""}`, key: true });
+    }
+    if (mts[i] != null)
+      rows.push({ v: (mts[i] > 0 ? "+" : "") + mts[i].toFixed(1) + "c", k: "make-take ceiling (right axis)" });
+    rows.push({ v: "", k: new Date(ts[i] * 1000).toLocaleTimeString("en-US", { hour12: false }) });
+    showTip(ev.clientX, ev.clientY, rows);
   });
   hot.addEventListener("pointerleave", () => { hair.setAttribute("visibility", "hidden"); hideTip(); });
 }
@@ -1385,6 +1784,9 @@ for (const tab of document.querySelectorAll(".tab")) {
     $("#view-overview").hidden = tab.id !== "tab-overview";
     $("#view-activity").hidden = tab.id !== "tab-activity";
     $("#view-sports").hidden = tab.id !== "tab-sports";
+    $("#view-maker").hidden = tab.id !== "tab-maker";
+    $("#view-capacity").hidden = tab.id !== "tab-capacity";
+    $("#view-positions").hidden = tab.id !== "tab-positions";
   });
 }
 load();
