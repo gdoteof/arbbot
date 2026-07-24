@@ -672,9 +672,19 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                 if st:
                     _exit_drop(rid, st, cancel=True)
                 continue
-            if st and st["price"] == target and st["qty"] == qty:
-                continue  # already resting there
             if st:
+                if st["price"] == target and st["qty"] == qty:
+                    continue  # already resting there
+                if target > st["price"] and st["price"] >= min_px \
+                        and time.monotonic() - st.get("placed_mono", 0.0) < 600:
+                    # upward (more passive) repricing is SLOW: an adversary
+                    # bot posts one tick inside us whenever we rest high and
+                    # pulls when we drop — chasing its vanish/reappear cycle
+                    # churned 12c<->10c every 15s (2026-07-24). Hold a
+                    # profitable, best-or-tied price; recapture passivity at
+                    # most every 10 min. Downward (stay best) and min_px
+                    # (stay profitable) moves are immediate.
+                    continue
                 _exit_drop(rid, st, cancel=True)
             try:
                 r = kgw.place_yes(w["kt"], "ask", target, qty, post_only=True)
@@ -684,7 +694,8 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                 continue
             if not oid:
                 continue
-            exit_q[rid] = {**w, "order_id": oid, "price": target, "qty": qty, "filled": 0}
+            exit_q[rid] = {**w, "order_id": oid, "price": target, "qty": qty,
+                           "filled": 0, "placed_mono": time.monotonic()}
             quoters[rid].suppress.add((w["kt"], "ask"))
             quoters[rid].intents.append(
                 {"ts": time.time(), "place": w["kt"], "venue": "kalshi",
