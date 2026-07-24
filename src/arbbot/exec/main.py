@@ -548,6 +548,10 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
     # quote is resting (two order-owners on one side both react to fills).
     EXIT_LOCK = Decimal("0.005")    # min locked profit/ct vs basis
     EXIT_SLIP = Decimal("0.01")     # assume PM close 1 tick through the ask
+# dust ahead of us is NOT competition (Geoff 2026-07-24: a small bot at 11c
+    # kept pushing our 10-lot exit to 10c, and the 13c "touch" itself was 1.11
+    # shares — price against the first level whose cumulative non-us depth is
+    # at least HALF our size; smaller stuff just fills first, fine)
     exit_q: dict[str, dict] = {}    # rid -> resting exit order state
     exit_ghost: dict[str, tuple] = {}  # rid -> (price, qty) of last cancelled exit
     exit_last = {"ts": 0.0}
@@ -659,8 +663,11 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
             if gp:
                 ours[gp[0]] = ours.get(gp[0], Decimal(0)) + Decimal(gp[1])
             comp = None
+            cum = Decimal(0)
+            comp_min = max(Decimal(2), Decimal(qty) / 2)
             for lpx, lsz in kasks:
-                if lsz - ours.get(lpx, Decimal(0)) > 0:
+                cum += max(lsz - ours.get(lpx, Decimal(0)), Decimal(0))
+                if cum >= comp_min:
                     comp = lpx
                     break
             exit_ghost.pop(rid, None)  # one-cycle memory, consumed
@@ -676,7 +683,7 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                 if st["price"] == target and st["qty"] == qty:
                     continue  # already resting there
                 if target > st["price"] and st["price"] >= min_px \
-                        and time.monotonic() - st.get("placed_mono", 0.0) < 600:
+                        and time.monotonic() - st.get("placed_mono", 0.0) < 180:
                     # upward (more passive) repricing is SLOW: an adversary
                     # bot posts one tick inside us whenever we rest high and
                     # pulls when we drop — chasing its vanish/reappear cycle
