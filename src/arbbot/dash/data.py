@@ -402,9 +402,16 @@ class DashboardData:
         """Recon snapshot rows + the maker-exit delta from marks (by rel)."""
         doc = self._read_json(self.raw_dir.parent / "exec" / "positions.json") or {}
         marks = self._read_json(self.raw_dir.parent / "exec" / "marks.json") or {}
-        by_rel = {m["relationship_id"]: m for m in marks.get("positions", [])}
+        by_kt: dict = {}   # a pair can hold several baskets — keep the BEST exit
+        for m in marks.get("positions", []):
+            kt = m.get("kalshi_ticker")
+            if kt is None or m.get("maker_exit_ct") is None:
+                continue
+            cur = by_kt.get(kt)
+            if cur is None or m["maker_exit_ct"] > cur["maker_exit_ct"]:
+                by_kt[kt] = m
         for row in doc.get("rows", []):
-            m = by_rel.get(row.get("rel"))
+            m = by_kt.get(row.get("kt"))
             if m is not None:
                 row["mx_ct"] = m.get("maker_exit_ct")
                 row["mx_elig"] = m.get("maker_exit_eligible")

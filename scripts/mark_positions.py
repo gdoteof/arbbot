@@ -110,6 +110,7 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
             except ValueError:
                 pass
     row = {"relationship_id": t["relationship_id"], "ts": t.get("ts"), "title": t.get("title"),
+           "kalshi_ticker": kleg.get("market_id"),
            "qty": int(qty), "cost_usd": float(cost), "locked_profit_usd": float(locked),
            "resolves_by": resolves, "resolves_estimated": estimated}
     # basket direction: standard = long Kalshi YES + long PM NO; Kalshi-maker
