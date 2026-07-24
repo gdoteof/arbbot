@@ -549,6 +549,7 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
     EXIT_LOCK = Decimal("0.005")    # min locked profit/ct vs basis
     EXIT_SLIP = Decimal("0.01")     # assume PM close 1 tick through the ask
     exit_q: dict[str, dict] = {}    # rid -> resting exit order state
+    exit_ghost: dict[str, tuple] = {}  # rid -> (price, qty) of last cancelled exit
     exit_last = {"ts": 0.0}
 
     def _exit_drop(rid: str, st: dict, cancel: bool) -> None:
@@ -556,12 +557,33 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
         if cancel and kgw is not None:
             with contextlib.suppress(Exception):
                 kgw.cancel(st["order_id"])
+            # remember the footprint for one refresh: the book's WS view lags
+            # the cancel, and our own ghost must not read as competition
+            exit_ghost[rid] = (st["price"], st["qty"])
             quoters[rid].intents.append(
                 {"ts": time.time(), "cancel": st["kt"], "venue": "kalshi",
                  "side": "ask", "price": str(st["price"]),
                  "order_id": st["order_id"], "tag": "exit"})
         quoters[rid].suppress.discard((st["kt"], "ask"))
         exit_q.pop(rid, None)
+
+    def _exit_kbook(kt: str):
+        """REST orderbook for exit pricing. The in-memory book can carry
+        phantom levels on quiet markets (suppressed gap deltas): a ghost of
+        our own cancelled 10c ask survived restarts and priced the Hollande
+        exit at 9c against a real 13c touch (2026-07-24). Passive exits are
+        slow — venue truth beats microlatency here."""
+        import httpx as _hx
+        kgw2 = gateways.get(Venue.KALSHI)
+        hdr = sign_headers(kgw2.kid, kgw2.key, "GET",
+                           f"/trade-api/v2/markets/{kt}/orderbook")
+        ob = (_hx.get(f"{REST_BASE}/markets/{kt}/orderbook", headers=hdr,
+                      timeout=10).json().get("orderbook_fp")) or {}
+        yes = [(Decimal(p), Decimal(s)) for p, s in ob.get("yes_dollars") or []]
+        no = [(Decimal(p), Decimal(s)) for p, s in ob.get("no_dollars") or []]
+        kb = max((p for p, s in yes if s > 0), default=None)
+        asks = sorted((Decimal(1) - p, s) for p, s in no if s > 0)
+        return kb, asks
 
     def _exit_refresh() -> None:
         if not live or time.monotonic() - exit_last["ts"] < 15:
@@ -584,7 +606,11 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                    for m in mdoc.get("positions", [])
                    if m.get("maker_exit_eligible")}
         want: dict[str, dict] = {}
-        for b in open_baskets(recs):
+        # OLDEST eligible basket per rel, deterministically — an unstable pick
+        # cancel/replaces every cycle, and each replace leaves a ghost of our
+        # own order in the book view that we then undercut (2026-07-24: the
+        # Hollande exit walked 12c -> 9c against a 13c competing ask)
+        for b in sorted(open_baskets(recs), key=lambda b: b.get("ts") or 0):
             rid = b.get("relationship_id")
             if (rid, b.get("ts")) not in flagged or rid not in quoters or rid in want:
                 continue
@@ -604,26 +630,43 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                 _exit_drop(rid, st, cancel=True)
         for rid, w in want.items():
             st = exit_q.get(rid)
-            kbook = books.get("kalshi", w["kt"])
             pbook = books.get("polymarket_us", w["ps"])
-            if kbook is None or pbook is None:
+            if pbook is None:
                 continue
-            kb, pa = kbook.best_bid(), pbook.best_ask()
-            if kb is None or pa is None or int(pa.size) < 1:
+            pa = pbook.best_ask()
+            try:
+                kb_px, kasks = _exit_kbook(w["kt"])
+            except Exception:
+                continue  # venue read failed — next cycle retries
+            if kb_px is None or pa is None or int(pa.size) < 1:
                 continue
-            qty = min(w["qty"], int(pa.size))  # only what the PM close absorbs
+            # size to the basket; PM top-level depth only caps at PLACEMENT
+            # (keying qty to live pa.size churned a cancel/replace every cycle
+            # as PM's displayed size flapped — 2026-07-24). A thinner book at
+            # fill time is handled by the partial-close alert + hedge timer.
+            qty = st["qty"] if st else max(1, min(w["qty"], int(pa.size)))
             # profitable floor: fill px + (1 - pm close px) - basis >= EXIT_LOCK
             min_px = w["cost_ct"] - (Decimal(1) - pa.price) + EXIT_LOCK + EXIT_SLIP
-            # competing ask, our own resting exit subtracted out (self-exclusion)
+            # competing ask with OUR footprint subtracted out: the current
+            # resting exit AND the ghost of the last replaced/cancelled one —
+            # WS book updates lag our cancels, and treating our own ghost as
+            # competition walked the price down one tick per cycle to the
+            # profit floor (2026-07-24 Hollande, 12c -> 9c vs a 13c ask)
+            ours = {}
+            if st:
+                ours[st["price"]] = ours.get(st["price"], Decimal(0)) + Decimal(st["qty"])
+            gp = exit_ghost.get(rid)
+            if gp:
+                ours[gp[0]] = ours.get(gp[0], Decimal(0)) + Decimal(gp[1])
             comp = None
-            for lvl in kbook.asks:
-                size = lvl.size - (Decimal(st["qty"]) if st and lvl.price == st["price"] else 0)
-                if size > 0:
-                    comp = lvl.price
+            for lpx, lsz in kasks:
+                if lsz - ours.get(lpx, Decimal(0)) > 0:
+                    comp = lpx
                     break
+            exit_ghost.pop(rid, None)  # one-cycle memory, consumed
             tick = Decimal("0.01")
             target = max(min_px, (comp - tick) if comp is not None else min_px)
-            target = max(target, kb.price + tick)  # post-only: never cross the bid
+            target = max(target, kb_px + tick)  # post-only: never cross the bid
             target = target.quantize(tick, rounding=ROUND_UP)
             if target > Decimal("0.99"):
                 if st:
@@ -648,6 +691,7 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                  "side": "ask", "price": str(target), "count": qty,
                  "order_id": oid, "tag": "exit"})
             print(f"[EXIT] {rid} resting ask x{qty} @ {target} (basis {w['cost_ct']:.3f}, "
+                  f"min_px {min_px:.4f}, comp {comp}, kb {kb_px}, pa {pa.price}, "
                   f"locks >= {EXIT_LOCK}/ct after PM close)", flush=True)
 
     def _exit_fill(rid: str, st: dict, cum: int) -> None:
