@@ -1,0 +1,20 @@
+# Explicit tradable allowlist (card c9ac7d1d): the runner refuses to quote a
+# relationship unless registry vetted_by == human OR its id is listed here.
+# This file exists for rels Geoff approved through board cards/conversation
+# before the registry's vetted_by field tracked it — listing here records the
+# provenance WITHOUT stamping a false "human" vetting on the registry entry.
+# New approvals should flip the registry field instead of growing this list.
+allow:
+  # France/TIME/Brazil/fedcut: built up live with Geoff 2026-07-21..22
+  # (make-take + take-take approvals on the board; Melenchon explicitly vetted)
+  - xvus-france-pres-27-jeanlucmelenchon
+  - xvus-france-pres-27-francoishollande
+  - xvus-france-pres-27-brunoretailleau
+  - xvus-time-poty-26-zohranmamdani
+  - xvus-time-poty-26-christinakoch
+  - xvus-time-poty-26-jeremyhansen
+  - xvus-time-poty-26-popeleoxiv
+  - xvus-time-poty-26-artificialintelligence
+  - xvus-time-poty-26-samaltman
+  - xvus-brazil-pres-26-flaviobolsonaro
+  - xvus-fedcut-26-usfed-2026-cut

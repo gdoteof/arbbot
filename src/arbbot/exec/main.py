@@ -128,6 +128,22 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
     cfg = load_recorder_config(config_path)
     reg = Registry.load(cfg.registry_path)
     rels = [next(r for r in reg.relationships if r.id == rid) for rid in rel_ids]
+    # HARD tradable gate (card c9ac7d1d): quote only what a human vetted
+    # (registry vetted_by) or what config/tradable.yaml explicitly allowlists
+    # with provenance (pre-field approvals). Convention is not a gate.
+    try:
+        import yaml as _y
+        _allow = set((_y.safe_load(Path("config/tradable.yaml").read_text())
+                      or {}).get("allow") or [])
+    except (OSError, ValueError):
+        _allow = set()
+    _dropped = [r for r in rels
+                if r.vetted_by.value != "human" and r.id not in _allow]
+    for _r in _dropped:
+        print(f"[GATE] {_r.id} NOT tradable (vetted_by={_r.vetted_by.value}, "
+              f"not allowlisted) — excluded from quoting", flush=True)
+    rels = [r for r in rels if r not in _dropped]
+    assert rels, "no tradable relationships survive the vetting gate"
     all_legs = [l for r in rels for l in r.legs]
     venues = {l.venue for l in all_legs}
 
