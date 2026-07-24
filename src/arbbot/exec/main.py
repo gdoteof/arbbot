@@ -575,10 +575,14 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
             recs = parse_lines(Path("data/exec/trades.jsonl").read_text().splitlines())
         except (OSError, ValueError):
             return
+        # candidates come from marks' maker_exit_eligible (Geoff 2026-07-24:
+        # the maker exit's OWN economics — locks >=0.5c/ct AND holding no
+        # longer better — not the taker mark, which held positions whose
+        # passive exit already locked profit). Live pricing below still
+        # enforces profit vs the current book at placement time.
         flagged = {(m["relationship_id"], m.get("ts")): m
                    for m in mdoc.get("positions", [])
-                   if (m.get("unwind_signal") or m.get("unwind_hard"))
-                   and (m.get("mark_pnl_usd") or 0) > 0}
+                   if m.get("maker_exit_eligible")}
         want: dict[str, dict] = {}
         for b in open_baskets(recs):
             rid = b.get("relationship_id")

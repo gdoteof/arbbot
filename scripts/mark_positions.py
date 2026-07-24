@@ -192,7 +192,16 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
             mx = (k_ask - Decimal("0.01")) + (Decimal(1) - (p_ask + Decimal("0.01"))) \
                  - cost / qty
             row["maker_exit_ct"] = round(float(mx), 4)
-            row["maker_exit_eligible"] = bool((unwind or unwind_hard) and mark > 0)
+            # eligibility keys on the MAKER exit's own economics (Geoff
+            # 2026-07-24: the taker mark held positions whose passive exit
+            # already locked profit): exit locks >= 0.5c/ct vs basis AND
+            # holding is no longer the better trade (unwind-flagged, or fwd
+            # APR under the 12% hurdle). Strong holds never churn; sports
+            # stay dark (the WS engine owns those books).
+            row["maker_exit_eligible"] = bool(
+                mx >= Decimal("0.005") and not is_sports
+                and (unwind or unwind_hard
+                     or (fwd_apr is not None and fwd_apr < HURDLE_APR)))
         else:
             row["maker_exit_ct"] = None
             row["maker_exit_eligible"] = False

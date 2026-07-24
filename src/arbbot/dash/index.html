@@ -608,7 +608,7 @@
           <th class="num" data-tip="Per-contract profit of the passive exit right now (Kalshi ask − 1 tick + PM close). Positive = exit locks money today.">exit Δ /ct</th>
           <th class="num" data-tip="Mark-to-market of the whole basket (liquidation vs cost).">mark $</th>
           <th class="num" data-tip="Forward hold APR — what the remaining capital earns by holding to resolution.">fwd APR</th>
-          <th data-tip="FLAGGED = the unwind policy wants out (soft/hard). ELIGIBLE = flagged AND mark-positive: the runner is resting (or about to rest) a live exit ask on it.">state</th>
+          <th data-tip="FLAGGED = the unwind policy wants out (soft/hard). ELIGIBLE = the passive exit locks ≥0.5c/ct vs basis AND holding is no longer the better trade (flagged, or fwd APR < 12% hurdle): the runner rests a live exit ask on it.">state</th>
         </tr></thead><tbody></tbody></table></div>
       <div id="exits-empty" style="display:none;color:var(--ink-mut);font-size:12px;padding:20px 4px">Collecting samples — the marks timer appends a point every ~2 minutes.</div>
     </section>
