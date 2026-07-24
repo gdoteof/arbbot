@@ -22,6 +22,13 @@ RELS=(
   xvus-nobel-peace-26-unrwa
   xvus-nobel-peace-26-donaldtrump
   xvus-nobel-peace-26-francescaalbanese
+  xvus-btcmax-26-31-2026-100k
+  xvus-btcmax-26-31-2026-110k
+  xvus-btcmax-26-31-2026-120k
+  xvus-btcmax-26-31-2026-130k
+  xvus-btcmax-26-31-2026-140k
+  xvus-btcmax-26-31-2026-150k
+  xvus-btcmax-26-31-2026-200k
 )
 setsid nohup .venv313/bin/python -m "arbbot.exec.main" \
   --relationship "${RELS[@]}" --clip 25 --live >> data/runner.log 2>&1 &
