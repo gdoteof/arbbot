@@ -181,6 +181,20 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
         # crossings at sub-second resolution — a 2-min marks snapshot of a
         # fast book is noise, not an actionable re-entry.
         row["reverse_signal"] = bool(rev is not None and rev >= Decimal("0.03")) and not is_sports
+        # maker-exit delta (Geoff 2026-07-24, Exits view): per-contract profit
+        # of the OPPORTUNISTIC exit right now — rest a Kalshi ask one tick
+        # inside the competing ask, close the PM NO one tick through its ask
+        # on fill (matches the runner's maker-unwind pricing). Positive =
+        # a passive exit locks money today; eligible = the runner would
+        # actually rest it (unwind-flagged AND mark-positive).
+        if not inverted and k_ask is not None and p_ask is not None and qty:
+            mx = (k_ask - Decimal("0.01")) + (Decimal(1) - (p_ask + Decimal("0.01"))) \
+                 - cost / qty
+            row["maker_exit_ct"] = round(float(mx), 4)
+            row["maker_exit_eligible"] = bool((unwind or unwind_hard) and mark > 0)
+        else:
+            row["maker_exit_ct"] = None
+            row["maker_exit_eligible"] = False
     else:
         row.update(liq_value_usd=None, mark_pnl_usd=None, converged_pct=None,
                    forward_hold_apr=None, natural_hold_apr=None, unwind_apr=None,
@@ -222,6 +236,16 @@ def main():
                       "reverse_signals": sum(1 for p in positions if p.get("reverse_signal"))}}
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(doc, indent=0))
+    # exit-delta time series for the dash Exits view (marks.json is an
+    # overwritten snapshot; this appends one compact line per run)
+    hist = {"t": time.time(), "rows": [
+        {"rel": p["relationship_id"], "ts0": p["ts"], "qty": p["qty"],
+         "mx": p["maker_exit_ct"], "mark": p.get("mark_pnl_usd"),
+         "elig": p.get("maker_exit_eligible", False)}
+        for p in positions if p.get("maker_exit_ct") is not None]}
+    if hist["rows"]:
+        with open("data/exec/marks_history.jsonl", "a") as f:
+            f.write(json.dumps(hist) + "\n")
     print(json.dumps(doc["totals"]))
 
 
