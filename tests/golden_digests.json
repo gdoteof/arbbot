@@ -1,0 +1,24 @@
+{
+  "_comment": "Pinned golden decision-stream digests (portable fixed-scale serialization, cf00327). Regenerate only on a deliberate serialization change: scripts/golden_scan.py --day <day> with cwd=repo root. A Rust scanner port must reproduce these byte-for-byte over the same tapes (P2 gate). Full streams: data/golden/golden-v2-<day>.jsonl.",
+  "serialization": "fixed-scale-6dp-v2",
+  "days": {
+    "2026-07-20": {
+      "events": 5474100,
+      "book_events": 5454794,
+      "opportunities": 380728,
+      "sha256": "36c5a2c7191cf10439e46ccca50c0d7932353dbf2834f20173a0d6dc4b201654"
+    },
+    "2026-07-21": {
+      "events": 12577189,
+      "book_events": 12256075,
+      "opportunities": 864725,
+      "sha256": "7f1a76ea32e9abd2f2acaf1c60056b51106388ee162d0ba9d105b88c760f00b5"
+    },
+    "2026-07-22": {
+      "events": 16359775,
+      "book_events": 14516845,
+      "opportunities": 819652,
+      "sha256": "fac36343d5943fe7646cb41117bdd016200e875b6f52003bc6568cbbf2d60622"
+    }
+  }
+}

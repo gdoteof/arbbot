@@ -15,6 +15,7 @@ sys.path.insert(0, "src")
 import httpx
 
 from arbbot.ops.config import load_credential
+from arbbot.exec.ledgerdb import dual_append
 from arbbot.exec.polymarket_us_gateway import PolymarketUsOrderGateway
 
 SLUG = "aec-itfme-vindul-rapper-2026-07-23"
@@ -26,8 +27,7 @@ def main() -> None:
     gw = PolymarketUsOrderGateway(
         load_credential("polymarket_usa_key_id").decode().strip(),
         load_credential("polymarket_usa_private_key").decode().strip(), live=True)
-    pth = "/v1/portfolio/positions"
-    p = gw.client.get(gw.base + pth, headers=gw._headers("GET", pth)) \
+    p = gw.session.get("/v1/portfolio/positions") \
           .json().get("positions", {}).get(SLUG)
     net = int(float(p.get("netPosition", 0))) if p else 0
     print("current net:", net)
@@ -64,23 +64,24 @@ def main() -> None:
         entry = 0.768
         pnl = round((entry - px) * cum - 0.06 * px * (1 - px) * cum, 4)
         now = time.time()
-        with LEDGER.open("a") as f:
-            f.write(json.dumps({
-                "ts": now, "relationship_id": f"pmm-{SLUG}",
-                "title": "maker probe orphaned short (retro, card 6b54d1ce)",
-                "qty": cum, "strategy": "pmus-maker-probe",
-                "legs": [{"venue": "polymarket_us", "market_id": SLUG,
-                          "side": "no", "role": "maker", "qty": cum,
-                          "yes_price": str(entry)}],
-                "cost_usd": round((1 - entry) * cum, 4), "payoff_usd": cum,
-                "profit_usd": None, "status": "open",
-                "note": "orphaned fill from leaked order (incident #2)"}) + "\n")
-            f.write(json.dumps({
-                "ts": now + 0.001, "relationship_id": f"pmm-{SLUG}",
-                "strategy": "pmus-maker-probe", "status": "unwound",
-                "closes_ts": now, "qty": cum,
-                "realized_pnl_usd": pnl,
-                "note": f"buyback IOC {oid} @ <= {px} (card 6b54d1ce)"}) + "\n")
+        dual_append({
+            "ts": now, "relationship_id": f"pmm-{SLUG}",
+            "title": "maker probe orphaned short (retro, card 6b54d1ce)",
+            "qty": cum, "strategy": "pmus-maker-probe",
+            "legs": [{"venue": "polymarket_us", "market_id": SLUG,
+                      "side": "no", "role": "maker", "qty": cum,
+                      "yes_price": str(entry)}],
+            "cost_usd": round((1 - entry) * cum, 4), "payoff_usd": cum,
+            "profit_usd": None, "status": "open",
+            "note": "orphaned fill from leaked order (incident #2)"},
+            source="probe:pmus-maker")
+        dual_append({
+            "ts": now + 0.001, "relationship_id": f"pmm-{SLUG}",
+            "strategy": "pmus-maker-probe", "status": "unwound",
+            "closes_ts": now, "qty": cum,
+            "realized_pnl_usd": pnl,
+            "note": f"buyback IOC {oid} @ <= {px} (card 6b54d1ce)"},
+            source="probe:pmus-maker")
         print("ledgered, approx realized:", pnl)
 
 

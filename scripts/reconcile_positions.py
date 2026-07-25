@@ -5,18 +5,72 @@ regardless of how it arose (poll miss, restart orphan, failed hedge). Prints a
 single line; a NAKED result is the actionable alert. Read-only.
 """
 
-import base64
 import pathlib
 import time
 
 import httpx
-from cryptography.hazmat.primitives.asymmetric import ed25519
 
+from arbbot.exec import ledgerdb
 from arbbot.models.core import Venue
 from arbbot.record.kalshi import REST_BASE, load_private_key, sign_headers
 from arbbot.registry.model import Registry
+from arbbot.venues.pmus import PmusSession, get_bbo
 
 D = pathlib.Path.home() / ".arbbot-credentials"
+
+
+def _migrate_dotfiles(db, d=pathlib.Path("data/exec")):
+    """One-time import of the legacy .recon_*.json state blobs into the
+    recon_* tables (semantics preserved); each imported dot-file is renamed
+    to <name>.migrated so this never runs twice."""
+    import json as _j
+    now = time.time_ns()
+
+    def _empty(table):
+        return not db.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+
+    f = d / ".recon_pm_n.json"          # ratcheting last-known-good PM count
+    if f.exists() and _empty("recon_baseline"):
+        with __import__("contextlib").suppress(Exception):
+            n = int(_j.loads(f.read_text()).get("n", 0))
+            with db:
+                db.execute("INSERT INTO recon_baseline (venue, n_positions, updated_ns)"
+                           " VALUES ('polymarket_us', ?, ?)", (n, now))
+            f.rename(f.with_name(f.name + ".migrated"))
+    f = d / ".recon_state.json"         # last run's naked sightings (confirm set)
+    if f.exists() and _empty("recon_sighting"):
+        with __import__("contextlib").suppress(Exception):
+            entries = _j.loads(f.read_text())
+            with db:
+                for e in entries:
+                    db.execute("INSERT OR IGNORE INTO recon_sighting"
+                               " (imbalance_key, first_seen_ns, last_seen_ns, runs)"
+                               " VALUES (?, ?, ?, 1)", (e, now, now))
+            f.rename(f.with_name(f.name + ".migrated"))
+    f = d / ".recon_ignore.json"        # scoped tolerated-dust ignores
+    if f.exists() and _empty("recon_ignore"):
+        with __import__("contextlib").suppress(Exception):
+            entries = _j.loads(f.read_text())
+            with db:
+                for i in entries:
+                    db.execute("INSERT OR IGNORE INTO recon_ignore"
+                               " (fragment, max_imb, expires_ns, added_by, note)"
+                               " VALUES (?, ?, ?, ?, ?)",
+                               (i["fragment"], int(i.get("max_imb", 0)),
+                                int(float(i.get("expires", 0)) * 1e9),
+                                i.get("added_by"), i.get("note")))
+            f.rename(f.with_name(f.name + ".migrated"))
+    f = d / ".recon_degraded.json"      # last degraded-read details
+    if f.exists() and _empty("recon_incident"):
+        with __import__("contextlib").suppress(Exception):
+            doc = _j.loads(f.read_text())
+            with db:
+                db.execute("INSERT INTO recon_incident"
+                           " (ts_ns, venue, n_positions, baseline, missing_json)"
+                           " VALUES (?, 'polymarket_us', ?, ?, ?)",
+                           (int(float(doc.get("ts", 0)) * 1e9), doc.get("pm_n"),
+                            doc.get("baseline"), _j.dumps(doc.get("missing"))))
+            f.rename(f.with_name(f.name + ".migrated"))
 
 
 def _retry(fn, tries=3, delay=0.8):
@@ -56,23 +110,16 @@ def main():
     def pmus_pos():
         KID = (D / "polymarket_usa_key_id").read_text().strip()
         KEY = (D / "polymarket_usa_private_key").read_text().strip()
-        priv = ed25519.Ed25519PrivateKey.from_private_bytes(base64.b64decode(KEY)[:32])
-        ts = str(int(time.time() * 1000))
-        pth = "/v1/portfolio/positions"
-        sig = base64.b64encode(priv.sign(f"{ts}GET{pth}".encode())).decode()
-        r = c.get("https://api.polymarket.us" + pth,
-                  headers={"X-PM-Access-Key": KID, "X-PM-Timestamp": ts, "X-PM-Signature": sig})
-        r.raise_for_status()
+        # the endpoint transiently serves EMPTY (and hours-stale) snapshots
+        # (2026-07-22) — we always hold PM positions, so empty = glitch;
+        # get_positions raises so _retry re-fetches instead of emitting a
+        # false NAKED.
+        pos = PmusSession(KID, KEY, client=c).get_positions()
         out = {}
-        for k2, v in r.json().get("positions", {}).items():
+        for k2, v in pos.items():
             out[k2] = float(v.get("netPosition") or 0)
             if out[k2]:
                 pm_info[k2] = {"basis_ct": float((v.get("costPerShare") or {}).get("value") or 0)}
-        if not out:
-            # the endpoint transiently serves EMPTY (and hours-stale) snapshots
-            # (2026-07-22) — we always hold PM positions, so empty = glitch;
-            # raising lets _retry re-fetch instead of emitting a false NAKED.
-            raise RuntimeError("PM positions empty — glitch read")
         return out
 
     try:
@@ -80,13 +127,22 @@ def main():
     except Exception as e:
         print(f"RECON error {type(e).__name__} — could not fetch positions")
         return
+    # recon guard state lives in the trading DB (recon_* tables; legacy
+    # dot-file blobs are migrated once then renamed *.migrated)
+    import json as _jg
+    db = None
+    try:
+        db = ledgerdb.connect()
+        _migrate_dotfiles(db)
+    except Exception as _de:
+        print(f"RECON guard error: {type(_de).__name__}: {_de}")
     # PM platform outages serve PARTIAL position sets (n=1-4 of ~10) that pass
     # the empty-read guard and paint pm+0 under every pair. Track last-known-
     # good count; a collapsed read means DEGRADED, not naked.
-    import json as _jg
-    good_f = pathlib.Path("data/exec/.recon_pm_n.json")
     try:
-        last_good = int(_jg.loads(good_f.read_text()).get("n", 0))
+        row = db.execute("SELECT n_positions FROM recon_baseline"
+                         " WHERE venue = 'polymarket_us'").fetchone()
+        last_good = int(row["n_positions"]) if row else 0
     except Exception:
         last_good = 0
     # the LEDGER defines every PM leg that MUST exist (open baskets with a
@@ -96,11 +152,7 @@ def main():
     # evaluates normally.)
     expected = set()
     try:
-        import sys as _sys
-        _sys.path.insert(0, "src")
-        from arbbot.exec.ledger import open_baskets as _ob, parse_lines as _pl
-        led = pathlib.Path("data/exec/trades.jsonl")
-        for t2 in _ob(_pl(led.read_text().splitlines())):
+        for t2 in ledgerdb.open_baskets_db(db):
             for l2 in t2.get("legs", []):
                 if l2.get("venue") == "polymarket_us" and float(t2.get("qty") or 0) >= 1:
                     expected.add(l2.get("market_id"))
@@ -113,17 +165,25 @@ def main():
     missing, collapsed = _degraded(ppos)
     if missing or collapsed:
         # STABLE message (no counts) so the alert monitor's consecutive-dedupe
-        # suppresses repeats during a long outage; details go to a state file.
+        # suppresses repeats during a long outage; details go to recon_incident.
         with __import__("contextlib").suppress(Exception):
-            pathlib.Path("data/exec/.recon_degraded.json").write_text(_jg.dumps(
-                {"ts": time.time(), "pm_n": len(ppos), "baseline": last_good,
-                 "missing": missing}))
+            with db:
+                db.execute("INSERT INTO recon_incident"
+                           " (ts_ns, venue, n_positions, baseline, missing_json)"
+                           " VALUES (?, 'polymarket_us', ?, ?, ?)",
+                           (time.time_ns(), len(ppos), last_good, _jg.dumps(missing)))
         print("RECON degraded — PM positions API partial (platform incident); skipping naked evaluation")
         return
     with __import__("contextlib").suppress(Exception):
         # ratchet-up only: a healthy read raises the baseline; genuine
-        # portfolio shrinkage requires a manual reset of .recon_pm_n.json
-        good_f.write_text(_jg.dumps({"n": max(len(ppos), last_good)}))
+        # portfolio shrinkage requires a manual reset of recon_baseline
+        with db:
+            db.execute("INSERT INTO recon_baseline (venue, n_positions, updated_ns)"
+                       " VALUES ('polymarket_us', ?, ?)"
+                       " ON CONFLICT(venue) DO UPDATE SET"
+                       " n_positions = MAX(n_positions, excluded.n_positions),"
+                       " updated_ns = excluded.updated_ns",
+                       (len(ppos), time.time_ns()))
 
     # --- SPORTS: cross-venue MLB game legs must net to zero per game ---
     # Kalshi KXMLBGAME-<date><time><away+home>-<TEAM> vs PM aec-mlb-<away>-<home>-<date>.
@@ -287,8 +347,7 @@ def main():
             row["pm_basis_ct"] = pi.get("basis_ct")
             pmq = row.get("pq")
             with __import__("contextlib").suppress(Exception):
-                b = c.get(f"https://gateway.polymarket.us/v1/markets/{row['pm']}/bbo",
-                          timeout=8).json().get("marketData", {})
+                b = get_bbo(c, row["pm"], timeout=8)
                 row["pm_bid"] = (b.get("bestBid") or {}).get("value")
                 row["pm_ask"] = (b.get("bestAsk") or {}).get("value")
             # locked/ct for hedged pairs: $1 payoff minus both held-side bases
@@ -320,17 +379,29 @@ def main():
     except Exception:
         pass
 
-    state_f = pathlib.Path("data/exec/.recon_state.json")
     prev = set()
     try:
-        import json as _json
-        prev = set(_json.loads(state_f.read_text()))
+        prev = {r["imbalance_key"] for r in
+                db.execute("SELECT imbalance_key FROM recon_sighting")}
     except Exception:
         pass
     cur = set(naked)
     try:
-        import json as _json
-        state_f.write_text(_json.dumps(sorted(cur)))
+        kt_map0 = getattr(_find_naked, "kt_map", {})
+        now_ns = time.time_ns()
+        with db:
+            if cur:
+                db.execute("DELETE FROM recon_sighting WHERE imbalance_key NOT IN (%s)"
+                           % ",".join("?" * len(cur)), tuple(cur))
+            else:
+                db.execute("DELETE FROM recon_sighting")
+            for e in cur:
+                db.execute("INSERT INTO recon_sighting"
+                           " (imbalance_key, kalshi_ticker, first_seen_ns, last_seen_ns)"
+                           " VALUES (?, ?, ?, ?)"
+                           " ON CONFLICT(imbalance_key) DO UPDATE SET"
+                           " last_seen_ns = excluded.last_seen_ns, runs = runs + 1",
+                           (e, kt_map0.get(e), now_ns, now_ns))
     except Exception:
         pass
     confirmed = sorted(cur & prev)
@@ -378,14 +449,13 @@ def main():
     # scoped ignores: known tolerated dust (fragment + max size + expiry) —
     # growth beyond max_imb still pages
     try:
-        import json as _json
         import re as _re4
-        ig = [i for i in _json.loads(pathlib.Path("data/exec/.recon_ignore.json").read_text())
-              if i.get("expires", 0) > time.time()]
+        ig = db.execute("SELECT fragment, max_imb FROM recon_ignore"
+                        " WHERE expires_ns > ?", (time.time_ns(),)).fetchall()
         def _ignored(e):
             m4 = _re4.search(r"imb([+-]?\d+)", e)
             sz = abs(int(m4.group(1))) if m4 else 99
-            return any(i["fragment"][:16] in e and sz <= i.get("max_imb", 0) for i in ig)
+            return any(i["fragment"][:16] in e and sz <= i["max_imb"] for i in ig)
         confirmed = [e for e in confirmed if not _ignored(e)]
     except Exception:
         pass

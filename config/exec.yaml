@@ -1,0 +1,5 @@
+# Execution capital config (tracked). Loaded by arbbot.ops.config.load_exec_config;
+# consumed by the trader runner (RiskConfig bankroll) and the unwind executor
+# (class budget = bankroll_usd * per_class_cap).
+bankroll_usd: 980
+per_class_cap: 0.35

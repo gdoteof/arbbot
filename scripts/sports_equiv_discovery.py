@@ -22,9 +22,14 @@ from pathlib import Path
 
 import httpx
 
+from arbbot.models.core import Role, Side, Venue
+from arbbot.registry.model import (Leg, Registry, Relationship,
+                                   RelationshipType, Verdict, VettedBy)
+
 K = "https://api.elections.kalshi.com/trade-api/v2"
 P = "https://gateway.polymarket.us/v1"
 OUT = Path("data/scan/sports_equiv_map.json")
+REG_DIR = Path("data/registry")
 
 # pm slug prefix -> kalshi series (curated; extend as leagues appear)
 LEAGUES = [
@@ -149,6 +154,48 @@ def date_near(d1: str, d2: str) -> bool:
     return abs((a - b).days) <= 1
 
 
+def emit_registry_yaml(map_path=OUT, out_dir=REG_DIR):
+    """Relationship-shaped mirror of the matched-game map for the registry
+    compiler (scripts/compile_registry.py): data/registry/sports-<utcdate>.yaml,
+    vetted_by=mechanical (tradable only via the sports carve-out in
+    v_tradable_relationships). Ids match the sports_arb.py ledger shape
+    sports-<league>-<away>@<home>; the JSON map stays the probes' interface.
+    Missing/corrupt map -> no file, no error (offline-safe)."""
+    try:
+        doc = json.loads(Path(map_path).read_text())
+    except (OSError, ValueError):
+        return None
+    rels, seen = [], set()
+    for m in doc.get("matches", []):
+        if not (m.get("pm_moneyline") and m.get("kalshi_long_ticker")):
+            continue
+        a, _, b = (m.get("teams") or "").partition(" vs ")
+        # away/home exactly as sports_arb.load_equiv_games builds its game key
+        away = (m.get("pm_long_team") or a)[:20]
+        home = (b if m.get("pm_long_team", a) != b else a)[:20]
+        rid = f"sports-{m['league']}-{away}@{home}"
+        if rid in seen:
+            continue
+        seen.add(rid)
+        rels.append(Relationship(
+            id=rid, type=RelationshipType.CROSS_VENUE_EQUIVALENT,
+            legs=[Leg(venue=Venue.KALSHI, market_id=m["kalshi_long_ticker"],
+                      side=Side.YES, role=Role.TAKER),
+                  Leg(venue=Venue.POLYMARKET_US, market_id=m["pm_moneyline"],
+                      side=Side.NO, role=Role.TAKER)],
+            direction=f"Kalshi {away} YES == PM {away} moneyline YES "
+                      f"(basket: Kalshi YES + PM NO)",
+            verdict=Verdict.EQUIVALENT, vetted_by=VettedBy.MECHANICAL,
+            vetted_at=doc.get("generated_at"),
+            category="sports", topic=m["league"],
+            event_date=m.get("date") or None))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"sports-{time.strftime('%Y-%m-%d', time.gmtime())}.yaml"
+    Registry(relationships=rels).dump(str(out))
+    print(f"{len(rels)} relationships -> {out}")
+    return out
+
+
 def main():
     c = httpx.Client(timeout=30)
     report, matches = [], []
@@ -200,7 +247,11 @@ def main():
     OUT.write_text(json.dumps({"generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                                "report": report, "matches": matches}, indent=1))
     print(f"\n{len(matches)} matched games -> {OUT}")
+    emit_registry_yaml()
 
 
 if __name__ == "__main__":
-    main()
+    if "--emit-only" in sys.argv:  # offline: regenerate YAML from existing map
+        emit_registry_yaml()
+    else:
+        main()

@@ -56,8 +56,8 @@ def main():
     except Exception as e:
         flags.append(f"kalshi-balance-err:{type(e).__name__}")
     try:
-        b = httpx.get("https://api.polymarket.us/v1/account/balances",
-                      headers=pm._headers("GET", "/v1/account/balances"), timeout=15).json()
+        # background read on the shared PM-US rate budget (monitor may wait)
+        b = pm.session.get("/v1/account/balances", timeout=15).json()
         pmbal = Decimal(str(b["balances"][0]["buyingPower"]))
     except Exception as e:
         flags.append(f"pmus-balance-err:{type(e).__name__}")

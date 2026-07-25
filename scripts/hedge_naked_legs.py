@@ -16,21 +16,22 @@ guards (empty read = retry; imbalance confirmed by a second fetch).
 """
 
 import argparse
-import base64
 import json
 import pathlib
 import time
 from decimal import Decimal
 
 import httpx
-from cryptography.hazmat.primitives.asymmetric import ed25519
 
+from arbbot.exec import ledgerdb
 from arbbot.exec.kalshi_gateway import KalshiOrderGateway
+from arbbot.exec.ledgerdb import dual_append
 from arbbot.models.core import Venue
 from arbbot.ops.alerts import Alerter
 from arbbot.ops.config import load_recorder_config
 from arbbot.record.kalshi import REST_BASE, load_private_key, sign_headers
 from arbbot.registry.model import Registry
+from arbbot.venues.pmus import PmusSession
 
 D = pathlib.Path.home() / ".arbbot-credentials"
 LEDGER = pathlib.Path("data/exec/trades.jsonl")
@@ -60,19 +61,13 @@ def kalshi_positions(c, kid, kkey):
 def pmus_positions(c):
     kid = (D / "polymarket_usa_key_id").read_text().strip()
     key = (D / "polymarket_usa_private_key").read_text().strip()
-    priv = ed25519.Ed25519PrivateKey.from_private_bytes(base64.b64decode(key)[:32])
-    ts = str(int(time.time() * 1000))
-    pth = "/v1/portfolio/positions"
-    sig = base64.b64encode(priv.sign(f"{ts}GET{pth}".encode())).decode()
-    r = c.get("https://api.polymarket.us" + pth,
-              headers={"X-PM-Access-Key": kid, "X-PM-Timestamp": ts, "X-PM-Signature": sig})
-    r.raise_for_status()
+    # empty-read glitch guard (2026-07-22 API quirk) lives in get_positions:
+    # it raises so _retry re-fetches instead of trusting a glitched snapshot
+    pos = PmusSession(kid, key, client=c).get_positions()
     out = {}
-    for slug, v in r.json().get("positions", {}).items():
+    for slug, v in pos.items():
         out[slug] = {"net": float(v.get("netPosition") or 0),
                      "cost_per_share": float((v.get("costPerShare") or {}).get("value") or 0)}
-    if not out:
-        raise RuntimeError("PM positions empty — glitch read")  # 2026-07-22 API quirk
     return out
 
 
@@ -111,8 +106,19 @@ def kalshi_taker_fee(p: Decimal) -> Decimal:
 
 def probe_owned_slugs():
     """PM slugs the research probes are actively working (coordination
-    contract): never treat their positions as our naked legs to complete."""
+    contract): never treat their positions as our naked legs to complete.
+    Authoritative source: the ownership table (owner 'probe-*')."""
     owned = set()
+    try:
+        conn = ledgerdb.connect()
+        try:
+            owned.update(ledgerdb.owned_by(conn, "probe-"))
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001 — coordination read must not block hedging
+        pass
+    # TRANSITIONAL: union in the probes' own logs until every probe registers
+    # its markets via ledgerdb.claim_ownership — drop this grep once they do.
     for pf in ("data/exec/pmus_maker_probe.jsonl", "data/exec/toxicity_probe.jsonl",
                "data/exec/leadlag_probe.jsonl"):
         try:
@@ -133,10 +139,6 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--live", action="store_true")
     args = ap.parse_args()
-
-    if pathlib.Path("data/KILL").exists():  # global kill switch (card 39140c2e)
-        print("data/KILL present — hedger halted")
-        return
 
     c = httpx.Client(timeout=20)
     kid = (D / "kalshi_api_key_id").read_text().strip()
@@ -219,8 +221,7 @@ def main() -> None:
                "payoff_usd": float(filled),
                "profit_usd": round((1 - cost_ct) * filled, 4),
                "status": "open"}
-        with open(LEDGER, "a") as f:
-            f.write(json.dumps(rec) + "\n")
+        dual_append(rec, source="py:hedge_naked_legs")
         Alerter(load_recorder_config().ntfy_topic).alert(
             f"arbbot HEDGED naked {rel_id} x{filled} @ <= {limit:.3f} — basket complete, "
             f"locks ~${(1 - cost_ct) * filled:.2f}")

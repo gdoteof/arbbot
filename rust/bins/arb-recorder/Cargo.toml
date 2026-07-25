@@ -1,0 +1,20 @@
+[package]
+name = "arb-recorder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arb-core = { path = "../../crates/arb-core" }
+arb-tape = { path = "../../crates/arb-tape" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+futures-util = "0.3"
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
+ed25519-dalek = "2"
+base64 = "0.22"
+anyhow = "1"

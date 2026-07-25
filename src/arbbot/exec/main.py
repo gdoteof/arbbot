@@ -18,17 +18,18 @@ import contextlib
 import json
 import time
 from collections import defaultdict
-from decimal import ROUND_UP, Decimal
+from decimal import Decimal
 from pathlib import Path
 
 from arbbot.book.builder import BookBuilder, GapDetected, NotSynced
 from arbbot.exec.kalshi_gateway import KalshiOrderGateway
+from arbbot.exec.ledgerdb import dual_append
 from arbbot.exec.polymarket_gateway import PolymarketOrderGateway
 from arbbot.exec.quoter import Quoter
 from arbbot.fees.curves import FeeSchedule
 from arbbot.models.core import BookDelta, BookSnapshot, Venue
 from arbbot.ops.alerts import Alerter
-from arbbot.ops.config import load_credential, load_recorder_config
+from arbbot.ops.config import load_credential, load_exec_config, load_recorder_config
 from arbbot.exec.resolve_dates import resolve_date
 from arbbot.record.jsonl import parse_event
 from arbbot.record.kalshi import REST_BASE, KalshiCatalog, load_private_key, sign_headers
@@ -38,10 +39,7 @@ from arbbot.risk.manager import RiskConfig, RiskManager
 # --- trigger-based take-take auto-execution (riskless cross-venue arb) ---
 TT_VETTED = ("xvus-time-poty-26", "xvus-france-pres-27", "xvus-brazil-pres-26", "xvus-fedcut-26")
 TT_FEE = Decimal("0.02")     # ~both-leg taker fees per contract (conservative)
-TT_MAX_CLIP = 100            # safety ceiling only (card 938df47b: depth-aware
-                             # sizing) — effective size is bounded by displayed
-                             # depth min(ka.size, pb.size), TT_CAP, and the
-                             # risk manager's per-rel/topic/class caps
+TT_MAX_CLIP = 10             # max contracts per single take-take execution
 TT_CAP = 50                  # per-relationship concentration cap (contracts)
 TT_COOLDOWN = 30.0           # s between fires on the same relationship
 # floating APR bar (Geoff 2026-07-22): scales with capital utilization of the
@@ -118,10 +116,7 @@ def _record_maker_fill(cfg, rel, i, side, filled, maker_px, hedge_res, latency_m
            "cost_usd": cost, "payoff_usd": float(filled),
            "profit_usd": float(filled) - cost, "status": "open",
            "hedge_latency_ms": (round(latency_ms, 1) if latency_ms is not None else None)}
-    p = Path("data/exec/trades.jsonl")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "a") as f:
-        f.write(json.dumps(rec) + "\n")
+    dual_append(rec, source="python-trader")
 
 
 async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> None:
@@ -181,8 +176,9 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
     if tf.exists():
         import yaml as _yaml
         topics_cfg = _yaml.safe_load(tf.read_text()) or {}
+    exec_cfg = load_exec_config()
     risk = RiskManager(config=RiskConfig(
-        bankroll=Decimal("980"),            # actual capital (~$800 idle + ~$180 locked)
+        bankroll=exec_cfg.bankroll_usd,     # actual capital (config/exec.yaml)
         per_rel_cap=Decimal("150"),         # Geoff-approved max per name (oracle-scaled)
         topics=topics_cfg.get("topics", []),
         default_topic_budget=topics_cfg.get("default_topic_budget"),
@@ -222,26 +218,17 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                             fees=FeeSchedule(), clip=clip, safety_ticks=0,
                             quote_venue=None, size_jitter=2) for r in rels}
     rel_by_id = {r.id: r for r in rels}
-    # maker APR hurdle (card 80ff7987): each quoter knows its time-to-resolve
-    # so _target can require the locked edge to annualize above the floating
-    # bar (propagated in _tt_refresh). No date => no hurdle (edge-only gating).
-    for rid2, q2 in quoters.items():
-        rd2, _ = resolve_date(rid2)
-        if rd2:
-            import datetime as _dt2
-            q2.resolve_years = max(
-                (_dt2.date.fromisoformat(rd2) - _dt2.date.today()).days, 1) / 365.25
     alerter = Alerter(cfg.ntfy_topic)
 
     # seed exposure from the trades ledger so per-name caps survive restarts —
     # without this, exposure resets to zero every restart and the cap becomes
     # "per session" (Mamdani reached $78 against a $10 design cap that way).
-    from arbbot.exec.ledger import open_baskets, parse_lines
-    ledger = Path("data/exec/trades.jsonl")
+    from arbbot.exec import ledgerdb
     tt_fired_seed: dict[str, int] = {}  # PM slug -> open take-take qty (cap floor)
-    if ledger.exists():
-        # net of appended unwind records — an unwound basket frees exposure/cap
-        for t in open_baskets(parse_lines(ledger.read_text().splitlines())):
+    ledger_conn = ledgerdb.connect()
+    try:
+        # net of recorded close records — an unwound basket frees exposure/cap
+        for t in ledgerdb.open_baskets_db(ledger_conn):
             rel = rel_by_id.get(t.get("relationship_id"))
             if rel is None:
                 continue
@@ -251,9 +238,11 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                     if l.get("venue") == "polymarket_us":
                         tt_fired_seed[l["market_id"]] = (
                             tt_fired_seed.get(l["market_id"], 0) + int(t.get("qty", 0)))
-        seeded = {k: str(v) for k, v in risk.exposure.by_relationship.items()}
-        if seeded:
-            print(f"seeded open exposure from ledger: {seeded}", flush=True)
+    finally:
+        ledger_conn.close()
+    seeded = {k: str(v) for k, v in risk.exposure.by_relationship.items()}
+    if seeded:
+        print(f"seeded open exposure from ledger: {seeded}", flush=True)
 
     mode = "LIVE" if live else "DRY-RUN"
     balstr = " ".join(f"{v.value}=${b}" for v, b in risk.balances.items())
@@ -358,8 +347,6 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
         cap = float(risk.config.bankroll * risk.config.per_class_cap)
         util = min(max(float(risk.exposure.total) / cap if cap else 1.0, 0.0), 1.0)
         tt["bar"] = TT_APR_FLOOR + (TT_APR_CEIL - TT_APR_FLOOR) * util
-        for q4 in quoters.values():  # makers clear the same bar (card 80ff7987)
-            q4.min_apr = tt["bar"]
         kgw = gateways.get(Venue.KALSHI)
         if kgw is not None:
             with contextlib.suppress(Exception):
@@ -465,8 +452,7 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                    "payoff_usd": float(filled),
                    "profit_usd": float((Decimal(1) - ka.price - (Decimal(1) - pb.price)) * filled),
                    "status": "open"}
-            with open(Path("data/exec/trades.jsonl"), "a") as f:
-                f.write(json.dumps(rec) + "\n")
+            dual_append(rec, source="python-trader")
             print(f"[LIVE] TAKE-TAKE filled+recorded {rid} x{filled}", flush=True)
         except Exception as e:
             print(f"[LIVE] TAKE-TAKE {rid} EXEC ERROR {type(e).__name__}: {e} "
@@ -522,168 +508,6 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                       flush=True)
                 await asyncio.sleep(2)
 
-    # ---- maker-unwind (card 1ed32918): rest passive EXIT asks on held ----
-    # standard-direction baskets the unwind policy flags (soft or hard, from
-    # marks.json) — capture maker spread on the way out instead of paying
-    # taker. The 5-min taker unwinder stays the backstop for hard signals.
-    # One basket per rel per cycle (oldest flagged); exit ask on the Kalshi
-    # leg, on fill the PM NO closes taker-side; recon + hedge timer backstop
-    # any legging miss. Entry quoter's ask side is suppressed while an exit
-    # quote is resting (two order-owners on one side both react to fills).
-    EXIT_LOCK = Decimal("0.005")    # min locked profit/ct vs basis
-    EXIT_SLIP = Decimal("0.01")     # assume PM close 1 tick through the ask
-    exit_q: dict[str, dict] = {}    # rid -> resting exit order state
-    exit_last = {"ts": 0.0}
-
-    def _exit_drop(rid: str, st: dict, cancel: bool) -> None:
-        kgw = gateways.get(Venue.KALSHI)
-        if cancel and kgw is not None:
-            with contextlib.suppress(Exception):
-                kgw.cancel(st["order_id"])
-            quoters[rid].intents.append(
-                {"ts": time.time(), "cancel": st["kt"], "venue": "kalshi",
-                 "side": "ask", "price": str(st["price"]),
-                 "order_id": st["order_id"], "tag": "exit"})
-        quoters[rid].suppress.discard((st["kt"], "ask"))
-        exit_q.pop(rid, None)
-
-    def _exit_refresh() -> None:
-        if not live or time.monotonic() - exit_last["ts"] < 15:
-            return
-        exit_last["ts"] = time.monotonic()
-        kgw = gateways.get(Venue.KALSHI)
-        if kgw is None:
-            return
-        try:
-            mdoc = json.loads(Path("data/exec/marks.json").read_text())
-            recs = parse_lines(Path("data/exec/trades.jsonl").read_text().splitlines())
-        except (OSError, ValueError):
-            return
-        flagged = {(m["relationship_id"], m.get("ts")): m
-                   for m in mdoc.get("positions", [])
-                   if (m.get("unwind_signal") or m.get("unwind_hard"))
-                   and (m.get("mark_pnl_usd") or 0) > 0}
-        want: dict[str, dict] = {}
-        for b in open_baskets(recs):
-            rid = b.get("relationship_id")
-            if (rid, b.get("ts")) not in flagged or rid not in quoters or rid in want:
-                continue
-            kleg = next((l for l in b["legs"] if l["venue"] == "kalshi"), None)
-            pleg = next((l for l in b["legs"] if l["venue"] == "polymarket_us"), None)
-            if not kleg or not pleg or kleg.get("side") != "yes":
-                continue  # standard direction only (v1)
-            qty = int(b["qty"])
-            if qty < 1:
-                continue
-            want[rid] = {"kt": kleg["market_id"], "ps": pleg["market_id"],
-                         "qty": qty, "basket_ts": b["ts"],
-                         "cost_ct": Decimal(str(b["cost_usd"])) / qty,
-                         "title": b.get("title")}
-        for rid, st in list(exit_q.items()):
-            if rid not in want or want[rid]["basket_ts"] != st["basket_ts"]:
-                _exit_drop(rid, st, cancel=True)
-        for rid, w in want.items():
-            st = exit_q.get(rid)
-            kbook = books.get("kalshi", w["kt"])
-            pbook = books.get("polymarket_us", w["ps"])
-            if kbook is None or pbook is None:
-                continue
-            kb, pa = kbook.best_bid(), pbook.best_ask()
-            if kb is None or pa is None or int(pa.size) < 1:
-                continue
-            qty = min(w["qty"], int(pa.size))  # only what the PM close absorbs
-            # profitable floor: fill px + (1 - pm close px) - basis >= EXIT_LOCK
-            min_px = w["cost_ct"] - (Decimal(1) - pa.price) + EXIT_LOCK + EXIT_SLIP
-            # competing ask, our own resting exit subtracted out (self-exclusion)
-            comp = None
-            for lvl in kbook.asks:
-                size = lvl.size - (Decimal(st["qty"]) if st and lvl.price == st["price"] else 0)
-                if size > 0:
-                    comp = lvl.price
-                    break
-            tick = Decimal("0.01")
-            target = max(min_px, (comp - tick) if comp is not None else min_px)
-            target = max(target, kb.price + tick)  # post-only: never cross the bid
-            target = target.quantize(tick, rounding=ROUND_UP)
-            if target > Decimal("0.99"):
-                if st:
-                    _exit_drop(rid, st, cancel=True)
-                continue
-            if st and st["price"] == target and st["qty"] == qty:
-                continue  # already resting there
-            if st:
-                _exit_drop(rid, st, cancel=True)
-            try:
-                r = kgw.place_yes(w["kt"], "ask", target, qty, post_only=True)
-                oid = (r.get("order") or {}).get("order_id") or r.get("order_id")
-            except Exception as e:
-                print(f"[EXIT] {rid} place failed: {type(e).__name__}: {e}", flush=True)
-                continue
-            if not oid:
-                continue
-            exit_q[rid] = {**w, "order_id": oid, "price": target, "qty": qty, "filled": 0}
-            quoters[rid].suppress.add((w["kt"], "ask"))
-            quoters[rid].intents.append(
-                {"ts": time.time(), "place": w["kt"], "venue": "kalshi",
-                 "side": "ask", "price": str(target), "count": qty,
-                 "order_id": oid, "tag": "exit"})
-            print(f"[EXIT] {rid} resting ask x{qty} @ {target} (basis {w['cost_ct']:.3f}, "
-                  f"locks >= {EXIT_LOCK}/ct after PM close)", flush=True)
-
-    def _exit_fill(rid: str, st: dict, cum: int) -> None:
-        delta = cum - st["filled"]
-        st["filled"] = cum
-        if delta < 1:
-            return
-        pgw = gateways.get(Venue.POLYMARKET_US)
-        pbook = books.get("polymarket_us", st["ps"])
-        pa = pbook.best_ask() if pbook is not None else None
-        px = min((pa.price if pa is not None else Decimal("0.99")) + Decimal("0.01"),
-                 Decimal("0.99"))
-        pf = 0
-        try:  # close the PM NO leg taker-side, exact delta, confirmed (fill-lag LAW)
-            r1 = pgw.place_yes(st["ps"], "bid", px, delta, post_only=False)
-            oid1 = r1.get("id") or r1.get("order_id")
-            quoters[rid].intents.append(
-                {"ts": time.time(), "place": st["ps"], "venue": "polymarket_us",
-                 "side": "bid", "price": str(px), "count": delta,
-                 "order_id": oid1, "tag": "exit-close"})
-            for _ in range(6):
-                pf = pgw.filled_qty(oid1) if oid1 else 0
-                if pf >= delta:
-                    break
-                time.sleep(0.5)
-        except Exception as e:
-            print(f"[EXIT] {rid} PM close error: {type(e).__name__}: {e}", flush=True)
-        m = min(delta, pf)
-        if pf < delta:
-            alerter.alert(f"arbbot EXIT {rid}: PM close {pf}/{delta} — naked PM NO "
-                          f"remainder, hedge timer/recon will complete it")
-        if m < 1:
-            return
-        proceeds = (st["price"] + Decimal(1) - px) * m
-        realized = float(proceeds - st["cost_ct"] * m)
-        rec = {"ts": time.time(), "relationship_id": rid, "title": st.get("title"),
-               "strategy": "unwind", "status": "unwound", "closes_ts": st["basket_ts"],
-               "qty": int(m),
-               "legs": [{"venue": "kalshi", "market_id": st["kt"], "side": "yes",
-                         "action": "sell", "qty": int(m), "yes_price": str(st["price"]),
-                         "role": "maker"},
-                        {"venue": "polymarket_us", "market_id": st["ps"], "side": "no",
-                         "action": "sell", "qty": int(m), "yes_price": str(px)}],
-               "proceeds_usd": float(proceeds),
-               "realized_pnl_usd": realized,
-               "note": "maker-unwind exit (card 1ed32918)"}
-        with open(Path("data/exec/trades.jsonl"), "a") as f:
-            f.write(json.dumps(rec) + "\n")
-        risk.record_close(rel_by_id[rid], Decimal(m))
-        alerter.alert(f"arbbot MAKER-UNWIND {rid} x{m} @ {st['price']} "
-                      f"realized ${realized:.2f}")
-        print(f"[EXIT] {rid} filled x{m} @ {st['price']}, PM closed @ {px}, "
-              f"realized ${realized:.2f}", flush=True)
-        if st["filled"] >= st["qty"]:
-            _exit_drop(rid, st, cancel=False)
-
     async def socket_loop() -> None:
         last_flush = 0.0
         last_fill_check = 0.0
@@ -695,117 +519,11 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
             writer = None
             try:
                 reader, writer = await asyncio.open_unix_connection(cfg.socket_path)
-                # READER/PROCESSOR DECOUPLE (rust-rewrite bench finding, card
-                # 23d15e3f): the recorder disconnects a subscriber at ~1MB of
-                # queued backlog (~2.2s at burst peak), and our inline venue
-                # I/O (hedge REST + confirmed-fill polls, 3-5s) exceeds that
-                # during exactly the bursts that produce fills. The reader
-                # task ONLY drains the socket into a bounded in-memory queue;
-                # processing (which may block) consumes from the queue, so
-                # stalls grow OUR buffer instead of the recorder's.
-                q_lines: asyncio.Queue = asyncio.Queue(maxsize=200_000)
-
-                async def _drain():
-                    while True:
-                        ln = await reader.readline()
-                        if not ln:
-                            await q_lines.put(None)
-                            return
-                        try:
-                            q_lines.put_nowait(ln)
-                        except asyncio.QueueFull:
-                            # shed oldest by draining one — never block the reader
-                            with contextlib.suppress(Exception):
-                                q_lines.get_nowait()
-                            with contextlib.suppress(Exception):
-                                q_lines.put_nowait(ln)
-
-                drain_task = asyncio.create_task(_drain())
-                pause_until: dict[str, float] = {}
-                pause_mtime = [0.0]
-                pause_f = Path("data/exec/.quote_pause_requests.json")
-                last_pause_check = [0.0]
-
-                def _check_pause_requests():
-                    now2 = time.time()
-                    if now2 - last_pause_check[0] < 5:
-                        return
-                    last_pause_check[0] = now2
-                    try:
-                        mt = pause_f.stat().st_mtime
-                    except OSError:
-                        return
-                    if mt == pause_mtime[0]:
-                        return
-                    pause_mtime[0] = mt
-                    try:
-                        reqs = json.loads(pause_f.read_text())
-                    except (OSError, ValueError):
-                        return
-                    for rid2, until in reqs.items():
-                        if until > now2 and pause_until.get(rid2, 0) < until:
-                            pause_until[rid2] = until
-                            q2 = quoters.get(rid2)
-                            if q2 is not None:
-                                with contextlib.suppress(Exception):
-                                    q2.cancel_all()
-                                print(f"[LIVE] quote PAUSE {rid2} until "
-                                      f"+{until - now2:.0f}s (unwinder handshake)", flush=True)
-
-                # FEED-HEALTH QUOTE PULL (Geoff ask, card 0a7e5478): a stale
-                # venue feed invalidates CROSS-VENUE pricing on both sides (each
-                # venue's quote is hedge-priced against the other's book), so
-                # any critical-feed staleness cancels ALL resting quotes until
-                # the recorder reports the feeds healthy again. Signal source =
-                # the recorder's health.jsonl (venue-heartbeat-aware — mere
-                # event silence on sleepy political books does NOT trip it).
-                feed_paused = [False]
-                last_health_check = [0.0]
-                health_f = Path("data/health.jsonl")
-
-                def _check_feed_health():
-                    now3 = time.time()
-                    if now3 - last_health_check[0] < 10:
-                        return
-                    last_health_check[0] = now3
-                    try:
-                        with open(health_f, "rb") as hf:
-                            hf.seek(max(hf.seek(0, 2) - 2048, 0))
-                            tail_lines = hf.read().decode(errors="ignore").strip().splitlines()
-                        h = json.loads(tail_lines[-1])
-                    except Exception:
-                        return
-                    if now3 - h.get("ts", 0) > 30:
-                        stale_now = True   # health writer itself silent = recorder down
-                    else:
-                        st = h.get("stale", {})
-                        stale_now = bool(st.get("kalshi-ws") or st.get("polymarket_us-ws"))
-                    if stale_now and not feed_paused[0]:
-                        feed_paused[0] = True
-                        for q3 in quoters.values():
-                            with contextlib.suppress(Exception):
-                                q3.cancel_all()
-                        print("[LIVE] FEED STALE — all quotes PULLED until feeds recover",
-                              flush=True)
-                        alerter.alert("arbbot trader: feed stale — quotes pulled")
-                    elif not stale_now and feed_paused[0]:
-                        feed_paused[0] = False
-                        print("[LIVE] feeds healthy — quoting resumes", flush=True)
-
                 while True:
-                    # timeout so the periodic tasks below (2s fill-poll
-                    # fallback, TT refresh, pause/feed checks, intent flush)
-                    # keep running on a QUIET book — without it a resting fill
-                    # could sit undetected until the next book event arrives
-                    # (card ad08160c: quiet book + WS gap + fill = naked leg).
-                    try:
-                        line = await asyncio.wait_for(q_lines.get(), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        line = b""          # no event — periodic tasks only
-                    if line is None:
+                    line = await reader.readline()
+                    if not line:
                         break
-                    _check_pause_requests()
-                    _check_feed_health()
+                    hb_events += 1
                     # liveness heartbeat: quiet-vs-stuck is unanswerable without
                     # this — books can legitimately sleep for long stretches.
                     if time.monotonic() - last_hb > 60:
@@ -814,28 +532,20 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                               f"resting={n_rest}", flush=True)
                         last_hb = time.monotonic()
                         hb_events = hb_onbook = 0
-                    ev = None
-                    if line:
-                        hb_events += 1
-                        try:
-                            ev = parse_event(json.loads(line))
-                        except ValueError:
-                            ev = None  # truncated line at recorder cut-over
+                    try:
+                        ev = parse_event(json.loads(line))
+                    except ValueError:
+                        continue  # truncated line at recorder cut-over
                     if isinstance(ev, BookSnapshot):
                         books.apply_snapshot(ev)
                     elif isinstance(ev, BookDelta):
                         with contextlib.suppress(GapDetected, NotSynced):
                             books.apply_delta(ev)
                     else:
-                        ev = None  # non-book event — still run periodic tasks
-                    for rid in (leg_to_rels.get((ev.venue.value, ev.market_id), ())
-                                if ev is not None else ()):
+                        continue
+                    for rid in leg_to_rels.get((ev.venue.value, ev.market_id), ()):
                         q = quoters[rid]
                         hb_onbook += 1
-                        if feed_paused[0]:
-                            continue  # stale feed — cross-venue pricing invalid
-                        if pause_until.get(rid, 0) > time.time():
-                            continue  # unwinder is closing this basket — stay out of the book
                         try:
                             q.on_book(books)
                         except Exception as e:  # never let one quote error kill the loop; SURFACE it
@@ -852,17 +562,10 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                     if live and now - tt["last_refresh"] > 60:
                         tt["last_refresh"] = now
                         _tt_refresh()
-                    _exit_refresh()  # maker-unwind exits (self-throttled, 15s)
                     # fallback fill detection (WS is primary): poll each resting
                     # order every 2s; _process_fill dedupes vs the WS path.
                     if live and now - last_fill_check > 2.0:
                         last_fill_check = now
-                        kgw_x = gateways.get(Venue.KALSHI)
-                        for rid_x, st_x in list(exit_q.items()):  # maker-unwind fills
-                            with contextlib.suppress(Exception):
-                                fx = kgw_x.filled_qty(st_x["order_id"]) if kgw_x else 0
-                                if fx > st_x["filled"]:
-                                    _exit_fill(rid_x, st_x, fx)
                         for rid, q in quoters.items():
                             r = rel_by_id[rid]
                             for (i, side), rq in list(q._resting.items()):
@@ -884,8 +587,6 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
             except (ConnectionError, FileNotFoundError, OSError):
                 pass
             finally:
-                with contextlib.suppress(Exception):
-                    drain_task.cancel()
                 # close the old connection before reconnecting — leaking it
                 # leaves a zombie the recorder keeps writing into (Send-Q grows
                 # until it notices and drops the client).
@@ -922,8 +623,6 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
         # graceful shutdown: cancel every resting quote + sweep both venues so a
         # restart never orphans a live untracked order (naked-fill risk).
         if live:
-            for rid_s, st_s in list(exit_q.items()):  # maker-unwind exit asks
-                _exit_drop(rid_s, st_s, cancel=True)
             for q in quoters.values():
                 with contextlib.suppress(Exception):
                     q.cancel_all()

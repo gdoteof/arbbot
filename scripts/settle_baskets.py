@@ -14,19 +14,20 @@ Read-only on venues (no orders). Designed for an hourly timer.
 
 import json
 import time
-from pathlib import Path
 
 import httpx
 
-from arbbot.exec.ledger import apply_corrections, open_baskets, parse_lines
+from arbbot.exec import ledgerdb
+from arbbot.exec.ledgerdb import dual_append
 from arbbot.record.kalshi import REST_BASE
-
-LEDGER = Path("data/exec/trades.jsonl")
 
 
 def main():
-    records = parse_lines(LEDGER.read_text().splitlines()) if LEDGER.exists() else []
-    baskets = open_baskets(records)
+    conn = ledgerdb.connect()
+    try:
+        baskets = ledgerdb.open_baskets_db(conn)
+    finally:
+        conn.close()
     with_k = [(t, next((l for l in t.get("legs", []) if l.get("venue") == "kalshi"), None))
               for t in baskets]
     leans = [t for t in baskets
@@ -56,8 +57,7 @@ def main():
                "kalshi_result": result,
                "proceeds_usd": qty,                       # $1/ct at resolution by construction
                "realized_pnl_usd": round(qty - cost, 4)}
-        with open(LEDGER, "a") as f:
-            f.write(json.dumps(rec) + "\n")
+        dual_append(rec, source="py:settle_baskets")
         settled += 1
         print(f"SETTLED {t['relationship_id'][:55]} x{qty:.0f} "
               f"result={result} realized=${qty - cost:+.2f}")
@@ -77,8 +77,7 @@ def main():
                "closes_ts": t["ts"], "qty": qty, "kalshi_result": result,
                "proceeds_usd": proceeds,
                "realized_pnl_usd": round(proceeds - cost, 4)}
-        with open(LEDGER, "a") as f:
-            f.write(json.dumps(rec) + "\n")
+        dual_append(rec, source="py:settle_baskets")
         settled += 1
         print(f"SETTLED LEAN {t['relationship_id'][:50]} x{qty:.0f} "
               f"{'WON' if won else 'LOST'} realized=${proceeds - cost:+.2f}")

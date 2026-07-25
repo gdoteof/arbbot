@@ -24,11 +24,13 @@ from decimal import Decimal
 import httpx
 
 from arbbot.exec.kalshi_gateway import KalshiOrderGateway
+from arbbot.exec.ledgerdb import dual_append
 from arbbot.exec.polymarket_us_gateway import PolymarketUsOrderGateway
 from arbbot.models.core import Venue
 from arbbot.ops.config import load_credential
 from arbbot.record.kalshi import REST_BASE, load_private_key
 from arbbot.registry.model import Registry
+from arbbot.venues.pmus import get_bbo, get_book
 
 D = "~/.arbbot-credentials"
 
@@ -40,9 +42,9 @@ def kalshi_top(client, ticker):
 
 
 def pmus_top(client, slug):
-    b = client.get(f"https://gateway.polymarket.us/v1/markets/{slug}/bbo").json().get("marketData", {})
+    b = get_bbo(client, slug)
     bid = (b.get("bestBid") or {}); ask = (b.get("bestAsk") or {})
-    book = client.get(f"https://gateway.polymarket.us/v1/markets/{slug}/book").json().get("marketData", {})
+    book = get_book(client, slug)
     bid_sz = sum(Decimal(str(x["qty"])) for x in (book.get("bids") or [])
                  if x["px"]["value"] == bid.get("value"))
     return (Decimal(bid["value"]) if bid.get("value") else None,
@@ -161,9 +163,7 @@ def _record_trade(rel, qty, pb, pa, ka, hedge_px, edge, r1, r2):
         "profit_usd": float(Decimal(qty) - cost), "status": "open",
     }
     p = Path("data/exec/trades.jsonl")
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "a") as f:
-        f.write(json.dumps(rec) + "\n")
+    dual_append(rec, source="py:execute_xv")
     print(f"   recorded to {p} (profit ~${rec['profit_usd']:.2f})")
 
 

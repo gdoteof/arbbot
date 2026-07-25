@@ -1,0 +1,41 @@
+# Rust recorder SHADOW unit (P1). Runs beside arbbot-recorder.service with
+# isolated outputs (data/raw-rs, arbbot-rs.sock, health-rs.jsonl).
+#
+# SAFETY MODES:
+#   Kalshi: full WS with its OWN read-only key (kalshi_recorder_rs_*, provisioned 2026-07-23). PM-US: --pmus-poll-only public REST — cannot contend with the live
+#     Python recorder's WS key sessions. Low rate via --pmus-poll-interval.
+#   Full WS shadow: REMOVE --poll-only only after the key-session question is
+#     resolved (board card): needs either a second read-only Kalshi key
+#     provisioned for the shadow, or confirmation that concurrent WS sessions
+#     per key don't evict each other. The PM-US WS uses the trade-capable key
+#     the LIVE recorder holds — never open a second session on it without
+#     that confirmation.
+#
+# Install (manual, deployment-time):
+#   cp systemd/arbbot-recorder-rs.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user start arbbot-recorder-rs
+
+[Unit]
+Description=arbbot Rust recorder (shadow)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude/arbbot
+# rs-suffixed READ-ONLY key only; the trade-capable keys are never loaded
+# (--pmus-poll-only) even though the dir contains them
+Environment=ARBBOT_CREDENTIALS_DIR=%h/.arbbot-credentials
+ExecStart=%h/claude/arbbot/.claude/worktrees/rust-rewrite/rust/target/release/arb-recorder \
+    --config config/recorder.yaml \
+    --data-dir data/raw-rs \
+    --socket data/arbbot-rs.sock \
+    --health data/health-rs.jsonl \
+    --shadow --kalshi-cred-suffix rs
+Restart=always
+RestartSec=5
+# shadow must never starve the real stack
+Nice=10
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target

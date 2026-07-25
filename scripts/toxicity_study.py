@@ -25,16 +25,14 @@ MARKOUTS_S = [10, 60, 300, 600]
 
 def load_day(rdir: Path, day: str):
     df = pd.read_parquet(rdir / f"tob-{day}.parquet")
-    tob = df[df["kind"] == "tob"].copy()
-    for c in ["bid", "ask"]:
-        tob[c] = pd.to_numeric(tob[c], errors="coerce")
-    tob = tob.dropna(subset=["bid", "ask"])
+    # typed tape: bid/ask are DOUBLE on tob rows, trade rows carry
+    # trade_price/trade_size/taker_side (no column overloading)
+    tob = df[df["kind"] == "tob"].dropna(subset=["bid", "ask"]).copy()
     tob = tob[(tob["ask"] > tob["bid"]) & (tob["ask"] - tob["bid"] < 0.20)]
     tob["mid"] = (tob["bid"] + tob["ask"]) / 2
     tr = df[df["kind"] == "trade"].copy()
-    tr["price"] = pd.to_numeric(tr["bid"], errors="coerce")
-    tr["taker_side"] = tr["ask"]
-    tr["size"] = pd.to_numeric(tr["bid_sz"], errors="coerce")
+    tr["price"] = tr["trade_price"]
+    tr["size"] = tr["trade_size"]
     tr = tr.dropna(subset=["price", "size"])
     return tob, tr
 

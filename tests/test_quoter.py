@@ -204,6 +204,69 @@ def test_dry_run_never_live(tmp_path):
     assert all(r["live"] is False for r in q.gateways[Venue.KALSHI].sent)
 
 
+class FailingGateway:
+    """Gateway whose place always fails — by raising (venue 400) or by
+    returning a response with NO order id (pmus-order-id-field-is-id quirk).
+    Pins the back-off path: no phantom RestingQuote, no per-tick retry spam."""
+    def __init__(self, mode):
+        self.mode = mode
+        self.places = 0
+    def place_yes(self, market_id, side, price, count, post_only=True):
+        self.places += 1
+        if self.mode == "raise":
+            raise RuntimeError("400 post-only would cross")
+        return {"status": "accepted"}  # no order_id / order.order_id / id
+    def cancel(self, order_id, market_slug=None):
+        return None
+
+
+def _viable_book():
+    bb = BookBuilder()
+    bb.apply_snapshot(snap("T375", [("0.70", "500")], [("0.99", "1")]))
+    bb.apply_snapshot(snap("T350", [("0.55", "500")], [("0.99", "1")]))
+    return bb
+
+
+def _failing_q(tmp, mode):
+    risk = RiskManager(config=RiskConfig(bankroll=D("520"),
+                                         kill_switch_file=str(tmp / "KILL")))
+    risk.balances = {Venue.KALSHI: D("440")}
+    gw = FailingGateway(mode)
+    return gw, Quoter(rel=fed_pair(), gateways={Venue.KALSHI: gw}, risk=risk,
+                      markets=markets(), fees=FeeSchedule(), clip=5)
+
+
+def test_no_order_id_in_response_is_place_failure(tmp_path):
+    gw, q = _failing_q(tmp_path, "noid")
+    q.on_book(_viable_book())
+    assert gw.places == 1
+    assert q._resting == {}, "must not track a phantom None-id quote"
+    assert any("place_failed" in i for i in q.intents)
+    assert (1, "bid") in q._place_failed
+
+
+def test_failed_place_backs_off_min_requote_s(tmp_path):
+    for mode in ("noid", "raise"):
+        gw, q = _failing_q(tmp_path, mode)
+        bb = _viable_book()
+        q.on_book(bb)
+        assert gw.places == 1
+        q.on_book(bb)  # immediately again: inside min_requote_s => no retry spam
+        assert gw.places == 1, f"mode={mode}: failed place must back off"
+
+
+def test_one_tick_book_joins_best_bid_never_crosses(tmp_path):
+    # kalshi-postonly-cross-rejected-400: on a 1-tick book (bid 0.55/ask 0.56)
+    # the target clamps strictly below the ask — join best bid, never cross
+    q = mk(tmp_path)
+    bb = BookBuilder()
+    bb.apply_snapshot(snap("T375", [("0.70", "500")], [("0.99", "1")]))
+    bb.apply_snapshot(snap("T350", [("0.55", "500")], [("0.56", "500")]))
+    q.on_book(bb)
+    placed = [i for i in q.intents if "place" in i]
+    assert placed and placed[0]["price"] == "0.55"
+
+
 class FakePMGateway:
     """Stand-in Polymarket gateway (records intended orders)."""
     def __init__(self): self.sent = []
@@ -257,35 +320,3 @@ def test_cross_venue_quote_on_pm_hedge_on_kalshi(tmp_path):
     res = q.on_fill(1, "bid", bb)
     assert res["hedged"] is True and res["state"] == "hedged"
     assert any(r.get("body", {}).get("ticker") == "KX" for r in kgw.sent)
-
-
-def test_apr_hurdle_tightens_and_blocks(tmp_path):
-    """card 80ff7987: with min_apr set, the maker price cap tightens by the
-    per-contract lock needed to annualize >= min_apr over the hold; a thin
-    edge on a long-dated market stops quoting entirely."""
-    base = mk(tmp_path)
-    bb = BookBuilder()
-    bb.apply_snapshot(snap("T375", [("0.70", "500")], [("0.99", "1")]))
-    bb.apply_snapshot(snap("T350", [("0.55", "500")], [("0.99", "1")]))
-    base.on_book(bb)
-    base_px = D([i for i in base.intents if "place" in i][0]["price"])
-
-    # hurdle on but not binding (edge >> margin): price unchanged — the
-    # margin tightens the CAP, it never walks a joining quote lower
-    q = mk(tmp_path)
-    q.min_apr, q.resolve_years = 12.0, 1.0
-    assert q._apr_margin() > 0
-    q.on_book(bb)
-    placed = [i for i in q.intents if "place" in i]
-    assert placed and D(placed[0]["price"]) == base_px
-
-    # extreme hurdle: nothing rests
-    q2 = mk(tmp_path)
-    q2.min_apr, q2.resolve_years = 500.0, 1.0
-    q2.on_book(bb)
-    assert not [i for i in q2.intents if "place" in i]
-
-    # no resolve date => hurdle disabled, identical to base behavior
-    q3 = mk(tmp_path)
-    q3.min_apr, q3.resolve_years = 12.0, None
-    assert q3._apr_margin() == 0

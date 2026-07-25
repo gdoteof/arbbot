@@ -67,6 +67,7 @@ class Tranche(str, enum.Enum):
 class VettedBy(str, enum.Enum):
     HUMAN = "human"
     AGENT = "agent"
+    MECHANICAL = "mechanical"  # rule-generated (e.g. sports equiv discovery)
 
 
 class Leg(BaseModel):
@@ -109,6 +110,11 @@ class Relationship(BaseModel):
     vetted_at: Optional[str] = None
     oracle_risk: OracleRisk = OracleRisk.MEDIUM
     tranche: Tranche = Tranche.LONG_TAIL
+    # Stored classification (P0 registry unification). None = derive from the
+    # id via arbbot.registry.categorize; existing YAML loads unchanged.
+    category: Optional[str] = None
+    topic: Optional[str] = None
+    event_date: Optional[str] = None  # ISO date the underlying event occurs
 
     @model_validator(mode="after")
     def _validate(self) -> "Relationship":

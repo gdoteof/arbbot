@@ -1,0 +1,9 @@
+[Unit]
+Description=daily Rust-recorder shadow gate at 07:40 UTC
+
+[Timer]
+OnCalendar=*-*-* 07:40:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

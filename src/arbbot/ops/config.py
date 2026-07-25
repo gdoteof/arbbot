@@ -37,6 +37,20 @@ class RecorderConfig(BaseModel):
         return FeeSchedule(polymarket=PolymarketVariant(mode=self.polymarket_mode))
 
 
+class ExecConfig(BaseModel):
+    """Execution capital settings (config/exec.yaml, tracked in git)."""
+    bankroll_usd: Decimal = Decimal("980")
+    # fraction of bankroll one relationship class may tie up — keep in sync
+    # with RiskConfig.per_class_cap (arbbot/risk/manager.py)
+    per_class_cap: Decimal = Decimal("0.35")
+
+
+def load_exec_config(path: str | Path = "config/exec.yaml") -> ExecConfig:
+    p = Path(path)
+    return ExecConfig() if not p.exists() else ExecConfig.model_validate(
+        yaml.safe_load(p.read_text()) or {})
+
+
 def load_recorder_config(path: str | Path = "config/recorder.yaml") -> RecorderConfig:
     p = Path(path)
     cfg = RecorderConfig() if not p.exists() else RecorderConfig.model_validate(

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import asdict, dataclass, field
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_EVEN, Decimal
 from typing import Optional
 
 from arbbot.book.builder import BookBuilder
@@ -41,6 +41,7 @@ from arbbot.registry.model import Relationship
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
+EMIT_Q = Decimal("0.000001")  # fixed emit scale — see Opportunity.to_json_dict
 
 
 def no_ask_ladder(book: Book) -> list[Level]:
@@ -99,16 +100,22 @@ class Opportunity:
     max_hold_close_time: Optional[str] = None  # latest close among legs
 
     def to_json_dict(self) -> dict:
+        # Emitted Decimals are quantized to a FIXED scale (6dp; whole
+        # contracts for size) so the canonical string is portable by
+        # construction: a port using any spec decimal reproduces it without
+        # matching CPython's 28-significant-digit division context.
+        # Internal math is untouched — this is emit-time only.
         d = asdict(self)
-        for k in ("size", "gross_cost", "fees", "min_payoff",
+        d["size"] = str(d["size"].quantize(ONE, rounding=ROUND_HALF_EVEN))
+        for k in ("gross_cost", "fees", "min_payoff",
                   "net_edge_total", "net_edge_per_contract"):
-            d[k] = str(d[k])
+            d[k] = str(d[k].quantize(EMIT_Q, rounding=ROUND_HALF_EVEN))
         for leg in d["basket"]:
             leg["venue"] = leg["venue"].value
             leg["buy_side"] = leg["buy_side"].value
             leg["role"] = leg["role"].value
-            leg["vwap"] = str(leg["vwap"])
-            leg["fee"] = str(leg["fee"])
+            leg["vwap"] = str(leg["vwap"].quantize(EMIT_Q, rounding=ROUND_HALF_EVEN))
+            leg["fee"] = str(leg["fee"].quantize(EMIT_Q, rounding=ROUND_HALF_EVEN))
         return d
 
 

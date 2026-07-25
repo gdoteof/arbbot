@@ -1,0 +1,12 @@
+[package]
+name = "arb-trader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arb-core = { path = "../../crates/arb-core" }
+serde_json = { workspace = true }
+serde = { workspace = true }
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["full"] }
+sha2 = "0.10"

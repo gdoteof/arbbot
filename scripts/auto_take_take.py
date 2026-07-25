@@ -27,11 +27,13 @@ import httpx
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from arbbot.exec.kalshi_gateway import KalshiOrderGateway
+from arbbot.exec.ledgerdb import dual_append
 from arbbot.exec.polymarket_us_gateway import PolymarketUsOrderGateway
 from arbbot.exec.resolve_dates import resolve_date
 from arbbot.models.core import Venue
 from arbbot.record.kalshi import REST_BASE, load_private_key, sign_headers
 from arbbot.registry.model import Registry
+from arbbot.venues.pmus import get_bbo, get_book
 
 D = pathlib.Path.home() / ".arbbot-credentials"
 VETTED = ("xvus-time-poty-26", "xvus-france-pres-27", "xvus-brazil-pres-26", "xvus-fedcut-26")
@@ -75,9 +77,9 @@ def kalshi_top(c, ticker):
 
 
 def pmus_top(c, slug):
-    b = c.get(f"https://gateway.polymarket.us/v1/markets/{slug}/bbo").json().get("marketData", {})
+    b = get_bbo(c, slug)
     bid, ask = (b.get("bestBid") or {}), (b.get("bestAsk") or {})
-    book = c.get(f"https://gateway.polymarket.us/v1/markets/{slug}/book").json().get("marketData", {})
+    book = get_book(c, slug)
     bid_sz = sum(Decimal(str(x["qty"])) for x in (book.get("bids") or [])
                  if x["px"]["value"] == bid.get("value"))
     return (Decimal(bid["value"]) if bid.get("value") else None,
@@ -186,8 +188,7 @@ def main():
                         {"venue": "polymarket_us", "market_id": ps, "side": "no", "role": "taker",
                          "qty": int(filled), "yes_price": str(pb)}],
                "status": "open"}
-        with open("data/exec/trades.jsonl", "a") as f:
-            f.write(json.dumps(rec) + "\n")
+        dual_append(rec, source="py:auto_take_take")
         print(f"   recorded take-take basket {r.id} x{filled}")
 
 

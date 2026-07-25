@@ -4,9 +4,16 @@ Fixes the disk cliff (raw tape ~2GB/day, 25-123x smaller as Parquet) and makes
 analysis out-of-core queryable. The recorder is untouched — it keeps writing
 today's data as append-only JSONL; this runs the next day on static files.
 
+Raw tapes are written with the FIXED schema (archive.RAW_JSON_COLUMNS): no
+read_json_auto inference, every scalar VARCHAR/BIGINT, bids/asks as JSON text,
+ts_venue verbatim (auto-inference typed ISO strings as TIMESTAMP and silently
+truncated nanoseconds). Scan files (opportunities) keep auto inference.
+
 SAFETY: only archives days strictly before today (UTC); verifies the Parquet
-row count EXACTLY equals the JSONL line count before deleting; on any mismatch
-it keeps the JSONL and reports (never silently loses irreplaceable data).
+row count EXACTLY equals the JSONL line count; raw tapes additionally verify
+CONTENT — both sources are streamed through a canonical per-row JSON sha256
+and must digest-match — before deleting; on any mismatch it keeps the JSONL
+and reports (never silently loses irreplaceable data).
 
 Usage: python scripts/archive_to_parquet.py [--day YYYY-MM-DD] [--keep-jsonl]
 Default day = yesterday (UTC). Targets: data/raw/<venue>-<day>.jsonl and
@@ -15,6 +22,7 @@ data/scan/opportunities-<day>.jsonl (the big derived log). Small scan files
 """
 
 import argparse
+import hashlib
 import json
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -22,29 +30,51 @@ from pathlib import Path
 
 import duckdb
 
-from arbbot.record.archive import PARQUET_DIR
+from arbbot.record.archive import (PARQUET_DIR, iter_parquet_rows,
+                                   raw_json_reader)
+from arbbot.record.jsonl import iter_jsonl
 
 RAW_STEMS = ("kalshi", "polymarket", "polymarket_us")
-# raw tapes interleave 3 heterogeneous row types; every field must survive
-REQUIRED_RAW_COLS = {"kind", "venue", "market_id", "side", "price", "size",
-                     "bids", "asks", "seq", "ts_local_ns"}
 
 
 def line_count(path: Path) -> int:
     return int(subprocess.check_output(["grep", "-c", "", str(path)]).split()[0])
 
 
+def canonical_row(raw: dict) -> bytes:
+    """Canonical per-row JSON for content verification, applied identically to
+    both sources: drop nulls (SQL NULL and JSON null alike — the read layer
+    drops them, model_dump_json emits them), then sort keys, no whitespace."""
+    d = {k: v for k, v in raw.items() if v is not None}
+    return json.dumps(d, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def content_digests(src: Path, pq: Path) -> tuple[str, str]:
+    """(jsonl_sha256, parquet_sha256) of the canonical row streams — the
+    parquet side goes through the read layer, so a match proves a consumer
+    reading the archive sees byte-identical events to the raw tape."""
+    h_jl, h_pq = hashlib.sha256(), hashlib.sha256()
+    for _, raw in iter_jsonl(src):
+        h_jl.update(canonical_row(raw))
+    for row in iter_parquet_rows(pq):
+        h_pq.update(canonical_row(row))
+    return h_jl.hexdigest(), h_pq.hexdigest()
+
+
 def archive_one(con, src: Path, day: str, out_dir: Path, keep: bool) -> tuple[str, int]:
     pq = out_dir / f"{src.stem}.parquet"  # src.stem already '<stem>-<day>'
     if pq.exists() and not src.exists():
         return ("already-archived", 0)
-    # sample_size=-1: infer schema from ALL rows, not a sample — heterogeneous
-    # tapes (snapshot/delta/trade) otherwise silently DROP columns not seen in
-    # the sample (observed: delta side/price/size lost when the file starts
-    # with snapshots). Full-scan inference guarantees the field union.
+    is_raw = src.parent.name == "raw" or src.stem.rsplit("-", 3)[0] in RAW_STEMS
+    # raw tapes: explicit fixed schema — inference on a heterogeneous tape has
+    # silently DROPPED columns absent from a sample and TIMESTAMP-truncated
+    # ts_venue. sample_size=-1 (scan files): full-scan inference for the same
+    # dropped-column reason.
+    reader = (raw_json_reader(src) if is_raw else
+              f"read_json_auto('{src}', format='newline_delimited', "
+              f"union_by_name=true, sample_size=-1, maximum_object_size=20000000)")
     con.execute(
-        f"COPY (SELECT * FROM read_json_auto('{src}', format='newline_delimited', "
-        f"union_by_name=true, sample_size=-1, maximum_object_size=20000000)) "
+        f"COPY (SELECT * FROM {reader}) "
         f"TO '{pq}' (FORMAT parquet, COMPRESSION zstd)"
     )
     rows = con.execute(f"SELECT count(*) FROM read_parquet('{pq}')").fetchone()[0]
@@ -52,11 +82,12 @@ def archive_one(con, src: Path, day: str, out_dir: Path, keep: bool) -> tuple[st
     if rows != lines:
         pq.unlink(missing_ok=True)
         return (f"MISMATCH rows={rows} lines={lines} — kept JSONL", 0)
-    if src.parent.name == "raw" or src.stem.rsplit("-", 3)[0] in RAW_STEMS:
-        cols = {d[0] for d in con.execute(f"DESCRIBE SELECT * FROM read_parquet('{pq}')").fetchall()}
-        if not REQUIRED_RAW_COLS <= cols:
+    if is_raw:
+        d_jl, d_pq = content_digests(src, pq)
+        if d_jl != d_pq:
             pq.unlink(missing_ok=True)
-            return (f"SCHEMA-LOSS missing {REQUIRED_RAW_COLS - cols} — kept JSONL", 0)
+            return (f"CONTENT-MISMATCH jsonl={d_jl[:16]} parquet={d_pq[:16]} "
+                    f"— kept JSONL", 0)
     if not keep:
         src.unlink()
     return (f"ok {lines} rows", rows)

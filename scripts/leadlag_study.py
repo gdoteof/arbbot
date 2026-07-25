@@ -30,14 +30,13 @@ HORIZONS_S = [1, 5, 30, 120, 600]
 
 def load_tape(day: str, research_dir: Path, prefix: str = "tob"):
     df = pd.read_parquet(research_dir / f"{prefix}-{day}.parquet")
-    tob = df[df["kind"] == "tob"].copy()
-    for c in ["bid", "ask", "bid_sz", "ask_sz"]:
-        tob[c] = pd.to_numeric(tob[c], errors="coerce")
-    tob = tob.dropna(subset=["bid", "ask"])
+    # typed tape: bid/ask/bid_sz/ask_sz are DOUBLE on tob rows, trade rows
+    # carry trade_price/trade_size/taker_side (no column overloading)
+    tob = df[df["kind"] == "tob"].dropna(subset=["bid", "ask"]).copy()
     tob = tob[(tob["ask"] > tob["bid"]) & (tob["ask"] - tob["bid"] < 0.20)]
     tob["mid"] = (tob["bid"] + tob["ask"]) / 2
     trades = df[df["kind"] == "trade"].copy()
-    trades["size"] = pd.to_numeric(trades["bid_sz"], errors="coerce")
+    trades["size"] = trades["trade_size"]
     return tob, trades
 
 

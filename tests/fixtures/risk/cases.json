@@ -1,0 +1,2219 @@
+{
+ "cases": [
+  {
+   "name": "normal_allow",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "10",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "20.000",
+    "reasons": []
+   }
+  },
+  {
+   "name": "kill_on",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "5",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": true
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "0",
+    "reasons": [
+     "kill switch active"
+    ]
+   }
+  },
+  {
+   "name": "kill_on_masks_all",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "999999",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": true
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "0",
+    "reasons": [
+     "kill switch active"
+    ]
+   }
+  },
+  {
+   "name": "rel_cap_below",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "19",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "20.000",
+    "reasons": []
+   }
+  },
+  {
+   "name": "rel_cap_at",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "20",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "20.000",
+    "reasons": []
+   }
+  },
+  {
+   "name": "rel_cap_above",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "21",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "20.000",
+    "reasons": [
+     "per-relationship tail cap: notional 21 > headroom 20.000 (cap 20.000, oracle_risk=low)"
+    ]
+   }
+  },
+  {
+   "name": "rel_cap_medium",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "medium"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "11",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "10.000",
+    "reasons": [
+     "per-relationship tail cap: notional 11 > headroom 10.000 (cap 10.000, oracle_risk=medium)"
+    ]
+   }
+  },
+  {
+   "name": "rel_cap_high",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "high"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "6",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "5.0000",
+    "reasons": [
+     "per-relationship tail cap: notional 6 > headroom 5.0000 (cap 5.0000, oracle_risk=high)"
+    ]
+   }
+  },
+  {
+   "name": "rel_cap_abs_medium",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "150",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "medium"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "76",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "75.0",
+    "reasons": [
+     "per-relationship tail cap: notional 76 > headroom 75.0 (cap 75.0, oracle_risk=medium)"
+    ]
+   }
+  },
+  {
+   "name": "rel_concentration_deny",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [
+      [
+       "rel-x",
+       "15"
+      ]
+     ],
+     "by_class": [
+      [
+       "equivalent-pair",
+       "15"
+      ]
+     ],
+     "by_topic": [
+      [
+       "other",
+       "15"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "6",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "5.000",
+    "reasons": [
+     "per-relationship tail cap: notional 6 > headroom 5.000 (cap 20.000, oracle_risk=low)"
+    ]
+   }
+  },
+  {
+   "name": "rel_over_cap_negative_headroom",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [
+      [
+       "rel-x",
+       "30"
+      ]
+     ],
+     "by_class": [
+      [
+       "equivalent-pair",
+       "30"
+      ]
+     ],
+     "by_topic": [
+      [
+       "other",
+       "30"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "0",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "0",
+    "reasons": [
+     "per-relationship tail cap: notional 0 > headroom -10.000 (cap 20.000, oracle_risk=low)"
+    ]
+   }
+  },
+  {
+   "name": "class_cap_below",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [
+      [
+       "equivalent-pair",
+       "340"
+      ]
+     ],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "5",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "20.000",
+    "reasons": []
+   }
+  },
+  {
+   "name": "class_cap_at",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [
+      [
+       "equivalent-pair",
+       "340"
+      ]
+     ],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "10",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "20.000",
+    "reasons": []
+   }
+  },
+  {
+   "name": "class_cap_above_no_apr",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [
+      [
+       "equivalent-pair",
+       "340"
+      ]
+     ],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "11",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "20.000",
+    "reasons": [
+     "class cap: 340+11 > 350.00"
+    ]
+   }
+  },
+  {
+   "name": "class_cap_above_apr_below",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [
+      [
+       "equivalent-pair",
+       "340"
+      ]
+     ],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "11",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": "10.0",
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "20.000",
+    "reasons": [
+     "class cap: 340+11 > 350.00 (overflow needs apr>=25.0)"
+    ]
+   }
+  },
+  {
+   "name": "class_cap_overflow_ok",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [
+      [
+       "equivalent-pair",
+       "340"
+      ]
+     ],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "60",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": "30.0",
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "10000.0",
+    "reasons": []
+   }
+  },
+  {
+   "name": "class_cap_overflow_apr_at_min",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [
+      [
+       "equivalent-pair",
+       "400"
+      ]
+     ],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "50",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": "25.0",
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "10000.0",
+    "reasons": []
+   }
+  },
+  {
+   "name": "class_cap_overflow_above_ceiling",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [
+      [
+       "equivalent-pair",
+       "400"
+      ]
+     ],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "51",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": "99.0",
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "10000.0",
+    "reasons": [
+     "class cap: 400+51 > 350.00 (overflow needs apr>=25.0)"
+    ]
+   }
+  },
+  {
+   "name": "global_cap_above",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "r1",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [
+      [
+       "r1",
+       "300"
+      ],
+      [
+       "r2",
+       "195"
+      ]
+     ],
+     "by_class": [
+      [
+       "equivalent-pair",
+       "495"
+      ]
+     ],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "10",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "9700.0",
+    "reasons": [
+     "class cap: 495+10 > 350.00",
+     "global cap: 495+10 > 500.00"
+    ]
+   }
+  },
+  {
+   "name": "topic_budget_below",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": [
+      {
+       "family": "macron",
+       "budget_usd": "100",
+       "only_below_util": null
+      }
+     ]
+    },
+    "rel": {
+     "id": "fr-macron-24",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": [
+      [
+       "macron",
+       "80"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "10",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "10000.0",
+    "reasons": []
+   }
+  },
+  {
+   "name": "topic_budget_at",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": [
+      {
+       "family": "macron",
+       "budget_usd": "100",
+       "only_below_util": null
+      }
+     ]
+    },
+    "rel": {
+     "id": "fr-macron-24",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": [
+      [
+       "macron",
+       "80"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "20",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "10000.0",
+    "reasons": []
+   }
+  },
+  {
+   "name": "topic_budget_above_no_apr",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": [
+      {
+       "family": "macron",
+       "budget_usd": "100",
+       "only_below_util": null
+      }
+     ]
+    },
+    "rel": {
+     "id": "fr-macron-24",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": [
+      [
+       "macron",
+       "80"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "21",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "10000.0",
+    "reasons": [
+     "topic budget [macron]: 80+21 > 100"
+    ]
+   }
+  },
+  {
+   "name": "topic_budget_above_apr_no_marks",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": [
+      {
+       "family": "macron",
+       "budget_usd": "100",
+       "only_below_util": null
+      }
+     ]
+    },
+    "rel": {
+     "id": "fr-macron-24",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": [
+      [
+       "macron",
+       "80"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "21",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": "30.0",
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "10000.0",
+    "reasons": []
+   }
+  },
+  {
+   "name": "topic_budget_above_apr_below_min",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": [
+      {
+       "family": "macron",
+       "budget_usd": "100",
+       "only_below_util": null
+      }
+     ]
+    },
+    "rel": {
+     "id": "fr-macron-24",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": [
+      [
+       "macron",
+       "80"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "21",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": "10.0",
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "10000.0",
+    "reasons": [
+     "topic budget [macron]: 80+21 > 100 (overflow needs apr>=25.0)"
+    ]
+   }
+  },
+  {
+   "name": "topic_budget_weakest_bar",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": [
+      {
+       "family": "macron",
+       "budget_usd": "100",
+       "only_below_util": null
+      }
+     ]
+    },
+    "rel": {
+     "id": "fr-macron-24",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": [
+      [
+       "macron",
+       "80"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "21",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": "12.0",
+    "weakest_fwd_apr": "8.0",
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "10000.0",
+    "reasons": []
+   }
+  },
+  {
+   "name": "topic_budget_weakest_bar_deny",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": [
+      {
+       "family": "macron",
+       "budget_usd": "100",
+       "only_below_util": null
+      }
+     ]
+    },
+    "rel": {
+     "id": "fr-macron-24",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": [
+      [
+       "macron",
+       "80"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "21",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": "5.0",
+    "weakest_fwd_apr": "8.0",
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "10000.0",
+    "reasons": [
+     "topic budget [macron]: 80+21 > 100 (overflow needs apr>=8.0)"
+    ]
+   }
+  },
+  {
+   "name": "default_topic_budget_deny",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": "50",
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": [
+      [
+       "other",
+       "45"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "10",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "10000.0",
+    "reasons": [
+     "topic budget [other]: 45+10 > 50"
+    ]
+   }
+  },
+  {
+   "name": "topic_gate_open",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": [
+      {
+       "family": "macron",
+       "budget_usd": "10000",
+       "only_below_util": "0.50"
+      }
+     ]
+    },
+    "rel": {
+     "id": "fr-macron-24",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [
+      [
+       "r1",
+       "100"
+      ]
+     ],
+     "by_class": [],
+     "by_topic": [
+      [
+       "macron",
+       "0"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "10",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "10000.0",
+    "reasons": []
+   }
+  },
+  {
+   "name": "topic_gate_blocked",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": [
+      {
+       "family": "macron",
+       "budget_usd": "10000",
+       "only_below_util": "0.50"
+      }
+     ]
+    },
+    "rel": {
+     "id": "fr-macron-24",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [
+      [
+       "r1",
+       "200"
+      ]
+     ],
+     "by_class": [],
+     "by_topic": [
+      [
+       "macron",
+       "0"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "10",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "10000.0",
+    "reasons": [
+     "topic [macron] gated to util<0.50: at 0.57"
+    ]
+   }
+  },
+  {
+   "name": "default_topic_gate_blocked",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": "10000",
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": "0.30",
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [
+      [
+       "r1",
+       "200"
+      ]
+     ],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "10",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "10000.0",
+    "reasons": [
+     "topic [other] gated to util<0.30: at 0.57"
+    ]
+   }
+  },
+  {
+   "name": "balance_insufficient",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "3"
+     ]
+    ],
+    "notional": "10",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "20.000",
+    "reasons": [
+     "insufficient kalshi balance: 5 > 3"
+    ]
+   }
+  },
+  {
+   "name": "balance_missing_venue",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ]
+    ],
+    "notional": "10",
+    "venue_costs": [
+     [
+      "polymarket_us",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "20.000",
+    "reasons": [
+     "insufficient polymarket_us balance: 5 > 0"
+    ]
+   }
+  },
+  {
+   "name": "balance_exact_ok",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "notional": "10",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "20.000",
+    "reasons": []
+   }
+  },
+  {
+   "name": "balance_two_venues_order",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "1"
+     ],
+     [
+      "polymarket_us",
+      "1"
+     ]
+    ],
+    "notional": "10",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ],
+     [
+      "polymarket_us",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "20.000",
+    "reasons": [
+     "insufficient kalshi balance: 5 > 1",
+     "insufficient polymarket_us balance: 5 > 1"
+    ]
+   }
+  },
+  {
+   "name": "zero_notional_allow",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "0",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "20.000",
+    "reasons": []
+   }
+  },
+  {
+   "name": "zero_bankroll",
+   "input": {
+    "config": {
+     "bankroll": "0",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "0",
+    "venue_costs": [],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "0.000",
+    "reasons": []
+   }
+  },
+  {
+   "name": "negative_notional",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [],
+     "by_class": [],
+     "by_topic": []
+    },
+    "balances": [
+     [
+      "kalshi",
+      "100000"
+     ],
+     [
+      "polymarket_us",
+      "100000"
+     ]
+    ],
+    "notional": "-5",
+    "venue_costs": [],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": true,
+    "max_notional": "20.000",
+    "reasons": []
+   }
+  },
+  {
+   "name": "multi_reason",
+   "input": {
+    "config": {
+     "bankroll": "1000",
+     "tail_fraction": "0.02",
+     "per_rel_cap": null,
+     "per_class_cap": "0.35",
+     "global_cap": "0.50",
+     "overflow_min_apr": "25.0",
+     "overflow_frac": "0.10",
+     "default_topic_budget": null,
+     "default_only_below_util": null,
+     "topics": []
+    },
+    "rel": {
+     "id": "rel-x",
+     "type": "equivalent-pair",
+     "oracle_risk": "low"
+    },
+    "exposure": {
+     "by_relationship": [
+      [
+       "rel-x",
+       "100"
+      ]
+     ],
+     "by_class": [
+      [
+       "equivalent-pair",
+       "600"
+      ]
+     ],
+     "by_topic": [
+      [
+       "other",
+       "0"
+      ]
+     ]
+    },
+    "balances": [
+     [
+      "kalshi",
+      "1"
+     ]
+    ],
+    "notional": "30",
+    "venue_costs": [
+     [
+      "kalshi",
+      "5"
+     ]
+    ],
+    "opportunity_apr": null,
+    "weakest_fwd_apr": null,
+    "kill": false
+   },
+   "output": {
+    "allowed": false,
+    "max_notional": "0",
+    "reasons": [
+     "per-relationship tail cap: notional 30 > headroom -80.000 (cap 20.000, oracle_risk=low)",
+     "class cap: 600+30 > 350.00",
+     "insufficient kalshi balance: 5 > 1"
+    ]
+   }
+  }
+ ]
+}

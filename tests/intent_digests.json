@@ -1,0 +1,12 @@
+{
+  "_comment": "Pinned intent-parity digests: scripts/intent_replay.py (Python reference) and rust arb-intent must both reproduce these over the same merged-tape export + live registry. Harness: jitter 0, clip 5, tape-time clock, global mock ids, risk inert.",
+  "days": {
+    "2026-07-20": {
+      "events": 5474100,
+      "book_events": 5454794,
+      "intents": 80,
+      "sha256": "3bf83fa164bfabdd387c765b0b0d701dedf03711cbeaad77edfa2cb3a7be6f07",
+      "prefix_200k": "72e43032c6f4be9aea8419e73977a9cca209a900d6febe73ca1bc279656a6260"
+    }
+  }
+}

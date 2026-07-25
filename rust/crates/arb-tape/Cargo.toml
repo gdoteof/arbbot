@@ -1,0 +1,12 @@
+[package]
+name = "arb-tape"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arb-core = { path = "../arb-core" }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "macros", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

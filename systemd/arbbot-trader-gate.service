@@ -1,0 +1,11 @@
+# Daily P3 shadow-trader gate: compares yesterday's Rust dry-run trader
+# intents against the Python trader's flushed intents (decision-level, not
+# byte-level — the byte gate is arb-trader --bench-tape).
+# Output: data/reports/trader-gate-<day>.txt
+[Unit]
+Description=arbbot Rust-trader shadow gate (daily comparison)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/claude/arbbot
+ExecStart=/bin/bash -c 'day=$(date -u -d yesterday +%%Y-%%m-%%d); mkdir -p data/reports; .venv/bin/python .claude/worktrees/rust-rewrite/scripts/shadow_trader_gate.py --day $day > data/reports/trader-gate-$day.txt 2>&1; head -1 data/reports/trader-gate-$day.txt'

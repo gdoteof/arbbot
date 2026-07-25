@@ -19,13 +19,10 @@ k*P*(1-P)*size), stored as taker_fee_coef_override.
 
 from __future__ import annotations
 
-import base64
-import time
 from decimal import Decimal
 from typing import Any
 
 import httpx
-from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from arbbot.models.core import (
     BookEvent,
@@ -92,12 +89,10 @@ def ws_auth_headers(key_id: str, secret_key_b64: str,
                     path: str = WS_MARKETS_PATH) -> dict[str, str]:
     """Signed handshake headers for the market-data WS (auth required — the
     only PM US key is trade-capable, but this task only reads market data).
-    Ed25519 over '{ts}GET{path}'; timestamp must be within 30s of server."""
-    priv = ed25519.Ed25519PrivateKey.from_private_bytes(
-        base64.b64decode(secret_key_b64)[:32])
-    ts = str(int(time.time() * 1000))
-    sig = base64.b64encode(priv.sign(f"{ts}GET{path}".encode())).decode()
-    return {"X-PM-Access-Key": key_id, "X-PM-Timestamp": ts, "X-PM-Signature": sig}
+    Ed25519 over '{ts}GET{path}'; timestamp must be within 30s of server.
+    Signing lives in arbbot.venues.pmus (one shared implementation)."""
+    from arbbot.venues.pmus import load_ed25519, sign_headers
+    return sign_headers(key_id, load_ed25519(secret_key_b64), "GET", path)
 
 
 def subscribe_frame(request_id: str, sub_type: str, slugs: list[str]) -> str:

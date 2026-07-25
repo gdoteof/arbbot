@@ -11,15 +11,22 @@ that belongs to a cross-venue pairing:
 Trade events for tracked markets are passed through as-is.
 
 Output: data/research/tob-<day>.parquet
-Columns: ts_local_ns, venue, market_id, kind ('tob'|'trade'),
-         bid, ask, bid_sz, ask_sz  (trade rows: bid=price, bid_sz=size)
+Columns: ts_local_ns BIGINT, venue, market_id, kind ('tob'|'trade'),
+         bid/ask/bid_sz/ask_sz DOUBLE (tob rows), and
+         trade_price/trade_size DOUBLE, taker_side (trade rows) —
+         each kind fills only its own columns, the rest are NULL.
+
+Events come from the one read layer (arbbot.record.archive.iter_day_merged),
+parquet-or-JSONL. For non-default raw dirs (data/raw-sports) the parquet
+archive dir is derived as the sibling parquet-<suffix> (data/parquet-sports),
+never the prod data/parquet, whose stems would collide.
 
     .venv313/bin/python scripts/build_tob_tape.py --day 2026-07-22
+    .venv313/bin/python scripts/build_tob_tape.py --day 2026-07-22 --raw-dir data/raw-sports
 """
 
 import argparse
 import csv
-import heapq
 import json
 import tempfile
 from pathlib import Path
@@ -31,6 +38,13 @@ from arbbot.models.core import BookDelta, BookSnapshot, Trade
 from arbbot.record.archive import iter_day_merged
 from arbbot.record.jsonl import parse_event
 from arbbot.registry.model import Registry
+
+CSV_COLUMNS = {"ts_local_ns": "BIGINT", "venue": "VARCHAR",
+               "market_id": "VARCHAR", "kind": "VARCHAR",
+               "bid": "DOUBLE", "ask": "DOUBLE",
+               "bid_sz": "DOUBLE", "ask_sz": "DOUBLE",
+               "trade_price": "DOUBLE", "trade_size": "DOUBLE",
+               "taker_side": "VARCHAR"}
 
 
 def tracked_markets(registry_path: str, sports_map_path: str) -> set[tuple[str, str]]:
@@ -51,28 +65,19 @@ def tracked_markets(registry_path: str, sports_map_path: str) -> set[tuple[str, 
     return tracked
 
 
-def iter_day_jsonl(day: str, venues: list[str], raw_dir: str):
-    """Direct JSONL merge (bypasses the archive layer — needed for
-    data/raw-sports, whose stems would collide with the prod parquet dir).
-    Files are single-writer append-ordered, so a heap merge on
-    (ts_local_ns, venue, seq) is a total order."""
-    from arbbot.record.jsonl import iter_jsonl
-
-    def gen(venue):
-        path = Path(raw_dir) / f"{venue}-{day}.jsonl"
-        if not path.exists():
-            return
-        for _, raw in iter_jsonl(path):
-            yield (raw.get("ts_local_ns", 0), venue, raw.get("seq", 0)), raw
-
-    for _, raw in heapq.merge(*(gen(v) for v in venues), key=lambda t: t[0]):
-        yield raw
+def parquet_dir_for(raw_dir: str) -> Path | None:
+    """None (default sibling data/parquet) for the prod raw dir; for variants
+    like data/raw-sports, the sibling parquet-sports — keeps sports stems from
+    colliding with the prod archive."""
+    raw = Path(raw_dir)
+    if raw.name == "raw":
+        return None
+    return raw.parent / raw.name.replace("raw", "parquet", 1)
 
 
 def run(day: str, raw_dir: str, out_path: Path,
         registry_path: str = "config/registry.yaml",
-        sports_map_path: str = "data/scan/sports_equiv_map.json",
-        jsonl_only: bool = False) -> dict:
+        sports_map_path: str = "data/scan/sports_equiv_map.json") -> dict:
     tracked = tracked_markets(registry_path, sports_map_path)
     tracked_ids = {mid for _, mid in tracked}
     books = BookBuilder()
@@ -83,11 +88,10 @@ def run(day: str, raw_dir: str, out_path: Path,
         "w", suffix=".csv", delete=False, newline="",
         dir=out_path.parent)
     writer = csv.writer(tmp)
-    writer.writerow(["ts_local_ns", "venue", "market_id", "kind",
-                     "bid", "ask", "bid_sz", "ask_sz"])
+    writer.writerow(CSV_COLUMNS)
     venues = ["kalshi", "polymarket", "polymarket_us"]
-    source = (iter_day_jsonl(day, venues, raw_dir) if jsonl_only
-              else iter_day_merged(day, venues, raw_dir))
+    source = iter_day_merged(day, venues, raw_dir,
+                             parquet_dir=parquet_dir_for(raw_dir))
     try:
         for raw in source:
             n_ev += 1
@@ -101,11 +105,10 @@ def run(day: str, raw_dir: str, out_path: Path,
             if key not in tracked:
                 continue
             if isinstance(ev, Trade):
-                # trade rows reuse tob columns: bid=price, ask=taker_side,
-                # bid_sz=size
                 writer.writerow([ev.ts_local_ns, key[0], key[1], "trade",
-                                 str(ev.price), ev.taker_side or "",
-                                 str(ev.size), ""])
+                                 "", "", "", "",
+                                 str(ev.price), str(ev.size),
+                                 ev.taker_side or ""])
                 n_rows += 1
                 continue
             if isinstance(ev, BookSnapshot):
@@ -130,18 +133,17 @@ def run(day: str, raw_dir: str, out_path: Path,
             if last_tob.get(key) == tob:
                 continue
             last_tob[key] = tob
-            writer.writerow([ev.ts_local_ns, key[0], key[1], "tob", *tob])
+            writer.writerow([ev.ts_local_ns, key[0], key[1], "tob", *tob,
+                             "", "", ""])
             n_rows += 1
     finally:
         tmp.close()
 
+    cols = ", ".join(f"'{k}': '{t}'" for k, t in CSV_COLUMNS.items())
     con = duckdb.connect()
     con.execute(f"""
-        COPY (SELECT ts_local_ns::BIGINT AS ts_local_ns, venue, market_id, kind,
-                     bid, ask, bid_sz, ask_sz
-              FROM read_csv_auto('{tmp.name}', header=true,
-                                 types={{'ts_local_ns':'BIGINT','bid':'VARCHAR',
-                                        'ask':'VARCHAR','bid_sz':'VARCHAR','ask_sz':'VARCHAR'}})
+        COPY (SELECT * FROM read_csv('{tmp.name}', header=true,
+                                     columns={{{cols}}})
               ORDER BY ts_local_ns)
         TO '{out_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
     """)
@@ -156,14 +158,11 @@ def main() -> None:
     ap.add_argument("--raw-dir", default="data/raw")
     ap.add_argument("--out-dir", default="data/research")
     ap.add_argument("--out-prefix", default="tob")
-    ap.add_argument("--jsonl-only", action="store_true",
-                    help="read raw JSONL directly (required for data/raw-sports)")
     args = ap.parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{args.out_prefix}-{args.day}.parquet"
-    print(json.dumps(run(args.day, args.raw_dir, out,
-                         jsonl_only=args.jsonl_only)))
+    print(json.dumps(run(args.day, args.raw_dir, out)))
 
 
 if __name__ == "__main__":

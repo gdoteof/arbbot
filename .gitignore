@@ -34,3 +34,4 @@ config/registry-rejected.yaml
 config/registry.yaml.bak*
 # topic capital budgets reveal the trading-family strategy — same treatment
 config/topics.yaml
+rust/target/

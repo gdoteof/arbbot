@@ -23,6 +23,7 @@ import websockets
 
 from arbbot.book.builder import BookBuilder, GapDetected, NotSynced
 from arbbot.exec.kalshi_gateway import KalshiOrderGateway
+from arbbot.exec.ledgerdb import dual_append
 from arbbot.exec.polymarket_us_gateway import PolymarketUsOrderGateway
 from arbbot.ops.alerts import Alerter
 from arbbot.record.kalshi import (REST_BASE, KalshiWsBook, load_private_key,
@@ -349,8 +350,7 @@ def execute(g, kbid, kask, pbid, pask, kg, pg, alerter, state):
                                   "role": "taker", "qty": int(lf), "yes_price": str(sell_px)}],
                         "cost_usd": float((Decimal(1) - sell_px) * lf),
                         "payoff_usd": float(lf), "profit_usd": 0.0}
-                with open("data/exec/trades.jsonl", "a") as fh:
-                    fh.write(json.dumps(lrec) + "\n")
+                dual_append(lrec, source="py:sports_arb")
                 print(f"  LEAN rider x{lf} PM short @ {sell_px} [{lean_used()}/{LEAN_CAP}]", flush=True)
         prof = float((sell_px - buy_px) * f2) - FEE * f2
         alerter.alert(f"arbbot SPORTS CAPTURE {key} x{f2} +${prof:.2f} riskless")
@@ -364,24 +364,14 @@ def execute(g, kbid, kask, pbid, pask, kg, pg, alerter, state):
                          "side": "yes" if dear == "k" else "no", "qty": int(f2), "yes_price": str(sell_px if dear == "pm" else buy_px)}],
                "cost_usd": float(min(buy_px, Decimal(1) - sell_px) * f2), "payoff_usd": float(f2),
                "profit_usd": prof, "status": "open"}
-        with open("data/exec/trades.jsonl", "a") as fh:
-            fh.write(json.dumps(rec) + "\n")
+        dual_append(rec, source="py:sports_arb")
         print(f"  CAPTURED {key} x{f2}  +${prof:.2f} riskless (recorded)", flush=True)
     except Exception as e:
         print(f"  *** SPORTS EXEC ERROR {key}: {type(e).__name__}: {e} — 60s recon net will flag any naked leg ***", flush=True)
 
 
-KILL_FILE = pathlib.Path("data/KILL")   # global kill switch (card d821411a)
-
 MAP_FILE = pathlib.Path("data/scan/sports_equiv_map.json")
 MAP_LEAGUES = {"itfme", "itfwo", "wta", "atp", "kbo", "npb", "mlb"}  # 2-way only
-
-# Geoff 2026-07-23: sports de-vetted — mlb and itfwo explicitly removed, and
-# "everything else sports should just give up". NEW entries (take-take + lean
-# riders) require a league in TRADE_LEAGUES; detection/scan, the rehedge and
-# naked-hold watchers, and settlement handling stay live for existing
-# positions. Re-vet a league by adding it back here.
-TRADE_LEAGUES: set = set()
 
 
 def map_games():
@@ -625,23 +615,8 @@ async def detector(games, books, pm_bbo, stop, live, kg, pg, alerter, state):
                     print(f"[{time.strftime('%H:%M:%S')}] SPORTS-DISLOCATION {key}: "
                           f"K={kbid:.2f}/{kask:.2f} PM={pbid:.2f}/{pask:.2f} edge={edge*100:+.1f}c ({side})"
                           + (" -> EXECUTE" if live else ""), flush=True)
-                    if live and g.get("league", "mlb") in TRADE_LEAGUES \
-                            and not KILL_FILE.exists() \
-                            and not circuit_open() and not probe_owned(g["slug"]) \
-                            and key not in state.setdefault("inflight", set()):
-                        # run in a thread: execute() blocks up to ~5s on
-                        # confirmed fills — inline it would stall BOTH WS
-                        # readers (card 23d15e3f finding, sports analogue)
-                        state["inflight"].add(key)
-
-                        async def _bg(g=g, kbid=kbid, kask=kask, pbid=pbid, pask=pask, key=key):
-                            try:
-                                await asyncio.to_thread(execute, g, kbid, kask, pbid, pask,
-                                                        kg, pg, alerter, state)
-                            finally:
-                                state["inflight"].discard(key)
-
-                        asyncio.create_task(_bg())
+                    if live and not circuit_open() and not probe_owned(g["slug"]):
+                        execute(g, kbid, kask, pbid, pask, kg, pg, alerter, state)
 
 
 def _mt_candidates(games, books, pm_bbo):
@@ -863,8 +838,6 @@ async def rehedge_watcher(pm_bbo, books, stop, live, pg, kg, alerter):
     State survives restarts via data/exec/sports_naked.json."""
     while not stop.is_set():
         await asyncio.sleep(2)
-        if KILL_FILE.exists():
-            continue  # global kill switch halts rehedge/flatten orders too
         holds = load_naked()
         if not holds:
             continue
@@ -907,15 +880,15 @@ async def rehedge_watcher(pm_bbo, books, stop, live, pg, kg, alerter):
                 try:
                     if h["side"] == "bid":
                         px = Decimal(str(round(h["ref_px"] + MT_FEE + MIN_REHEDGE_LOCK, 2)))
-                        r2 = await asyncio.to_thread(kg.place_yes, h["kt"], "ask", px, qty, post_only=False)
+                        r2 = kg.place_yes(h["kt"], "ask", px, qty, post_only=False)
                     else:
                         px = Decimal(str(round(h["ref_px"] - MT_FEE - MIN_REHEDGE_LOCK, 2)))
-                        r2 = await asyncio.to_thread(kg.place_yes, h["kt"], "bid", px, qty, post_only=False)
+                        r2 = kg.place_yes(h["kt"], "bid", px, qty, post_only=False)
                     oid2 = (r2.get("order") or {}).get("order_id") or r2.get("order_id") or ""
                     _intent(place=h["kt"], venue="kalshi",
                             side="ask" if h["side"] == "bid" else "bid",
                             price=str(px), count=qty, order_id=oid2)
-                    ff = await asyncio.to_thread(_confirm_ioc_fill, kg, oid2, qty)
+                    ff = _confirm_ioc_fill(kg, oid2, qty)
                 except Exception as e:
                     print(f"  *** FLATTEN ERROR {h['game']}: {type(e).__name__}: {e} ***", flush=True)
                     h["next_try"] = now + 60; changed = True
@@ -925,15 +898,15 @@ async def rehedge_watcher(pm_bbo, books, stop, live, pg, kg, alerter):
                           f"x{ff}/{qty} on Kalshi — realized ~+{flat_lock*100:.1f}c/ct roundtrip", flush=True)
                     alerter.alert(f"arbbot FLATTENED naked {h['game']} x{ff} ~+{flat_lock*100:.1f}c/ct")
                     with contextlib.suppress(OSError):
-                        with open("data/exec/trades.jsonl", "a") as fh:
-                            fh.write(json.dumps({
-                                "ts": time.time(), "relationship_id": f"sports-flatten-{h['game']}",
-                                "title": f"{h['game']} (naked flatten)", "qty": int(ff),
-                                "strategy": "flatten", "status": "realized",
-                                "cost_usd": round(h["ref_px"] * ff, 4),
-                                "payoff_usd": round((h["ref_px"] + flat_lock) * ff, 4),
-                                "profit_usd": round(flat_lock * ff, 4),
-                                "realized_pnl_usd": round(flat_lock * ff, 4)}) + "\n")
+                        dual_append({
+                            "ts": time.time(), "relationship_id": f"sports-flatten-{h['game']}",
+                            "title": f"{h['game']} (naked flatten)", "qty": int(ff),
+                            "strategy": "flatten", "status": "realized",
+                            "cost_usd": round(h["ref_px"] * ff, 4),
+                            "payoff_usd": round((h["ref_px"] + flat_lock) * ff, 4),
+                            "profit_usd": round(flat_lock * ff, 4),
+                            "realized_pnl_usd": round(flat_lock * ff, 4)},
+                            source="py:sports_arb")
                     h["qty"] = qty - int(ff)
                     if h["qty"] < 1:
                         holds.remove(h)
@@ -951,11 +924,11 @@ async def rehedge_watcher(pm_bbo, books, stop, live, pg, kg, alerter):
                     limit = round(h["ref_px"] + MT_FEE + MIN_REHEDGE_LOCK, 2)
                     if not live:
                         continue
-                    hr = await asyncio.to_thread(pg.place_short, h["slug"], Decimal(str(limit)), qty, post_only=False)
+                    hr = pg.place_short(h["slug"], Decimal(str(limit)), qty, post_only=False)
                     oid = hr.get("id") or hr.get("order_id") or ""
                     _intent(place=h["slug"], venue="polymarket_us", side="ask",
                             price=str(limit), count=qty, order_id=oid)
-                    hf = await asyncio.to_thread(_confirm_ioc_fill, pg, oid, qty)
+                    hf = _confirm_ioc_fill(pg, oid, qty)
                 else:                       # short Kalshi YES -> need to BUY PM YES
                     lock = h["ref_px"] - pask - MT_FEE
                     if lock < MIN_REHEDGE_LOCK:
@@ -963,11 +936,11 @@ async def rehedge_watcher(pm_bbo, books, stop, live, pg, kg, alerter):
                     limit = round(h["ref_px"] - MT_FEE - MIN_REHEDGE_LOCK, 2)
                     if not live:
                         continue
-                    hr = await asyncio.to_thread(pg.place_yes, h["slug"], "bid", Decimal(str(limit)), qty, post_only=False)
+                    hr = pg.place_yes(h["slug"], "bid", Decimal(str(limit)), qty, post_only=False)
                     oid = hr.get("id") or hr.get("order_id") or ""
                     _intent(place=h["slug"], venue="polymarket_us", side="bid",
                             price=str(limit), count=qty, order_id=oid)
-                    hf = await asyncio.to_thread(_confirm_ioc_fill, pg, oid, qty)
+                    hf = _confirm_ioc_fill(pg, oid, qty)
             except Exception as e:
                 print(f"  *** REHEDGE ERROR {h['game']}: {type(e).__name__}: {e} ***", flush=True)
                 h["next_try"] = now + 60; changed = True
@@ -1018,8 +991,7 @@ async def rehedge_watcher(pm_bbo, books, stop, live, pg, kg, alerter):
                        "payoff_usd": float(hf),
                        "profit_usd": round(lock * hf, 4), "status": "open"}
                 with contextlib.suppress(OSError):
-                    with open("data/exec/trades.jsonl", "a") as fh:
-                        fh.write(json.dumps(rec) + "\n")
+                    dual_append(rec, source="py:sports_arb")
                 h["qty"] = qty - int(hf)
                 if h["qty"] < 1:
                     holds.remove(h)

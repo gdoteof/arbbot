@@ -25,10 +25,12 @@ from decimal import Decimal
 import httpx
 
 from arbbot.exec.kalshi_gateway import KalshiOrderGateway
+from arbbot.exec.ledgerdb import dual_append
 from arbbot.exec.polymarket_us_gateway import PolymarketUsOrderGateway
 from arbbot.models.core import Venue
 from arbbot.record.kalshi import REST_BASE, load_private_key
 from arbbot.registry.model import Registry
+from arbbot.venues.pmus import top_of_book as pmus_top
 
 CRED = pathlib.Path("~/.arbbot-credentials").expanduser()
 KALSHI_FEE = Decimal("0.01")   # ~taker fee/ct on the hedge
@@ -38,13 +40,6 @@ TICK = Decimal("0.01")
 def kalshi_top(c, t):
     m = c.get(f"{REST_BASE}/markets", params={"tickers": t}).json()["markets"][0]
     return Decimal(str(m["yes_bid_dollars"])), Decimal(str(m["yes_ask_dollars"])), Decimal(str(m.get("yes_ask_size_fp") or 0))
-
-
-def pmus_top(c, slug):
-    b = c.get(f"https://gateway.polymarket.us/v1/markets/{slug}/bbo").json().get("marketData", {})
-    bid, ask = (b.get("bestBid") or {}), (b.get("bestAsk") or {})
-    return (Decimal(bid["value"]) if bid.get("value") else None,
-            Decimal(ask["value"]) if ask.get("value") else None)
 
 
 def main():
@@ -141,8 +136,7 @@ def _record(rel, kleg, pleg, qty, pm_ask, r2):
            "cost_usd": float(cost), "payoff_usd": float(qty),
            "profit_usd": float(Decimal(qty) - cost), "status": "open"}
     p = pathlib.Path("data/exec/trades.jsonl")
-    with open(p, "a") as f:
-        f.write(json.dumps(rec) + "\n")
+    dual_append(rec, source="py:make_take")
     print(f"   recorded make-take to {p} (profit ~${rec['profit_usd']:.2f})")
 
 

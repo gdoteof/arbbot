@@ -23,9 +23,9 @@ import httpx
 
 from arbbot.exec.resolve_dates import resolve_date
 from arbbot.record.kalshi import REST_BASE
+from arbbot.venues.pmus import top_of_book as pmus_topbook  # noqa: F401 (re-exported to unwind_positions)
 
 KALSHI_FEE = Decimal("0.01")  # ~taker fee/ct to unwind the Kalshi leg
-LEDGER = Path("data/exec/trades.jsonl")
 OUT = Path("data/exec/marks.json")
 
 
@@ -37,13 +37,6 @@ def kalshi_books(client, tickers):
             out[m["ticker"]] = (Decimal(str(m.get("yes_bid_dollars") or 0)),
                                 Decimal(str(m.get("yes_ask_dollars") or 0)))
     return out
-
-
-def pmus_topbook(client, slug):
-    b = client.get(f"https://gateway.polymarket.us/v1/markets/{slug}/bbo").json().get("marketData", {})
-    bid, ask = (b.get("bestBid") or {}), (b.get("bestAsk") or {})
-    return (Decimal(bid["value"]) if bid.get("value") else None,
-            Decimal(ask["value"]) if ask.get("value") else None)
 
 
 # opportunity cost of locked capital (%/yr). A hold whose REMAINING return
@@ -91,24 +84,6 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
         resolves = (_dt2.date.fromtimestamp(float(t.get("ts", now)))
                     + _dt2.timedelta(days=1)).isoformat()
         estimated = True
-    if not resolves:
-        # probe-originated baskets (card e5696107) stamp no resolves_by, but
-        # their event slugs embed the date (aec-...-2026-07-23): event date
-        # + 1 day, same fast-settle model. Records with no date anywhere stay
-        # None (a wrong entry+1d guess on a long-dated market would fire
-        # false hard-unwind signals).
-        import datetime as _dt2
-        import re as _re2
-        hay = str(t.get("relationship_id", "")) + " " + " ".join(
-            str(l.get("market_id") or "") for l in t.get("legs", []))
-        m2 = _re2.search(r"(20\d{2}-\d{2}-\d{2})", hay)
-        if m2:
-            try:
-                resolves = (_dt2.date.fromisoformat(m2.group(1))
-                            + _dt2.timedelta(days=1)).isoformat()
-                estimated = True
-            except ValueError:
-                pass
     row = {"relationship_id": t["relationship_id"], "ts": t.get("ts"), "title": t.get("title"),
            "qty": int(qty), "cost_usd": float(cost), "locked_profit_usd": float(locked),
            "resolves_by": resolves, "resolves_estimated": estimated}
@@ -190,9 +165,12 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
 
 
 def main():
-    from arbbot.exec.ledger import open_baskets, parse_lines
-    trades = parse_lines(LEDGER.read_text().splitlines()) if LEDGER.exists() else []
-    open_t = open_baskets(trades)  # open records net of appended unwind records
+    from arbbot.exec import ledgerdb
+    conn = ledgerdb.connect()
+    try:
+        open_t = ledgerdb.open_baskets_db(conn)  # open records net of close records
+    finally:
+        conn.close()
     c = httpx.Client(timeout=20)
     ktickers = [next(l["market_id"] for l in t["legs"] if l["venue"] == "kalshi")
                 for t in open_t if len(t.get("legs", [])) >= 2]

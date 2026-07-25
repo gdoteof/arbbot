@@ -1,0 +1,35 @@
+# Rust trader SHADOW unit (P3). The dry-run decision shell running beside
+# the live stack: subscribes to the Rust shadow recorder's socket
+# (data/arbbot-rs.sock), quotes in-memory only — this binary contains NO
+# venue order code path and loads NO credentials — and appends its intent
+# stream to data/trader-rs/intents.jsonl with latency stats to the journal
+# every 5 min. Honors the live kill switch (data/KILL) like the Python
+# trader: kill => cancel-all intents + quoting pause until cleared.
+#
+# Gate: scripts/shadow_trader_gate.py (arbbot-trader-gate.timer) compares
+# each day's Rust intents against the Python trader's data/scan intents.
+#
+# Install (manual, deployment-time):
+#   cp systemd/arbbot-trader-rs.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user start arbbot-trader-rs
+
+[Unit]
+Description=arbbot Rust trader shell (dry-run shadow, P3)
+After=arbbot-recorder-rs.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude/arbbot
+ExecStart=%h/claude/arbbot/.claude/worktrees/rust-rewrite/rust/target/release/arb-trader \
+    --socket data/arbbot-rs.sock \
+    --registry config/registry.yaml \
+    --out data/trader-rs/intents.jsonl \
+    --stats-every 300
+Restart=always
+RestartSec=5
+# shadow must never starve the real stack
+Nice=10
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target

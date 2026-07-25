@@ -1,0 +1,13 @@
+# Synthetic 2-leg relationship for the arb-trader determinism tests. Shape
+# only (cross-venue-equivalent, one Kalshi leg + one PM-US leg) — the ids are
+# invented, so nothing here mirrors the private live registry.
+relationships:
+  - id: synth-fill-rel
+    type: cross-venue-equivalent
+    verdict: confirmed
+    tranche: core
+    legs:
+      - venue: kalshi
+        market_id: SYNTH-K-YES
+      - venue: polymarket_us
+        market_id: SYNTH-P-YES

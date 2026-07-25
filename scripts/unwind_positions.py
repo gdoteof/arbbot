@@ -28,32 +28,15 @@ import httpx
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from mark_positions import compute_row, kalshi_books, pmus_topbook  # noqa: E402
 
+from arbbot.exec import ledgerdb
 from arbbot.exec.kalshi_gateway import KalshiOrderGateway
-from arbbot.exec.ledger import open_baskets, parse_lines
+from arbbot.exec.ledgerdb import dual_append
 from arbbot.exec.polymarket_us_gateway import PolymarketUsOrderGateway
 from arbbot.ops.alerts import Alerter
-from arbbot.ops.config import load_credential, load_recorder_config
+from arbbot.ops.config import load_credential, load_exec_config, load_recorder_config
 from arbbot.record.kalshi import load_private_key
 
-LEDGER = Path("data/exec/trades.jsonl")
 KTICK = Decimal("0.01")   # sweep one level past the touch on the Kalshi close
-
-
-PAUSE_REQ = Path("data/exec/.quote_pause_requests.json")
-
-
-def request_quote_pause(rid: str, seconds: float = 120.0) -> None:
-    """Ask the runner to pull its maker quotes on this relationship before we
-    close the basket — our own resting quotes are often the touch on these
-    thin books, and self-trade prevention deadlocks the unwind IOC otherwise
-    (card ed6a5910: 14 soft unwinds blocked)."""
-    try:
-        reqs = json.loads(PAUSE_REQ.read_text())
-    except (OSError, ValueError):
-        reqs = {}
-    reqs[rid] = time.time() + seconds
-    reqs = {k: v for k, v in reqs.items() if v > time.time()}
-    PAUSE_REQ.write_text(json.dumps(reqs))
 
 
 def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
@@ -75,29 +58,6 @@ def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
     if not live:
         print("[UNWIND] dry-run — no orders placed", flush=True)
         return
-    request_quote_pause(rid)
-    time.sleep(8)  # runner checks the request file every ~5s and pulls quotes
-    # RE-PRICE against the book WITHOUT our own quotes (card ed6a5910 pt.2):
-    # on thin books our maker quotes ARE the touch, so pre-pause prices — and
-    # marks' liq values generally — are flattered by ourselves. Only unwind if
-    # it is still profitable against the real residual book.
-    import httpx as _hx
-    _c2 = _hx.Client(timeout=15)
-    kb2 = kalshi_books(_c2, [kleg["market_id"]]).get(kleg["market_id"], (None, None))
-    pb2 = pmus_topbook(_c2, pleg["market_id"])
-    k_bid2, p_ask2 = kb2[0], pb2[1]
-    if k_bid2 is None or p_ask2 is None:
-        print(f"[UNWIND] {rid} book empty after quote pause — skip", flush=True)
-        return
-    liq2 = (Decimal(str(k_bid2)) + (Decimal(1) - Decimal(str(p_ask2)))) * qty \
-           - Decimal("0.01") * qty
-    mark2 = float(liq2) - float(t["cost_usd"])
-    if mark2 <= 0:
-        print(f"[UNWIND] {rid} not profitable against the residual book "
-              f"(mark {mark2:+.2f} vs {row['mark_pnl_usd']:+.2f} with our quotes) — skip",
-              flush=True)
-        return
-    k_bid, p_ask = k_bid2, p_ask2
     if inverted:
         # PM leg first (thin): close held YES via BUY_SHORT offset, IOC at bid
         r1 = pgw.place_short(pleg["market_id"], Decimal(str(p_bid)), qty,
@@ -117,76 +77,26 @@ def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
         return
     if inverted:
         # Kalshi leg: close held NO by buying YES, one tick through the ask
-        kr = kgw.place_yes(kleg["market_id"], "bid",
-                           min(Decimal(str(k_ask)) + KTICK, Decimal("0.99")),
-                           filled, post_only=False)
+        kgw.place_yes(kleg["market_id"], "bid",
+                      min(Decimal(str(k_ask)) + KTICK, Decimal("0.99")),
+                      filled, post_only=False)
     else:
         # Kalshi leg: sell YES, one tick through the bid, exact filled qty
-        kr = kgw.place_yes(kleg["market_id"], "ask", max(Decimal(str(k_bid)) - KTICK, KTICK),
-                           filled, post_only=False)
-    # CONFIRM the Kalshi close (2026-07-23: fire-and-forget sells silently
-    # failed during venue 429s, stranding longs mid-unwind after the PM close)
-    koid = (kr.get("order") or {}).get("order_id") or kr.get("order_id") or ""
-    kf = 0
-    for _ in range(8):
-        try:
-            kf = kgw.filled_qty(koid)
-        except Exception:
-            pass
-        if kf >= filled:
-            break
-        time.sleep(0.5)
-    if kf < filled:
-        # one repriced retry at the FRESH touch before giving up (2026-07-23:
-        # a fedcut sell missed, yet the record booked full proceeds — 4 YES
-        # stranded 2h until a recon page)
-        with __import__("contextlib").suppress(Exception):
-            kb3 = kalshi_books(httpx.Client(timeout=15),
-                               [kleg["market_id"]]).get(kleg["market_id"], (None, None))
-            if inverted and kb3[1] is not None:
-                kr2 = kgw.place_yes(kleg["market_id"], "bid",
-                                    min(Decimal(str(kb3[1])) + KTICK, Decimal("0.99")),
-                                    filled - kf, post_only=False)
-            elif not inverted and kb3[0] is not None:
-                kr2 = kgw.place_yes(kleg["market_id"], "ask",
-                                    max(Decimal(str(kb3[0])) - KTICK, KTICK),
-                                    filled - kf, post_only=False)
-            else:
-                kr2 = {}
-            koid2 = (kr2.get("order") or {}).get("order_id") or kr2.get("order_id") or ""
-            for _ in range(8):
-                try:
-                    kf += kgw.filled_qty(koid2) if koid2 else 0
-                except Exception:
-                    pass
-                if kf >= filled:
-                    break
-                time.sleep(0.5)
-    if kf < filled:
-        print(f"[UNWIND] {rid} KALSHI close underfilled {kf}/{filled} — stranded "
-              f"position; proceeds recorded for the FILLED portion only; recon "
-              f"flags the remainder, completion appends a correction", flush=True)
-        Alerter(load_recorder_config().ntfy_topic).alert(
-            f"arbbot UNWIND {rid}: Kalshi close underfilled {kf}/{filled} — "
-            f"{filled - kf} stranded, ledger records actuals only")
+        kgw.place_yes(kleg["market_id"], "ask", max(Decimal(str(k_bid)) - KTICK, KTICK),
+                      filled, post_only=False)
     frac = filled / qty
-    # proceeds count ONLY what each leg actually closed — an unfilled Kalshi
-    # remainder is stranded inventory, not proceeds; recon + a later
-    # completion (with a correction record) recover it at the real price
     if inverted:
-        proceeds = (Decimal(str(p_bid)) * filled
-                    + (Decimal(1) - Decimal(str(k_ask))) * kf)
+        proceeds = (Decimal(str(p_bid)) + (Decimal(1) - Decimal(str(k_ask)))) * filled
         legs = [{"venue": "kalshi", "market_id": kleg["market_id"],
-                 "side": "no", "action": "close_via_buy_yes", "qty": kf,
+                 "side": "no", "action": "close_via_buy_yes", "qty": filled,
                  "yes_price": str(k_ask)},
                 {"venue": "polymarket_us", "market_id": pleg["market_id"],
                  "side": "yes", "action": "close_via_buy_short", "qty": filled,
                  "yes_price": str(p_bid)}]
     else:
-        proceeds = (Decimal(str(k_bid)) * kf
-                    + (Decimal(1) - Decimal(str(p_ask))) * filled)
+        proceeds = (Decimal(str(k_bid)) + (Decimal(1) - Decimal(str(p_ask)))) * filled
         legs = [{"venue": "kalshi", "market_id": kleg["market_id"],
-                 "side": "yes", "action": "sell", "qty": kf, "yes_price": str(k_bid)},
+                 "side": "yes", "action": "sell", "qty": filled, "yes_price": str(k_bid)},
                 {"venue": "polymarket_us", "market_id": pleg["market_id"],
                  "side": "no", "action": "sell", "qty": filled, "yes_price": str(p_ask)}]
     rec = {"ts": time.time(), "relationship_id": rid, "title": t.get("title"),
@@ -195,10 +105,7 @@ def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
            "legs": legs,
            "proceeds_usd": float(proceeds),
            "realized_pnl_usd": float(proceeds) - float(t["cost_usd"]) * frac}
-    if kf < filled:
-        rec["stranded_kalshi_qty"] = filled - kf
-    with open(LEDGER, "a") as f:
-        f.write(json.dumps(rec) + "\n")
+    dual_append(rec, source="py:unwind_positions")
     print(f"[UNWIND] {rid} closed x{filled}/{qty} proceeds=${float(proceeds):.2f} "
           f"realized=${rec['realized_pnl_usd']:.2f}", flush=True)
     Alerter(load_recorder_config().ntfy_topic).alert(
@@ -211,12 +118,11 @@ def main() -> None:
     ap.add_argument("--live", action="store_true")
     args = ap.parse_args()
 
-    if Path("data/KILL").exists():  # global kill switch (card 39140c2e)
-        print("data/KILL present — unwinder halted")
-        return
-
-    records = parse_lines(LEDGER.read_text().splitlines()) if LEDGER.exists() else []
-    baskets = open_baskets(records)
+    conn = ledgerdb.connect()
+    try:
+        baskets = ledgerdb.open_baskets_db(conn)
+    finally:
+        conn.close()
     if not baskets:
         print("no open baskets")
         return
@@ -237,21 +143,12 @@ def main() -> None:
         # fwd APR below the 12% hurdle) — early unwinds have realized very
         # high annualized returns and the freed capital redeploys into the
         # opportunities the cap is otherwise blocking.
-        CLASS_BUDGET = 980 * 0.35   # keep in sync with RiskConfig
+        ecfg = load_exec_config()
+        CLASS_BUDGET = float(ecfg.bankroll_usd) * float(ecfg.per_class_cap)  # keep in sync with RiskConfig
         open_notional = sum(float(b.get("qty") or 0) for b in baskets)
         constrained = open_notional >= 0.95 * CLASS_BUDGET
         eligible = row.get("unwind_hard") or (constrained and row.get("unwind_signal"))
         if not eligible:
-            continue
-        # probe-owned baskets (coordination contract: research manages its own
-        # positions) — surface the signal, never auto-execute against them
-        if t.get("strategy") in ("pmus-maker-probe", "ml-leadlag-probe"):
-            print(f"[UNWIND] {t['relationship_id']} signal on PROBE basket "
-                  f"({t.get('strategy')}) — alerting, not acting (ownership)", flush=True)
-            Alerter(load_recorder_config().ntfy_topic).alert(
-                f"arbbot: unwind signal on probe basket {t['relationship_id']} "
-                f"({t.get('strategy')}, fwd_apr={row.get('forward_hold_apr')}) — "
-                f"research side to action")
             continue
         hard += 1
         # v2 (2026-07-23): inverted baskets (Kalshi NO + PM YES) are handled

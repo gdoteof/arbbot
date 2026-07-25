@@ -28,6 +28,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from arbbot.book.builder import BookBuilder, GapDetected, NotSynced
+from arbbot.exec.ledgerdb import dual_append
 from arbbot.models.core import BookDelta, BookSnapshot, Trade
 from arbbot.record.jsonl import parse_event
 
@@ -71,34 +72,6 @@ def top(book):
     return float(bid.price), float(ask.price)
 
 
-_health_cache: dict = {}
-
-
-def stale_feeds(health_path, ttl=3.0):
-    """Feed names currently flagged stale by the recorder's 1s heartbeat.
-    Returns {'__health__'} when the heartbeat itself is dead/unreadable —
-    treat that as everything-stale (recorder down = quoting blind)."""
-    now = time.time()
-    c = _health_cache.get(health_path)
-    if c and now - c[0] < ttl:
-        return c[1]
-    try:
-        with open(health_path, "rb") as f:
-            try:
-                f.seek(-4096, 2)
-            except OSError:
-                f.seek(0)
-            last = f.read().splitlines()[-1]
-        d = json.loads(last)
-        out = {k for k, v in d.get("stale", {}).items() if v}
-        if now - d.get("ts", 0) > 15:
-            out = {"__health__"}
-    except Exception:
-        out = {"__health__"}
-    _health_cache[health_path] = (now, out)
-    return out
-
-
 class PairState:
     def __init__(self, pair):
         self.pair = pair
@@ -109,7 +82,6 @@ class PairState:
         self.stopped = False
         self.last_fill = defaultdict(float)
         self.status = None
-        self.pending = None       # unhedged fresh fill awaiting a sweep pair
 
 
 class MakerProbe:
@@ -199,16 +171,6 @@ class MakerProbe:
     # ---------- quoting ----------
     def guards(self, st, now_ns):
         """(kbid, kask, kmid) when quotable, else (None, reason)."""
-        # feed-level staleness (Geoff 2026-07-23): if the recorder says a
-        # dependent feed is giving bad data, pull quotes and wait for restore
-        # — venue-side stale bursts measured at 1.1-1.6 s/min (rust A/B)
-        bad = stale_feeds("data/raw-sports/health.jsonl")
-        if "__health__" in bad:
-            return None, "sports recorder heartbeat dead"
-        if "kalshi-ws" in bad:
-            return None, "kalshi FEED stale"
-        if "polymarket_us-ws" in bad:
-            return None, "pm-us FEED stale"
         kt = st.pair["kalshi"]
         kb = self.books.get("kalshi", kt)
         if kb is None:
@@ -312,7 +274,7 @@ class MakerProbe:
                         if new > 0:
                             cur["cum"] = cum
                             st.last_fill[side] = time.time()
-                            await self.on_fill(st, side, new, cur["px"], cur)
+                            await self.hedge(st, side, new, cur["px"], cur)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -331,9 +293,12 @@ class MakerProbe:
             if not self.args.live:
                 continue
             try:
+                # off-loop (to_thread) AND priority="critical": a budget
+                # time.sleep would stall the event loop that services WS
+                # fills/hedges; the 429 jittered backoff below is this
+                # loop's throttle.
                 r = await asyncio.to_thread(
-                    self.pm_gw.client.get, self.pm_gw.base + pth,
-                    headers=self.pm_gw._headers("GET", pth))
+                    self.pm_gw.session.get, pth, priority="critical")
                 r.raise_for_status()
                 positions = r.json().get("positions", {})
             except Exception as e:
@@ -365,7 +330,7 @@ class MakerProbe:
                         new = cum - ocur["cum"]
                         if new > 0:  # late-recognized fill: hedge it now
                             ocur["cum"] = cum
-                            await self.on_fill(ost, oside, new, ocur["px"], ocur)
+                            await self.hedge(ost, oside, new, ocur["px"], ocur)
                             own = self.hedged_net[slug]
                 unexpected = net - own
                 if unexpected != 0 and not getattr(st, "recon_latched", False):
@@ -564,78 +529,17 @@ class MakerProbe:
         if new > 0:
             cur["cum"] = got
             st.last_fill[side] = time.time()
-            await self.on_fill(st, side, new, cur["px"], cur)
+            await self.hedge(st, side, new, cur["px"], cur)
 
     # ---------- hedge ----------
-    async def on_fill(self, st, side, qty, px, cur=None):
-        """Fill coordinator with a sweep-pairing window: if the OPPOSITE side
-        fills within --pair-window-s, net the PM legs and bank the full spread
-        with zero hedge fees (the morning's accidental sweeps banked 8-9c/ct
-        exactly this way). Otherwise hedge on Kalshi as before."""
+    async def hedge(self, st, side, qty, fill_px, cur=None):
         self.session_fills += 1
-        self.log({"ts": time.time(), "pm": st.pair["pm"], "action": "fill",
-                  "side": side, "qty": qty, "px": px})
-        print(f"[FILL] {st.pair['teams']} {side} {qty}@{px} — pair window",
-              flush=True)
-        p = st.pending
-        if p and p["side"] != side:
-            st.pending = None
-            m = min(p["qty"], qty)
-            bid_px = px if side == "buy" else p["px"]
-            ask_px = px if side == "sell" else p["px"]
-            locked = (ask_px - bid_px) * m
-            self.realized += locked
-            st.pnl += locked
-            now = time.time()
-            with LEDGER.open("a") as f:
-                f.write(json.dumps({
-                    "ts": now, "relationship_id": f"pmm-{st.pair['pm']}",
-                    "title": f"PM-US maker SWEEP: {st.pair['teams']} "
-                             f"({st.pair['league']})",
-                    "qty": m, "strategy": "pmus-maker-probe",
-                    "legs": [{"venue": "polymarket_us", "market_id": st.pair["pm"],
-                              "side": "yes", "role": "maker", "qty": m,
-                              "yes_price": str(bid_px)},
-                             {"venue": "polymarket_us", "market_id": st.pair["pm"],
-                              "side": "no", "role": "maker", "qty": m,
-                              "yes_price": str(ask_px)}],
-                    "cost_usd": round(bid_px * m + (1 - ask_px) * m, 4),
-                    "payoff_usd": m, "profit_usd": round(locked, 4),
-                    "status": "open",
-                    "note": "both-side sweep — netted, no hedge, no fees"}) + "\n")
-                f.write(json.dumps({
-                    "ts": now + 0.001, "relationship_id": f"pmm-{st.pair['pm']}",
-                    "strategy": "pmus-maker-probe", "status": "unwound",
-                    "closes_ts": now, "qty": m,
-                    "realized_pnl_usd": round(locked, 4),
-                    "note": "sweep legs net to zero on venue"}) + "\n")
-            self.log({"ts": now, "pm": st.pair["pm"], "action": "sweep",
-                      "qty": m, "bid_px": bid_px, "ask_px": ask_px,
-                      "locked": round(locked, 4)})
-            print(f"[SWEEP] {st.pair['teams']} paired {m}x "
-                  f"{bid_px}/{ask_px} locked={locked:+.3f} "
-                  f"session={self.realized:+.2f}", flush=True)
-            if p["qty"] > m:
-                await self._hedge_now(st, p["side"], p["qty"] - m, p["px"], p["cur"])
-            if qty > m:
-                await self._hedge_now(st, side, qty - m, px, cur)
-            return
-        if p:  # same-side second fill: hedge the older leg now, pend the new
-            st.pending = None
-            await self._hedge_now(st, p["side"], p["qty"], p["px"], p["cur"])
-        mine = {"side": side, "qty": qty, "px": px, "cur": cur, "ts": time.time()}
-        st.pending = mine
-        asyncio.create_task(self._pending_expire(st, mine))
-
-    async def _pending_expire(self, st, p):
-        await asyncio.sleep(self.args.pair_window_s)
-        if st.pending is p:
-            st.pending = None
-            await self._hedge_now(st, p["side"], p["qty"], p["px"], p["cur"])
-
-    async def _hedge_now(self, st, side, qty, fill_px, cur=None):
         kt = st.pair["kalshi"]
-        print(f"[HEDGE] {st.pair['teams']} {side} {qty}@{fill_px}", flush=True)
+        rec = {"ts": time.time(), "pm": st.pair["pm"], "action": "fill",
+               "side": side, "qty": qty, "px": fill_px}
+        self.log(rec)
+        print(f"[FILL] {st.pair['teams']} {side} {qty}@{fill_px} — hedging",
+              flush=True)
         hedged = 0
         hpx_avg = 0.0
         for attempt in range(6):
@@ -729,18 +633,17 @@ class MakerProbe:
             st.pnl += locked
             self.open_baskets += 1
             self.hedged_net[st.pair["pm"]] += hedged if side == "buy" else -hedged
-            with LEDGER.open("a") as f:
-                f.write(json.dumps({
-                    "ts": time.time(),
-                    "relationship_id": f"pmm-{st.pair['pm']}",
-                    "title": f"PM-US maker probe: {st.pair['teams']} "
-                             f"({st.pair['league']})",
-                    "qty": hedged, "strategy": "pmus-maker-probe",
-                    "legs": legs, "cost_usd": round(cost, 4),
-                    "payoff_usd": hedged, "profit_usd": round(hedged - cost, 4),
-                    "status": "open",
-                    "note": f"locked={locked:+.4f} margin={self.args.margin}",
-                }) + "\n")
+            dual_append({
+                "ts": time.time(),
+                "relationship_id": f"pmm-{st.pair['pm']}",
+                "title": f"PM-US maker probe: {st.pair['teams']} "
+                         f"({st.pair['league']})",
+                "qty": hedged, "strategy": "pmus-maker-probe",
+                "legs": legs, "cost_usd": round(cost, 4),
+                "payoff_usd": hedged, "profit_usd": round(hedged - cost, 4),
+                "status": "open",
+                "note": f"locked={locked:+.4f} margin={self.args.margin}",
+            }, source="probe:pmus-maker")
             rec2["locked"] = round(locked, 4)
             print(f"[HEDGED] {st.pair['teams']} {side} {hedged}/{qty} "
                   f"@{hpx_avg:.2f} locked={locked:+.3f} "
@@ -772,11 +675,6 @@ class MakerProbe:
 
     async def cancel_all(self):
         for st in self.ps.values():
-            # flush any pending sweep-pair leg before shutdown — never leave
-            # an unhedged fill waiting on a window that won't be serviced
-            if st.pending:
-                p, st.pending = st.pending, None
-                await self._hedge_now(st, p["side"], p["qty"], p["px"], p["cur"])
             for side in ("buy", "sell"):
                 await self.cancel(st, side)
 
@@ -857,9 +755,6 @@ def main():
     ap.add_argument("--jump-standdown", type=float, default=0.04)
     ap.add_argument("--min-px", type=float, default=0.05)
     ap.add_argument("--max-px", type=float, default=0.95)
-    ap.add_argument("--pair-window-s", type=float, default=1.5,
-                    help="hold the hedge this long after a fill to pair an "
-                         "opposite-side fill into a fee-free netted sweep")
     args = ap.parse_args()
     asyncio.run(MakerProbe(args).run())
 

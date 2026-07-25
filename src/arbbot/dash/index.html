@@ -578,7 +578,6 @@
     <section class="card">
       <h2>Open positions — venue truth <span id="pos-stale" class="stale-pill" hidden></span></h2>
       <div class="cap" data-tip="What we ACTUALLY hold on each venue right now (reconciliation snapshot, refreshed ~60s): Kalshi position + PM US net per pair, joined via the registry and the sports equivalence map. HEDGED = legs net to zero (a complete basket). NAKED = a directional imbalance. WATCHED = the imbalance is registered with the profit-only rehedge/flatten watcher. Orphans are venue positions no known pair explains.">every open position, hedged and unhedged — from venue APIs, not the ledger</div>
-      <div class="cap" id="gate-line" data-tip="The capital-displacement gate: soft UNWIND flags (fwd APR < 12%) only EXECUTE while the class budget is ≥95% used — below that, holding a sub-hurdle basket beats freeing capital with nowhere better to go. Hard flags (fwd APR < 4%) execute regardless. The system breathes at the cap: new fills push utilization over the line, the timer recycles the lowest-APR profitable soft candidates, and it settles back under." style="margin-top:2px"></div>
       <div class="act-strip" id="pos-strip"></div>
       <div style="overflow-x:auto"><table id="pos-table">
         <thead><tr>
@@ -872,7 +871,6 @@ function render(d) {
   renderMakerProbe(d);
   renderCapacity(d.capacity);
   renderPositions(d.positions);
-  renderUnwindGate(d.unwind_gate);
   /* accumulating counters get FULL digits — the tick is the signal that
      the instrument is alive; compact notation hides it */
   $("#hero-val").textContent = d.hero.observations.toLocaleString("en-US");
@@ -1320,7 +1318,6 @@ function renderActivity(d) {
     const parts = [
       `<span class="t">${relTime(e.ts)}</span>`,
       `<span class="abadge ${e.action}">${e.action}</span>`,
-      e.tag ? `<span class="abadge" style="background:#7c3aed26;color:#a78bfa">${e.tag}</span>` : "",
       `<span class="vchip ${vc}">${vn}</span>`,
       e.side ? `<span class="side-tag ${e.side}">${e.side.toUpperCase()}</span>` : `<span class="side-tag" style="visibility:hidden">—</span>`,
       `<span class="mk" title="${e.market} · ${e.rel || ""}">${e.market}</span>`,
@@ -1468,21 +1465,6 @@ function renderSports(d) {
     tb.appendChild(tr);
   }
   renderMtProbe(d.sports && d.sports.mt_probe);
-}
-
-function renderUnwindGate(g) {
-  const el = $("#gate-line");
-  if (!el) return;
-  if (!g || g.open_notional == null) { el.textContent = ""; return; }
-  const state = g.constrained
-    ? "displacement gate OPEN — soft UNWIND flags execute"
-    : "displacement gate CLOSED — soft UNWIND flags hold (not capital-constrained)";
-  el.innerHTML =
-    `class capital <b>$${g.open_notional.toFixed(0)}</b> / $${g.class_budget.toFixed(0)} ` +
-    `(<b>${g.util_pct}%</b>) · ${state}` +
-    (g.soft_signals ? ` · ${g.soft_signals} soft` : "") +
-    (g.hard_signals ? ` · <span style="color:var(--delta-bad,#c33)">${g.hard_signals} hard</span>` : "");
-  el.style.color = g.constrained ? "var(--st-warn)" : "var(--ink-mut)";
 }
 
 function renderPositions(px) {

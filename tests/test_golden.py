@@ -52,14 +52,20 @@ def test_decision_stream_is_deterministic():
 
 
 def test_canonical_encoding_stable():
-    """Decimals serialize as strings, keys sorted — the parity contract."""
+    """Decimals serialize as fixed-scale strings, keys sorted — the parity
+    contract. Fixed scale (6dp; whole contracts for size) makes the encoding
+    portable: a port need not reproduce CPython's 28-significant-digit
+    division context, only quantize its result to the same scale."""
     line = _decision_stream()[0]
     d = json.loads(line)
     assert list(d.keys()) == sorted(d.keys())
-    for k in ("size", "gross_cost", "fees", "min_payoff",
+    assert "." not in d["size"], "size is whole contracts"
+    for k in ("gross_cost", "fees", "min_payoff",
               "net_edge_total", "net_edge_per_contract"):
         assert isinstance(d[k], str), f"{k} must be a Decimal string, not float"
+        assert len(d[k].split(".")[1]) == 6, f"{k} must be quantized to 6dp"
     for leg in d["basket"]:
-        assert isinstance(leg["vwap"], str) and isinstance(leg["fee"], str)
+        assert len(leg["vwap"].split(".")[1]) == 6
+        assert len(leg["fee"].split(".")[1]) == 6
     # re-encoding the parsed dict reproduces the exact line (no float drift)
     assert json.dumps(d, sort_keys=True, separators=(",", ":")) == line

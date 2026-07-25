@@ -1,0 +1,456 @@
+# Strategy manifest v2 — DESIGN-ONLY today (2026-07-23). Nothing reads this
+# file yet; it becomes load-bearing when the P4 engine compiles it to the
+# strategy/strategy_claim tables. From that point every order-placing actor
+# must have an entry here BEFORE its first live order, and ledger strategy
+# tags/sources not listed here are rejected.
+#
+# v2 (Geoff design feedback 2026-07-23): the Rust engine is the SOLE executor
+# in the end state — every entry declares `family` (a Rust template whose
+# typed `params` ARE the strategy, or bespoke/external-intents/audit-readonly/
+# manual-tool/retires), `target_runtime` (end state) and `today` (current
+# reality). Schema + semantics: docs/strategy-contract.md §2-§4.
+#
+# Values below are the REAL current knobs lifted from the code as of this
+# worktree (which lags main: re-verify make-take clip/quoter knobs against
+# main's toxgate + clip-25 work before this file becomes load-bearing).
+
+strategies:
+  # ---- family: maker-hedge ---------------------------------------------
+  - id: make-take
+    kind: maker
+    family: maker-hedge
+    target_runtime: rust-template(maker-hedge)
+    today: python-daemon          # launch_runner.sh / arbbot-trader.service
+    params:
+      quote_venue: both           # per relationship legs
+      anchor: riskless-hedge-cost # min(top+tick, p_max - safety), quoter.py
+      safety_ticks: 0
+      clip: 5                     # RE-VERIFY vs main (clip-25 scale-up)
+      size_jitter: 2              # live runner; rest clip - random(0..2)
+      price_jitter_ticks: 0
+      deadband_ticks: 0
+      min_requote_s: 15.0
+      hedge: cross-venue-anchor-ladder   # quote-time anchor -> stale book -> snapshot -> unwind
+      guards:
+        toxicity_gate: main-only  # RE-VERIFY: exists on main, not this worktree
+    claims:
+      - registry_query: vetted cross-venue relationships passed via --relationship
+        rel_ids:                  # current launch_runner.sh set (prefixes)
+          - xvus-france-pres-27-*
+          - xvus-time-poty-26-*
+    budget_share:
+      kalshi: place/cancel via gateway, no shared meter
+      polymarket_us: critical (unmetered) for order path
+    caps:
+      bankroll_usd: {value: 980, scope: lifetime, source_of_truth: config/exec.yaml}
+      per_class_cap: {value: 0.35, scope: lifetime}
+    ledger_tags: [make-take]
+    close_kinds: []
+    source: python-trader
+    intents_stream: data/scan/trader-intents-{rel}.jsonl
+    kill: honors                  # target: engine (arbitration-enforced)
+    state_files: [data/exec/trades.jsonl, data/runner.log]
+
+  - id: pmus-maker-probe
+    kind: maker
+    family: maker-hedge
+    target_runtime: rust-template(maker-hedge)   # runs external-intents while research
+    today: python-daemon          # launch_pmus_maker_probe.sh
+    params:
+      quote_venue: polymarket_us
+      anchor: reference-mid       # kalshi_mid +/- margin, pmus_maker_probe.py:391
+      margin: 0.04
+      clip: 5
+      size_jitter: 0
+      price_jitter_ticks: 0
+      deadband_ticks: 0
+      hedge: none-inventory       # single-venue; inventory-managed
+      guards:
+        max_kspread: 0.05
+        jump_standdown: 0.04
+        px_bounds: [0.05, 0.95]
+    claims:
+      - venue: polymarket_us
+        registry_query: sports map slugs it quotes; advertised via probe JSONL
+    budget_share:
+      polymarket_us: background metered (30/min shared) + critical for place/cancel
+    caps:
+      max_baskets: {value: 4, scope: per-session}
+      max_fills: {value: 20, scope: per-session}
+      max_loss_usd: {value: 5.0, scope: per-session}
+    ledger_tags: [pmus-maker-probe]
+    close_kinds: []
+    source: probe:pmus-maker
+    intents_stream: data/exec/pmus_maker_probe.jsonl
+    kill: honors
+    state_files: [data/exec/pmus_maker_probe.jsonl]
+
+  # ---- family: take-take-cross -----------------------------------------
+  - id: take-take
+    kind: taker
+    family: take-take-cross
+    target_runtime: rust-template(take-take-cross)
+    today: python-daemon          # in-process trigger inside the runner
+    params:
+      universe: [xvus-time-poty-26, xvus-france-pres-27, xvus-brazil-pres-26, xvus-fedcut-26]
+      edge_model: apr-bar         # bar floats with class-budget utilization
+      apr_floor_pct: 4.0
+      apr_ceil_pct: 16.0
+      fee_ct: 0.02
+      max_clip: 10
+      per_market_cap: 50          # contracts per relationship
+      cooldown_s: 30.0
+      legging: abort
+    claims:
+      - rel_ids: [xvus-time-poty-26, xvus-france-pres-27, xvus-brazil-pres-26, xvus-fedcut-26]
+    budget_share:
+      kalshi: shares runner gateway
+      polymarket_us: critical (unmetered)
+    caps:
+      per_rel_cap_contracts: {value: 50, scope: lifetime}
+    ledger_tags: [take-take]
+    close_kinds: []
+    source: python-trader
+    intents_stream: null
+    kill: inherits                # runner's kill_switch_file; target: engine
+    state_files: []
+
+  - id: sports-take-take
+    kind: taker
+    family: take-take-cross
+    target_runtime: rust-template(take-take-cross)
+    today: python-daemon          # scripts/sports_arb.py / arbbot-sports.service
+    params:
+      universe: equiv-map         # data/scan/sports_equiv_map.json
+      universe_note: leagues itfme,itfwo,wta,atp,kbo,npb,mlb (2-way only)
+      edge_model: min-edge
+      min_edge: 0.02
+      fee_ct: 0.02
+      max_clip: 5                 # CLIP per capture
+      per_market_cap: 20          # CAP_PER_GAME
+      cooldown_s: 20.0
+      max_spread: 0.03
+      legging: record-naked-and-rehedge
+    claims:
+      - registry_query: matched games from data/scan/sports_equiv_map.json
+    budget_share:
+      kalshi: own gateway
+      polymarket_us: critical (unmetered) order path
+    caps:
+      cap_per_game: {value: 20, scope: lifetime}
+    ledger_tags: [sports-take-take]
+    close_kinds: []
+    source: py:sports_arb
+    intents_stream: data/scan/trader-intents-sports.jsonl
+    kill: DOES-NOT-CHECK (gap)    # own circuit breaker only; target: engine
+    state_files: [data/exec/sports_naked.json]
+
+  - id: auto-take-take
+    kind: taker
+    family: retires               # duplicate of take-take with drift-prone constants
+    target_runtime: retires
+    today: python-manual
+    claims:
+      - rel_ids: [xvus-time-poty-26, xvus-france-pres-27, xvus-brazil-pres-26, xvus-fedcut-26]
+    budget_share:
+      polymarket_us: critical (unmetered)
+      kalshi: own gateway
+    caps:
+      apr_bar: {value: "blended portfolio APR (or --min-apr)", scope: per-invocation}
+      fee_ct: {value: 0.02, scope: per-contract}
+    ledger_tags: [take-take]
+    close_kinds: []
+    source: py:auto_take_take
+    intents_stream: null
+    kill: n/a
+    state_files: []
+
+  # ---- family: directional-signal --------------------------------------
+  - id: leadlag-probe
+    kind: directional
+    family: directional-signal
+    target_runtime: rust-template(directional-signal)  # external-intents until the template evaluates the model artifact
+    today: python-daemon
+    params:
+      model_ref: data/research/leadlag_model_sports.txt  # LightGBM booster
+      thresh: 0.02
+      min_p: 0.65
+      clip: 5
+      max_open_usd: 50.0
+      max_trades: 20
+      per_market: 2
+      cooldown_s: 180.0
+      exit: settlement
+    claims:
+      - registry_query: sports map pairs from data/scan/sports_equiv_map.json
+    budget_share:
+      kalshi: own gateway
+      polymarket_us: background metered
+    caps:
+      max_open_usd: {value: 50.0, scope: per-session}
+      max_trades: {value: 20, scope: per-session}
+    ledger_tags: [ml-leadlag-probe]
+    close_kinds: []
+    source: probe:leadlag
+    intents_stream: data/exec/leadlag_probe.jsonl
+    kill: honors
+    state_files: [data/exec/leadlag_probe.jsonl]
+
+  - id: pm-lean
+    kind: directional
+    family: directional-signal
+    target_runtime: rust-template(directional-signal)
+    today: python-daemon          # rider inside sports_arb
+    params:
+      model_ref: null             # rule signal: rides sports-take-take captures when PM is dear
+      clip: 2                     # LEAN_CLIP
+      lifetime_cap: 20            # LEAN_CAP contracts, then the experiment stops
+      exit: settlement
+    claims:
+      - slug_patterns: [PM slugs of matched games (rider on sports-take-take captures)]
+    budget_share:
+      polymarket_us: critical (unmetered)
+    caps:
+      lean_cap_contracts: {value: 20, scope: lifetime}
+    ledger_tags: [pm-lean]
+    close_kinds: []
+    source: py:sports_arb
+    intents_stream: null
+    kill: DOES-NOT-CHECK (gap)    # target: engine
+    state_files: [data/exec/pm_lean_state.json]
+
+  # ---- external-intents sidecars (gateway proposers) --------------------
+  - id: toxicity-probe
+    kind: maker
+    family: external-intents      # ML gate IS the strategy; churns with the model
+    target_runtime: external-intents
+    today: python-daemon
+    claims:
+      - venue: kalshi
+        rel_ids: [KXPRESNOMD-28-GN, KXPRESPERSON-28-JVAN]   # default --tickers
+    budget_share:
+      kalshi: own gateway
+    caps:
+      clip: {value: 5, scope: per-order}
+      max_inv: {value: 10, scope: per-session}
+      max_fills: {value: 12, scope: per-session}
+      max_loss_usd: {value: 3.0, scope: per-session}
+      hold_s: {value: 600, scope: per-position}
+    ledger_tags: [ml-toxicity-probe]
+    close_kinds: []
+    source: probe:toxicity
+    intents_stream: data/exec/toxicity_probe.jsonl
+    kill: honors
+    state_files: [data/exec/toxicity_probe.jsonl]
+
+  - id: sports-mt-probe
+    kind: maker
+    family: external-intents      # fits maker-hedge; promotes only if it graduates
+    target_runtime: external-intents
+    today: python-daemon          # opt-in --mt-probe inside sports_arb
+    claims:
+      - registry_query: matched games (Kalshi maker leg, PM hedge)
+    budget_share:
+      kalshi: own gateway
+      polymarket_us: critical (unmetered) hedge path
+    caps:
+      mt_clip: {value: 2, scope: per-quote}
+      mt_lifetime_cap: {value: 60, scope: lifetime, note: round-2 budget}
+      mt_max_concurrent: {value: 8, scope: per-session}
+      mt_quote_ttl_s: {value: 120, scope: per-quote}
+    ledger_tags: []               # logs to its own JSONL, NOT the ledger
+    close_kinds: []
+    source: null
+    intents_stream: data/exec/sports_mt_probe.jsonl
+    kill: DOES-NOT-CHECK (gap)
+    state_files: [data/exec/sports_mt_probe.jsonl]
+
+  - id: sports-rehedge
+    kind: lifecycle
+    family: external-intents
+    target_runtime: external-intents   # later-phase gateway submitter
+    today: python-daemon          # rehedge_watcher inside sports_arb
+    claims:
+      - registry_query: naked holds recorded in data/exec/sports_naked.json
+    budget_share:
+      polymarket_us: critical (unmetered)
+      kalshi: own gateway
+    caps:
+      min_rehedge_lock: {value: 0.005, scope: per-hedge, note: usd/contract}
+    ledger_tags: [sports-take-take]   # legacy tag reuse; flattens use close-kind
+    close_kinds: [flatten]
+    source: py:sports_arb
+    intents_stream: null
+    kill: DOES-NOT-CHECK (gap)
+    state_files: []               # naked-holds file is OWNED by sports-take-take
+                                  # (the detector writes it); the rehedge watcher
+                                  # mutates it as that strategy's in-process
+                                  # lifecycle counterpart — single owner rule kept
+
+  # ---- lifecycle timers (external-intents, later-phase) -----------------
+  - id: naked-hedge
+    kind: lifecycle
+    family: external-intents
+    target_runtime: external-intents   # later-phase; detection input stays the diverse auditor
+    today: python-timer           # arbbot-hedge.timer
+    claims:
+      - registry_query: naked legs from reconcile net, minus probe-owned slugs
+    budget_share:
+      kalshi: own gateway
+      polymarket_us: background metered (consensus reads)
+    caps:
+      policy: {value: profitable-only tick-floored limit, scope: per-hedge}
+    ledger_tags: [take-take]      # LEGACY COLLISION -> becomes naked-hedge at migration
+    close_kinds: []
+    source: py:hedge_naked_legs
+    intents_stream: null
+    kill: DOES-NOT-CHECK (gap)
+    state_files: []
+
+  - id: unwind
+    kind: lifecycle
+    family: external-intents
+    target_runtime: external-intents   # later-phase
+    today: python-timer           # arbbot-unwind.timer
+    claims:
+      - registry_query: open ledger baskets with HARD unwind signal (and SOFT at >=95% budget)
+    budget_share:
+      kalshi: own gateway
+      polymarket_us: background metered
+    caps:
+      hard_apr_floor_pct: {value: 4, scope: per-basket}
+      soft_apr_hurdle_pct: {value: 12, scope: per-basket, note: util-gated at >=95% class budget}
+    ledger_tags: []
+    close_kinds: [unwind]
+    source: py:unwind_positions
+    intents_stream: null
+    kill: DOES-NOT-CHECK (gap)
+    state_files: []
+
+  - id: settlement
+    kind: lifecycle
+    family: external-intents
+    target_runtime: external-intents   # later-phase; writes closes only today
+    today: python-timer           # arbbot-settle.timer
+    claims:
+      - registry_query: resolved markets of open pm-lean / ml-leadlag-probe baskets
+    budget_share: {}
+    caps: {}
+    ledger_tags: []
+    close_kinds: [settlement]
+    source: py:settle_baskets
+    intents_stream: null
+    kill: DOES-NOT-CHECK (gap)    # writes closes only; places no orders
+    state_files: []
+
+  - id: flatten-probe-residual
+    kind: lifecycle
+    family: manual-tool
+    target_runtime: manual-tool
+    today: python-manual          # one-off, board card 6b54d1ce (completed)
+    claims:
+      - venue: polymarket_us
+        rel_ids: [aec-itfme-vindul-rapper-2026-07-23]
+    budget_share:
+      polymarket_us: critical (unmetered)
+    caps:
+      qty: {value: 5, scope: lifetime, note: "buys back the probe's -5 residual, IOC"}
+    ledger_tags: [pmus-maker-probe]   # attributes cleanup to the probe
+    close_kinds: [flatten]
+    source: null                  # dual_append default
+    intents_stream: null
+    kill: n/a
+    state_files: []
+
+  # ---- manual one-shots (gateway submitters, later-phase) ---------------
+  - id: execute-xv
+    kind: taker
+    family: manual-tool
+    target_runtime: manual-tool   # later-phase: submits through the gateway
+    today: python-manual
+    claims:
+      - registry_query: single --rel vetted cross-venue relationship
+    budget_share:
+      polymarket_us: critical (unmetered)
+      kalshi: own gateway
+    caps:
+      max_size: {value: --max-size, scope: per-invocation}
+      max_notional_usd: {value: --max-notional, scope: per-invocation}
+      min_edge: {value: 0.03, scope: per-invocation, note: recomputed at fire time}
+    ledger_tags: []               # records carry NO strategy key (legacy gap)
+    close_kinds: []
+    source: py:execute_xv
+    intents_stream: null
+    kill: n/a
+    state_files: []
+
+  - id: make-take-manual
+    kind: maker
+    family: manual-tool
+    target_runtime: manual-tool
+    today: python-manual
+    claims:
+      - registry_query: single vetted relationship per invocation
+    budget_share:
+      kalshi: own gateway
+      polymarket_us: critical (unmetered)
+    caps: {}
+    ledger_tags: [make-take]      # tag shared with the runner (legacy)
+    close_kinds: []
+    source: py:make_take
+    intents_stream: null
+    kill: n/a
+    state_files: []
+
+  - id: kalshi-cancel-all
+    kind: manual
+    family: manual-tool
+    target_runtime: manual-tool   # end state: gateway cancel-all-owned replaces it
+    today: python-manual
+    claims: []                    # cancels EVERY resting Kalshi order, unfiltered (hazard)
+    budget_share:
+      kalshi: own gateway
+    caps: {}
+    ledger_tags: []
+    close_kinds: []
+    source: null
+    intents_stream: null
+    kill: n/a
+    state_files: []
+
+  - id: rehearse-live
+    kind: manual
+    family: manual-tool
+    target_runtime: manual-tool   # may stay direct-to-venue: tests credentials, not strategy
+    today: python-manual
+    claims:
+      - rel_ids: [KXPRESNOMR-28-RDS]   # far-from-market rehearsal markets
+        note: plus one pinned PM token; place-then-cancel, near-zero fill risk
+    budget_share:
+      kalshi: own gateway
+      polymarket_us: critical (unmetered)
+    caps: {}
+    ledger_tags: []
+    close_kinds: []
+    source: null
+    intents_stream: null
+    kill: n/a
+    state_files: []
+
+  # ---- diverse auditor (permanent) --------------------------------------
+  - id: reconcile-audit
+    kind: audit
+    family: audit-readonly
+    target_runtime: audit-readonly   # PERMANENT: must not share the engine's code/event stream
+    today: python-timer           # reconcile_positions + mark_positions timers
+    claims: []                    # places no orders, ever
+    budget_share:
+      kalshi: background reads
+      polymarket_us: background metered reads
+    caps: {}
+    ledger_tags: []
+    close_kinds: []
+    source: null
+    intents_stream: null
+    kill: n/a                     # read-only
+    state_files: [data/exec/positions.json, data/exec/marks.json]

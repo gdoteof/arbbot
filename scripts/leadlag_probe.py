@@ -26,6 +26,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from arbbot.book.builder import BookBuilder, GapDetected, NotSynced
+from arbbot.exec.ledgerdb import dual_append
 from arbbot.models.core import BookDelta, BookSnapshot, Trade
 from arbbot.record.jsonl import parse_event
 
@@ -216,8 +217,7 @@ class Probe:
                     "profit_usd": None, "status": "open",
                     "note": f"p_hat={p_hat} jump={round(jump, 4)} model={MODEL_PATH.name}",
                 }
-                with LEDGER.open("a") as f:
-                    f.write(json.dumps(ledger) + "\n")
+                dual_append(ledger, source="probe:leadlag")
                 print(f"[LIVE FILL] {pair['teams']} {rec['side']} {filled}@{entry} "
                       f"p={p_hat}", flush=True)
         except Exception as e:

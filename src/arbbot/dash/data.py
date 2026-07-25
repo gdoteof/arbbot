@@ -392,7 +392,6 @@ class DashboardData:
             "order_activity": self._order_activity(),
             "sports": self._sports(),
             "maker_probe": self._maker_probe(),
-            "unwind_gate": self._unwind_gate(),
             "capacity": self._read_json(self.raw_dir.parent / "reports" / "capacity.json"),
             "positions": self._read_json(self.raw_dir.parent / "exec" / "positions.json"),
         }
@@ -413,31 +412,6 @@ class DashboardData:
         doc["history"] = self._sports_history()
         doc["mt_probe"] = self._mt_probe()
         return doc
-
-    def _unwind_gate(self) -> dict:
-        """Capital-displacement gate state: soft UNWIND flags (fwd APR < 12%)
-        only EXECUTE while the class budget is >=95% used. Shown on the
-        positions tab so 'UNWIND but holding' is self-explanatory."""
-        try:
-            from arbbot.exec.ledger import open_baskets, parse_lines
-            ledger = self.raw_dir.parent / "exec" / "trades.jsonl"
-            baskets = open_baskets(parse_lines(ledger.read_text().splitlines()))
-            notional = sum(float(b.get("qty") or 0) for b in baskets)
-        except Exception:
-            return {"open_notional": None}
-        budget = 980 * 0.35  # keep in sync with RiskConfig / unwind_positions
-        marks = self._read_json(self.raw_dir.parent / "exec" / "marks.json")
-        rows = marks if isinstance(marks, list) else (
-            marks.get("rows", marks.get("positions", [])) if marks else [])
-        return {
-            "open_notional": round(notional, 2),
-            "class_budget": round(budget, 2),
-            "util_pct": round(100 * notional / budget, 1),
-            "constrained": notional >= 0.95 * budget,
-            "soft_signals": sum(1 for r in rows if r.get("unwind_signal")
-                                and not r.get("unwind_hard")),
-            "hard_signals": sum(1 for r in rows if r.get("unwind_hard")),
-        }
 
     def _maker_probe(self) -> dict:
         """Candidate-pair status written by the PM-US maker probe
@@ -523,13 +497,16 @@ class DashboardData:
         return out[-cap:]
 
     def _trades(self) -> dict:
-        """Executed cross-venue arbitrage baskets from data/exec/trades.jsonl,
-        netted against appended unwind records (arbbot.exec.ledger convention):
+        """Executed cross-venue arbitrage baskets from data/exec/trading.db,
+        netted against close records (mirrors arbbot.exec.ledger convention):
         a fully-unwound basket renders as CLOSED with its realized P&L."""
-        from arbbot.exec.ledger import apply_corrections, open_baskets, parse_lines
-        p = self.raw_dir.parent / "exec" / "trades.jsonl"
-        raw = apply_corrections(parse_lines(p.read_text().splitlines())) if p.exists() else []
-        netted = open_baskets(raw)  # open baskets net of unwinds (aggregates)
+        from arbbot.exec import ledgerdb
+        conn = ledgerdb.connect(self.raw_dir.parent / "exec" / "trading.db")
+        try:
+            raw = ledgerdb.all_records_db(conn)   # corrected view, ledger order
+            netted = ledgerdb.open_baskets_db(conn)  # open net of closes (aggregates)
+        finally:
+            conn.close()
         netted_keys = {(r.get("relationship_id"), r.get("ts")) for r in netted}
         unwound_by_key: dict[tuple, dict] = {}
         for r in raw:
@@ -576,32 +553,25 @@ class DashboardData:
                 if m.get("resolves_by"):
                     r["resolves_by"] = m["resolves_by"]
         lats = [float(r["hedge_latency_ms"]) for r in rows if r.get("hedge_latency_ms") is not None]
-        # ALL P&L numbers below come from the accounting fold (card a6ad626d):
-        # one definition, identity-checked — the view layer only renders.
-        accounting = self._accounting(raw, marks)
-        acc_rows = accounting.get("rows", [])
-        acc_totals = accounting.get("totals", {})
-        mark_resolves = {(m["relationship_id"], m.get("ts")): m["resolves_by"]
-                         for m in marks.get("positions", []) if m.get("resolves_by")}
         # portfolio APR: raw RoC annualized over the capital-weighted time to
         # resolution — the "7% locked" expressed as a comparable yearly rate.
         today = datetime.now(timezone.utc).date()
         num = den = 0.0
-        for r in acc_rows:
-            # prefer the resolver's (authoritative) date over the record's
-            rb = mark_resolves.get((r["relationship_id"], r["ts"])) or r.get("resolves_by")
-            if rb and r["remaining_cost"]:
+        for r in open_rows:
+            rb = (r.get("mark") or {}).get("resolves_by") or r.get("resolves_by")
+            if rb and r.get("cost_usd"):
                 try:
                     yrs = max((date.fromisoformat(str(rb)[:10]) - today).days, 1) / 365.25
                 except ValueError:
                     continue
-                num += r["remaining_cost"] * yrs
-                den += r["remaining_cost"]
-        cap = float(acc_totals.get("remaining_cost") or 0)
-        prof = float(acc_totals.get("remaining_locked") or 0)
+                num += r["cost_usd"] * yrs
+                den += r["cost_usd"]
+        cap = sum(r.get("cost_usd", 0) for r in open_rows)
+        prof = sum(r.get("profit_usd", 0) for r in open_rows)
         wavg_yrs = (num / den) if den else None
         portfolio_apr = round(prof / cap / wavg_yrs * 100, 1) if (cap and wavg_yrs) else None
-        realized = round(float(acc_totals.get("realized") or 0), 2)
+        realized = round(sum(float(r.get("realized_pnl_usd") or 0)
+                             for r in raw if r.get("status") in ("unwound", "realized")), 2)
 
         # per-category breakdown: open capital/locked + realized (incl losses)
         FAMILIES = ("france-pres-27", "time-poty-26", "nobel-peace-26",
@@ -631,19 +601,24 @@ class DashboardData:
                     return f2
             return "other"
 
-        # rollups from the fold rows — same numbers every other view sees
         cats: dict[str, dict] = {}
-        for r in acc_rows:
+        for r in netted:
             cat = cats.setdefault(_category(r.get("relationship_id")),
                                   {"open": 0, "capital": 0.0, "locked": 0.0,
                                    "realized": 0.0, "losses": 0.0})
-            if r["remaining_qty"] > 0:
-                cat["open"] += 1
-                cat["capital"] += r["remaining_cost"]
-                cat["locked"] += r["remaining_locked"]
-            cat["realized"] += r["realized"]
-            if r["realized"] < 0:
-                cat["losses"] += r["realized"]  # per-basket net loss
+            cat["open"] += 1
+            cat["capital"] += float(r.get("cost_usd") or 0)
+            cat["locked"] += float(r.get("profit_usd") or 0)
+        for r in raw:
+            if r.get("status") not in ("unwound", "realized"):
+                continue
+            v = float(r.get("realized_pnl_usd") or 0)
+            cat = cats.setdefault(_category(r.get("relationship_id")),
+                                  {"open": 0, "capital": 0.0, "locked": 0.0,
+                                   "realized": 0.0, "losses": 0.0})
+            cat["realized"] += v
+            if v < 0:
+                cat["losses"] += v
         categories = [{"category": k, "open": v["open"],
                        "capital": round(v["capital"], 2), "locked": round(v["locked"], 2),
                        "realized": round(v["realized"], 2), "losses": round(v["losses"], 2)}
@@ -700,32 +675,14 @@ class DashboardData:
             "realized_usd": realized,
             "categories": categories,
             "funnel": funnel,
-            "capital_locked": round(cap, 2),
-            "profit_locked": round(prof, 2),
+            "capital_locked": round(sum(r.get("cost_usd", 0) for r in open_rows), 2),
+            "profit_locked": round(sum(r.get("profit_usd", 0) for r in open_rows), 2),
             "marks": marks.get("totals", {}),
             "marks_at": marks.get("generated_at"),
             "hedge_latency_p50": round(_median(lats), 0) if lats else None,
             "hedge_latency_n": len(lats),
             "portfolio_apr": portfolio_apr,
             "wavg_years": round(wavg_yrs, 2) if wavg_yrs else None,
-            "accounting": accounting,
-        }
-
-    @staticmethod
-    def _accounting(records: list, marks: dict) -> dict:
-        """The single-fold accounting view (card 988c18d8): per-basket rows
-        from arbbot.exec.accounting plus its identity-pinned digest. New
-        views should read THIS, not re-derive P&L at render time."""
-        from arbbot.exec.accounting import fold, row_floats
-        try:
-            res = fold(records, marks)
-        except Exception as e:  # surface, never blank the dash
-            return {"error": f"{type(e).__name__}: {e}"}
-        return {
-            "totals": {k: (float(v) if not isinstance(v, int) else v)
-                       for k, v in res["totals"].items()},
-            "digest": res["digest"],
-            "rows": [row_floats(r) for r in res["rows"]],
         }
 
     def _order_activity(self, limit: int = 250) -> dict:
@@ -763,34 +720,27 @@ class DashboardData:
                 venue = e.get("venue")
                 if not venue:  # older logs pre-date venue tagging — infer from id
                     venue = "kalshi" if str(ev.get("market", "")).startswith("KX") else "polymarket_us"
-                ev.update(ts=e.get("ts"), rel=rel_id, venue=venue, side=e.get("side"),
-                          tag=e.get("tag"))
+                ev.update(ts=e.get("ts"), rel=rel_id, venue=venue, side=e.get("side"))
                 events.append(ev)
-        # maker fills — the "destroyed by fill" outcome — from the trade log,
+        # maker fills — the "destroyed by fill" outcome — from the trading DB,
         # so the graph shows the full lifecycle (place -> move -> cancel|fill).
-        tp = self.raw_dir.parent / "exec" / "trades.jsonl"
-        if tp.exists():
-            try:
-                trows = tp.read_text().splitlines()[-400:]
-            except OSError:
-                trows = []
-            for line in trows:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    r = json.loads(line)
-                except ValueError:
-                    continue
-                if r.get("strategy") != "make-take":
-                    continue
-                maker = next((l for l in r.get("legs", []) if l.get("role") == "maker"), None)
-                if not maker:
-                    continue
-                events.append({"action": "fill", "market": maker.get("market_id"),
-                               "price": maker.get("yes_price"), "count": maker.get("qty"),
-                               "ts": r.get("ts"), "rel": r.get("relationship_id"),
-                               "venue": maker.get("venue"), "side": maker.get("side")})
+        # Bounded to the newest 400 make-take baskets (was: last 400 log lines).
+        from arbbot.exec import ledgerdb
+        conn = ledgerdb.connect(self.raw_dir.parent / "exec" / "trading.db")
+        try:
+            trows = [json.loads(row["raw_json"]) for row in conn.execute(
+                "SELECT raw_json FROM basket WHERE strategy='make-take'"
+                " ORDER BY ts_ns DESC LIMIT 400")]
+        finally:
+            conn.close()
+        for r in trows:
+            maker = next((l for l in r.get("legs", []) if l.get("role") == "maker"), None)
+            if not maker:
+                continue
+            events.append({"action": "fill", "market": maker.get("market_id"),
+                           "price": maker.get("yes_price"), "count": maker.get("qty"),
+                           "ts": r.get("ts"), "rel": r.get("relationship_id"),
+                           "venue": maker.get("venue"), "side": maker.get("side")})
         events.sort(key=lambda x: -(x.get("ts") or 0))
         counts: dict[str, int] = {}
         for e in events:
