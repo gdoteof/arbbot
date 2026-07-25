@@ -289,3 +289,55 @@ def test_apr_hurdle_tightens_and_blocks(tmp_path):
     q3 = mk(tmp_path)
     q3.min_apr, q3.resolve_years = 12.0, None
     assert q3._apr_margin() == 0
+
+
+def test_no_instant_repost_after_cancel(tmp_path, monkeypatch):
+    """fraalb sawtooth (card 6fb469da): a side we just cancelled must not be
+    re-posted on the next book event. A 500-1000 lot maker walks the ask down a
+    tick at a time; we chase to our floor, cancel, they pull, and the re-post
+    was unthrottled — 961 places + 420 cancels in 24h on one relationship."""
+    import arbbot.exec.quoter as qm
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(qm.time, "monotonic", lambda: clock["t"])
+    q = mk(tmp_path)
+    bb = BookBuilder()
+    bb.apply_snapshot(snap("T375", [("0.70", "500")], [("0.99", "1")]))
+    bb.apply_snapshot(snap("T350", [("0.55", "500")], [("0.99", "1")]))
+    q.on_book(bb)
+    assert len(q._resting) == 1
+    placed = lambda: sum(1 for i in q.intents if "place" in i)
+    n = placed()
+
+    # hedge collapses -> unviable -> prompt cancel (cancels must stay immediate)
+    bb.apply_snapshot(snap("T375", [("0.30", "500")], [("0.99", "1")], seq=2))
+    clock["t"] += 1
+    q.on_book(bb)
+    assert len(q._resting) == 0
+
+    # ...and recovers a second later: the old code re-posted on this very event
+    bb.apply_snapshot(snap("T375", [("0.70", "500")], [("0.99", "1")], seq=3))
+    clock["t"] += 1
+    q.on_book(bb)
+    assert placed() == n, "re-entry within min_requote_s must be throttled"
+    assert not q._resting
+
+    # past the throttle it re-enters normally
+    clock["t"] += q.min_requote_s
+    q.on_book(bb)
+    assert placed() == n + 1
+    assert len(q._resting) == 1
+
+
+def test_fill_clears_the_requote_throttle(tmp_path):
+    """The re-entry throttle must not outlive a FILL: on_fill drops the
+    timestamp so the side can re-quote fresh next tick (whether it actually
+    does is then the risk manager's call, not the throttle's)."""
+    q = mk(tmp_path)
+    bb = BookBuilder()
+    bb.apply_snapshot(snap("T375", [("0.70", "500")], [("0.99", "1")]))
+    bb.apply_snapshot(snap("T350", [("0.55", "500")], [("0.99", "1")]))
+    q.on_book(bb)
+    key = next(iter(q._resting))
+    assert key in q._last_quote_ts
+    q.on_fill(key[0], key[1], bb)
+    assert key not in q._last_quote_ts, "a fill must not leave the side throttled"
