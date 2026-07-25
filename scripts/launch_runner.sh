@@ -10,18 +10,11 @@ RELS=(
   xvus-france-pres-27-brunoretailleau
   xvus-time-poty-26-zohranmamdani
   xvus-time-poty-26-christinakoch
-  xvus-time-poty-26-jeremyhansen
   xvus-time-poty-26-popeleoxiv
   xvus-time-poty-26-artificialintelligence
-  xvus-time-poty-26-samaltman
   xvus-brazil-pres-26-flaviobolsonaro
   xvus-fedcut-26-usfed-2026-cut
   xvus-nobel-peace-26-sudansemergencyresponser
-  xvus-nobel-peace-26-doctorswithoutborders
-  xvus-nobel-peace-26-volodymyrzelensky
-  xvus-nobel-peace-26-unrwa
-  xvus-nobel-peace-26-donaldtrump
-  xvus-nobel-peace-26-francescaalbanese
   xvus-btcmax-26-31-2026-100k
   xvus-btcmax-26-31-2026-110k
   xvus-btcmax-26-31-2026-120k
@@ -30,6 +23,9 @@ RELS=(
   xvus-btcmax-26-31-2026-150k
   xvus-btcmax-26-31-2026-200k
 )
+# 2026-07-25: dropped 7 zero-fill legs (1,694 placements -> 0 baskets over
+# 3.1 days, 74%+ of order traffic; card 6fb469da analysis). Still registry-
+# vetted + scanner-watched; re-add by listing them again.
 setsid nohup .venv313/bin/python -m "arbbot.exec.main" \
   --relationship "${RELS[@]}" --clip 25 --live >> data/runner.log 2>&1 &
   # clip 5 -> 25: phase 1 of the capacity scale-up, Geoff-approved card
