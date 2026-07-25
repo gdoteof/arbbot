@@ -1058,6 +1058,14 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
 
 
 def main() -> None:
+    # stall diagnosis (2026-07-24: runner.log went silent ~200s twice with
+    # the process alive in ep_poll): kill -USR1 <pid> dumps every thread's
+    # stack to stderr (runner.log) without disturbing the process — the
+    # stall watchdog fires it automatically.
+    import faulthandler
+    import signal as _sig
+    import sys as _sys
+    faulthandler.register(_sig.SIGUSR1, file=_sys.stderr, all_threads=True)
     ap = argparse.ArgumentParser()
     ap.add_argument("--relationship", required=True, nargs="+",
                     help="one or more relationship ids to quote in this process")
