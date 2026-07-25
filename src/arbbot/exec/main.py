@@ -577,12 +577,15 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
         our own cancelled 10c ask survived restarts and priced the Hollande
         exit at 9c against a real 13c touch (2026-07-24). Passive exits are
         slow — venue truth beats microlatency here."""
-        import httpx as _hx
         kgw2 = gateways.get(Venue.KALSHI)
         hdr = sign_headers(kgw2.kid, kgw2.key, "GET",
                            f"/trade-api/v2/markets/{kt}/orderbook")
-        ob = (_hx.get(f"{REST_BASE}/markets/{kt}/orderbook", headers=hdr,
-                      timeout=10).json().get("orderbook_fp")) or {}
+        # ALWAYS the gateway's pooled client: a bare httpx.get here opened a
+        # fresh connection every 15s, and a hanging getaddrinfo (which NO
+        # httpx timeout covers) froze the event loop ~200s (2026-07-24 stall
+        # pages, main thread parked in poll). Keep-alive = no per-call DNS.
+        ob = (kgw2.client.get(f"{REST_BASE}/markets/{kt}/orderbook",
+                              headers=hdr).json().get("orderbook_fp")) or {}
         yes = [(Decimal(p), Decimal(s)) for p, s in ob.get("yes_dollars") or []]
         no = [(Decimal(p), Decimal(s)) for p, s in ob.get("no_dollars") or []]
         kb = max((p for p, s in yes if s > 0), default=None)
