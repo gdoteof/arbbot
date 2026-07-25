@@ -222,13 +222,19 @@ def main() -> None:
         return
 
     c = httpx.Client(timeout=20)
-    kb = kalshi_books(c, [next(l["market_id"] for l in t["legs"] if l["venue"] == "kalshi")
-                          for t in baskets])
+    kb = kalshi_books(c, [l["market_id"] for t in baskets
+                          for l in t["legs"] if l["venue"] == "kalshi"])
     pgw = kgw = None
     hard = 0
     for t in baskets:
-        kleg = next(l for l in t["legs"] if l["venue"] == "kalshi")
-        pleg = next(l for l in t["legs"] if l["venue"] == "polymarket_us")
+        kleg = next((l for l in t["legs"] if l["venue"] == "kalshi"), None)
+        pleg = next((l for l in t["legs"] if l["venue"] == "polymarket_us"), None)
+        if kleg is None or pleg is None:
+            # single-venue basket (e.g. a research probe leg) — not a cross-venue
+            # pair this unwinder can price or close; leave it to its owner
+            print(f"[UNWIND] {t['relationship_id']} skipped — not a kalshi/pm-us pair "
+                  f"(legs: {[l['venue'] for l in t['legs']]})", flush=True)
+            continue
         k_bid, k_ask = kb.get(kleg["market_id"], (None, None))
         p_bid, p_ask = pmus_topbook(c, pleg["market_id"])
         row = compute_row(t, k_bid, k_ask, p_bid, p_ask)
