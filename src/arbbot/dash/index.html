@@ -589,7 +589,7 @@
           <th class="num" data-tip="PM US net (negative = short YES = holding NO) · held-side cost/ct at entry → the book NOW.">PM US qty · entry → now</th>
           <th class="num" data-tip="Net directional exposure in contracts (Kalshi + PM). Zero = market-neutral basket; nonzero = we win/lose |Δ| × price move.">Δ</th>
           <th data-tip="HEDGED pairs: profit/ct locked at entry ($1 payoff − both bases). WATCHED holds: how many cents each profit-only exit is from firing (≤0 = available now, watcher is on it).">lock</th>
-          <th class="num" data-tip="Opportunistic maker-exit delta: per-contract profit of a passive exit right now (Kalshi ask − 1 tick, PM close through its ask). Green = exit locks money today; ⚡ = unwind-flagged and mark-positive, the runner rests a live exit ask. Full timeline on the Exits tab.">exit Δ</th>
+          <th class="num" data-tip="Opportunistic maker-exit delta: per-contract profit of a passive exit right now (Kalshi ask − 1 tick, PM close through its ask), NET of the Kalshi maker fee on the resting ask and the PM US taker fee on the close (~1.2-1.9c/ct together — Kalshi charges makers, only Polymarket makers are free). Green = exit locks money today; ⚡ = unwind-flagged and mark-positive, the runner rests a live exit ask. Full timeline on the Exits tab.">exit Δ</th>
           <th>status</th>
         </tr></thead><tbody></tbody></table></div>
       <div id="pos-empty" style="display:none;color:var(--ink-mut);font-size:12px;padding:20px 4px">No open positions.</div>
@@ -605,7 +605,7 @@
         <thead><tr>
           <th>position</th>
           <th class="num" data-tip="Contracts remaining in the basket.">qty</th>
-          <th class="num" data-tip="Per-contract profit of the passive exit right now (Kalshi ask − 1 tick + PM close). Positive = exit locks money today.">exit Δ /ct</th>
+          <th class="num" data-tip="Per-contract profit of the passive exit right now (Kalshi ask − 1 tick + PM close), net of the Kalshi maker fee and the PM US taker fee on the close. Positive = exit locks money today.">exit Δ /ct</th>
           <th class="num" data-tip="Mark-to-market of the whole basket (liquidation vs cost).">mark $</th>
           <th class="num" data-tip="Forward hold APR — what the remaining capital earns by holding to resolution.">fwd APR</th>
           <th data-tip="FLAGGED = the unwind policy wants out (soft/hard). ELIGIBLE = the passive exit locks ≥0.5c/ct vs basis AND holding is no longer the better trade (flagged, or fwd APR < 12% hurdle): the runner rests a live exit ask on it.">state</th>

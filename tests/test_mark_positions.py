@@ -7,6 +7,8 @@ direction handling and both unwind tiers get pinned here.
 import datetime
 import importlib.util
 import time
+
+import pytest
 from decimal import Decimal
 from pathlib import Path
 
@@ -72,6 +74,32 @@ def test_inverted_basket_no_phantom_reverse():
     row2 = mp.compute_row(t, D("0.17"), D("0.19"), D("0.11"), D("0.13"), now=now)
     # rev = 0.11 - 0.19 = -8c -> no signal (the old bug flagged k_bid - p_ask)
     assert row2["reverse_edge_c"] == -8.0 and not row2["reverse_signal"]
+
+
+def test_maker_exit_delta_is_net_of_maker_and_taker_fees():
+    """The Exits view's headline per-contract number, and the flag the runner
+    rests real orders off. A passive exit is cheaper than the taker round trip
+    but NOT free: Kalshi charges makers (0.0175 coef), and the PM NO close is
+    still a taker."""
+    t, now = trade(cost=4.50)  # 0.90/ct basis, qty 5
+    # rest Kalshi ask @ 0.62-1t = 0.61, close PM NO @ 0.55+1t = 0.56
+    # gross = 0.61 + 0.44 - 0.90 = 0.15/ct
+    # Kalshi maker: ceil(0.0175*5*0.61*0.39) = ceil(0.0208) = 0.03 -> 0.006/ct
+    # PM US taker:  0.06*0.56*0.44*5 = 0.07392            -> 0.014784/ct
+    row = mp.compute_row(t, D("0.50"), D("0.62"), D("0.53"), D("0.55"), now=now)
+    # the row rounds to 4dp for display
+    assert row["maker_exit_ct"] == pytest.approx(0.15 - 0.006 - 0.014784, abs=1e-4)
+
+
+def test_maker_exit_eligibility_keys_off_the_net_number():
+    """Whatever the book, an exit is only flagged eligible if it clears the
+    0.5c/ct floor AFTER fees — the fee-free version flagged net losers."""
+    for k_ask, p_ask in [("0.53", "0.53"), ("0.62", "0.55"),
+                         ("0.57", "0.47"), ("0.99", "0.02")]:
+        t, now = trade(cost=4.85, profit=0.5, resolves_days=183)
+        row = mp.compute_row(t, D("0.51"), D(k_ask), D("0.45"), D(p_ask), now=now)
+        if row["maker_exit_eligible"]:
+            assert row["maker_exit_ct"] >= 0.005
 
 
 def test_unwind_soft_between_floor_and_hurdle():

@@ -25,8 +25,8 @@ from arbbot.book.builder import BookBuilder, GapDetected, NotSynced
 from arbbot.exec.kalshi_gateway import KalshiOrderGateway
 from arbbot.exec.polymarket_gateway import PolymarketOrderGateway
 from arbbot.exec.quoter import Quoter
-from arbbot.fees.curves import FeeSchedule
-from arbbot.models.core import BookDelta, BookSnapshot, Venue
+from arbbot.fees.curves import FeeSchedule, leg_fee
+from arbbot.models.core import BookDelta, BookSnapshot, Role, Venue
 from arbbot.ops.alerts import Alerter
 from arbbot.ops.config import load_credential, load_recorder_config
 from arbbot.exec.resolve_dates import resolve_date
@@ -546,8 +546,9 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
     # leg, on fill the PM NO closes taker-side; recon + hedge timer backstop
     # any legging miss. Entry quoter's ask side is suppressed while an exit
     # quote is resting (two order-owners on one side both react to fills).
-    EXIT_LOCK = Decimal("0.005")    # min locked profit/ct vs basis
+    EXIT_LOCK = Decimal("0.005")    # min locked profit/ct vs basis, NET of fees
     EXIT_SLIP = Decimal("0.01")     # assume PM close 1 tick through the ask
+    EXIT_FEES = FeeSchedule()       # maker Kalshi + taker PM US on the way out
 # dust ahead of us is NOT competition (Geoff 2026-07-24: a small bot at 11c
     # kept pushing our 10-lot exit to 10c, and the 13c "touch" itself was 1.11
     # shares — price against the first level whose cumulative non-us depth is
@@ -657,8 +658,19 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
             # as PM's displayed size flapped — 2026-07-24). A thinner book at
             # fill time is handled by the partial-close alert + hedge timer.
             qty = st["qty"] if st else max(1, min(w["qty"], int(pa.size)))
-            # profitable floor: fill px + (1 - pm close px) - basis >= EXIT_LOCK
-            min_px = w["cost_ct"] - (Decimal(1) - pa.price) + EXIT_LOCK + EXIT_SLIP
+            # profitable floor: fill px + (1 - pm close px) - basis >= EXIT_LOCK,
+            # NET OF FEES (card b83b0449). The Kalshi ask rests as a maker
+            # (0.0175 coef; Kalshi charges makers) and the PM NO closes taker
+            # (0.06 coef) — 1.2-1.9c/ct together, versus a 0.5c/ct required
+            # lock, so the fee-free floor could rest exits that lose money.
+            # EXIT_SLIP is a PRICE buffer for closing a tick through the ask;
+            # it never was fee budget.
+            base_px = w["cost_ct"] - (Decimal(1) - pa.price) + EXIT_LOCK + EXIT_SLIP
+            _q = Decimal(qty)
+            fees_ct = (leg_fee(EXIT_FEES, Venue.KALSHI, Role.MAKER, base_px, _q)
+                       + leg_fee(EXIT_FEES, Venue.POLYMARKET_US, Role.TAKER,
+                                 pa.price, _q)) / _q
+            min_px = base_px + fees_ct
             # competing ask with OUR footprint subtracted out: the current
             # resting exit AND the ghost of the last replaced/cancelled one —
             # WS book updates lag our cancels, and treating our own ghost as

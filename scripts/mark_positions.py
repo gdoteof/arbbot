@@ -51,6 +51,17 @@ def exit_fees_usd(k_yes_px: Decimal, p_yes_px: Decimal,
             + leg_fee(FEES, Venue.POLYMARKET_US, Role.TAKER, p_yes_px, p_qty))
 
 
+def maker_exit_fees_usd(k_yes_px: Decimal, p_yes_px: Decimal, qty: Decimal) -> Decimal:
+    """Fees on the OPPORTUNISTIC exit: the Kalshi leg rests as a maker ask, the
+    PM NO leg closes taker-side on fill.
+
+    Kalshi charges makers (0.0175 coef) — only Polymarket makers are free — so
+    a passive exit is cheaper than the taker round trip, not free.
+    """
+    return (leg_fee(FEES, Venue.KALSHI, Role.MAKER, k_yes_px, qty)
+            + leg_fee(FEES, Venue.POLYMARKET_US, Role.TAKER, p_yes_px, qty))
+
+
 def kalshi_books(client, tickers):
     out = {}
     for i in range(0, len(tickers), 50):
@@ -213,8 +224,15 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
         # a passive exit locks money today; eligible = the runner would
         # actually rest it (unwind-flagged AND mark-positive).
         if not inverted and k_ask is not None and p_ask is not None and qty:
-            mx = (k_ask - Decimal("0.01")) + (Decimal(1) - (p_ask + Decimal("0.01"))) \
-                 - cost / qty
+            k_exit_px = k_ask - Decimal("0.01")
+            p_close_px = p_ask + Decimal("0.01")
+            # net of BOTH legs' fees (card b83b0449): the Kalshi ask rests as a
+            # MAKER (0.0175 coef — Kalshi charges makers, unlike PM) and the PM
+            # NO close pays TAKER. That is 1.2-1.9c/ct, so the fee-free version
+            # of this number called exits "profitable" at 0.5c/ct that were net
+            # losers — and the runner rests real orders off this flag.
+            mx_fees = maker_exit_fees_usd(k_exit_px, p_close_px, qty) / qty
+            mx = k_exit_px + (Decimal(1) - p_close_px) - cost / qty - mx_fees
             row["maker_exit_ct"] = round(float(mx), 4)
             # eligibility keys on the MAKER exit's own economics (Geoff
             # 2026-07-24: the taker mark held positions whose passive exit
