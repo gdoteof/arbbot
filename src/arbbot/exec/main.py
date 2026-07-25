@@ -773,10 +773,15 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
         hb_events = hb_onbook = 0
         if live:
             _tt_refresh()  # populate bar + position caps before the first tick
+        reconn = {"since": 0.0, "log": 0.0, "pulled": False}
         while True:
             writer = None
             try:
                 reader, writer = await asyncio.open_unix_connection(cfg.socket_path)
+                if reconn["since"]:
+                    print(f"[LIVE] recorder socket back after "
+                          f"{int(time.monotonic() - reconn['since'])}s", flush=True)
+                reconn.update(since=0.0, log=0.0, pulled=False)
                 # READER/PROCESSOR DECOUPLE (rust-rewrite bench finding, card
                 # 23d15e3f): the recorder disconnects a subscriber at ~1MB of
                 # queued backlog (~2.2s at burst peak), and our inline venue
@@ -974,6 +979,42 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                 if writer is not None:
                     with contextlib.suppress(Exception):
                         writer.close()
+            # ---- disconnected-path safety (2026-07-24 stall page): this
+            # reconnect loop used to spin SILENTLY with no fill polling and
+            # no quote safety — runner.log went dead and a resting fill
+            # during a recorder outage would sit undetected (naked window).
+            now_d = time.monotonic()
+            if not reconn["since"]:
+                reconn["since"] = now_d
+            if now_d - reconn["log"] > 30:
+                reconn["log"] = now_d
+                print(f"[LIVE] recorder socket unavailable — reconnecting "
+                      f"(blind {int(now_d - reconn['since'])}s)", flush=True)
+            if live:
+                if now_d - reconn["since"] > 30 and not reconn["pulled"]:
+                    # blind >30s: same policy as feed-stale (which cannot run
+                    # here — its health file is recorder-written too)
+                    reconn["pulled"] = True
+                    for q4 in quoters.values():
+                        with contextlib.suppress(Exception):
+                            q4.cancel_all()
+                    print("[LIVE] blind >30s — all maker quotes pulled", flush=True)
+                kgw_x = gateways.get(Venue.KALSHI)
+                for rid_x, st_x in list(exit_q.items()):  # exit fills: never pause
+                    with contextlib.suppress(Exception):
+                        fx = kgw_x.filled_qty(st_x["order_id"]) if kgw_x else 0
+                        if fx > st_x["filled"]:
+                            _exit_fill(rid_x, st_x, fx)
+                for rid4, q4 in quoters.items():  # maker fills: never pause
+                    r4 = rel_by_id[rid4]
+                    for (i4, side4), rq4 in list(q4._resting.items()):
+                        gw4 = gateways.get(r4.legs[i4].venue)
+                        if gw4 is None or not hasattr(gw4, "filled_qty"):
+                            continue
+                        with contextlib.suppress(Exception):
+                            f4 = gw4.filled_qty(rq4.order_id)
+                            if f4 >= 1:
+                                _process_fill(rid4, i4, side4, rq4, f4)
             await asyncio.sleep(2)
 
     async def conn_warmer() -> None:
