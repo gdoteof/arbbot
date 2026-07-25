@@ -31,19 +31,35 @@ def trade(kside="yes", pside="no", qty=5, cost=4.5, profit=0.5,
     }, now
 
 
+def test_exit_fees_are_the_published_taker_curves():
+    """Card b83b0449: exit fees were a flat 1c/ct Kalshi-only guess. Real cost
+    is ceil_cents(0.07*qty*P*(1-P)) on Kalshi + 0.06*P*(1-P)*qty on PM US."""
+    # K @ 0.50: ceil(0.07*5*0.25) = ceil(0.0875) = 0.09
+    # PM @ 0.55: 0.06*0.55*0.45*5 = 0.07425
+    assert mp.exit_fees_usd(D("0.50"), D("0.55"), D(5)) == D("0.09") + D("0.07425")
+    # per-leg quantities differ when a close legs out partially
+    assert mp.exit_fees_usd(D("0.50"), D("0.55"), D(3), D(5)) == (
+        D("0.06") + D("0.07425"))  # ceil(0.07*3*0.25)=ceil(0.0525)=0.06
+    # at the money it is 3.3c/ct — 3.3x the old flat assumption
+    assert mp.exit_fees_usd(D("0.50"), D("0.50"), D(100)) > D("3.00")
+
+
 def test_standard_basket_liq_and_mark():
     t, now = trade()  # K YES + PM NO, cost 0.90/ct, locked 0.5
-    # liq: sell K YES @ 0.50 bid + PM NO worth 1-0.55 ask = 0.95/ct - 1c fee
+    # liq: sell K YES @ 0.50 bid + PM NO worth 1-0.55 ask = 0.95/ct, less the
+    # real both-leg taker exit: 0.09 (Kalshi @ 0.50) + 0.07425 (PM US @ 0.55)
     row = mp.compute_row(t, D("0.50"), D("0.52"), D("0.53"), D("0.55"), now=now)
-    assert abs(row["liq_value_usd"] - (0.95 * 5 - 0.01 * 5)) < 1e-9
-    assert abs(row["mark_pnl_usd"] - (4.70 - 4.5)) < 1e-9
+    assert abs(row["liq_value_usd"] - (0.95 * 5 - 0.16425)) < 1e-9
+    assert abs(row["mark_pnl_usd"] - (4.75 - 0.16425 - 4.5)) < 1e-9
 
 
 def test_inverted_basket_liq_uses_no_bid_and_pm_yes_bid():
     t, now = trade(kside="no", pside="yes")  # Kalshi NO + PM YES (Koch shape)
-    # liq: K NO @ (1 - 0.52 ask) + PM YES @ 0.53 bid = 1.01 - fee
+    # liq: K NO @ (1 - 0.52 ask) + PM YES @ 0.53 bid = 1.01/ct, and the exit
+    # fees price off the legs we actually close: Kalshi @ 0.52, PM US @ 0.53
+    # -> ceil(0.07*5*0.52*0.48)=0.09 + 0.06*0.53*0.47*5=0.07473
     row = mp.compute_row(t, D("0.50"), D("0.52"), D("0.53"), D("0.55"), now=now)
-    assert abs(row["liq_value_usd"] - (1.01 * 5 - 0.05)) < 1e-9
+    assert abs(row["liq_value_usd"] - (1.01 * 5 - 0.16473)) < 1e-9
 
 
 def test_inverted_basket_no_phantom_reverse():

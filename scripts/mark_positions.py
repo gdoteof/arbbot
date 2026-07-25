@@ -22,11 +22,33 @@ from pathlib import Path
 import httpx
 
 from arbbot.exec.resolve_dates import resolve_date
+from arbbot.fees.curves import FeeSchedule, leg_fee
+from arbbot.models.core import Role, Venue
 from arbbot.record.kalshi import REST_BASE
 
-KALSHI_FEE = Decimal("0.01")  # ~taker fee/ct to unwind the Kalshi leg
+FEES = FeeSchedule()
 LEDGER = Path("data/exec/trades.jsonl")
 OUT = Path("data/exec/marks.json")
+
+
+def exit_fees_usd(k_yes_px: Decimal, p_yes_px: Decimal,
+                  k_qty: Decimal, p_qty: Decimal | None = None) -> Decimal:
+    """Taker fees to liquidate both legs at the given per-leg YES exit prices.
+
+    Both venues' taker curves are coef * P * (1-P) * size — symmetric in P vs
+    1-P — so each leg's YES price prices its fee whichever side we close. This
+    replaces a flat $0.01/ct Kalshi-only assumption that understated the real
+    round trip by 1.3-3.3x (it is 1.3c/ct in the tails, 3.3c/ct at the money,
+    and omitted PM US entirely) — card b83b0449.
+
+    PM US uses the schedule's fallback taker coefficient: the venue-reported
+    per-market feeCoefficient isn't in hand on the exit path, and the fallback
+    is deliberately conservative (it can over-state fees, never manufacture a
+    profitable-looking exit).
+    """
+    p_qty = k_qty if p_qty is None else p_qty
+    return (leg_fee(FEES, Venue.KALSHI, Role.TAKER, k_yes_px, k_qty)
+            + leg_fee(FEES, Venue.POLYMARKET_US, Role.TAKER, p_yes_px, p_qty))
 
 
 def kalshi_books(client, tickers):
@@ -120,13 +142,15 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
     if inverted and not (k_ask is None or p_bid is None):
         # liquidate: sell Kalshi NO @ NO-bid (=1-YES-ask); sell PM YES @ bid
         liq_ct = (Decimal(1) - k_ask) + p_bid
+        k_exit, p_exit = k_ask, p_bid
     elif not inverted and k_bid is not None and p_ask is not None:
         # liquidate: sell Kalshi YES @ its bid; close PM NO by buying YES @ ask -> NO worth 1-ask
         liq_ct = k_bid + (Decimal(1) - p_ask)
+        k_exit, p_exit = k_bid, p_ask
     else:
         liq_ct = None
     if liq_ct is not None:
-        liq = liq_ct * qty - KALSHI_FEE * qty
+        liq = liq_ct * qty - exit_fees_usd(k_exit, p_exit, qty)
         mark = liq - cost
         # forward APR of CONTINUING to hold: remaining profit annualized over
         # the capital currently tied up (the liq value we'd otherwise free).

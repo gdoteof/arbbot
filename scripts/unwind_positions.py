@@ -26,7 +26,7 @@ from pathlib import Path
 import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from mark_positions import compute_row, kalshi_books, pmus_topbook  # noqa: E402
+from mark_positions import compute_row, exit_fees_usd, kalshi_books, pmus_topbook  # noqa: E402
 
 from arbbot.exec.kalshi_gateway import KalshiOrderGateway
 from arbbot.exec.ledger import open_baskets, parse_lines
@@ -85,19 +85,35 @@ def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
     _c2 = _hx.Client(timeout=15)
     kb2 = kalshi_books(_c2, [kleg["market_id"]]).get(kleg["market_id"], (None, None))
     pb2 = pmus_topbook(_c2, pleg["market_id"])
-    k_bid2, p_ask2 = kb2[0], pb2[1]
-    if k_bid2 is None or p_ask2 is None:
+    k_bid2, k_ask2 = kb2
+    p_bid2, p_ask2 = pb2
+    # direction-correct liquidation: an inverted basket closes Kalshi by BUYING
+    # yes @ ask and sells PM YES @ bid, so pricing it off (k_bid, p_ask) — as
+    # this guard did — checked a trade we never place
+    if inverted:
+        k_exit2, p_exit2 = k_ask2, p_bid2
+        liq_ct2 = ((Decimal(1) - Decimal(str(k_ask2))) + Decimal(str(p_bid2))
+                   if not (k_ask2 is None or p_bid2 is None) else None)
+    else:
+        k_exit2, p_exit2 = k_bid2, p_ask2
+        liq_ct2 = (Decimal(str(k_bid2)) + (Decimal(1) - Decimal(str(p_ask2)))
+                   if not (k_bid2 is None or p_ask2 is None) else None)
+    if liq_ct2 is None:
         print(f"[UNWIND] {rid} book empty after quote pause — skip", flush=True)
         return
-    liq2 = (Decimal(str(k_bid2)) + (Decimal(1) - Decimal(str(p_ask2)))) * qty \
-           - Decimal("0.01") * qty
+    # net of REAL both-leg taker exit fees (card b83b0449): the flat 1c/ct this
+    # used to subtract understated the round trip by up to 3.3x, so the
+    # "never unwind at a loss" guard could green-light a losing close
+    fees2 = exit_fees_usd(Decimal(str(k_exit2)), Decimal(str(p_exit2)), Decimal(qty))
+    liq2 = liq_ct2 * qty - fees2
     mark2 = float(liq2) - float(t["cost_usd"])
     if mark2 <= 0:
         print(f"[UNWIND] {rid} not profitable against the residual book "
-              f"(mark {mark2:+.2f} vs {row['mark_pnl_usd']:+.2f} with our quotes) — skip",
-              flush=True)
+              f"(mark {mark2:+.2f} net of ${float(fees2):.2f} exit fees vs "
+              f"{row['mark_pnl_usd']:+.2f} with our quotes) — skip", flush=True)
         return
-    k_bid, p_ask = k_bid2, p_ask2
+    # execute against the same refreshed book the guard just cleared
+    k_bid, k_ask, p_bid, p_ask = k_bid2, k_ask2, p_bid2, p_ask2
     if inverted:
         # PM leg first (thin): close held YES via BUY_SHORT offset, IOC at bid
         r1 = pgw.place_short(pleg["market_id"], Decimal(str(p_bid)), qty,
@@ -174,8 +190,10 @@ def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
     # remainder is stranded inventory, not proceeds; recon + a later
     # completion (with a correction record) recover it at the real price
     if inverted:
-        proceeds = (Decimal(str(p_bid)) * filled
-                    + (Decimal(1) - Decimal(str(k_ask))) * kf)
+        gross = (Decimal(str(p_bid)) * filled
+                 + (Decimal(1) - Decimal(str(k_ask))) * kf)
+        fees = exit_fees_usd(Decimal(str(k_ask)), Decimal(str(p_bid)),
+                             Decimal(kf), Decimal(filled))
         legs = [{"venue": "kalshi", "market_id": kleg["market_id"],
                  "side": "no", "action": "close_via_buy_yes", "qty": kf,
                  "yes_price": str(k_ask)},
@@ -183,23 +201,33 @@ def close_basket(t: dict, row: dict, k_bid, p_ask, pgw, kgw, live: bool,
                  "side": "yes", "action": "close_via_buy_short", "qty": filled,
                  "yes_price": str(p_bid)}]
     else:
-        proceeds = (Decimal(str(k_bid)) * kf
-                    + (Decimal(1) - Decimal(str(p_ask))) * filled)
+        gross = (Decimal(str(k_bid)) * kf
+                 + (Decimal(1) - Decimal(str(p_ask))) * filled)
+        fees = exit_fees_usd(Decimal(str(k_bid)), Decimal(str(p_ask)),
+                             Decimal(kf), Decimal(filled))
         legs = [{"venue": "kalshi", "market_id": kleg["market_id"],
                  "side": "yes", "action": "sell", "qty": kf, "yes_price": str(k_bid)},
                 {"venue": "polymarket_us", "market_id": pleg["market_id"],
                  "side": "no", "action": "sell", "qty": filled, "yes_price": str(p_ask)}]
+    # proceeds are recorded NET of the exit taker fees we just paid — the
+    # accounting kernel takes proceeds_usd/realized_pnl_usd at face value
+    # (fold() does no fee math), so booking them gross overstated realized P&L
+    # by the whole round trip and hid the error inside `slippage` (b83b0449)
+    proceeds = gross - fees
     rec = {"ts": time.time(), "relationship_id": rid, "title": t.get("title"),
            "strategy": "unwind", "status": "unwound", "closes_ts": t["ts"],
            "qty": filled,
            "legs": legs,
            "proceeds_usd": float(proceeds),
+           "gross_proceeds_usd": float(gross),
+           "exit_fees_usd": float(fees),
            "realized_pnl_usd": float(proceeds) - float(t["cost_usd"]) * frac}
     if kf < filled:
         rec["stranded_kalshi_qty"] = filled - kf
     with open(LEDGER, "a") as f:
         f.write(json.dumps(rec) + "\n")
     print(f"[UNWIND] {rid} closed x{filled}/{qty} proceeds=${float(proceeds):.2f} "
+          f"(gross ${float(gross):.2f} - fees ${float(fees):.2f}) "
           f"realized=${rec['realized_pnl_usd']:.2f}", flush=True)
     Alerter(load_recorder_config().ntfy_topic).alert(
         f"arbbot UNWIND {rid} x{filled} realized ${rec['realized_pnl_usd']:.2f} "
