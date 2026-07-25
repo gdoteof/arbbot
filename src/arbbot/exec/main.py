@@ -613,14 +613,19 @@ async def run(rel_ids: list[str], live: bool, clip: int, config_path: str) -> No
                    for m in mdoc.get("positions", [])
                    if m.get("maker_exit_eligible")}
         want: dict[str, dict] = {}
-        # OLDEST eligible basket per rel, deterministically — an unstable pick
-        # cancel/replaces every cycle, and each replace leaves a ghost of our
-        # own order in the book view that we then undercut (2026-07-24: the
-        # Hollande exit walked 12c -> 9c against a 13c competing ask)
+        # basket per rel: STICK with the basket already being worked while it
+        # stays eligible; otherwise oldest eligible. An unstable pick
+        # cancel/replaces every cycle (ghost undercut, 2026-07-24) — and
+        # switching to a newly-eligible basket that then can't place (thin PM
+        # depth for a 30-lot) cancelled a WORKING 10-lot exit and left
+        # nothing resting (2026-07-25, Geoff caught the empty book).
         for b in sorted(open_baskets(recs), key=lambda b: b.get("ts") or 0):
             rid = b.get("relationship_id")
-            if (rid, b.get("ts")) not in flagged or rid not in quoters or rid in want:
+            if (rid, b.get("ts")) not in flagged or rid not in quoters:
                 continue
+            cur = exit_q.get(rid)
+            if rid in want and not (cur and b.get("ts") == cur["basket_ts"]):
+                continue  # keep first (oldest) unless a later one is CURRENT
             kleg = next((l for l in b["legs"] if l["venue"] == "kalshi"), None)
             pleg = next((l for l in b["legs"] if l["venue"] == "polymarket_us"), None)
             if not kleg or not pleg or kleg.get("side") != "yes":
