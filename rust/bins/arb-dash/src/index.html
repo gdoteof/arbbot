@@ -330,6 +330,39 @@ async function poll(){
   if(st.running) setTimeout(poll, 1500);
 }
 
+function intentsPanel(d){
+  if(d.error) return $(`<section class="wide"><h2>Engine intents</h2>
+    <div class="err">${esc(d.error)}</div>
+    <div class="sub" style="margin-top:8px">${esc(d.hint||'')}</div></section>`);
+  const live = d.engine_live;
+  const rows = (d.live||[]).map(o=>`<tr>
+      <td>${esc(o.venue)}</td>
+      <td>${esc(o.market)}</td>
+      <td class="${o.side==='bid'?'ok':'warn'}">${esc(o.side)}</td>
+      <td class="num">${Number(o.price).toFixed(4)}</td>
+      <td class="num">${o.count}</td>
+      <td class="num ${o.reprices>20?'warn':'dim'}">${o.reprices}</td>
+      <td class="num dim">${new Date(o.ts*1000).toLocaleTimeString()}</td>
+    </tr>`).join('');
+  return $(`<section class="wide">
+    <h2>Would-be resting orders &middot; ${(d.live||[]).length}
+      &middot; <span class="badge ${live?'ok':'bad'}">${live?'ENGINE LIVE':'ENGINE NOT RUNNING'}</span>
+      <span class="dim">last intent ${d.last_intent_age_s<0?'never':d.last_intent_age_s+'s ago'}</span></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>venue</th><th>market</th><th>side</th><th class="num">price</th>
+        <th class="num">count</th><th class="num">reprices</th><th class="num">since</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <div class="kv" style="margin-top:10px"><span>opens / reprices / cancels</span>
+      <b>${d.opens.toLocaleString()} / ${d.reprices.toLocaleString()} / ${d.cancels.toLocaleString()}</b></div>
+    <div class="sub" style="margin-top:8px">These are the orders the DRY-RUN engine
+      would have resting on the venues right now — the real quoter against the live
+      recorder feed, with no credentials and no order code path. Where this
+      disagrees with Current, this is authoritative: that view is a calculator over
+      snapshots, this is the engine. A high reprice count is the quoter chasing,
+      which is a cost, not activity.</div>
+  </section>`);
+}
+
 function currentPanel(d){
   if(d.error) return $(`<section class="wide"><h2>Current opportunities</h2>
     <div class="err">${esc(d.error)}</div></section>`);
@@ -431,6 +464,7 @@ const VIEWS = [
   {path:'/opportunities', label:'Opportunities'},
   {path:'/pairs',         label:'Pairs'},
   {path:'/current',       label:'Current'},
+  {path:'/intents',       label:'Intents'},
 ];
 
 function renderNav(active){
@@ -471,6 +505,12 @@ const ROUTES = {
     setMeta(d.error ? 'no rollup' :
       `${d.scenario} &middot; clip ${d.clip} &middot; ${d.profitable}/${d.priced_pairs} profitable`);
     root.append(currentPanel(d));
+  },
+  '/intents': async (root) => {
+    const d = await json('/api/intents');
+    setMeta(d.error ? 'engine not running' :
+      `${(d.live||[]).length} resting &middot; ${d.total.toLocaleString()} intents &middot; last ${d.last_intent_age_s}s ago`);
+    root.append(intentsPanel(d));
   },
   '/pairs': async (root) => {
     const d = await json('/api/pairs');

@@ -29,7 +29,7 @@ use arb_core::scan::Cx;
 use arb_ledger::kalshi::{Deposit, Fill, KalshiImport, Settlement};
 use arb_ledger::pmus::{Balances, PmusImport, Position};
 use arb_ledger::{accounts, report, Journal};
-use arb_query::{opps, sources_for_range};
+use arb_query::{intents, opps, sources_for_range};
 use arb_registry::{Allowlist, Registry};
 use arb_scenario::{price, Quote, Scenario};
 use arb_tob::{build_day, series, DEFAULT_INTERVAL_NS};
@@ -46,6 +46,7 @@ struct Args {
     raw_dir: String,
     parquet_dir: String,
     rollup_dir: String,
+    intents_path: String,
     registry: String,
     tradable: String,
     port: u16,
@@ -213,6 +214,41 @@ fn opps_json(a: &Args, query: &str) -> String {
         }
         Err(e) => format!("{{\"error\":\"{}\"}}", e.replace('"', "'")),
     }
+}
+
+/// What the engine would have RESTING right now.
+///
+/// This is the answer to "what would we be trading if trading were enabled" —
+/// the dry-run `arb-trader` runs the real quoter against the live recorder
+/// socket and appends its intents here. Where this disagrees with the scenario
+/// view, THIS is authoritative: that one is a calculator, this is the engine.
+///
+/// The age of the last intent is reported prominently because a stale file
+/// looks exactly like a quiet market unless you say which it is.
+fn intents_json(a: &Args) -> String {
+    let st = match intents::reconstruct(&a.intents_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return serde_json::json!({
+                "error": e,
+                "hint": "start the dry-run engine: arb-trader --socket data/arbbot.sock \
+                         --registry config/registry.yaml --out <this path>",
+            })
+            .to_string()
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let age = if st.last_ts > 0.0 { now - st.last_ts } else { -1.0 };
+    let mut v = serde_json::to_value(&st).unwrap_or_else(|_| serde_json::json!({}));
+    v["last_intent_age_s"] = serde_json::json!(age.round() as i64);
+    // 120s is generous for a quoter watching three live feeds; beyond that the
+    // engine is almost certainly not running.
+    v["engine_live"] = serde_json::json!(age >= 0.0 && age < 120.0);
+    v["path"] = serde_json::json!(a.intents_path);
+    v.to_string()
 }
 
 /// The register of tracked pairs. Distinguishes DETECTED from PERMITTED: a
@@ -547,7 +583,7 @@ fn handle(s: TcpStream, a: &Args, sh: &Shared) {
         // router picks the view from the path and fetches ONLY that view's
         // endpoints, which is the point — a single page would fan out to
         // every endpoint on every load as views are added.
-        "/" | "/recording" | "/opportunities" | "/pairs" | "/current" => {
+        "/" | "/recording" | "/opportunities" | "/pairs" | "/current" | "/intents" => {
             respond(s, "200 OK", "text/html; charset=utf-8", PAGE)
         }
         "/api/books" => respond(s, "200 OK", "application/json", &books_json(a)),
@@ -558,6 +594,7 @@ fn handle(s: TcpStream, a: &Args, sh: &Shared) {
         }
         "/api/opportunities" => respond(s, "200 OK", "application/json", &opps_json(a, &query)),
         "/api/pairs" => respond(s, "200 OK", "application/json", &pairs_json(a)),
+        "/api/intents" => respond(s, "200 OK", "application/json", &intents_json(a)),
         // The single write surface. GET reports status; only POST can start a
         // build, so nothing fires it by merely loading a page.
         "/api/rollup" => {
@@ -584,6 +621,7 @@ fn main() {
         raw_dir: "data/raw".into(),
         parquet_dir: "data/parquet".into(),
         rollup_dir: "data/rollup".into(),
+        intents_path: "data/trader-rs/intents.jsonl".into(),
         registry: "config/registry.yaml".into(),
         tradable: "config/tradable.yaml".into(),
         port: 4749,
@@ -602,6 +640,7 @@ fn main() {
             "--raw-dir" => a.raw_dir = v,
             "--parquet-dir" => a.parquet_dir = v,
             "--rollup-dir" => a.rollup_dir = v,
+            "--intents" => a.intents_path = v,
             "--registry" => a.registry = v,
             "--tradable" => a.tradable = v,
             "--port" => a.port = v.parse().unwrap_or(4749),

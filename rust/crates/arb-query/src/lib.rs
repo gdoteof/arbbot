@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod intents;
 pub mod opps;
 
 /// Which physical file backs a `<stem>-<day>`, and in what format.
