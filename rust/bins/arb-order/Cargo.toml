@@ -1,0 +1,8 @@
+[package]
+name = "arb-order"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arb-venue = { path = "../../crates/arb-venue" }
+serde_json = { workspace = true }

@@ -23,6 +23,19 @@ pub enum VenueError {
     },
     /// Signing failed (bad key material or format).
     Sign(String),
+    /// The request never completed (DNS, TLS, timeout, malformed method).
+    Transport(String),
+    /// The venue answered with a non-success status. Kept as data, not a
+    /// panic: callers decide, because some statuses are success in disguise
+    /// (a 404 on cancel means the order is already gone).
+    Status {
+        endpoint: &'static str,
+        status: u16,
+        body: String,
+    },
+    /// The local rate budget for this priority is exhausted. Refusing here is
+    /// the point — a venue-side 429 costs far more than a local wait.
+    RateLimited { priority: &'static str },
 }
 
 impl fmt::Display for VenueError {
@@ -36,6 +49,13 @@ impl fmt::Display for VenueError {
                 write!(f, "{endpoint}: parse error: {detail}")
             }
             VenueError::Sign(m) => write!(f, "signing failed: {m}"),
+            VenueError::Transport(m) => write!(f, "transport error: {m}"),
+            VenueError::Status { endpoint, status, body } => {
+                write!(f, "{endpoint}: HTTP {status}: {body}")
+            }
+            VenueError::RateLimited { priority } => {
+                write!(f, "local rate budget exhausted ({priority})")
+            }
         }
     }
 }

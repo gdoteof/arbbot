@@ -11,6 +11,7 @@ pub mod gateway;
 pub mod ratelimit;
 pub mod resp;
 pub mod sign;
+pub mod transport;
 pub mod wire;
 
 pub use error::VenueError;
@@ -19,3 +20,4 @@ pub use gateway::{
 };
 pub use ratelimit::{Priority, RateLimiter, TokenBucket};
 pub use sign::{KalshiSigner, KalshiVerifier, PmusSigner};
+pub use transport::{HttpTransport, NotWired, Response, Transport};
