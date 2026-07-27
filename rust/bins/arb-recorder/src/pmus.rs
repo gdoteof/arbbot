@@ -3,7 +3,7 @@
 //! chunked 150-slug subscriptions, or credential-free REST polling.
 //! Transliteration of record/polymarket_us.py + the recorder tasks.
 
-use crate::core::{dec_string, Core, SeqCounter, STALL_RECONNECT_S};
+use crate::core::{dec_string, stall_reconnect_s, ws_url, Core, SeqCounter};
 use crate::health::Liveness;
 use crate::sign::PmusSigner;
 use anyhow::Result;
@@ -200,9 +200,9 @@ async fn ws_session(
         let frame = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
             Err(_) => {
                 // Deliberately NOT a liveness beat — see STALL_RECONNECT_S.
-                if last_frame.elapsed() > Duration::from_secs(STALL_RECONNECT_S) {
+                if last_frame.elapsed() > Duration::from_secs(stall_reconnect_s()) {
                     anyhow::bail!(
-                        "no frame in {STALL_RECONNECT_S}s — socket is half-open, reconnecting"
+                        "no frame in {}s — socket is half-open, reconnecting", stall_reconnect_s()
                     );
                 }
                 continue;

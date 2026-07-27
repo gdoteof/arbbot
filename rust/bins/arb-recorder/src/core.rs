@@ -116,4 +116,19 @@ impl Core {
 /// Silence is only ambiguous on a quiet feed, and these are not quiet: the
 /// recorded days run ~7 events/s on Kalshi, ~87/s on PM-intl and ~140/s on
 /// PM-US. A full minute of nothing is a dead socket, not a lull.
-pub const STALL_RECONNECT_S: u64 = 60;
+pub const STALL_RECONNECT_S_DEFAULT: u64 = 60;
+
+/// Stall threshold, overridable ONLY so the half-open-socket test does not have
+/// to take a real minute. Production never sets it.
+pub fn stall_reconnect_s() -> u64 {
+    std::env::var("ARBBOT_STALL_RECONNECT_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(STALL_RECONNECT_S_DEFAULT)
+}
+
+/// WS endpoint override, for pointing a test at a local server. Production
+/// never sets these; the constants remain the real venues.
+pub fn ws_url(env_key: &str, default: &str) -> String {
+    std::env::var(env_key).unwrap_or_else(|_| default.to_string())
+}

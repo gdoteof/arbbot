@@ -3,7 +3,7 @@
 //! REST re-snapshot, periodic 300s integrity re-snapshot.
 //! Transliteration of record/polymarket.py + polymarket_ws_task.
 
-use crate::core::{dec_string, Core, SeqCounter, STALL_RECONNECT_S};
+use crate::core::{dec_string, stall_reconnect_s, ws_url, Core, SeqCounter};
 use crate::health::Liveness;
 use anyhow::Result;
 use arb_core::dec::Dec;
@@ -218,7 +218,7 @@ async fn ws_session(
 ) -> Result<()> {
     use tokio_tungstenite::tungstenite::Message;
 
-    let (mut ws, _) = tokio_tungstenite::connect_async(WS_MARKET_URL).await?;
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url("ARBBOT_WS_PMINTL", WS_MARKET_URL)).await?;
     ws.send(Message::Text(
         json!({"type": "market", "assets_ids": token_ids, "custom_feature_enabled": true})
             .to_string(),
@@ -232,9 +232,9 @@ async fn ws_session(
     loop {
         let frame = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
             Err(_) => {
-                if last_frame.elapsed() > Duration::from_secs(STALL_RECONNECT_S) {
+                if last_frame.elapsed() > Duration::from_secs(stall_reconnect_s()) {
                     anyhow::bail!(
-                        "no frame in {STALL_RECONNECT_S}s — socket is half-open, reconnecting"
+                        "no frame in {}s — socket is half-open, reconnecting", stall_reconnect_s()
                     );
                 }
                 None

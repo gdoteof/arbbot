@@ -10,7 +10,7 @@
 //!   for the shared BookBuilder (2026-07-20 incident).
 //! - trades get their own `|tape` seq stream (traded-markets-die bug).
 
-use crate::core::{dec_string, Core, SeqCounter, STALL_RECONNECT_S};
+use crate::core::{dec_string, stall_reconnect_s, ws_url, Core, SeqCounter};
 use crate::health::Liveness;
 use crate::sign::KalshiSigner;
 use anyhow::Result;
@@ -244,7 +244,7 @@ async fn ws_session(
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
 
-    let mut req = WS_URL.into_client_request()?;
+    let mut req = ws_url("ARBBOT_WS_KALSHI", WS_URL).into_client_request()?;
     for (k, v) in signer.headers("GET", WS_PATH) {
         req.headers_mut().insert(
             reqwest::header::HeaderName::from_bytes(k.as_bytes())?,
@@ -272,9 +272,9 @@ async fn ws_session(
                 // Deliberately NOT a liveness beat. Beating here made a dead
                 // socket look healthy forever; the tracker must report what the
                 // feed actually delivered.
-                if last_frame.elapsed() > Duration::from_secs(STALL_RECONNECT_S) {
+                if last_frame.elapsed() > Duration::from_secs(stall_reconnect_s()) {
                     anyhow::bail!(
-                        "no frame in {STALL_RECONNECT_S}s — socket is half-open, reconnecting"
+                        "no frame in {}s — socket is half-open, reconnecting", stall_reconnect_s()
                     );
                 }
                 continue;
