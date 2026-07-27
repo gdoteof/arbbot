@@ -103,6 +103,58 @@ pub struct Priced {
     pub fill_plausible: bool,
 }
 
+/// Price a basket from EXPLICIT entry prices — the prices we are actually
+/// resting at, rather than the venue touch.
+///
+/// The scenario view asks "what if we quoted at the touch"; this asks "what is
+/// the basket worth at the prices our engine has actually posted". They differ
+/// whenever the quoter improves or backs off the touch, which is most of the
+/// time.
+#[allow(clippy::too_many_arguments)]
+pub fn price_at(
+    cx: &mut Cx,
+    sched: &FeeSchedule,
+    label: &'static str,
+    venue_a: Venue,
+    venue_b: Venue,
+    role_a: Role,
+    role_b: Role,
+    entry_a: &str,
+    exit_b: &str,
+    clip: D,
+    category: &str,
+) -> Option<Priced> {
+    let pa: D = cx.parse(entry_a)?;
+    let pb: D = cx.parse(exit_b)?;
+    let no_cost = cx.one_minus(pb);
+    let gross = cx.add(pa, no_cost);
+
+    let fee_a_total = sched.fee(cx, venue_a, role_a, pa, clip, category);
+    let fee_b_total = sched.fee(cx, venue_b, role_b, pb, clip, category);
+    let fee_a = cx.div(fee_a_total, clip);
+    let fee_b = cx.div(fee_b_total, clip);
+    let total = {
+        let t = cx.add(gross, fee_a);
+        cx.add(t, fee_b)
+    };
+    let one = cx.parse_exact("1");
+    let edge = cx.sub(one, total);
+    let zero = cx.zero();
+    Some(Priced {
+        scenario: label,
+        entry_a: entry_a.to_string(),
+        exit_b: exit_b.to_string(),
+        gross_cost: gross.to_string(),
+        fee_a: fee_a.to_string(),
+        fee_b: fee_b.to_string(),
+        total_cost: total.to_string(),
+        edge_per_contract: edge.to_string(),
+        profitable: cx.cmp(edge, zero) == std::cmp::Ordering::Greater,
+        maker_spread: None,
+        fill_plausible: true,
+    })
+}
+
 /// Price one basket under one scenario. `None` when a needed side is missing —
 /// making on a leg needs the side you would REST on, taking needs the side you
 /// would HIT, and they are different sides.
@@ -282,6 +334,27 @@ mod tests {
         let ok = price(&mut cx, &sched, Scenario::TakeAMakeB, Venue::Kalshi,
                        Venue::PolymarketUs, &qa, &qb2, clip, "politics", tight).unwrap();
         assert!(ok.fill_plausible);
+    }
+
+    /// Our posted price is not the touch, so the two must be able to differ.
+    #[test]
+    fn price_at_uses_our_posted_price_not_the_touch() {
+        let (mut cx, sched, wide) = setup();
+        let clip = cx.parse_exact("25");
+        let (qa, qb) = (q("0.20", "0.22"), q("0.80", "0.83"));
+        // at-touch maker on A rests at 0.20
+        let touch = price(&mut cx, &sched, Scenario::MakeATakeB, Venue::Kalshi,
+                          Venue::PolymarketUs, &qa, &qb, clip, "politics", wide).unwrap();
+        assert_eq!(touch.entry_a, "0.20");
+        // our engine actually posted 0.18 — better basket, same fee role
+        let ours = price_at(&mut cx, &sched, "make-a-take-b", Venue::Kalshi,
+                            Venue::PolymarketUs, Role::Maker, Role::Taker,
+                            "0.18", "0.80", clip, "politics").unwrap();
+        assert_eq!(ours.entry_a, "0.18");
+        let (t, o) = (cx.parse_exact(&touch.edge_per_contract),
+                      cx.parse_exact(&ours.edge_per_contract));
+        assert_eq!(cx.cmp(o, t), std::cmp::Ordering::Greater,
+                   "posting inside the touch must show a better edge");
     }
 
     #[test]

@@ -330,37 +330,115 @@ async function poll(){
   if(st.running) setTimeout(poll, 1500);
 }
 
+function intentSeriesChart(ev){
+  if(!ev.length) return '<div class="dim" style="padding:16px 0">no intent history for this pair</div>';
+  const pts = ev.filter(e=>e.kind!=='cancel' && e.price);
+  if(!pts.length) return '<div class="dim">only cancels</div>';
+  const W=1100,H=200,PL=54,PR=14,PT=12,PB=24;
+  const xs=pts.map(p=>p.ts), ys=pts.map(p=>Number(p.price));
+  const x0=Math.min(...xs),x1=Math.max(...xs);
+  let y0=Math.min(...ys),y1=Math.max(...ys); const pad=(y1-y0)*0.15||0.02; y0-=pad;y1+=pad;
+  const sx=t=>PL+(W-PL-PR)*(x1===x0?0.5:(t-x0)/(x1-x0));
+  const sy=v=>PT+(H-PT-PB)*(1-(v-y0)/(y1-y0));
+  // one line per (venue, market, side) so both legs and both sides are distinct
+  const keys=[...new Set(pts.map(p=>`${p.venue}|${p.market}|${p.side}`))];
+  const cols=['var(--accent)','var(--ok)','var(--warn)','var(--bad)'];
+  const paths=keys.map((k,i)=>{
+    const sub=pts.filter(p=>`${p.venue}|${p.market}|${p.side}`===k);
+    const d=sub.map((p,j)=>`${j?'L':'M'}${sx(p.ts).toFixed(1)},${sy(Number(p.price)).toFixed(1)}`).join('');
+    const dots=sub.map(p=>`<circle cx="${sx(p.ts).toFixed(1)}" cy="${sy(Number(p.price)).toFixed(1)}" r="2"
+        fill="${cols[i%4]}" opacity="${p.kind==='reprice'?0.9:1}"/>`).join('');
+    return `<path d="${d}" fill="none" stroke="${cols[i%4]}" stroke-width="1.4"/>${dots}`;
+  }).join('');
+  const legend=keys.map((k,i)=>{const[,m,side]=k.split('|');
+    return `<span style="color:${cols[i%4]}">■</span> <span class="dim">${esc(m.slice(0,30))} ${esc(side)}</span>`;
+  }).join(' &nbsp; ');
+  const tick=v=>`<line x1="${PL}" x2="${W-PR}" y1="${sy(v).toFixed(1)}" y2="${sy(v).toFixed(1)}"
+      stroke="var(--line)" stroke-dasharray="2,4"/><text x="6" y="${(sy(v)+4).toFixed(1)}"
+      fill="var(--dim)" font-size="11">${v.toFixed(3)}</text>`;
+  return `<div class="sub" style="margin-bottom:6px">${legend}</div>
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">
+      ${tick(y0+pad)}${tick((y0+y1)/2)}${tick(y1-pad)}${paths}
+      <text x="${PL}" y="${H-4}" fill="var(--dim)" font-size="11">${new Date(x0*1000).toLocaleTimeString()}</text>
+      <text x="${W-PR}" y="${H-4}" fill="var(--dim)" font-size="11" text-anchor="end">${new Date(x1*1000).toLocaleTimeString()}</text>
+    </svg>`;
+}
+
+async function showSeries(rel, host){
+  host.innerHTML = '<div class="dim">loading…</div>';
+  const d = await json('/api/intent-series?rel=' + encodeURIComponent(rel));
+  if(d.error){ host.innerHTML = `<div class="err">${esc(d.error)}</div>`; return; }
+  host.innerHTML = `<h2>${esc(rel)} &middot; ${d.events.length} intents</h2>
+    ${intentSeriesChart(d.events)}
+    <div class="sub" style="margin-top:6px">Our posted quote, moving. Each dot is a
+      place or reprice; the venue's own book is on the pair page.</div>`;
+  host.scrollIntoView({behavior:'smooth', block:'nearest'});
+}
+
 function intentsPanel(d){
   if(d.error) return $(`<section class="wide"><h2>Engine intents</h2>
     <div class="err">${esc(d.error)}</div>
     <div class="sub" style="margin-top:8px">${esc(d.hint||'')}</div></section>`);
-  const live = d.engine_live;
-  const rows = (d.live||[]).map(o=>`<tr>
-      <td>${esc(o.venue)}</td>
-      <td>${esc(o.market)}</td>
-      <td class="${o.side==='bid'?'ok':'warn'}">${esc(o.side)}</td>
-      <td class="num">${Number(o.price).toFixed(4)}</td>
-      <td class="num">${o.count}</td>
-      <td class="num ${o.reprices>20?'warn':'dim'}">${o.reprices}</td>
-      <td class="num dim">${new Date(o.ts*1000).toLocaleTimeString()}</td>
-    </tr>`).join('');
-  return $(`<section class="wide">
-    <h2>Would-be resting orders &middot; ${(d.live||[]).length}
-      &middot; <span class="badge ${live?'ok':'bad'}">${live?'ENGINE LIVE':'ENGINE NOT RUNNING'}</span>
-      <span class="dim">last intent ${d.last_intent_age_s<0?'never':d.last_intent_age_s+'s ago'}</span></h2>
+  const STYLE = {'make-both':'make / make','make-a-take-b':'make A → take B','take-a-make-b':'take A → make B'};
+  const n = (v,dp=4)=> v==null||v===''? '<span class="dim">—</span>' : Number(v).toFixed(dp);
+  const rows=(d.rows||[]).map(r=>{
+    const p=r.priced, e=p?Number(p.edge_per_contract):null;
+    const age=Math.max(r.leg_a.quote_age_s??0, r.leg_b.quote_age_s??0);
+    return `<tr class="irow" data-rel="${esc(r.relationship_id)}" style="cursor:pointer">
+      <td><span class="rel">${esc(r.relationship_id)}</span>
+        ${r.tradable?'':'<span class="dim">(not tradable)</span>'}</td>
+      <td class="dim">${esc(STYLE[r.style]||r.style)}</td>
+      <td class="num">${n(r.leg_a.our_bid)}</td>
+      <td class="num dim">${n(r.leg_a.venue_bid,2)}/${n(r.leg_a.venue_ask,2)}</td>
+      <td class="num">${n(r.leg_b.our_ask)}</td>
+      <td class="num dim">${n(r.leg_b.venue_bid,2)}/${n(r.leg_b.venue_ask,2)}</td>
+      <td class="num dim">${p?n(p.gross_cost):'—'}</td>
+      <td class="num dim">${p?n(p.fee_a):'—'}</td>
+      <td class="num dim">${p?n(p.fee_b):'—'}</td>
+      <td class="num ${e==null?'dim':(e>0?(r.actionable?'ok':'warn'):'bad')}">
+        <b>${e==null?'—':(e>0?'+':'')+e.toFixed(4)}</b></td>
+      <td class="num ${r.fillable?'dim':'warn'}">${r.rest_spread==null?'—':r.rest_spread.toFixed(3)}</td>
+      <td class="num dim">${(r.leg_a.reprices??0)+(r.leg_b.reprices??0)}</td>
+      <td class="num dim">${age<0?'—':(age>3600?(age/3600).toFixed(1)+'h':age+'s')}</td>
+    </tr>`;
+  }).join('');
+  const el=$(`<section class="wide">
+    <h2>Engine intents &middot; ${d.resting_orders} resting across ${d.pairs} pairs
+      &middot; <span class="${d.actionable?'ok':'warn'}">${d.actionable} actionable</span>
+      &middot; <span class="badge ${d.rollup_current?'ok':'warn'}">rollup ${d.rollup_current?'current':(d.rollup_coverage_age_s<0?'missing':'stale '+(d.rollup_coverage_age_s/60|0)+'m')}</span>
+      &middot; <span class="badge ${d.engine_live?'ok':'bad'}">${d.engine_live?'ENGINE LIVE':'NOT RUNNING'}</span>
+      <span class="dim">last ${d.last_intent_age_s}s ago &middot; clip ${d.clip}</span></h2>
     <div class="scroll"><table>
-      <thead><tr><th>venue</th><th>market</th><th>side</th><th class="num">price</th>
-        <th class="num">count</th><th class="num">reprices</th><th class="num">since</th></tr></thead>
+      <thead><tr><th>relationship</th><th>style</th>
+        <th class="num">our bid A</th><th class="num">venue A</th>
+        <th class="num">our ask B</th><th class="num">venue B</th>
+        <th class="num">gross</th><th class="num">fee A</th><th class="num">fee B</th>
+        <th class="num">post-fee edge</th><th class="num">rest spread</th><th class="num">reprices</th>
+        <th class="num">since move</th></tr></thead>
       <tbody>${rows}</tbody></table></div>
-    <div class="kv" style="margin-top:10px"><span>opens / reprices / cancels</span>
-      <b>${d.opens.toLocaleString()} / ${d.reprices.toLocaleString()} / ${d.cancels.toLocaleString()}</b></div>
-    <div class="sub" style="margin-top:8px">These are the orders the DRY-RUN engine
-      would have resting on the venues right now — the real quoter against the live
-      recorder feed, with no credentials and no order code path. Where this
-      disagrees with Current, this is authoritative: that view is a calculator over
-      snapshots, this is the engine. A high reprice count is the quoter chasing,
-      which is a cost, not activity.</div>
+    <div class="sub" style="margin-top:8px">Click a row for that pair's intent history.
+      The stream is MAKER-ONLY — place, reprice, cancel — so a take-take crossing can
+      never appear here; it is an immediate execution, not a resting quote, and lives
+      in Current. Style is derived from which legs we rest on: one leg means we make
+      it and take the other, both means make/make. Fees are per contract at clip
+      ${d.clip} and separated so the maker/taker difference is visible. The take leg
+      is priced off the ToB rollup, so its age is the honesty column.<br>
+      <b>Actionable</b> = the leg we rest on has a book within ${d.max_rest_spread}, both legs
+      are in the rollup, and the rollup itself covers the last ${(d.max_coverage_age_s/60)|0} minutes.
+      Amber rows need an implausible fill — an ask at 0.98 against a 0.59 bid is a 40c
+      book — and sort below the actionable ones.<br>
+      <b>"Since move" is not staleness.</b> The series emits on CHANGE, so a quote from
+      hours ago on a market that has not moved is still the current book. What goes
+      stale is the rollup: rebuild it and every row is current again.<br>
+      A make/make edge is conditional on BOTH quotes filling, which is two
+      independent events, not one.</div>
+    <div id="series-host" style="margin-top:14px"></div>
   </section>`);
+  const host=el.querySelector('#series-host');
+  el.querySelectorAll('.irow').forEach(tr=>{
+    tr.onclick=()=>showSeries(tr.dataset.rel, host);
+  });
+  return el;
 }
 
 function currentPanel(d){
@@ -509,7 +587,7 @@ const ROUTES = {
   '/intents': async (root) => {
     const d = await json('/api/intents');
     setMeta(d.error ? 'engine not running' :
-      `${(d.live||[]).length} resting &middot; ${d.total.toLocaleString()} intents &middot; last ${d.last_intent_age_s}s ago`);
+      `${d.resting_orders} resting &middot; ${d.pairs} pairs &middot; last ${d.last_intent_age_s}s ago`);
     root.append(intentsPanel(d));
   },
   '/pairs': async (root) => {

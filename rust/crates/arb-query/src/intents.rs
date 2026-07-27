@@ -39,6 +39,8 @@ struct Raw {
     #[serde(default)]
     count: Option<f64>,
     #[serde(default)]
+    old_price: Option<String>,
+    #[serde(default)]
     ts: f64,
 }
 
@@ -169,6 +171,26 @@ mod tests {
         assert_eq!(st.total, 5);
     }
 
+    /// A cancel record carries no market, so the history must remember where
+    /// each order lived or cancels vanish from the series.
+    #[test]
+    fn history_follows_a_pair_including_its_cancels() {
+        let s = r#"
+{"place":"A","order_id":"m1","venue":"kalshi","side":"bid","price":"0.10","count":5,"ts":1.0}
+{"place":"Z","order_id":"m9","venue":"kalshi","side":"bid","price":"0.50","count":5,"ts":1.5}
+{"place":"A","order_id":"m2","replaces":"m1","old_price":"0.10","venue":"kalshi","side":"bid","price":"0.12","count":5,"ts":2.0}
+{"cancel":"A","order_id":"m2","venue":"kalshi","side":"bid","price":"0.12","ts":3.0}
+"#;
+        let markets = vec![("kalshi".to_string(), "A".to_string())];
+        let h = history_for(s, &markets);
+        assert_eq!(h.len(), 3, "the unrelated market Z must not appear: {h:?}");
+        assert_eq!(h[0].kind, "open");
+        assert_eq!(h[1].kind, "reprice");
+        assert_eq!(h[1].from_price.as_deref(), Some("0.10"), "a reprice shows the move");
+        assert_eq!(h[2].kind, "cancel", "cancel carries no market; must be resolved by order id");
+        assert!(h.windows(2).all(|w| w[0].ts <= w[1].ts), "time ordered");
+    }
+
     #[test]
     fn damaged_lines_are_counted_not_fatal() {
         let s = "{\"place\":\"M\",\"order_id\":\"m1\",\"ts\":1.0}\n\0\0\0\n{bad\n";
@@ -176,4 +198,68 @@ mod tests {
         assert_eq!(st.live.len(), 1);
         assert_eq!(st.parse_failures, 1, "NUL run trims to empty; only the torn line fails");
     }
+}
+
+/// One quote movement, for charting a single pair's intent history.
+#[derive(Debug, Clone, Serialize)]
+pub struct Event {
+    pub ts: f64,
+    pub venue: String,
+    pub market: String,
+    pub side: String,
+    pub price: String,
+    /// "open" | "reprice" | "cancel"
+    pub kind: &'static str,
+    /// Present on a reprice: where the quote came from, so a chart can show
+    /// the move rather than just the destination.
+    pub from_price: Option<String>,
+}
+
+/// Every intent touching any of `markets`, in time order. This is the series
+/// for one pair: the engine's own quote, moving.
+pub fn history_for(text: &str, markets: &[(String, String)]) -> Vec<Event> {
+    let want = |v: &str, m: &str| markets.iter().any(|(mv, mm)| mv == v && mm == m);
+    let mut out = Vec::new();
+    // A cancel record carries no market, so remember what each order was on.
+    let mut where_of: HashMap<String, (String, String)> = HashMap::new();
+
+    for line in text.lines() {
+        let t = line.trim_matches(char::from(0)).trim();
+        if t.is_empty() {
+            continue;
+        }
+        let Ok(r) = serde_json::from_str::<Raw>(t) else { continue };
+        let venue = r.venue.clone().unwrap_or_default();
+        if let Some(market) = &r.place {
+            where_of.insert(r.order_id.clone(), (venue.clone(), market.clone()));
+            if !want(&venue, market) {
+                continue;
+            }
+            out.push(Event {
+                ts: r.ts,
+                venue,
+                market: market.clone(),
+                side: r.side.clone().unwrap_or_default(),
+                price: r.price.clone().unwrap_or_default(),
+                kind: if r.replaces.is_some() { "reprice" } else { "open" },
+                from_price: r.old_price.clone(),
+            });
+        } else if r.cancel.is_some() {
+            let Some((v, m)) = where_of.get(&r.order_id).cloned() else { continue };
+            if !want(&v, &m) {
+                continue;
+            }
+            out.push(Event {
+                ts: r.ts,
+                venue: v,
+                market: m,
+                side: r.side.clone().unwrap_or_default(),
+                price: r.price.clone().unwrap_or_default(),
+                kind: "cancel",
+                from_price: None,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.ts.partial_cmp(&b.ts).unwrap_or(std::cmp::Ordering::Equal));
+    out
 }

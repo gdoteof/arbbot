@@ -20,6 +20,7 @@ mod integrity;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::process::exit;
 
@@ -31,7 +32,8 @@ use arb_ledger::pmus::{Balances, PmusImport, Position};
 use arb_ledger::{accounts, report, Journal};
 use arb_query::{intents, opps, sources_for_range};
 use arb_registry::{Allowlist, Registry};
-use arb_scenario::{price, Quote, Scenario};
+use arb_core::fees::Role;
+use arb_scenario::{price, price_at, Quote, Scenario};
 use arb_tob::{build_day, series, DEFAULT_INTERVAL_NS};
 
 const PAGE: &str = include_str!("index.html");
@@ -216,39 +218,255 @@ fn opps_json(a: &Args, query: &str) -> String {
     }
 }
 
-/// What the engine would have RESTING right now.
+/// What the engine would have RESTING right now, joined to the pair it belongs
+/// to and priced with fees broken out.
 ///
-/// This is the answer to "what would we be trading if trading were enabled" —
-/// the dry-run `arb-trader` runs the real quoter against the live recorder
-/// socket and appends its intents here. Where this disagrees with the scenario
-/// view, THIS is authoritative: that one is a calculator, this is the engine.
+/// The intent stream is MAKER-ONLY: place, reprice, cancel. A take-take
+/// crossing is an immediate execution, never a resting quote, so it cannot
+/// appear here by construction — that lives in the scenario view. What the
+/// stream DOES tell us is which legs we are resting on, and that is the
+/// execution style:
+///   resting on leg A only  -> make A, take B when it fills
+///   resting on leg B only  -> take A, make B
+///   resting on both        -> make/make (no taking at all)
 ///
-/// The age of the last intent is reported prominently because a stale file
-/// looks exactly like a quiet market unless you say which it is.
+/// The take leg is priced off the venue quote from the ToB rollup, so its age
+/// is reported per row: a stale quote makes the edge a guess, not a number.
 fn intents_json(a: &Args) -> String {
-    let st = match intents::reconstruct(&a.intents_path) {
-        Ok(s) => s,
+    let text = match std::fs::read_to_string(&a.intents_path) {
+        Ok(t) => t,
         Err(e) => {
             return serde_json::json!({
-                "error": e,
-                "hint": "start the dry-run engine: arb-trader --socket data/arbbot.sock \
-                         --registry config/registry.yaml --out <this path>",
+                "error": format!("read {}: {e}", a.intents_path),
+                "hint": "start the dry-run engine: systemctl --user start arbbot-trader-rs",
             })
             .to_string()
         }
     };
+    let st = intents::fold(&text);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
     let age = if st.last_ts > 0.0 { now - st.last_ts } else { -1.0 };
-    let mut v = serde_json::to_value(&st).unwrap_or_else(|_| serde_json::json!({}));
-    v["last_intent_age_s"] = serde_json::json!(age.round() as i64);
-    // 120s is generous for a quoter watching three live feeds; beyond that the
-    // engine is almost certainly not running.
-    v["engine_live"] = serde_json::json!(age >= 0.0 && age < 120.0);
-    v["path"] = serde_json::json!(a.intents_path);
-    v.to_string()
+
+    let reg = match Registry::load(&a.registry) {
+        Ok(r) => r,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e.replace('"', "'")),
+    };
+    let allow = Allowlist::load(&a.tradable);
+    // market -> relationship. A market can back more than one pair; the first
+    // is enough to name the row, and the leg lookup below is exact anyway.
+    let mut by_market: HashMap<(String, String), String> = HashMap::new();
+    for r in &reg.relationships {
+        if r.legs.len() != 2 {
+            continue;
+        }
+        for l in &r.legs {
+            by_market
+                .entry((l.venue.clone(), l.market_id.clone()))
+                .or_insert_with(|| r.id.clone());
+        }
+    }
+
+    // Our resting quote per (venue, market, side).
+    let mut ours: HashMap<(String, String, String), &intents::LiveOrder> = HashMap::new();
+    let mut rels: Vec<String> = Vec::new();
+    for o in &st.live {
+        if let Some(rel) = by_market.get(&(o.venue.clone(), o.market.clone())) {
+            if !rels.contains(rel) {
+                rels.push(rel.clone());
+            }
+        }
+        ours.insert((o.venue.clone(), o.market.clone(), o.side.clone()), o);
+    }
+
+    let day = integrity::build(&a.data_dir).today;
+    let paths: Vec<String> = ["kalshi", "polymarket", "polymarket_us"]
+        .iter()
+        .map(|v| format!("{}/tob-{v}-{day}.jsonl", a.rollup_dir))
+        .filter(|p| std::path::Path::new(p).is_file())
+        .collect();
+    let latest = series::latest_by_market(&paths);
+    // How far the ROLLUP covers, not when an individual market last moved.
+    //
+    // This distinction cost me a wrong headline. The series emits on CHANGE,
+    // so a sample from 13 hours ago on a market that has not moved IS the
+    // current book. Treating per-market sample age as staleness conflates
+    // "quiet" with "unknown" and reported 0 of 67 pairs as actionable when 47
+    // had a perfectly fillable book (median spread 2c). What actually goes
+    // stale is the rollup itself: if it was built at noon, nothing in it knows
+    // about the afternoon.
+    let coverage_ns = latest.values().map(|s| s.ts_local_ns).max().unwrap_or(0);
+    let coverage_age_s = if coverage_ns > 0 {
+        ((now * 1e9) as i64 - coverage_ns) / 1_000_000_000
+    } else {
+        i64::MAX
+    };
+    const MAX_COVERAGE_AGE_S: i64 = 1800;
+    let rollup_current = coverage_age_s <= MAX_COVERAGE_AGE_S;
+
+    let mut cx = Cx::default();
+    let sched = FeeSchedule::new(&mut cx);
+    let clip = cx.parse_exact("25");
+
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for rel_id in rels {
+        let Some(r) = reg.get(&rel_id) else { continue };
+        let (la, lb) = (&r.legs[0], &r.legs[1]);
+        let (Some(va), Some(vb)) = (venue_of(&la.venue), venue_of(&lb.venue)) else { continue };
+
+        let get = |l: &arb_registry::Leg, side: &str| {
+            ours.get(&(l.venue.clone(), l.market_id.clone(), side.to_string())).copied()
+        };
+        // Buying YES on A means resting a BID; selling YES on B means resting an ASK.
+        let rest_a = get(la, "bid");
+        let rest_b = get(lb, "ask");
+        if rest_a.is_none() && rest_b.is_none() {
+            continue;
+        }
+        let (style, role_a, role_b) = match (rest_a.is_some(), rest_b.is_some()) {
+            (true, true) => ("make-both", Role::Maker, Role::Maker),
+            (true, false) => ("make-a-take-b", Role::Maker, Role::Taker),
+            _ => ("take-a-make-b", Role::Taker, Role::Maker),
+        };
+
+        let qa = latest.get(&(la.venue.clone(), la.market_id.clone()));
+        let qb = latest.get(&(lb.venue.clone(), lb.market_id.clone()));
+        // Our posted price where we rest; the venue touch where we would take.
+        let entry_a = rest_a
+            .map(|o| o.price.clone())
+            .or_else(|| qa.and_then(|s| s.ask.clone()));
+        let exit_b = rest_b
+            .map(|o| o.price.clone())
+            .or_else(|| qb.and_then(|s| s.bid.clone()));
+        let priced = match (&entry_a, &exit_b) {
+            (Some(ea), Some(eb)) => price_at(
+                &mut cx, &sched, "posted", va, vb, role_a, role_b, ea, eb, clip, "politics",
+            ),
+            _ => None,
+        };
+        let q_age = |s: Option<&arb_tob::TobSample>| {
+            s.map(|s| ((now * 1e9) as i64 - s.ts_local_ns) / 1_000_000_000)
+        };
+
+        // Same guard as the scenario view, for the same reason: an edge is only
+        // real if the quote we rest on can actually fill. Two ways it cannot —
+        // the book is too wide to cross, or the quote we priced against is
+        // hours old. Observed: an ask posted at 0.98 against a 0.59 bid (a 40c
+        // book) showing +0.42, and a row priced off an 18-hour-old quote.
+        let spread_of = |s: Option<&arb_tob::TobSample>, cx: &mut Cx| -> Option<f64> {
+            let s = s?;
+            let (b, a2) = (s.bid.as_ref()?, s.ask.as_ref()?);
+            let _ = cx;
+            Some(a2.parse::<f64>().ok()? - b.parse::<f64>().ok()?)
+        };
+        let mut rest_spread: Option<f64> = None;
+        if rest_a.is_some() {
+            if let Some(sp) = spread_of(qa, &mut cx) {
+                rest_spread = Some(rest_spread.map_or(sp, |c: f64| c.max(sp)));
+            }
+        }
+        if rest_b.is_some() {
+            if let Some(sp) = spread_of(qb, &mut cx) {
+                rest_spread = Some(rest_spread.map_or(sp, |c: f64| c.max(sp)));
+            }
+        }
+        const MAX_REST_SPREAD: f64 = 0.05;
+        let fillable = rest_spread.map_or(false, |s| s <= MAX_REST_SPREAD);
+        // Both legs must be present in the rollup at all; beyond that,
+        // freshness is a property of the rollup, not of the market.
+        let have_books = qa.is_some() && qb.is_some();
+        let actionable = fillable && have_books && rollup_current;
+
+        rows.push(serde_json::json!({
+            "relationship_id": rel_id,
+            "tradable": r.tradable(&allow),
+            "style": style,
+            "leg_a": {
+                "venue": la.venue, "market": la.market_id,
+                "our_bid": rest_a.map(|o| o.price.clone()),
+                "our_count": rest_a.map(|o| o.count),
+                "reprices": rest_a.map(|o| o.reprices),
+                "venue_bid": qa.and_then(|s| s.bid.clone()),
+                "venue_ask": qa.and_then(|s| s.ask.clone()),
+                "quote_age_s": q_age(qa),
+            },
+            "leg_b": {
+                "venue": lb.venue, "market": lb.market_id,
+                "our_ask": rest_b.map(|o| o.price.clone()),
+                "our_count": rest_b.map(|o| o.count),
+                "reprices": rest_b.map(|o| o.reprices),
+                "venue_bid": qb.and_then(|s| s.bid.clone()),
+                "venue_ask": qb.and_then(|s| s.ask.clone()),
+                "quote_age_s": q_age(qb),
+            },
+            "priced": priced,
+            "rest_spread": rest_spread,
+            "fillable": fillable,
+            "have_books": have_books,
+            // Time since this market's book last MOVED — information about how
+            // quiet it is, deliberately not a staleness flag.
+            "since_change_s": q_age(qa).unwrap_or(-1).max(q_age(qb).unwrap_or(-1)),
+            "actionable": actionable,
+            "edge": priced.as_ref().map(|p| p.edge_per_contract.clone()),
+            "last_ts": rest_a.map(|o| o.ts).into_iter()
+                        .chain(rest_b.map(|o| o.ts)).fold(0.0f64, f64::max),
+        }));
+    }
+
+    // Actionable first. An un-fillable or stale-priced row is information, not
+    // a trade, and must not head the list.
+    rows.sort_by(|x, y| {
+        let ok = |v: &serde_json::Value| v["actionable"].as_bool().unwrap_or(false);
+        let f = |v: &serde_json::Value| {
+            v["edge"].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::MIN)
+        };
+        ok(y).cmp(&ok(x)).then(f(y).partial_cmp(&f(x)).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let actionable = rows.iter().filter(|v| v["actionable"].as_bool().unwrap_or(false)).count();
+
+    serde_json::json!({
+        "actionable": actionable,
+        "max_rest_spread": 0.05,
+        "rollup_current": rollup_current,
+        "rollup_coverage_age_s": if coverage_age_s == i64::MAX { -1 } else { coverage_age_s },
+        "max_coverage_age_s": MAX_COVERAGE_AGE_S,
+        "engine_live": age >= 0.0 && age < 120.0,
+        "last_intent_age_s": age.round() as i64,
+        "resting_orders": st.live.len(),
+        "pairs": rows.len(),
+        "opens": st.opens, "reprices": st.reprices, "cancels": st.cancels,
+        "total": st.total,
+        "clip": "25",
+        "maker_only": true,
+        "rows": rows,
+    })
+    .to_string()
+}
+
+/// One pair's intent history — the engine's own quote, moving over time.
+fn intent_series_json(a: &Args, query: &str) -> String {
+    let Some(rel_id) = query_param(query, "rel") else {
+        return "{\"error\":\"rel is required\"}".into();
+    };
+    let reg = match Registry::load(&a.registry) {
+        Ok(r) => r,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e.replace('"', "'")),
+    };
+    let Some(r) = reg.get(&rel_id) else {
+        return format!("{{\"error\":\"unknown relationship {rel_id}\"}}");
+    };
+    let text = std::fs::read_to_string(&a.intents_path).unwrap_or_default();
+    let markets: Vec<(String, String)> =
+        r.legs.iter().map(|l| (l.venue.clone(), l.market_id.clone())).collect();
+    let events = intents::history_for(&text, &markets);
+    serde_json::json!({
+        "relationship_id": rel_id,
+        "legs": markets.iter().map(|(v, m)| format!("{v}:{m}")).collect::<Vec<_>>(),
+        "events": events,
+    })
+    .to_string()
 }
 
 /// The register of tracked pairs. Distinguishes DETECTED from PERMITTED: a
@@ -595,6 +813,9 @@ fn handle(s: TcpStream, a: &Args, sh: &Shared) {
         "/api/opportunities" => respond(s, "200 OK", "application/json", &opps_json(a, &query)),
         "/api/pairs" => respond(s, "200 OK", "application/json", &pairs_json(a)),
         "/api/intents" => respond(s, "200 OK", "application/json", &intents_json(a)),
+        "/api/intent-series" => {
+            respond(s, "200 OK", "application/json", &intent_series_json(a, &query))
+        }
         // The single write surface. GET reports status; only POST can start a
         // build, so nothing fires it by merely loading a page.
         "/api/rollup" => {
