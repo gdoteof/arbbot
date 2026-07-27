@@ -135,14 +135,6 @@ function morphChildren(from, to){
   while(cursor){ const next = cursor.nextSibling; from.removeChild(cursor); cursor = next; }
 }
 
-/* A view builder is called two ways: with load()'s staging fragment, where
-   the caller applies the whole page at once, or with the live #root for a
-   synchronous repaint (sort, filter, search), where it must patch. */
-function emit(container, frag){
-  if(container.nodeType === Node.DOCUMENT_FRAGMENT_NODE) container.append(frag);
-  else apply(container, frag);
-}
-
 /* Apply a freshly built fragment to a live container. */
 function apply(container, frag){
   const shell = document.createElement(container.nodeName);
@@ -398,11 +390,9 @@ function pairPanels(d, root){
 
 /* 143 rows of registry, unsorted and unsearchable, with 78-digit Polymarket
    token ids in the legs column. Finding one pair meant ctrl-F. */
-let pairQuery = '';
-
 function pairsPanel(d){
   if(d.error) return $(`<section class="wide"><h2>Pairs</h2><div class="err">${esc(d.error)}</div></section>`);
-  const q = pairQuery.trim().toLowerCase();
+  const q = S.pairQuery.trim().toLowerCase();
   const match = r => !q || [r.id, r.verdict, r.vetted_by, ...(r.legs||[])]
     .some(v => String(v||'').toLowerCase().includes(q));
   const shown = (d.rows||[]).filter(match);
@@ -419,7 +409,7 @@ function pairsPanel(d){
         id(s) in the allowlist — the two overlap)</span>
       ${q?`&middot; <span class="ok">${shown.length} match "${esc(q)}"</span>`:''}</h2>
     <input id="pair-q" placeholder="filter by id, verdict, vetter or leg…"
-      value="${esc(pairQuery)}" style="width:100%;max-width:420px;margin-bottom:10px;
+      value="${esc(S.pairQuery)}" style="width:100%;max-width:420px;margin-bottom:10px;
       font:inherit;font-size:12px;padding:5px 9px;border-radius:6px;
       background:var(--bg);color:var(--ink);border:1px solid var(--line)">
     ${shown.length?'':'<div class="dim" style="padding:8px 0">no pair matches that.</div>'}
@@ -431,7 +421,7 @@ function pairsPanel(d){
   const inp = el.querySelector('#pair-q');
   // No focus/caret restore: the patch keeps this exact node, so the browser
   // keeps both. That is the whole argument for patching over replacing.
-  inp.oninput = () => { pairQuery = inp.value; repaintPairs(); };
+  inp.oninput = () => set(st => { st.pairQuery = inp.value; });
   return el;
 }
 
@@ -486,30 +476,10 @@ function rollupPanel(st, day){
       not scale with tape size. Writes are atomic — readers never see a partial
       series.</div>
   </section>`);
-  const btn = el.querySelector('#rollup-btn');
-  // Read the day at CLICK time from the host: patching preserves this button
-  // across repaints, so a day captured in the closure would go stale at the
-  // UTC rollover.
-  btn.onclick = async () => {
-    const host = document.getElementById('rollup-host');
-    const d = (host && host.dataset.day) || day;
-    btn.disabled = true; btn.textContent = 'starting…';
-    await fetch('/api/rollup?day=' + encodeURIComponent(d), {method:'POST'});
-    /* No poll loop: the build's progress arrives on the same stream that
-       carries everything else. */
-  };
+  // Dispatches an action. The button's own state comes back through the
+  // stream, so nothing here writes to the document.
+  el.querySelector('#rollup-btn').onclick = () => startRollup(day);
   return el;
-}
-
-/* Redraw the rollup panel in place from the pushed status. Called on every
-   stream frame, which is cheap and means the button reflects the server
-   without anyone asking it. */
-function paintRollup(st){
-  const host = document.getElementById('rollup-host');
-  if(!host) return;
-  const frag = document.createDocumentFragment();
-  frag.append(rollupPanel(st, host.dataset.day));
-  apply(host, frag);
 }
 
 /* Human-readable duration. "48054s" is a number; "13h 21m" is a fact. */
@@ -611,28 +581,6 @@ function quoteAndEdgeChart(ev, series){
   </svg>`;
 }
 
-/* The open drill-down survives a redraw: a push that arrives while you are
-   reading a pair's history must not close it. `scroll` is true only for a
-   click, so a background repaint never yanks the page. */
-let expandedRel = null;
-
-async function showSeries(rel, host, scroll){
-  expandedRel = rel;
-  host.innerHTML='<div class="dim">loading…</div>';
-  const d=await json('/api/intent-series?rel='+encodeURIComponent(rel));
-  if(d.error){ host.innerHTML=`<div class="err">${esc(d.error)}</div>`; return; }
-  host.innerHTML=`<h2>${esc(rel)} &middot; ${d.events.length} intents &middot; ${d.edge_series.length} priced points
-      &middot; <a href="#" id="series-close" class="rel">close</a></h2>
-    ${quoteAndEdgeChart(d.events, d.edge_series)}
-    <div class="sub" style="margin-top:6px">Solid = our posted quote (left axis).
-      Dashed = post-fee edge per route on its own right axis — different units, so a
-      shared axis would flatten both.</div>`;
-  host.querySelector('#series-close').onclick = e => {
-    e.preventDefault(); expandedRel = null; host.innerHTML='';
-  };
-  if(scroll) host.scrollIntoView({behavior:'smooth', block:'nearest'});
-}
-
 const COLS=[
   ['relationship_id','relationship','The vetted pair. Click the row for its history.','s'],
   ['best_route','route','Best available route now. take/take crosses both books immediately; make→take rests one leg and takes the other the moment it fills.','s'],
@@ -649,8 +597,6 @@ const COLS=[
   ['reprices','reprices','Times the quote has been moved. High means the quoter is chasing, which is a cost.','n'],
   ['since_change_s','since move','Time since this book last MOVED. Not staleness — the series emits on change, so a quiet market has an old sample and a valid quote.','n'],
 ];
-
-let iSort={key:'edge_f',dir:-1}, iFilter={route:'', actionable:true, tradable:true};
 
 function intentsPanel(d){
   if(d.error) return $(`<section class="wide"><h2>Engine intents</h2>
@@ -670,24 +616,24 @@ function intentsPanel(d){
 
   const all=(d.rows||[]).slice();
   let rows=all;
-  if(iFilter.route) rows=rows.filter(r=>r.best_route===iFilter.route);
-  if(iFilter.actionable) rows=rows.filter(r=>r.actionable);
-  if(iFilter.tradable) rows=rows.filter(r=>r.tradable);
+  if(S.filter.route) rows=rows.filter(r=>r.best_route===S.filter.route);
+  if(S.filter.actionable) rows=rows.filter(r=>r.actionable);
+  if(S.filter.tradable) rows=rows.filter(r=>r.tradable);
   // Prices arrive as strings, so a plain typeof check sorted "our bid A" and
   // both venue columns LEXICALLY: 0.09 above 0.1, and blanks first.
-  const numeric = (COLS.find(c=>c[0]===iSort.key)||[])[3] !== 's';
+  const numeric = (COLS.find(c=>c[0]===S.sort.key)||[])[3] !== 's';
   rows.sort((a,b)=>{
-    const x=val(a,iSort.key), y=val(b,iSort.key);
-    if(!numeric) return String(x??'').localeCompare(String(y??''))*iSort.dir;
+    const x=val(a,S.sort.key), y=val(b,S.sort.key);
+    if(!numeric) return String(x??'').localeCompare(String(y??''))*S.sort.dir;
     const nx=x==null||x===''?-Infinity:Number(x), ny=y==null||y===''?-Infinity:Number(y);
     const fx=isFinite(nx)?nx:-Infinity, fy=isFinite(ny)?ny:-Infinity;
-    return (fy-fx)*(iSort.dir<0?1:-1);
+    return (fy-fx)*(S.sort.dir<0?1:-1);
   });
 
   const head=COLS.map(([k,l,tip])=>{
-    const on=iSort.key===k;
+    const on=S.sort.key===k;
     return `<th class="${['n','x'].includes(COLS.find(c=>c[0]===k)[3])?'num':''} sortable" data-key="${k}" title="${esc(tip)}">
-      ${l}${on?(iSort.dir<0?' ▾':' ▴'):''}</th>`;
+      ${l}${on?(S.sort.dir<0?' ▾':' ▴'):''}</th>`;
   }).join('');
 
   const body=rows.map(r=>{
@@ -710,7 +656,7 @@ function intentsPanel(d){
       <td class="num ${r.deep_enough?'dim':'warn'}">${r.take_depth==null?'?':Math.floor(r.take_depth).toLocaleString()}</td>
       <td class="num dim">${(r.leg_a.reprices??0)+(r.leg_b.reprices??0)}</td>
       <td class="num dim">${dur(r.since_change_s)}</td>
-    </tr>`;}).join('');
+    </tr>${S.expanded===r.relationship_id ? expanderRow(r.relationship_id) : ''}`;}).join('');
 
   // An empty table is a claim, and it must say which claim. Filters hiding
   // everything and a stale rollup hiding everything look identical otherwise —
@@ -726,7 +672,7 @@ function intentsPanel(d){
           + 'or turn off <b>actionable only</b> to see the pairs as last priced.'
         : 'All ' + all.length + ' pair(s) are hidden by the filters above.')}</div>`;
 
-  const rbtn=(k,l)=>`<a href="#" data-route="${k}" class="rf ${iFilter.route===k?'on':''}">${l}</a>`;
+  const rbtn=(k,l)=>`<a href="#" data-route="${k}" class="rf ${S.filter.route===k?'on':''}">${l}</a>`;
   const el=$(`<section class="wide">
     <h2>Engine intents &middot; ${d.resting_orders} resting &middot; ${rows.length}/${d.pairs} shown
       &middot; <span class="${d.actionable?'ok':'warn'}">${d.actionable} actionable</span>
@@ -735,8 +681,8 @@ function intentsPanel(d){
     <nav style="padding:0;border:0;margin-bottom:8px">
       ${rbtn('','all routes')}${rbtn('take-take','take / take')}${rbtn('make-a-take-b','make A → take B')}${rbtn('take-a-make-b','take A → make B')}
       <span style="flex:1"></span>
-      <a href="#" id="f-act" class="${iFilter.actionable?'on':''}">actionable only</a>
-      <a href="#" id="f-trd" class="${iFilter.tradable?'on':''}">tradable only</a>
+      <a href="#" id="f-act" class="${S.filter.actionable?'on':''}">actionable only</a>
+      <a href="#" id="f-trd" class="${S.filter.tradable?'on':''}">tradable only</a>
     </nav>
     ${why}
     <div class="scroll" style="${rows.length?'':'display:none'}"><table>
@@ -750,24 +696,46 @@ function intentsPanel(d){
       at least ${d.min_take_depth} contracts resting at the touch we would cross, both
       books known, and the rollup covering the last ${(d.max_coverage_age_s/60)|0} minutes.<br>
       ${intlNote(d.rows)}</div>
-    <div id="series-host" style="margin-top:14px"></div>
   </section>`);
 
-  // Sort and filter are questions about data already in the browser. They
-  // repaint from cache; they do not go back to the server.
-  el.querySelectorAll('.sortable').forEach(th=>th.onclick=()=>{
+  // Every handler dispatches an action. None of them writes to the document.
+  el.querySelectorAll('.sortable').forEach(th=>th.onclick=()=>set(st=>{
     const k=th.dataset.key;
-    iSort = (iSort.key===k) ? {key:k,dir:-iSort.dir} : {key:k,dir:-1};
-    repaintIntents();
-  });
-  el.querySelectorAll('.rf').forEach(a=>a.onclick=(e)=>{
-    e.preventDefault(); iFilter.route=a.dataset.route; repaintIntents();});
-  el.querySelector('#f-act').onclick=e=>{e.preventDefault(); iFilter.actionable=!iFilter.actionable; repaintIntents();};
-  el.querySelector('#f-trd').onclick=e=>{e.preventDefault(); iFilter.tradable=!iFilter.tradable; repaintIntents();};
-  const host=el.querySelector('#series-host');
-  el.querySelectorAll('.irow').forEach(tr=>tr.onclick=()=>showSeries(tr.dataset.rel, host, true));
-  if(expandedRel) showSeries(expandedRel, host, false);
+    st.sort = (st.sort.key===k) ? {key:k, dir:-st.sort.dir} : {key:k, dir:-1};
+  }));
+  el.querySelectorAll('.rf').forEach(a=>a.onclick=e=>{
+    e.preventDefault(); set(st=>{ st.filter.route = a.dataset.route; });});
+  el.querySelector('#f-act').onclick=e=>{
+    e.preventDefault(); set(st=>{ st.filter.actionable = !st.filter.actionable; });};
+  el.querySelector('#f-trd').onclick=e=>{
+    e.preventDefault(); set(st=>{ st.filter.tradable = !st.filter.tradable; });};
+  el.querySelectorAll('.irow').forEach(tr=>tr.onclick=()=>toggleExpand(tr.dataset.rel));
+  el.querySelectorAll('.ser-close').forEach(a=>a.onclick=e=>{
+    e.preventDefault(); e.stopPropagation(); set(st=>{ st.expanded = null; });});
   return el;
+}
+
+/* The drill-down, rendered from state directly beneath the row it belongs to.
+   Previously it lived in a host at the bottom of the section and was written
+   by an async callback AFTER the patch had run — so the patch cleared the live
+   chart and the fetch resolved into a node no longer in the document. Drawing
+   it from `S.series` makes that impossible: a render mid-flight simply draws
+   the loading state, and the reply triggers another render. */
+function expanderRow(rel){
+  const st = S.series[rel];
+  const body = !st || st.loading
+    ? '<div class="dim">loading…</div>'
+    : st.error
+      ? `<div class="err">${esc(st.error)}</div>`
+      : `<div class="sub" style="margin-bottom:6px">${esc(rel)}
+           &middot; ${st.events.length} intents &middot; ${st.edge_series.length} priced points
+           &middot; <a href="#" class="ser-close rel">close</a></div>
+         ${quoteAndEdgeChart(st.events, st.edge_series)}
+         <div class="sub" style="margin-top:6px">Solid = our posted quote (left axis).
+           Dashed = post-fee edge per route on its own right axis — different units, so a
+           shared axis would flatten both.</div>`;
+  return `<tr class="expando" data-k="exp:${esc(rel)}">
+    <td colspan="${COLS.length}" style="padding:12px 8px;background:var(--bg)">${body}</td></tr>`;
 }
 
 function topSeriesPanel(t){
@@ -787,44 +755,6 @@ function topSeriesPanel(t){
     <div class="sub">Our posted quote joined against the venue books, priced per route
       at every point either moved. The red line is zero — below it the basket loses.</div>
   </section>`);
-}
-
-/* Sorting a column used to REFETCH /api/intents AND /api/top-series, which
-   re-prices every actionable pair's whole day server-side to answer a question
-   the browser already had the data for. The payload is cached and re-sorted in
-   place; only a pushed change goes back to the server. */
-let intentsData = null, topData = null;
-
-async function reloadIntents(root){
-  intentsData = await json('/api/intents');
-  topData = await json('/api/top-series?n=4').catch(()=>({rows:[]}));
-  paintIntents(root);
-}
-
-function paintIntents(container){
-  const d = intentsData;
-  if(!d) return;
-  const root = document.createDocumentFragment();
-  setMeta(d.error ? 'engine not running'
-    : `${d.resting_orders} resting &middot; ${d.pairs} pairs &middot; last ${dur(d.last_intent_age_s)} ago`);
-  // The rebuild control belongs where the problem is visible. With a stale
-  // rollup this view goes empty, and the fix used to live on two other pages.
-  if(!d.error && !d.rollup_current){
-    const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
-    host.dataset.day = lastState.today || '';
-    host.append(rollupPanel(lastState.rollup_status || {}, host.dataset.day));
-    root.append(host);
-  }
-  root.append(topSeriesPanel(topData||{rows:[]}));
-  root.append(intentsPanel(d));
-  emit(container, root);
-}
-
-/* Re-render from cache. Never mid-flight: load() clears and re-appends the
-   same root, so a synchronous repaint in between would interleave. */
-function repaintIntents(){
-  if(rendering){ queued = true; return; }
-  paintIntents(document.getElementById('root'));
 }
 
 function currentPanel(d){
@@ -971,161 +901,251 @@ const VIEWS = [
   {path:'/intents',       label:'Intents'},
 ];
 
+const json = (u) => fetch(u).then(r=>r.json());
+
+/* ===========================================================================
+   STATE
+
+   One mutable object, one renderer, and a rule with no exceptions:
+
+     the document is a pure function of S, and NOTHING outside render() may
+     touch it.
+
+   Everything asynchronous — a fetch reply, a pushed frame, a click — writes to
+   S through set() and stops there. That is not ceremony; it is the fix for a
+   bug that appeared twice in this file. Both times an async callback wrote
+   into a node that a later repaint had already discarded: first the drill-down
+   chart, then the drill-down chart again after the repaint became a patch. You
+   cannot write into a stale node if you never write into a node.
+
+   set() coalesces to one render per animation frame, so a burst of updates
+   costs one repaint, and render() morphs rather than replaces (see morph
+   above), so a repaint costs only what actually changed.
+   =========================================================================== */
+const S = {
+  data:      {},                 // endpoint key -> payload, or {error}
+  stream:    {},                 // last SSE frame
+  series:    {},                 // relationship -> {loading} | {error} | payload
+  expanded:  null,               // which intents row is open
+  reveal:    false,              // one-shot: bring the expander into view
+  sort:      {key:'edge_f', dir:-1},
+  filter:    {route:'', actionable:true, tradable:true},
+  pairQuery: '',
+  link:      {cls:'dim', text:'● connecting…', title:''},
+};
+
+let scheduled = false;
+function set(mutate){
+  mutate(S);
+  if(scheduled) return;
+  scheduled = true;
+  requestAnimationFrame(() => { scheduled = false; render(); });
+}
+
+/* --------------------------------------------------------------------------
+   ROUTES — what each page needs, which stream key invalidates it, how it draws
+   -------------------------------------------------------------------------- */
+function page(){
+  const p = location.pathname;
+  if(p.startsWith('/pair/')) return '/pair';
+  return NEEDS[p] ? p : '/';
+}
+function relOf(){ return decodeURIComponent(location.pathname.slice('/pair/'.length)); }
+
+const NEEDS = {
+  '/':              () => ({books:    '/api/books'}),
+  '/recording':     () => ({integrity:'/api/integrity'}),
+  '/opportunities': () => ({opps:     '/api/opportunities' + location.search}),
+  '/pairs':         () => ({pairs:    '/api/pairs'}),
+  '/current':       () => ({current:  '/api/current' + location.search}),
+  '/intents':       () => ({intents:  '/api/intents', top:'/api/top-series?n=4'}),
+  '/pair':          () => {
+    const q = new URLSearchParams(location.search);
+    q.set('rel', relOf());
+    return {pair: '/api/pair?' + q};
+  },
+};
+
+/* A frame that does not move THIS page's key is not a reason to refetch it —
+   which is what makes a push cheaper than a poll. */
+const TOPIC = {
+  '/':'books', '/recording':'recording', '/opportunities':'opportunities',
+  '/pairs':'pairs', '/current':'rollup', '/intents':'intents', '/pair':'rollup',
+};
+
+/* Each draw is PURE: reads S, appends to a fragment, returns the header text.
+   No fetching, no awaiting, no reaching into the document. */
+const DRAW = {
+  '/': (f) => {
+    const b = S.data.books;
+    if(!b) return loading(f, 'books');
+    if(b.error) return fail(f, b.error);
+    f.append(statement(b.statement, b.accounts||[]));
+    f.append(reconPanel(b.reconciliations, b.sources));
+    f.append(positionsPanel(b.positions||[]));
+    f.append(accountsPanel(b.accounts||[]));
+    return `${b.entries} entries &middot; trial balance ` +
+           `<span class="badge ${b.balanced?'ok':'bad'}">${b.balanced?'ZERO':'NOT ZERO'}</span>`;
+  },
+  '/recording': (f) => {
+    const iv = S.data.integrity;
+    if(!iv) return loading(f, 'recording integrity');
+    if(iv.error) return fail(f, iv.error);
+    f.append(integrityPanel(iv));
+    f.append(rollupHost(iv.today));
+    f.append(coveragePanel(iv));
+    return `recording integrity &middot; ${esc(iv.today)}`;
+  },
+  '/current': (f) => {
+    const d = S.data.current;
+    if(!d) return loading(f, 'current opportunities');
+    // The rebuild control stays even on the error path — that is exactly when
+    // it is the thing you need.
+    f.append(rollupHost(d.day || S.stream.today || ''));
+    f.append(currentPanel(d));
+    return d.error ? 'no rollup'
+      : `${d.scenario} &middot; clip ${d.clip} &middot; ${d.profitable}/${d.priced_pairs} profitable`;
+  },
+  '/intents': (f) => {
+    const d = S.data.intents;
+    if(!d) return loading(f, 'engine intents');
+    if(!d.error && !d.rollup_current) f.append(rollupHost(S.stream.today || ''));
+    f.append(topSeriesPanel(S.data.top || {rows:[]}));
+    f.append(intentsPanel(d));
+    return d.error ? 'engine not running'
+      : `${d.resting_orders} resting &middot; ${d.pairs} pairs &middot; last ${dur(d.last_intent_age_s)} ago`;
+  },
+  '/pairs': (f) => {
+    const d = S.data.pairs;
+    if(!d) return loading(f, 'tracked pairs');
+    f.append(pairsPanel(d));
+    return `${d.count||0} pairs registered &middot; ${d.tradable||0} tradable`;
+  },
+  '/opportunities': (f) => {
+    const o = S.data.opps;
+    if(!o) return loading(f, 'opportunity coverage');
+    f.append(oppsPanel(o));
+    return o.error ? 'no coverage'
+      : `${o.days||0} day(s) &middot; ${(o.observations||0).toLocaleString()} observations`;
+  },
+  '/pair': (f) => {
+    const d = S.data.pair;
+    if(!d) return loading(f, 'pair');
+    if(d.error) return fail(f, d.error);
+    pairPanels(d, f);
+    return `${d.samples_a + d.samples_b} quote samples across both legs`;
+  },
+};
+
+function loading(f, what){
+  f.append($(`<section class="wide"><div class="dim">loading ${esc(what)}…</div></section>`));
+  return `loading ${esc(what)}…`;
+}
+function fail(f, msg){
+  f.append($(`<section class="wide err">${esc(msg)}</section>`));
+  return `<span class="bad">${esc(msg)}</span>`;
+}
+function rollupHost(day){
+  const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
+  host.dataset.day = day || '';
+  host.append(rollupPanel(S.stream.rollup_status || {}, host.dataset.day));
+  return host;
+}
+
+/* --------------------------------------------------------------------------
+   RENDER — the only function permitted to touch the document
+   -------------------------------------------------------------------------- */
 function renderNav(active){
   document.getElementById('nav').innerHTML = VIEWS.map(v =>
     `<a href="${v.path}" class="${v.path===active?'on':''}">${v.label}</a>`).join('');
 }
 
-const json = (u) => fetch(u).then(r=>r.json());
+function render(){
+  const p = page();
+  renderNav(p === '/pair' ? '/pairs' : p);
 
-/* Each view fetches ONLY its own endpoints. Splitting the page by URL is what
-   keeps that true as views are added — a single page would fan out to every
-   endpoint on every load. */
-const ROUTES = {
-  '/': async (root) => {
-    const b = await json('/api/books');
-    if(b.error) throw new Error(b.error);
-    setMeta(`${b.entries} entries &middot; trial balance ` +
-      `<span class="badge ${b.balanced?'ok':'bad'}">${b.balanced?'ZERO':'NOT ZERO'}</span>`);
-    root.append(statement(b.statement, b.accounts||[]));
-    root.append(reconPanel(b.reconciliations, b.sources));
-    root.append(positionsPanel(b.positions||[]));
-    root.append(accountsPanel(b.accounts||[]));
-  },
-  '/recording': async (root) => {
-    const iv = await json('/api/integrity');
-    setMeta(`recording integrity &middot; ${esc(iv.today)}`);
-    root.append(integrityPanel(iv));
-    const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
-    host.dataset.day = iv.today || '';
-    host.append(rollupPanel(lastState.rollup_status || {}, host.dataset.day));
-    root.append(host);
-    root.append(coveragePanel(iv));
-  },
-  '/current': async (root) => {
-    const d = await json('/api/current' + (location.search || ''));
-    const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
-    // On the error path `d.day` is absent — and that is exactly when the
-    // rebuild button matters, so fall back to the day the server reports.
-    host.dataset.day = d.day || lastState.today || '';
-    host.append(rollupPanel(lastState.rollup_status || {}, host.dataset.day));
-    root.append(host);
-    setMeta(d.error ? 'no rollup' :
-      `${d.scenario} &middot; clip ${d.clip} &middot; ${d.profitable}/${d.priced_pairs} profitable`);
-    root.append(currentPanel(d));
-  },
-  '/intents': async (root) => { await reloadIntents(root); },
-  '/pairs': async (root) => {
-    pairsData = await json('/api/pairs');
-    paintPairs(root);
-  },
-  '/opportunities': async (root) => {
-    const qs = location.search || '';
-    const o = await json('/api/opportunities' + qs);
-    setMeta(`${o.days||0} day(s) &middot; ${o.observations ? o.observations.toLocaleString() : 0} observations`);
-    root.append(oppsPanel(o));
-  },
-};
+  const el = document.getElementById('link');
+  el.className = 'sub ' + S.link.cls;
+  el.textContent = S.link.text;
+  el.title = S.link.title;
 
-let pairsData = null;
-function paintPairs(container){
-  if(!pairsData) return;
-  const root = document.createDocumentFragment();
-  setMeta(`${pairsData.count||0} pairs registered &middot; ${pairsData.tradable||0} tradable`);
-  root.append(pairsPanel(pairsData));
-  emit(container, root);
-}
-function repaintPairs(){
-  if(rendering){ queued = true; return; }
-  paintPairs(document.getElementById('root'));
-}
-
-function setMeta(html){
-  document.getElementById('meta').innerHTML = html;
-}
-
-/* Which stream key each view depends on. A frame that does not move THIS
-   view's key is not a reason to redraw it — which is the whole reason a push
-   beats a timer: an idle board redraws nothing at all. */
-const VIEW_TOPIC = {
-  '/':'books', '/recording':'recording', '/opportunities':'opportunities',
-  '/pairs':'pairs', '/current':'rollup', '/intents':'intents',
-};
-
-let lastState = {};       // most recent stream frame
-let rendering = false;    // one render at a time; a redraw mid-render duplicates panels
-let queued = false;
-
-async function load(){
-  if(rendering){ queued = true; return; }
-  rendering = true;
-  const root = document.getElementById('root');
-  let path = location.pathname;
-  const isPair = path.startsWith('/pair/');
-  if(!isPair && !ROUTES[path]) path = '/';
-  renderNav(isPair ? '/pairs' : path);
-  // Build off-document, then PATCH the live tree with it. Clearing first and
-  // awaiting the fetch left the page blank for the length of the request;
-  // swapping wholesale destroyed scroll, focus and selection every frame.
-  const stage = document.createDocumentFragment();
+  const frag = document.createDocumentFragment();
+  let meta;
   try{
-    if(isPair){
-      const rel = decodeURIComponent(path.slice('/pair/'.length));
-      const qs = new URLSearchParams(location.search);
-      qs.set('rel', rel);
-      const d = await json('/api/pair?' + qs.toString());
-      if(d.error) throw new Error(d.error);
-      setMeta(`${d.samples_a + d.samples_b} quote samples across both legs`);
-      pairPanels(d, stage);
-    } else {
-      await ROUTES[path](stage);
-    }
-    apply(root, stage);
+    meta = DRAW[p](frag);
   }catch(e){
-    const msg = e.message || String(e);
-    const err = document.createDocumentFragment();
-    err.append($(`<section class="wide err">${esc(msg)}</section>`));
-    apply(root, err);
-    // The header must never keep describing the view that worked while the
-    // body shows the one that did not.
-    setMeta(`<span class="bad">${esc(msg)}</span>`);
-  }finally{
-    rendering = false;
-    if(queued){ queued = false; load(); }
+    while(frag.firstChild) frag.removeChild(frag.firstChild);
+    meta = fail(frag, e.message || String(e));
+  }
+  document.getElementById('meta').innerHTML = meta;
+  apply(document.getElementById('root'), frag);
+
+  // The one post-render effect, and it is explicit, one-shot, and only ever
+  // armed by a click — never by a background refresh.
+  if(S.reveal){
+    S.reveal = false;
+    const row = document.querySelector('tr.expando');
+    if(row) row.scrollIntoView({behavior:'smooth', block:'nearest'});
   }
 }
 
-/* Server-pushed freshness. The old build re-ran the whole page on a 15s timer,
-   which meant an idle dashboard hammered the box, a change waited up to 15s to
-   appear, and anything you had opened was thrown away mid-read. */
-function setLink(cls, text, title){
-  const el = document.getElementById('link');
-  el.className = 'sub ' + cls;
-  el.textContent = text;
-  el.title = title || '';
+/* --------------------------------------------------------------------------
+   ACTIONS — asynchronous, and they write to S, never to the document
+   -------------------------------------------------------------------------- */
+async function refresh(){
+  const needs = NEEDS[page()]();
+  const keys = Object.keys(needs);
+  const got = await Promise.all(
+    keys.map(k => json(needs[k]).catch(e => ({error: String(e.message || e)}))));
+  set(st => { keys.forEach((k,i) => { st.data[k] = got[i]; }); });
+}
+
+async function loadSeries(rel){
+  set(st => { st.series[rel] = {loading:true}; });
+  const d = await json('/api/intent-series?rel=' + encodeURIComponent(rel))
+              .catch(e => ({error: String(e.message || e)}));
+  set(st => { st.series[rel] = d; });
+}
+
+function toggleExpand(rel){
+  const opening = S.expanded !== rel;
+  set(st => { st.expanded = opening ? rel : null; st.reveal = opening; });
+  if(opening) loadSeries(rel);
+}
+
+async function startRollup(day){
+  set(st => { st.stream = {...st.stream,
+    rollup_status: {...(st.stream.rollup_status||{}), running: day}}; });
+  await fetch('/api/rollup?day=' + encodeURIComponent(day), {method:'POST'});
+  // Progress arrives on the stream; there is no poll loop.
 }
 
 function connect(){
   const es = new EventSource('/api/stream');
-  es.onopen = () => setLink('ok', '● live', 'pushed by the server as files change');
+  es.onopen = () => set(st => { st.link =
+    {cls:'ok', text:'● live', title:'pushed by the server as files change'}; });
   es.onmessage = (ev) => {
-    let s; try{ s = JSON.parse(ev.data); }catch{ return; }
-    const prev = lastState; lastState = s;
-    setLink('ok', '● live ' + new Date().toLocaleTimeString(),
-            'time of the last change the server pushed');
-    paintRollup(s.rollup_status || {});
-    // The first frame is not news: the initial load() already read everything.
+    let frame; try{ frame = JSON.parse(ev.data); }catch{ return; }
+    const prev = S.stream;
+    set(st => {
+      st.stream = frame;
+      st.link = {cls:'ok', text:'● live ' + new Date().toLocaleTimeString(),
+                 title:'time of the last change the server pushed'};
+    });
+    // The first frame is not news: the initial refresh() already read everything.
     if(!Object.keys(prev).length) return;
-    // A pair drill-down is drawn from the ToB rollup, not the registry.
-    const topic = location.pathname.startsWith('/pair/')
-      ? 'rollup' : VIEW_TOPIC[location.pathname] || 'books';
-    if(prev[topic] !== s[topic]) load();
+    const topic = TOPIC[page()] || 'books';
+    if(prev[topic] !== frame[topic]){
+      refresh();
+      if(S.expanded) loadSeries(S.expanded);   // keep an open chart honest
+    }
   };
-  es.onerror = () => setLink('bad', '● reconnecting…',
-                             'the dashboard cannot reach the server');
+  es.onerror = () => set(st => { st.link =
+    {cls:'bad', text:'● reconnecting…', title:'the dashboard cannot reach the server'}; });
 }
 
-load();
+render();
+refresh();
 connect();
 </script>
 </body>
