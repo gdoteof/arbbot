@@ -718,7 +718,7 @@ async function reloadIntents(root){
 function paintIntents(root){
   const d = intentsData;
   if(!d) return;
-  root.innerHTML='';
+  root.replaceChildren();
   setMeta(d.error ? 'engine not running'
     : `${d.resting_orders} resting &middot; ${d.pairs} pairs &middot; last ${dur(d.last_intent_age_s)} ago`);
   // The rebuild control belongs where the problem is visible. With a stale
@@ -726,7 +726,7 @@ function paintIntents(root){
   if(!d.error && !d.rollup_current){
     const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
     host.dataset.day = lastState.today || '';
-    root.append(host); paintRollup(lastState.rollup_status || {});
+    root.append(host);
   }
   root.append(topSeriesPanel(topData||{rows:[]}));
   root.append(intentsPanel(d));
@@ -910,7 +910,7 @@ const ROUTES = {
     root.append(integrityPanel(iv));
     const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
     host.dataset.day = iv.today || '';
-    root.append(host); paintRollup(lastState.rollup_status || {});
+    root.append(host);
     root.append(coveragePanel(iv));
   },
   '/current': async (root) => {
@@ -919,7 +919,7 @@ const ROUTES = {
     // On the error path `d.day` is absent — and that is exactly when the
     // rebuild button matters, so fall back to the day the server reports.
     host.dataset.day = d.day || lastState.today || '';
-    root.append(host); paintRollup(lastState.rollup_status || {});
+    root.append(host);
     setMeta(d.error ? 'no rollup' :
       `${d.scenario} &middot; clip ${d.clip} &middot; ${d.profitable}/${d.priced_pairs} profitable`);
     root.append(currentPanel(d));
@@ -940,7 +940,7 @@ const ROUTES = {
 let pairsData = null;
 function paintPairs(root){
   if(!pairsData) return;
-  root.innerHTML='';
+  root.replaceChildren();
   setMeta(`${pairsData.count||0} pairs registered &middot; ${pairsData.tradable||0} tradable`);
   root.append(pairsPanel(pairsData));
 }
@@ -975,8 +975,11 @@ async function load(){
   const isPair = path.startsWith('/pair/');
   if(!isPair && !ROUTES[path]) path = '/';
   renderNav(isPair ? '/pairs' : path);
+  // Build off-document and swap once. Clearing first and THEN awaiting the
+  // fetch left the page blank for the length of the request, which a 15s timer
+  // hid and a 3s push does not: the board flickered empty every few seconds.
+  const stage = document.createDocumentFragment();
   try{
-    root.innerHTML='';
     if(isPair){
       const rel = decodeURIComponent(path.slice('/pair/'.length));
       const qs = new URLSearchParams(location.search);
@@ -984,13 +987,14 @@ async function load(){
       const d = await json('/api/pair?' + qs.toString());
       if(d.error) throw new Error(d.error);
       setMeta(`${d.samples_a + d.samples_b} quote samples across both legs`);
-      pairPanels(d, root);
+      pairPanels(d, stage);
     } else {
-      await ROUTES[path](root);
+      await ROUTES[path](stage);
     }
+    root.replaceChildren(stage);
   }catch(e){
     const msg = e.message || String(e);
-    root.innerHTML = `<section class="wide err">${esc(msg)}</section>`;
+    root.replaceChildren($(`<section class="wide err">${esc(msg)}</section>`));
     // The header must never keep describing the view that worked while the
     // body shows the one that did not.
     setMeta(`<span class="bad">${esc(msg)}</span>`);
