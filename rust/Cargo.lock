@@ -28,6 +28,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "arb-dash"
+version = "0.1.0"
+dependencies = [
+ "arb-core",
+ "arb-ledger",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "arb-golden"
 version = "0.1.0"
 dependencies = [

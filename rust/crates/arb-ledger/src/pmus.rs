@@ -49,6 +49,22 @@ pub struct Balances {
     pub margin_requirement: serde_json::Value,
 }
 
+impl Balances {
+    /// The SPENDABLE figure, and the one `cash:pmus` reconciles against.
+    pub fn buying_power_str(&self) -> String {
+        money(&self.buying_power)
+    }
+
+    pub fn current_balance_str(&self) -> String {
+        money(&self.current_balance)
+    }
+
+    /// Reported, never posted — see the module docs.
+    pub fn margin_requirement_str(&self) -> String {
+        money(&self.margin_requirement)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Position {
     #[serde(rename = "marketMetadata")]

@@ -22,6 +22,7 @@ use arb_core::scan::{Cx, D};
 pub mod accounts;
 pub mod kalshi;
 pub mod pmus;
+pub mod report;
 
 /// Where a posting's authority comes from. `Reconciliation` entries are the
 /// only ones allowed to move a suspense account, and they must never be

@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>arbbot books</title>
+<style>
+  :root{
+    --bg:#0e1013; --panel:#161a20; --line:#242a33; --ink:#e6e9ef; --dim:#8b94a3;
+    --ok:#3fb950; --bad:#f85149; --warn:#d29922; --accent:#58a6ff;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f6f7f9; --panel:#fff; --line:#e3e6ea; --ink:#11151a; --dim:#5b6472;
+           --ok:#1a7f37; --bad:#cf222e; --warn:#9a6700; --accent:#0969da; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{padding:20px 24px 8px;display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+  h1{font-size:16px;margin:0;letter-spacing:.04em;text-transform:uppercase}
+  .sub{color:var(--dim);font-size:12px}
+  main{padding:8px 24px 48px;display:grid;gap:16px;
+    grid-template-columns:repeat(auto-fit,minmax(340px,1fr));max-width:1500px}
+  section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:14px 16px}
+  section.wide{grid-column:1/-1}
+  h2{font-size:11px;margin:0 0 12px;color:var(--dim);letter-spacing:.09em;text-transform:uppercase}
+  table{border-collapse:collapse;width:100%;font-size:13px}
+  th{text-align:left;font-weight:500;color:var(--dim);font-size:11px;
+     text-transform:uppercase;letter-spacing:.06em;padding:4px 8px 6px;border-bottom:1px solid var(--line)}
+  td{padding:4px 8px;border-bottom:1px solid var(--line)}
+  tr:last-child td{border-bottom:none}
+  .num{text-align:right;font-variant-numeric:tabular-nums}
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .warn{color:var(--warn)} .dim{color:var(--dim)}
+  .badge{display:inline-block;padding:1px 8px;border-radius:99px;font-size:11px;
+    border:1px solid currentColor}
+  .big{font-size:26px;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+  .kv{display:flex;justify-content:space-between;gap:16px;padding:5px 0;border-bottom:1px solid var(--line)}
+  .kv:last-child{border-bottom:none}
+  .kv b{font-weight:600;font-variant-numeric:tabular-nums}
+  .rule{border-top:1px solid var(--line);margin:8px 0}
+  .scroll{overflow-x:auto}
+  .err{color:var(--bad);padding:12px}
+  code{color:var(--accent)}
+</style>
+</head>
+<body>
+<header>
+  <h1>arbbot books</h1>
+  <span class="sub" id="meta">loading…</span>
+</header>
+<main id="root"></main>
+
+<script>
+const $ = (h) => { const t=document.createElement('template'); t.innerHTML=h.trim(); return t.content.firstChild; };
+const money = (s) => {
+  const n = Number(s);
+  if (!isFinite(n)) return s;
+  return n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+};
+const sign = (s) => Number(s) < 0 ? 'bad' : 'ok';
+const esc = (s) => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+function statement(st){
+  const net = Number(st.net_vs_capital);
+  return $(`<section>
+    <h2>Statement of position &middot; cost basis</h2>
+    <div class="big ${net<0?'bad':'ok'}">${net<0?'−':'+'}$${money(Math.abs(net))}</div>
+    <div class="sub" style="margin-bottom:10px">net versus capital in</div>
+    <div class="kv"><span>capital in</span><b>$${money(st.capital_in)}</b></div>
+    <div class="kv"><span>cash</span><b>$${money(st.cash)}</b></div>
+    <div class="kv"><span>positions at cost</span><b>$${money(st.positions_at_cost)}</b></div>
+    <div class="kv"><span>total assets</span><b>$${money(st.total_assets)}</b></div>
+    <div class="rule"></div>
+    <div class="kv"><span>trading (realized)</span>
+      <b class="${sign(st.trading_realized)}">$${money(st.trading_realized)}</b></div>
+    <div class="kv"><span>fees</span><b class="bad">−$${money(st.fees)}</b></div>
+  </section>`);
+}
+
+function integrityPanel(iv){
+  const feeds = (iv.live_feeds||[]).map(f=>`<tr>
+      <td>${esc(f.stem)}</td>
+      <td class="num">${(f.bytes/1e9).toFixed(2)} GB</td>
+      <td class="num ${f.stale?'bad':'ok'}">${f.age_seconds}s</td>
+    </tr>`).join('');
+  const warns = (iv.warnings||[]).map(w=>`<div class="warn">▲ ${esc(w)}</div>`).join('')
+    || '<div class="ok">✓ no warnings</div>';
+  return $(`<section>
+    <h2>Recording integrity &middot; ${esc(iv.today)}</h2>
+    <table><thead><tr><th>feed</th><th class="num">today</th><th class="num">age</th></tr></thead>
+    <tbody>${feeds}</tbody></table>
+    <div class="rule"></div>
+    ${warns}
+  </section>`);
+}
+
+function reconPanel(rs){
+  if(!rs || !rs.length) return $(`<section><h2>Reconciliation</h2>
+    <div class="dim">no venue balances supplied</div></section>`);
+  const rows = rs.map(r=>`<tr>
+      <td>${esc(r.account)}</td>
+      <td class="num">$${money(r.books)}</td>
+      <td class="num">$${money(r.venue)}</td>
+      <td class="num ${r.exact?'ok':'bad'}">${r.exact?'EXACT':money(r.diff)}</td>
+    </tr>`).join('');
+  return $(`<section>
+    <h2>Reconciliation vs venue truth</h2>
+    <table><thead><tr><th>account</th><th class="num">books</th>
+      <th class="num">venue</th><th class="num">diff</th></tr></thead>
+    <tbody>${rows}</tbody></table>
+  </section>`);
+}
+
+function positionsPanel(ps){
+  const rows = ps.map(p=>`<tr>
+      <td>${esc(p.venue)}</td>
+      <td>${esc(p.market)}</td>
+      <td class="num ${Number(p.qty)<0?'warn':''}">${Number(p.qty).toLocaleString()}</td>
+      <td class="num">$${money(p.cost)}</td>
+    </tr>`).join('');
+  return $(`<section class="wide">
+    <h2>Open positions &middot; ${ps.length}</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>venue</th><th>market</th><th class="num">qty</th>
+        <th class="num">cost basis</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <div class="sub" style="margin-top:8px">negative qty = short (the hedge leg).
+      Both venues withhold $1.00/contract, already inside the cost basis.</div>
+  </section>`);
+}
+
+function accountsPanel(as_){
+  const rows = as_.map(a=>`<tr>
+      <td>${esc(a.account)}</td>
+      <td class="num ${sign(a.balance)}">$${money(a.balance)}</td>
+    </tr>`).join('');
+  return $(`<section class="wide">
+    <h2>Trial balance &middot; all accounts</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>account</th><th class="num">balance</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+  </section>`);
+}
+
+async function load(){
+  const root = document.getElementById('root');
+  try{
+    const [b, iv] = await Promise.all([
+      fetch('/api/books').then(r=>r.json()),
+      fetch('/api/integrity').then(r=>r.json()).catch(()=>({}))
+    ]);
+    if(b.error){ root.innerHTML = `<section class="wide err">${esc(b.error)}</section>`; return; }
+    document.getElementById('meta').innerHTML =
+      `${b.entries} entries &middot; trial balance ` +
+      `<span class="badge ${b.balanced?'ok':'bad'}">${b.balanced?'ZERO':'NOT ZERO'}</span>` +
+      ` &middot; ${new Date().toLocaleTimeString()}`;
+    root.innerHTML='';
+    root.append(statement(b.statement));
+    root.append(reconPanel(b.reconciliations));
+    root.append(integrityPanel(iv));
+    root.append(positionsPanel(b.positions||[]));
+    root.append(accountsPanel(b.accounts||[]));
+  }catch(e){
+    root.innerHTML = `<section class="wide err">${esc(e)}</section>`;
+  }
+}
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>
