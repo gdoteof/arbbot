@@ -66,6 +66,89 @@
 
 <script>
 const $ = (h) => { const t=document.createElement('template'); t.innerHTML=h.trim(); return t.content.firstChild; };
+
+/* ---------------------------------------------------------------------------
+   In-place DOM patching.
+
+   Panels are still built as strings — that code is fine and readable. What
+   changed is how the result is APPLIED: the new tree is diffed against the
+   live one and only the differences are written. Nodes are never destroyed,
+   so scroll position, focus, caret, text selection and :hover survive a
+   repaint for free. The previous build replaced everything and then tried to
+   put the scroll back by hand, which is exactly the jump you could see.
+
+   Rows carry `data-k`; matching on it means a re-sort MOVES existing rows
+   instead of rewriting every cell in the table.
+
+   ~60 lines, no build step, no dependency — the alternative was a bundler and
+   node_modules inside a Rust binary that ships its UI via include_str!.
+   --------------------------------------------------------------------------- */
+function morph(from, to){
+  if(from.nodeType !== to.nodeType || from.nodeName !== to.nodeName){
+    from.replaceWith(to);
+    return;
+  }
+  if(from.nodeType === Node.TEXT_NODE || from.nodeType === Node.COMMENT_NODE){
+    if(from.nodeValue !== to.nodeValue) from.nodeValue = to.nodeValue;
+    return;
+  }
+  if(from.nodeType !== Node.ELEMENT_NODE) return;
+
+  for(const a of Array.from(to.attributes))
+    if(from.getAttribute(a.name) !== a.value) from.setAttribute(a.name, a.value);
+  for(const a of Array.from(from.attributes))
+    if(!to.hasAttribute(a.name)) from.removeAttribute(a.name);
+
+  // Never fight the user for a field they are typing in.
+  if(from === document.activeElement && 'value' in from) return;
+  if('value' in from && from.value !== to.value) from.value = to.value;
+
+  morphChildren(from, to);
+}
+
+function morphChildren(from, to){
+  const keyed = new Map();
+  for(const c of Array.from(from.children))
+    if(c.dataset && c.dataset.k != null) keyed.set(c.dataset.k, c);
+
+  let cursor = from.firstChild;
+  for(const n of Array.from(to.childNodes)){
+    const k = (n.nodeType === Node.ELEMENT_NODE && n.dataset) ? n.dataset.k : null;
+    let target = null;
+    if(k != null && keyed.has(k)){
+      target = keyed.get(k);
+      keyed.delete(k);
+    } else if(cursor && cursor.nodeName === n.nodeName &&
+              !(cursor.nodeType === Node.ELEMENT_NODE && cursor.dataset &&
+                cursor.dataset.k != null)){
+      target = cursor;
+    }
+    if(target){
+      if(target === cursor) cursor = cursor.nextSibling;
+      else from.insertBefore(target, cursor);   // a keyed row that moved
+      morph(target, n);
+    } else {
+      from.insertBefore(n, cursor);
+    }
+  }
+  // Anything the new tree did not claim is at or after the cursor.
+  while(cursor){ const next = cursor.nextSibling; from.removeChild(cursor); cursor = next; }
+}
+
+/* A view builder is called two ways: with load()'s staging fragment, where
+   the caller applies the whole page at once, or with the live #root for a
+   synchronous repaint (sort, filter, search), where it must patch. */
+function emit(container, frag){
+  if(container.nodeType === Node.DOCUMENT_FRAGMENT_NODE) container.append(frag);
+  else apply(container, frag);
+}
+
+/* Apply a freshly built fragment to a live container. */
+function apply(container, frag){
+  const shell = document.createElement(container.nodeName);
+  shell.append(frag);
+  morphChildren(container, shell);
+}
 const money = (s) => {
   const n = Number(s);
   if (!isFinite(n)) return s;
@@ -154,7 +237,7 @@ function reconPanel(rs, sources){
 }
 
 function positionsPanel(ps){
-  const rows = ps.map(p=>`<tr>
+  const rows = ps.map(p=>`<tr data-k="${esc(p.account)}">
       <td>${esc(p.venue)}</td>
       <td>${esc(p.market)}</td>
       <td class="num ${Number(p.qty)<0?'warn':''}">${Number(p.qty).toLocaleString()}</td>
@@ -172,7 +255,7 @@ function positionsPanel(ps){
 }
 
 function accountsPanel(as_){
-  const rows = as_.map(a=>`<tr>
+  const rows = as_.map(a=>`<tr data-k="${esc(a.account)}">
       <td>${esc(a.account)}</td>
       <td class="num ${sign(a.balance)}">$${money(a.balance)}</td>
     </tr>`).join('');
@@ -323,7 +406,7 @@ function pairsPanel(d){
   const match = r => !q || [r.id, r.verdict, r.vetted_by, ...(r.legs||[])]
     .some(v => String(v||'').toLowerCase().includes(q));
   const shown = (d.rows||[]).filter(match);
-  const rows=shown.map(r=>`<tr>
+  const rows=shown.map(r=>`<tr data-k="${esc(r.id)}">
       <td><a class="rel" href="/pair/${encodeURIComponent(r.id)}">${esc(r.id)}</a></td>
       <td>${esc(r.verdict||'—')}</td>
       <td>${esc(r.vetted_by||'—')}${r.tradable && !r.human_vetted ? ' <span class="dim">+allowlist</span>' : ''}</td>
@@ -346,13 +429,9 @@ function pairsPanel(d){
       <tbody>${rows}</tbody></table></div>
   </section>`);
   const inp = el.querySelector('#pair-q');
-  inp.oninput = () => {
-    pairQuery = inp.value;
-    const at = inp.selectionStart;
-    repaintPairs();
-    const next = document.getElementById('pair-q');
-    if(next){ next.focus(); next.setSelectionRange(at, at); }
-  };
+  // No focus/caret restore: the patch keeps this exact node, so the browser
+  // keeps both. That is the whole argument for patching over replacing.
+  inp.oninput = () => { pairQuery = inp.value; repaintPairs(); };
   return el;
 }
 
@@ -408,9 +487,14 @@ function rollupPanel(st, day){
       series.</div>
   </section>`);
   const btn = el.querySelector('#rollup-btn');
+  // Read the day at CLICK time from the host: patching preserves this button
+  // across repaints, so a day captured in the closure would go stale at the
+  // UTC rollover.
   btn.onclick = async () => {
+    const host = document.getElementById('rollup-host');
+    const d = (host && host.dataset.day) || day;
     btn.disabled = true; btn.textContent = 'starting…';
-    await fetch('/api/rollup?day=' + encodeURIComponent(day), {method:'POST'});
+    await fetch('/api/rollup?day=' + encodeURIComponent(d), {method:'POST'});
     /* No poll loop: the build's progress arrives on the same stream that
        carries everything else. */
   };
@@ -423,7 +507,9 @@ function rollupPanel(st, day){
 function paintRollup(st){
   const host = document.getElementById('rollup-host');
   if(!host) return;
-  host.innerHTML=''; host.append(rollupPanel(st, host.dataset.day));
+  const frag = document.createDocumentFragment();
+  frag.append(rollupPanel(st, host.dataset.day));
+  apply(host, frag);
 }
 
 /* Human-readable duration. "48054s" is a number; "13h 21m" is a fact. */
@@ -606,7 +692,7 @@ function intentsPanel(d){
 
   const body=rows.map(r=>{
     const e=r.edge_f, p=r.priced;
-    return `<tr class="irow" data-rel="${esc(r.relationship_id)}" style="cursor:pointer">
+    return `<tr class="irow" data-k="${esc(r.relationship_id)}" data-rel="${esc(r.relationship_id)}" style="cursor:pointer">
       <td><span class="rel">${esc(r.relationship_id)}</span>
         ${r.intl_leg?'<span class="warn" title="Polymarket international leg: fee priced at the 0.04 default, not this market\'s category">⌁</span>':''}
         ${r.tradable?'':'<span class="dim">(not tradable)</span>'}</td>
@@ -715,10 +801,10 @@ async function reloadIntents(root){
   paintIntents(root);
 }
 
-function paintIntents(root){
+function paintIntents(container){
   const d = intentsData;
   if(!d) return;
-  root.replaceChildren();
+  const root = document.createDocumentFragment();
   setMeta(d.error ? 'engine not running'
     : `${d.resting_orders} resting &middot; ${d.pairs} pairs &middot; last ${dur(d.last_intent_age_s)} ago`);
   // The rebuild control belongs where the problem is visible. With a stale
@@ -726,10 +812,12 @@ function paintIntents(root){
   if(!d.error && !d.rollup_current){
     const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
     host.dataset.day = lastState.today || '';
+    host.append(rollupPanel(lastState.rollup_status || {}, host.dataset.day));
     root.append(host);
   }
   root.append(topSeriesPanel(topData||{rows:[]}));
   root.append(intentsPanel(d));
+  emit(container, root);
 }
 
 /* Re-render from cache. Never mid-flight: load() clears and re-appends the
@@ -761,7 +849,7 @@ function currentPanel(d){
     // every scenario priced, so the alternatives are visible on the same row
     const alt = SCENARIOS.filter(([k])=>k!==d.scenario && r.scenarios[k])
       .map(([k,l])=>`${l} ${Number(r.scenarios[k].edge_per_contract).toFixed(4)}`).join('   ');
-    return `<tr>
+    return `<tr data-k="${esc(r.relationship_id)}">
       <td><a class="rel" href="/pair/${encodeURIComponent(r.relationship_id)}">${esc(r.relationship_id)}</a>
           ${r.intl_leg?'<span class="warn" title="Polymarket international leg: fee priced at the 0.04 default, not this market\'s category">⌁</span>':''}
           ${r.tradable?'':'<span class="dim">(not tradable)</span>'}</td>
@@ -847,7 +935,7 @@ function oppsPanel(o){
   const range = (o.from && o.to) ? `?from=${encodeURIComponent(o.from)}&to=${encodeURIComponent(o.to)}` : '';
   const SHOWN = 25;
   const total = (o.rows||[]).length;
-  const rows = (o.rows||[]).slice(0,SHOWN).map(r=>`<tr>
+  const rows = (o.rows||[]).slice(0,SHOWN).map(r=>`<tr data-k="${esc(r.relationship_id)}">
       <td><a class="rel" href="/pair/${encodeURIComponent(r.relationship_id)}${range}">${esc(r.relationship_id)}</a></td>
       <td class="num">${r.observations.toLocaleString()}</td>
       <td class="num">${r.minutes_seen.toLocaleString()}</td>
@@ -910,6 +998,7 @@ const ROUTES = {
     root.append(integrityPanel(iv));
     const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
     host.dataset.day = iv.today || '';
+    host.append(rollupPanel(lastState.rollup_status || {}, host.dataset.day));
     root.append(host);
     root.append(coveragePanel(iv));
   },
@@ -919,6 +1008,7 @@ const ROUTES = {
     // On the error path `d.day` is absent — and that is exactly when the
     // rebuild button matters, so fall back to the day the server reports.
     host.dataset.day = d.day || lastState.today || '';
+    host.append(rollupPanel(lastState.rollup_status || {}, host.dataset.day));
     root.append(host);
     setMeta(d.error ? 'no rollup' :
       `${d.scenario} &middot; clip ${d.clip} &middot; ${d.profitable}/${d.priced_pairs} profitable`);
@@ -938,11 +1028,12 @@ const ROUTES = {
 };
 
 let pairsData = null;
-function paintPairs(root){
+function paintPairs(container){
   if(!pairsData) return;
-  root.replaceChildren();
+  const root = document.createDocumentFragment();
   setMeta(`${pairsData.count||0} pairs registered &middot; ${pairsData.tradable||0} tradable`);
   root.append(pairsPanel(pairsData));
+  emit(container, root);
 }
 function repaintPairs(){
   if(rendering){ queued = true; return; }
@@ -969,15 +1060,13 @@ async function load(){
   if(rendering){ queued = true; return; }
   rendering = true;
   const root = document.getElementById('root');
-  // A background redraw must not throw away where you were reading.
-  const wasAt = window.scrollY;
   let path = location.pathname;
   const isPair = path.startsWith('/pair/');
   if(!isPair && !ROUTES[path]) path = '/';
   renderNav(isPair ? '/pairs' : path);
-  // Build off-document and swap once. Clearing first and THEN awaiting the
-  // fetch left the page blank for the length of the request, which a 15s timer
-  // hid and a 3s push does not: the board flickered empty every few seconds.
+  // Build off-document, then PATCH the live tree with it. Clearing first and
+  // awaiting the fetch left the page blank for the length of the request;
+  // swapping wholesale destroyed scroll, focus and selection every frame.
   const stage = document.createDocumentFragment();
   try{
     if(isPair){
@@ -991,19 +1080,17 @@ async function load(){
     } else {
       await ROUTES[path](stage);
     }
-    root.replaceChildren(stage);
+    apply(root, stage);
   }catch(e){
     const msg = e.message || String(e);
-    root.replaceChildren($(`<section class="wide err">${esc(msg)}</section>`));
+    const err = document.createDocumentFragment();
+    err.append($(`<section class="wide err">${esc(msg)}</section>`));
+    apply(root, err);
     // The header must never keep describing the view that worked while the
     // body shows the one that did not.
     setMeta(`<span class="bad">${esc(msg)}</span>`);
   }finally{
     rendering = false;
-    // The stream frame that carries the rollup can land while this render is
-    // still building the panel, so paint it once more on the way out.
-    paintRollup(lastState.rollup_status || {});
-    if(wasAt) window.scrollTo(0, wasAt);
     if(queued){ queued = false; load(); }
   }
 }
