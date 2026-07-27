@@ -78,6 +78,54 @@ Venue values: `kalshi`, `polymarket_us` (QCX DCM), `polymarket_intl`
 - **Current handling:** `scripts/reconcile_positions.py:41-53`, `scripts/settle_baskets.py:47-49` (finalized+result gate), `scripts/hedge_naked_legs.py:52-57`.
 - **Port requirement:** Gate settlement on `status=="finalized" AND result in {yes,no}`; read positions from `position_fp`.
 
+## Kalshi — accounting / cash
+
+All six entries below were paid for on 2026-07-27 while building the
+double-entry books. Together they make the Kalshi account reconcile to
+**exactly $0.000000** residual:
+`deposits − buys@yes_price + sells@yes_price − fees + settlement_revenue
+− (net_short_contracts × $1.00) = balance_dollars`.
+
+### `kalshi-fills-are-the-fee-authority`
+- **Venue:** kalshi
+- **What the API does:** `GET /portfolio/fills` (paginated, cursor) returns every fill with `fill_id`, `order_id`, `count_fp`, `is_taker`, `yes_price_dollars`, `no_price_dollars`, and `fee_cost` — **the fee actually charged**, which is the per-order ceil-to-cent of the curve, not the raw curve value.
+- **Failure it caused:** nothing in the repo had ever read this endpoint. The ledger stored the raw un-ceiled `fees/curves.py` value, so every Kalshi fee was systematically light — **$11.51 actually charged vs $3.52 booked** across 217 fills.
+- **Current handling:** none in Python; this endpoint is unused. The Rust ledger importer is the first consumer.
+- **Port requirement:** Book `fee_cost` from the fill as the expense; compute the curve value only as a drift check. Never book a modelled fee when the venue reports the charged one.
+
+### `kalshi-sell-no-is-closing-long-yes`
+- **Venue:** kalshi
+- **What the API does:** Fills come back only as `action=buy, side=yes` or `action=sell, side=no`. A `sell no` fill is how Kalshi represents **closing a long YES**, and its cash proceeds are `count_fp × yes_price_dollars` — NOT `no_price_dollars`. Position is `Σ buy_yes − Σ sell_no`, which matches `position_fp` on every market including net-short ones.
+- **Failure it caused:** pricing `sell no` at `no_price_dollars` put the cash reconciliation **$156.67** off.
+- **Current handling:** none — no Python code reconstructs position or cash from fills.
+- **Port requirement:** Price both fill directions off the YES axis. Verify against `position_fp` per market; a mismatch means the sign convention is wrong.
+
+### `kalshi-short-collateral-one-dollar-per-contract`
+- **Venue:** kalshi
+- **What the API does:** A net-short YES position encumbers **exactly $1.00 per contract** of `balance_dollars`. The balance endpoint does not itemize it.
+- **Failure it caused:** the last **$15.00** of an otherwise-closed reconciliation — six markets ending net-short 15 contracts total.
+- **Current handling:** none.
+- **Port requirement:** Cash reconciliation must subtract `Σ max(0, −position) × $1.00`. See the identical PM-US mechanic in `pmus-margin-is-one-dollar-per-short`.
+
+### `kalshi-settlement-fee-restates-fill-fees`
+- **Venue:** kalshi
+- **What the API does:** `GET /portfolio/settlements` returns `fee_cost` per settled market, and that value **restates the sum of that market's trading fees** — it is NOT an additional settlement charge. Verified 28/28 settled markets match their fill-fee sum exactly.
+- **Failure it prevents:** summing fill fees *and* settlement fees injects phantom expense — **$5.52** on the current history.
+- **Current handling:** none.
+- **Port requirement:** Book fees from fills only. Treat `settlement.fee_cost` as a cross-check, never as an expense posting.
+
+### `kalshi-settlement-revenue-is-net-cents`
+- **Venue:** kalshi
+- **What the API does:** Settlement `revenue` is in **cents** and reflects the **net** position payout: Kalshi nets YES against NO within a market, so 15 YES + 5 NO with `market_result=yes` pays `revenue=1000` ($10), not $15. `yes_count_fp`/`no_count_fp`/`*_total_cost_dollars` carry the per-side detail; `value` is a different, smaller field — do not use it as the payout.
+- **Failure it prevents:** paying out gross rather than net overstates settlement cash.
+- **Port requirement:** Credit `revenue/100`; derive realized P&L against the per-side cost fields.
+
+### `kalshi-deposits-endpoint-exists`
+- **Venue:** kalshi
+- **What the API does:** `GET /portfolio/deposits` and `/portfolio/withdrawals` exist and return funding history (`amount_cents`, `status`, `type`, `created_ts`). `/portfolio/transfers` and `/portfolio/transactions` are 404.
+- **Failure it prevents:** without these the cash accounts have no legitimate source and the books open with an unexplained plug.
+- **Port requirement:** Seed `equity:capital` from these endpoints rather than asking a human. Contrast `pmus-no-history-endpoints`, where you must.
+
 ## Kalshi — market data (WS/REST)
 
 ### `kalshi-both-ladders-are-bids`
@@ -211,6 +259,27 @@ Venue values: `kalshi`, `polymarket_us` (QCX DCM), `polymarket_intl`
 - **Failure it prevents:** list-shaped parsers or numeric-typed decoders fail on real payloads; misreading `costPerShare` misprices hedge-completion limits.
 - **Current handling:** `scripts/hedge_naked_legs.py:60-77` (+ basis math `:173-182`), `src/arbbot/exec/main.py:362-365`.
 - **Port requirement:** Parse the slug-keyed dict with string decimals; interpret short-position `costPerShare` on the NO axis.
+
+## Polymarket US (QCX) — accounting / cash
+
+### `pmus-no-history-endpoints`
+- **Venue:** polymarket_us
+- **What the API does:** PM-US exposes **only** `/v1/account/balances` and `/v1/portfolio/positions`. There is no fill history, no settlement history, and no deposit/transfer history. Probed and 404 on 2026-07-27: `/v1/portfolio/fills`, `/v1/portfolio/trades`, `/v1/portfolio/settlements`, `/v1/account/transfers`, `/v1/account/transactions`, `/v1/account/activity`, `/v1/account/deposits`, `/v1/portfolio/activity`.
+- **Failure it prevents:** assuming a Kalshi-style rebuild is possible on PM-US. It is not — the account cannot be reconstructed from the venue.
+- **Port requirement:** PM-US books open from a human-supplied funding total plus a reconciling entry against `currentBalance`, and record fills going forward from our own observation. Only Kalshi gets penny-exact provenance. Re-probe periodically in case PM-US ships history endpoints.
+
+### `pmus-margin-is-one-dollar-per-short`
+- **Venue:** polymarket_us
+- **What the API does:** `/v1/account/balances` returns `currentBalance` (total cash), `marginRequirement`, and `buyingPower`, where `buyingPower = currentBalance − marginRequirement` and **`marginRequirement` is exactly $1.00 × total short contracts**. Verified: 7 short positions summing 323.86 contracts ⇒ `marginRequirement` 323.86.
+- **Failure it prevents:** treating `buyingPower` as total cash understates the account by the margin (here $323.86 of $653.16). Conversely, treating `currentBalance` as spendable overstates it.
+- **Current handling:** `scripts/capital_snapshot.py:59-62` reads `buyingPower` — correct for its "idle capital" purpose, and it should stay.
+- **Port requirement:** Books carry `currentBalance` as `cash:pmus` with the `marginRequirement` portion encumbered; use `buyingPower` only for "what can we deploy." Same $1/contract mechanic as `kalshi-short-collateral-one-dollar-per-contract`.
+
+### `pmus-positions-carry-fees-and-stale-marks`
+- **Venue:** polymarket_us
+- **What the API does:** Each position carries `fees` (cumulative, per position), `baseCost`, `costPerShare`, `avgPx`, and `cashValue` — but also an `updateTime` that can be **days stale** (observed 07-22 on a position read 07-27), so `cashValue` is not a live mark.
+- **Failure it prevents:** (a) believing PM-US reports no fees — it does, and they totalled $1.30 on open positions against $0.12 booked; (b) using `cashValue` as a current mark and reporting a stale portfolio value as live.
+- **Port requirement:** Book `fees` as a real expense. For marks, price positions off the live book, not `cashValue`; if `cashValue` is used, surface `updateTime` alongside it.
 
 ## Polymarket US (QCX) — market data / WS
 
