@@ -41,6 +41,11 @@
   .scroll{overflow-x:auto}
   .err{color:var(--bad);padding:12px}
   code{color:var(--accent)}
+  nav{display:flex;gap:2px;padding:0 24px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  nav a{color:var(--dim);text-decoration:none;padding:8px 14px;font-size:12px;
+    letter-spacing:.06em;text-transform:uppercase;border-bottom:2px solid transparent}
+  nav a:hover{color:var(--ink)}
+  nav a.on{color:var(--accent);border-bottom-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -48,6 +53,7 @@
   <h1>arbbot books</h1>
   <span class="sub" id="meta">loading…</span>
 </header>
+<nav id="nav"></nav>
 <main id="root"></main>
 
 <script>
@@ -142,6 +148,25 @@ function accountsPanel(as_){
   </section>`);
 }
 
+function coveragePanel(iv){
+  const rows=(iv.coverage||[]).slice().reverse().map(c=>`<tr>
+      <td>${esc(c.stem)}</td><td>${esc(c.day)}</td>
+      <td class="num">${c.jsonl_bytes==null?'<span class="dim">—</span>':(c.jsonl_bytes/1e9).toFixed(2)+' GB'}</td>
+      <td class="num">${c.parquet_bytes==null?'<span class="dim">—</span>':(c.parquet_bytes/1e6).toFixed(0)+' MB'}</td>
+      <td class="num ${c.unarchived?'bad':'ok'}">${c.unarchived?'UNARCHIVED':'ok'}</td>
+    </tr>`).join('');
+  return $(`<section class="wide">
+    <h2>Archive coverage &middot; ${iv.unarchived_days} unarchived day(s),
+      ${(iv.unarchived_bytes/1e9).toFixed(1)} GB still raw</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>stem</th><th>day</th><th class="num">jsonl</th>
+        <th class="num">parquet</th><th class="num">state</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <div class="sub" style="margin-top:8px">A closed day with raw JSONL and no Parquet
+      failed to archive. Today is legitimately raw-only.</div>
+  </section>`);
+}
+
 function oppsPanel(o){
   if(o.error) return $(`<section class="wide"><h2>Opportunity coverage</h2>
     <div class="err">${esc(o.error)}</div></section>`);
@@ -168,30 +193,64 @@ function oppsPanel(o){
   </section>`);
 }
 
-async function load(){
-  const root = document.getElementById('root');
-  try{
-    const [b, iv, op] = await Promise.all([
-      fetch('/api/books').then(r=>r.json()),
-      fetch('/api/integrity').then(r=>r.json()).catch(()=>({})),
-      fetch('/api/opportunities').then(r=>r.json()).catch(e=>({error:String(e)}))
-    ]);
-    if(b.error){ root.innerHTML = `<section class="wide err">${esc(b.error)}</section>`; return; }
-    document.getElementById('meta').innerHTML =
-      `${b.entries} entries &middot; trial balance ` +
-      `<span class="badge ${b.balanced?'ok':'bad'}">${b.balanced?'ZERO':'NOT ZERO'}</span>` +
-      ` &middot; ${new Date().toLocaleTimeString()}`;
-    root.innerHTML='';
+const VIEWS = [
+  {path:'/',              label:'Books'},
+  {path:'/recording',     label:'Recording'},
+  {path:'/opportunities', label:'Opportunities'},
+];
+
+function renderNav(active){
+  document.getElementById('nav').innerHTML = VIEWS.map(v =>
+    `<a href="${v.path}" class="${v.path===active?'on':''}">${v.label}</a>`).join('');
+}
+
+const json = (u) => fetch(u).then(r=>r.json());
+
+/* Each view fetches ONLY its own endpoints. Splitting the page by URL is what
+   keeps that true as views are added — a single page would fan out to every
+   endpoint on every load. */
+const ROUTES = {
+  '/': async (root) => {
+    const b = await json('/api/books');
+    if(b.error) throw new Error(b.error);
+    setMeta(`${b.entries} entries &middot; trial balance ` +
+      `<span class="badge ${b.balanced?'ok':'bad'}">${b.balanced?'ZERO':'NOT ZERO'}</span>`);
     root.append(statement(b.statement));
     root.append(reconPanel(b.reconciliations));
-    root.append(integrityPanel(iv));
-    root.append(oppsPanel(op));
     root.append(positionsPanel(b.positions||[]));
     root.append(accountsPanel(b.accounts||[]));
+  },
+  '/recording': async (root) => {
+    const iv = await json('/api/integrity');
+    setMeta(`recording integrity &middot; ${esc(iv.today)}`);
+    root.append(integrityPanel(iv));
+    root.append(coveragePanel(iv));
+  },
+  '/opportunities': async (root) => {
+    const qs = location.search || '';
+    const o = await json('/api/opportunities' + qs);
+    setMeta(`${o.days||0} day(s) &middot; ${o.observations ? o.observations.toLocaleString() : 0} observations`);
+    root.append(oppsPanel(o));
+  },
+};
+
+function setMeta(html){
+  document.getElementById('meta').innerHTML = html + ` &middot; ${new Date().toLocaleTimeString()}`;
+}
+
+async function load(){
+  const root = document.getElementById('root');
+  let path = location.pathname;
+  if(!ROUTES[path]) path = '/';
+  renderNav(path);
+  try{
+    root.innerHTML='';
+    await ROUTES[path](root);
   }catch(e){
-    root.innerHTML = `<section class="wide err">${esc(e)}</section>`;
+    root.innerHTML = `<section class="wide err">${esc(e.message||e)}</section>`;
   }
 }
+
 load();
 setInterval(load, 15000);
 </script>

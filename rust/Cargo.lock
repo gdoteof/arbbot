@@ -131,6 +131,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arb-tob"
+version = "0.1.0"
+dependencies = [
+ "arb-core",
+ "arb-query",
+ "parquet",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "arb-trader"
 version = "0.1.0"
 dependencies = [

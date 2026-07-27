@@ -150,7 +150,13 @@ fn handle(s: TcpStream, a: &Args) {
     let path = full.split('?').next().unwrap_or("/");
     let query = full.split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
     match path {
-        "/" => respond(s, "200 OK", "text/html; charset=utf-8", PAGE),
+        // Every view is a real URL. The shell is the same document; its
+        // router picks the view from the path and fetches ONLY that view's
+        // endpoints, which is the point — a single page would fan out to
+        // every endpoint on every load as views are added.
+        "/" | "/recording" | "/opportunities" => {
+            respond(s, "200 OK", "text/html; charset=utf-8", PAGE)
+        }
         "/api/books" => respond(s, "200 OK", "application/json", &books_json(a)),
         "/api/integrity" => {
             let i = integrity::build(&a.data_dir);
