@@ -48,6 +48,7 @@ struct Args {
     /// the shadow's OWN read-only key, so it never shares a WS session with
     /// the live Python recorder's key.
     kalshi_cred_suffix: Option<String>,
+    pmus_cred_suffix: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -63,6 +64,7 @@ fn parse_args() -> Args {
         pmus_poll_interval_s: 4.0,
         kalshi_poll_interval_s: None,
         kalshi_cred_suffix: None,
+        pmus_cred_suffix: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -87,6 +89,7 @@ fn parse_args() -> Args {
                     Some(it.next().expect("--kalshi-poll-interval value").parse().expect("float"))
             }
             "--kalshi-cred-suffix" => a.kalshi_cred_suffix = it.next(),
+            "--pmus-cred-suffix" => a.pmus_cred_suffix = it.next(),
             "--parse-check" => a.parse_check = it.next(),
             other => {
                 eprintln!("unknown arg: {other}");
@@ -259,17 +262,31 @@ async fn main() -> Result<()> {
         )));
     }
 
-    // Polymarket US: authed WS when the key exists, else REST poll
+    // Polymarket US: authed WS when the key exists, else REST poll.
+    //
+    // The suffix mirrors --kalshi-cred-suffix so a SHADOW can run on its own
+    // key. Without it the shadow opens a second WS session on the very key the
+    // live recorder holds, which is the contention the unit header warns about.
+    //
+    // NOTE: PM-US has no read-only key tier — any key is trade-capable. That is
+    // acceptable here only because this binary has NO order code path: the only
+    // endpoints it can reach are the Kalshi/PM market-data hosts and ntfy, and
+    // it references no order route at all.
+    let pm_infix = args
+        .pmus_cred_suffix
+        .as_ref()
+        .map(|s| format!("_{s}"))
+        .unwrap_or_default();
     if !pmus_slugs.is_empty() {
         let us_id = if args.pmus_poll_only {
             None
         } else {
-            config::load_credential_str("polymarket_usa_key_id")
+            config::load_credential_str(&format!("polymarket_usa{pm_infix}_key_id"))
         };
         let us_key = if args.pmus_poll_only {
             None
         } else {
-            config::load_credential_str("polymarket_usa_private_key")
+            config::load_credential_str(&format!("polymarket_usa{pm_infix}_private_key"))
         };
         match (us_id, us_key) {
             (Some(kid), Some(key)) => {

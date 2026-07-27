@@ -11,11 +11,16 @@
 #     the LIVE recorder holds — never open a second session on it without
 #     that confirmation.
 #
-# 2026-07-27: --pmus-poll-only is now ACTUALLY SET. The header always said it
-# was required but the ExecStart never carried it, so the shadow was opening a
-# second PM-US WS session on the TRADE-CAPABLE key the live recorder holds.
-# Poll-only loads no PM-US key at all. Kalshi runs full WS on its own
-# rs-suffixed READ-ONLY key.
+# 2026-07-27: FULL WS on all three venues, each on its own key.
+#   Kalshi  -> kalshi_recorder_rs_*   (read-only tier)
+#   PM-US   -> polymarket_usa_rs_*    (Geoff provisioned; PM-US has no
+#              read-only tier, so it is trade-capable — acceptable only
+#              because this binary has NO order code path: it references no
+#              order route and can reach only market-data hosts + ntfy)
+# The separate PM-US key is the point: sharing the live recorder's key meant a
+# second WS session on it, which is the contention the note below warns about.
+# If the LIVE recorder's PM-US feed degrades after this, revert to
+# --pmus-poll-only --pmus-poll-interval 8 immediately.
 #
 # Install (manual, deployment-time):
 #   cp systemd/arbbot-recorder-rs.service ~/.config/systemd/user/
@@ -37,7 +42,7 @@ ExecStart=%h/claude/arbbot/.claude/worktrees/rust-rewrite/rust/target/release/ar
     --socket data/arbbot-rs.sock \
     --health data/health-rs.jsonl \
     --shadow --kalshi-cred-suffix rs \
-    --pmus-poll-only --pmus-poll-interval 8
+    --pmus-cred-suffix rs
 Restart=always
 RestartSec=5
 # shadow must never starve the real stack
