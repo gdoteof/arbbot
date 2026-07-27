@@ -42,6 +42,9 @@
   .err{color:var(--bad);padding:12px}
   code{color:var(--accent)}
   a.rel{color:var(--accent);text-decoration:none}
+  button{font:inherit;font-size:12px;padding:5px 12px;border-radius:6px;cursor:pointer;
+    background:var(--panel);color:var(--accent);border:1px solid var(--accent)}
+  button:disabled{color:var(--dim);border-color:var(--line);cursor:default}
   a.rel:hover{text-decoration:underline}
   nav{display:flex;gap:2px;padding:0 24px;border-bottom:1px solid var(--line);flex-wrap:wrap}
   nav a{color:var(--dim);text-decoration:none;padding:8px 14px;font-size:12px;
@@ -286,6 +289,47 @@ const SCENARIOS = [
   ['take-a-make-b', 'take A / make B'],
 ];
 
+async function rollupStatus(){ return json('/api/rollup'); }
+
+/* The dashboard's ONLY write. POST so nothing fires it by loading a page;
+   the server refuses a second concurrent build and writes atomically. */
+function rollupPanel(st, day){
+  const running = st.running;
+  const l = st.last;
+  const summary = l ? (l.ok
+    ? `<span class="ok">✓ ${esc(l.day)} &middot; ${l.samples.toLocaleString()} samples from
+       ${l.events.toLocaleString()} events in ${l.elapsed_s}s</span>`
+    : `<span class="bad">✗ ${esc(l.day)}: ${esc(l.error||'failed')}</span>`)
+    : '<span class="dim">no build this session</span>';
+  const el = $(`<section class="wide">
+    <h2>Top-of-book rollup</h2>
+    <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+      <button id="rollup-btn" ${running?'disabled':''}>
+        ${running?`building ${esc(running)}…`:`rebuild ${esc(day)}`}</button>
+      <span class="sub">${summary}</span>
+    </div>
+    <div class="sub" style="margin-top:8px">Replays the day's tape through a book
+      builder to produce the quote series the pair and current views read.
+      Costs ~30s on two cores and under 40 MB of memory; it streams, so it does
+      not scale with tape size. Writes are atomic — readers never see a partial
+      series.</div>
+  </section>`);
+  const btn = el.querySelector('#rollup-btn');
+  btn.onclick = async () => {
+    btn.disabled = true; btn.textContent = 'starting…';
+    await fetch('/api/rollup?day=' + encodeURIComponent(day), {method:'POST'});
+    poll();
+  };
+  return el;
+}
+
+async function poll(){
+  const st = await rollupStatus();
+  const host = document.getElementById('rollup-host');
+  if(host){ host.innerHTML=''; host.append(rollupPanel(st, host.dataset.day)); }
+  if(st.running) setTimeout(poll, 1500);
+}
+
 function currentPanel(d){
   if(d.error) return $(`<section class="wide"><h2>Current opportunities</h2>
     <div class="err">${esc(d.error)}</div></section>`);
@@ -414,10 +458,16 @@ const ROUTES = {
     const iv = await json('/api/integrity');
     setMeta(`recording integrity &middot; ${esc(iv.today)}`);
     root.append(integrityPanel(iv));
+    const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
+    host.dataset.day = iv.today || '';
+    root.append(host); poll();
     root.append(coveragePanel(iv));
   },
   '/current': async (root) => {
     const d = await json('/api/current' + (location.search || ''));
+    const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
+    host.dataset.day = d.day || '';
+    root.append(host); poll();
     setMeta(d.error ? 'no rollup' :
       `${d.scenario} &middot; clip ${d.clip} &middot; ${d.profitable}/${d.priced_pairs} profitable`);
     root.append(currentPanel(d));

@@ -1,7 +1,13 @@
-//! arb-dash — read-only instrument over the double-entry books.
+//! arb-dash — instrument over the double-entry books.
 //!
-//! Binds 127.0.0.1 only, reads local files, never writes and never touches a
-//! venue order path. Deliberately runs on a DIFFERENT port from the Python
+//! Binds 127.0.0.1 only and never touches a venue order path: it holds no
+//! credentials and cannot place, cancel or move an order.
+//!
+//! It is read-only with ONE exception: `POST /api/rollup` rebuilds the local
+//! ToB series. That writes files under the rollup dir and burns ~30s of two
+//! cores, so it is deliberately POST-only (a prefetch or crawler cannot fire
+//! it), single-flight (one build at a time), and atomic (temp file + rename,
+//! so a reader never sees a half-built series). Deliberately runs on a DIFFERENT port from the Python
 //! dash (4748) so both can be open side by side while the numbers are compared.
 //!
 //! No HTTP crate: the workspace's only dependencies are serde/serde_json, and a
@@ -14,6 +20,7 @@ mod integrity;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::process::exit;
 
 use arb_core::fees::FeeSchedule;
@@ -25,7 +32,7 @@ use arb_ledger::{accounts, report, Journal};
 use arb_query::{opps, sources_for_range};
 use arb_registry::{Allowlist, Registry};
 use arb_scenario::{price, Quote, Scenario};
-use arb_tob::series;
+use arb_tob::{build_day, series, DEFAULT_INTERVAL_NS};
 
 const PAGE: &str = include_str!("index.html");
 
@@ -36,11 +43,86 @@ struct Args {
     kalshi_balance: Option<String>,
     data_dir: String,
     scan_dir: String,
+    raw_dir: String,
     parquet_dir: String,
     rollup_dir: String,
     registry: String,
     tradable: String,
     port: u16,
+}
+
+/// The one piece of mutable state in the process, and it exists only so a
+/// second trigger cannot start while a build is in flight.
+#[derive(Default)]
+struct Rollup {
+    running_day: Option<String>,
+    last: Option<serde_json::Value>,
+}
+
+type Shared = Arc<Mutex<Rollup>>;
+
+fn rollup_status(sh: &Shared) -> String {
+    let g = sh.lock().unwrap_or_else(|e| e.into_inner());
+    serde_json::json!({
+        "running": g.running_day,
+        "last": g.last,
+    })
+    .to_string()
+}
+
+/// Start a build if one is not already running. Returns immediately — the
+/// build runs on its own thread so the single-threaded accept loop keeps
+/// serving while ~30s of work happens.
+fn rollup_start(a: &Args, sh: &Shared, query: &str) -> String {
+    let day = query_param(query, "day")
+        .unwrap_or_else(|| integrity::build(&a.data_dir).today);
+    {
+        let mut g = sh.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = &g.running_day {
+            return serde_json::json!({
+                "started": false,
+                "reason": format!("a build for {d} is already running"),
+                "running": d,
+            })
+            .to_string();
+        }
+        g.running_day = Some(day.clone());
+    }
+
+    let (raw, pq, out, sh2, d2) = (
+        a.raw_dir.clone(),
+        a.parquet_dir.clone(),
+        a.rollup_dir.clone(),
+        Arc::clone(sh),
+        day.clone(),
+    );
+    std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        let venues = ["kalshi", "polymarket", "polymarket_us"];
+        let res = build_day(&raw, &pq, &out, &d2, DEFAULT_INTERVAL_NS, &venues);
+        let secs = t0.elapsed().as_secs_f64();
+        let value = match res {
+            Ok(stats) => serde_json::json!({
+                "day": d2,
+                "ok": true,
+                "elapsed_s": (secs * 10.0).round() / 10.0,
+                "venues": stats.iter().map(|(v, s)| serde_json::json!({
+                    "venue": v, "events": s.events, "samples": s.samples,
+                    "markets": s.markets, "gaps": s.gaps,
+                    "not_synced": s.not_synced, "parse_failures": s.parse_failures,
+                })).collect::<Vec<_>>(),
+                "samples": stats.iter().map(|(_, s)| s.samples).sum::<u64>(),
+                "events": stats.iter().map(|(_, s)| s.events).sum::<u64>(),
+            }),
+            Err(e) => serde_json::json!({ "day": d2, "ok": false, "error": e,
+                                          "elapsed_s": (secs * 10.0).round() / 10.0 }),
+        };
+        let mut g = sh2.lock().unwrap_or_else(|e| e.into_inner());
+        g.running_day = None;
+        g.last = Some(value);
+    });
+
+    serde_json::json!({ "started": true, "day": day }).to_string()
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
@@ -441,7 +523,7 @@ fn respond(mut s: TcpStream, status: &str, ctype: &str, body: &str) {
     let _ = s.flush();
 }
 
-fn handle(s: TcpStream, a: &Args) {
+fn handle(s: TcpStream, a: &Args, sh: &Shared) {
     let mut line = String::new();
     {
         let mut r = BufReader::new(match s.try_clone() {
@@ -452,6 +534,7 @@ fn handle(s: TcpStream, a: &Args) {
             return;
         }
     }
+    let method = line.split_whitespace().next().unwrap_or("GET").to_string();
     let full = line.split_whitespace().nth(1).unwrap_or("/").to_string();
     let path = full.split('?').next().unwrap_or("/");
     let query = full.split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
@@ -475,6 +558,15 @@ fn handle(s: TcpStream, a: &Args) {
         }
         "/api/opportunities" => respond(s, "200 OK", "application/json", &opps_json(a, &query)),
         "/api/pairs" => respond(s, "200 OK", "application/json", &pairs_json(a)),
+        // The single write surface. GET reports status; only POST can start a
+        // build, so nothing fires it by merely loading a page.
+        "/api/rollup" => {
+            if method == "POST" {
+                respond(s, "200 OK", "application/json", &rollup_start(a, sh, &query))
+            } else {
+                respond(s, "200 OK", "application/json", &rollup_status(sh))
+            }
+        }
         "/api/current" => respond(s, "200 OK", "application/json", &current_json(a, &query)),
         "/api/pair" => respond(s, "200 OK", "application/json", &pair_json(a, &query)),
         _ => respond(s, "404 Not Found", "text/plain", "not found"),
@@ -489,6 +581,7 @@ fn main() {
         kalshi_balance: None,
         data_dir: "data".into(),
         scan_dir: "data/scan".into(),
+        raw_dir: "data/raw".into(),
         parquet_dir: "data/parquet".into(),
         rollup_dir: "data/rollup".into(),
         registry: "config/registry.yaml".into(),
@@ -506,6 +599,7 @@ fn main() {
             "--kalshi-balance" => a.kalshi_balance = Some(v),
             "--data-dir" => a.data_dir = v,
             "--scan-dir" => a.scan_dir = v,
+            "--raw-dir" => a.raw_dir = v,
             "--parquet-dir" => a.parquet_dir = v,
             "--rollup-dir" => a.rollup_dir = v,
             "--registry" => a.registry = v,
@@ -532,7 +626,8 @@ fn main() {
         }
     };
     println!("arb-dash on http://{addr}  (read-only, 127.0.0.1 only)");
+    let shared: Shared = Arc::new(Mutex::new(Rollup::default()));
     for s in l.incoming().flatten() {
-        handle(s, &a);
+        handle(s, &a, &shared);
     }
 }
