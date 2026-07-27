@@ -22,11 +22,44 @@ from pathlib import Path
 import httpx
 
 from arbbot.exec.resolve_dates import resolve_date
+from arbbot.fees.curves import FeeSchedule, leg_fee
+from arbbot.models.core import Role, Venue
 from arbbot.record.kalshi import REST_BASE
-from arbbot.venues.pmus import top_of_book as pmus_topbook  # noqa: F401 (re-exported to unwind_positions)
 
-KALSHI_FEE = Decimal("0.01")  # ~taker fee/ct to unwind the Kalshi leg
+FEES = FeeSchedule()
+LEDGER = Path("data/exec/trades.jsonl")
 OUT = Path("data/exec/marks.json")
+
+
+def exit_fees_usd(k_yes_px: Decimal, p_yes_px: Decimal,
+                  k_qty: Decimal, p_qty: Decimal | None = None) -> Decimal:
+    """Taker fees to liquidate both legs at the given per-leg YES exit prices.
+
+    Both venues' taker curves are coef * P * (1-P) * size — symmetric in P vs
+    1-P — so each leg's YES price prices its fee whichever side we close. This
+    replaces a flat $0.01/ct Kalshi-only assumption that understated the real
+    round trip by 1.3-3.3x (it is 1.3c/ct in the tails, 3.3c/ct at the money,
+    and omitted PM US entirely) — card b83b0449.
+
+    PM US uses the schedule's fallback taker coefficient: the venue-reported
+    per-market feeCoefficient isn't in hand on the exit path, and the fallback
+    is deliberately conservative (it can over-state fees, never manufacture a
+    profitable-looking exit).
+    """
+    p_qty = k_qty if p_qty is None else p_qty
+    return (leg_fee(FEES, Venue.KALSHI, Role.TAKER, k_yes_px, k_qty)
+            + leg_fee(FEES, Venue.POLYMARKET_US, Role.TAKER, p_yes_px, p_qty))
+
+
+def maker_exit_fees_usd(k_yes_px: Decimal, p_yes_px: Decimal, qty: Decimal) -> Decimal:
+    """Fees on the OPPORTUNISTIC exit: the Kalshi leg rests as a maker ask, the
+    PM NO leg closes taker-side on fill.
+
+    Kalshi charges makers (0.0175 coef) — only Polymarket makers are free — so
+    a passive exit is cheaper than the taker round trip, not free.
+    """
+    return (leg_fee(FEES, Venue.KALSHI, Role.MAKER, k_yes_px, qty)
+            + leg_fee(FEES, Venue.POLYMARKET_US, Role.TAKER, p_yes_px, qty))
 
 
 def kalshi_books(client, tickers):
@@ -37,6 +70,13 @@ def kalshi_books(client, tickers):
             out[m["ticker"]] = (Decimal(str(m.get("yes_bid_dollars") or 0)),
                                 Decimal(str(m.get("yes_ask_dollars") or 0)))
     return out
+
+
+def pmus_topbook(client, slug):
+    b = client.get(f"https://gateway.polymarket.us/v1/markets/{slug}/bbo").json().get("marketData", {})
+    bid, ask = (b.get("bestBid") or {}), (b.get("bestAsk") or {})
+    return (Decimal(bid["value"]) if bid.get("value") else None,
+            Decimal(ask["value"]) if ask.get("value") else None)
 
 
 # opportunity cost of locked capital (%/yr). A hold whose REMAINING return
@@ -84,7 +124,26 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
         resolves = (_dt2.date.fromtimestamp(float(t.get("ts", now)))
                     + _dt2.timedelta(days=1)).isoformat()
         estimated = True
+    if not resolves:
+        # probe-originated baskets (card e5696107) stamp no resolves_by, but
+        # their event slugs embed the date (aec-...-2026-07-23): event date
+        # + 1 day, same fast-settle model. Records with no date anywhere stay
+        # None (a wrong entry+1d guess on a long-dated market would fire
+        # false hard-unwind signals).
+        import datetime as _dt2
+        import re as _re2
+        hay = str(t.get("relationship_id", "")) + " " + " ".join(
+            str(l.get("market_id") or "") for l in t.get("legs", []))
+        m2 = _re2.search(r"(20\d{2}-\d{2}-\d{2})", hay)
+        if m2:
+            try:
+                resolves = (_dt2.date.fromisoformat(m2.group(1))
+                            + _dt2.timedelta(days=1)).isoformat()
+                estimated = True
+            except ValueError:
+                pass
     row = {"relationship_id": t["relationship_id"], "ts": t.get("ts"), "title": t.get("title"),
+           "kalshi_ticker": kleg.get("market_id"),
            "qty": int(qty), "cost_usd": float(cost), "locked_profit_usd": float(locked),
            "resolves_by": resolves, "resolves_estimated": estimated}
     # basket direction: standard = long Kalshi YES + long PM NO; Kalshi-maker
@@ -94,13 +153,15 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
     if inverted and not (k_ask is None or p_bid is None):
         # liquidate: sell Kalshi NO @ NO-bid (=1-YES-ask); sell PM YES @ bid
         liq_ct = (Decimal(1) - k_ask) + p_bid
+        k_exit, p_exit = k_ask, p_bid
     elif not inverted and k_bid is not None and p_ask is not None:
         # liquidate: sell Kalshi YES @ its bid; close PM NO by buying YES @ ask -> NO worth 1-ask
         liq_ct = k_bid + (Decimal(1) - p_ask)
+        k_exit, p_exit = k_bid, p_ask
     else:
         liq_ct = None
     if liq_ct is not None:
-        liq = liq_ct * qty - KALSHI_FEE * qty
+        liq = liq_ct * qty - exit_fees_usd(k_exit, p_exit, qty)
         mark = liq - cost
         # forward APR of CONTINUING to hold: remaining profit annualized over
         # the capital currently tied up (the liq value we'd otherwise free).
@@ -156,6 +217,36 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
         # crossings at sub-second resolution — a 2-min marks snapshot of a
         # fast book is noise, not an actionable re-entry.
         row["reverse_signal"] = bool(rev is not None and rev >= Decimal("0.03")) and not is_sports
+        # maker-exit delta (Geoff 2026-07-24, Exits view): per-contract profit
+        # of the OPPORTUNISTIC exit right now — rest a Kalshi ask one tick
+        # inside the competing ask, close the PM NO one tick through its ask
+        # on fill (matches the runner's maker-unwind pricing). Positive =
+        # a passive exit locks money today; eligible = the runner would
+        # actually rest it (unwind-flagged AND mark-positive).
+        if not inverted and k_ask is not None and p_ask is not None and qty:
+            k_exit_px = k_ask - Decimal("0.01")
+            p_close_px = p_ask + Decimal("0.01")
+            # net of BOTH legs' fees (card b83b0449): the Kalshi ask rests as a
+            # MAKER (0.0175 coef — Kalshi charges makers, unlike PM) and the PM
+            # NO close pays TAKER. That is 1.2-1.9c/ct, so the fee-free version
+            # of this number called exits "profitable" at 0.5c/ct that were net
+            # losers — and the runner rests real orders off this flag.
+            mx_fees = maker_exit_fees_usd(k_exit_px, p_close_px, qty) / qty
+            mx = k_exit_px + (Decimal(1) - p_close_px) - cost / qty - mx_fees
+            row["maker_exit_ct"] = round(float(mx), 4)
+            # eligibility keys on the MAKER exit's own economics (Geoff
+            # 2026-07-24: the taker mark held positions whose passive exit
+            # already locked profit): exit locks >= 0.5c/ct vs basis AND
+            # holding is no longer the better trade (unwind-flagged, or fwd
+            # APR under the 12% hurdle). Strong holds never churn; sports
+            # stay dark (the WS engine owns those books).
+            row["maker_exit_eligible"] = bool(
+                mx >= Decimal("0.005") and not is_sports
+                and (unwind or unwind_hard
+                     or (fwd_apr is not None and fwd_apr < HURDLE_APR)))
+        else:
+            row["maker_exit_ct"] = None
+            row["maker_exit_eligible"] = False
     else:
         row.update(liq_value_usd=None, mark_pnl_usd=None, converged_pct=None,
                    forward_hold_apr=None, natural_hold_apr=None, unwind_apr=None,
@@ -165,12 +256,9 @@ def compute_row(t: dict, k_bid, k_ask, p_bid, p_ask, now: float | None = None) -
 
 
 def main():
-    from arbbot.exec import ledgerdb
-    conn = ledgerdb.connect()
-    try:
-        open_t = ledgerdb.open_baskets_db(conn)  # open records net of close records
-    finally:
-        conn.close()
+    from arbbot.exec.ledger import open_baskets, parse_lines
+    trades = parse_lines(LEDGER.read_text().splitlines()) if LEDGER.exists() else []
+    open_t = open_baskets(trades)  # open records net of appended unwind records
     c = httpx.Client(timeout=20)
     ktickers = [next(l["market_id"] for l in t["legs"] if l["venue"] == "kalshi")
                 for t in open_t if len(t.get("legs", [])) >= 2]
@@ -200,6 +288,16 @@ def main():
                       "reverse_signals": sum(1 for p in positions if p.get("reverse_signal"))}}
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(doc, indent=0))
+    # exit-delta time series for the dash Exits view (marks.json is an
+    # overwritten snapshot; this appends one compact line per run)
+    hist = {"t": time.time(), "rows": [
+        {"rel": p["relationship_id"], "ts0": p["ts"], "qty": p["qty"],
+         "mx": p["maker_exit_ct"], "mark": p.get("mark_pnl_usd"),
+         "elig": p.get("maker_exit_eligible", False)}
+        for p in positions if p.get("maker_exit_ct") is not None]}
+    if hist["rows"]:
+        with open("data/exec/marks_history.jsonl", "a") as f:
+            f.write(json.dumps(hist) + "\n")
     print(json.dumps(doc["totals"]))
 
 

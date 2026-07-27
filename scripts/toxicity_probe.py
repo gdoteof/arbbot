@@ -321,7 +321,7 @@ class ToxProbe:
                   for k, v in f.items()}}
         self.log(rec)
         self.ledger({
-            "ts": time.time(), "relationship_id": f"mltox-{m.ticker}",
+            "ts": m.open_ts, "relationship_id": f"mltox-{m.ticker}",
             "title": f"ML toxicity probe fill: {m.ticker}",
             "qty": qty, "strategy": "ml-toxicity-probe",
             "legs": [{"venue": "kalshi", "market_id": m.ticker, "side": "yes",

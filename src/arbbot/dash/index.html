@@ -272,6 +272,8 @@
     <button class="tab" id="tab-capacity" role="tab" aria-selected="false">Capacity</button>
     <button class="tab" id="tab-positions" role="tab" aria-selected="false">Positions
       <span class="badge" id="tab-positions-n" hidden></span></button>
+    <button class="tab" id="tab-exits" role="tab" aria-selected="false">Exits
+      <span class="badge" id="tab-exits-n" hidden></span></button>
   </div>
 
   <div id="view-overview">
@@ -578,6 +580,7 @@
     <section class="card">
       <h2>Open positions — venue truth <span id="pos-stale" class="stale-pill" hidden></span></h2>
       <div class="cap" data-tip="What we ACTUALLY hold on each venue right now (reconciliation snapshot, refreshed ~60s): Kalshi position + PM US net per pair, joined via the registry and the sports equivalence map. HEDGED = legs net to zero (a complete basket). NAKED = a directional imbalance. WATCHED = the imbalance is registered with the profit-only rehedge/flatten watcher. Orphans are venue positions no known pair explains.">every open position, hedged and unhedged — from venue APIs, not the ledger</div>
+      <div class="cap" id="gate-line" data-tip="The capital-displacement gate: soft UNWIND flags (fwd APR < 12%) only EXECUTE while the class budget is ≥95% used — below that, holding a sub-hurdle basket beats freeing capital with nowhere better to go. Hard flags (fwd APR < 4%) execute regardless. The system breathes at the cap: new fills push utilization over the line, the timer recycles the lowest-APR profitable soft candidates, and it settles back under." style="margin-top:2px"></div>
       <div class="act-strip" id="pos-strip"></div>
       <div style="overflow-x:auto"><table id="pos-table">
         <thead><tr>
@@ -586,11 +589,30 @@
           <th class="num" data-tip="PM US net (negative = short YES = holding NO) · held-side cost/ct at entry → the book NOW.">PM US qty · entry → now</th>
           <th class="num" data-tip="Net directional exposure in contracts (Kalshi + PM). Zero = market-neutral basket; nonzero = we win/lose |Δ| × price move.">Δ</th>
           <th data-tip="HEDGED pairs: profit/ct locked at entry ($1 payoff − both bases). WATCHED holds: how many cents each profit-only exit is from firing (≤0 = available now, watcher is on it).">lock</th>
+          <th class="num" data-tip="Opportunistic maker-exit delta: per-contract profit of a passive exit right now (Kalshi ask − 1 tick, PM close through its ask), NET of the Kalshi maker fee on the resting ask and the PM US taker fee on the close (~1.2-1.9c/ct together — Kalshi charges makers, only Polymarket makers are free). Green = exit locks money today; ⚡ = unwind-flagged and mark-positive, the runner rests a live exit ask. Full timeline on the Exits tab.">exit Δ</th>
           <th>status</th>
         </tr></thead><tbody></tbody></table></div>
       <div id="pos-empty" style="display:none;color:var(--ink-mut);font-size:12px;padding:20px 4px">No open positions.</div>
     </section>
   </div><!-- /view-positions -->
+
+  <div id="view-exits" hidden>
+    <section class="card">
+      <h2>Opportunistic maker exits — delta from profit</h2>
+      <div class="cap" data-tip="For every open basket, the per-contract profit of exiting PASSIVELY right now: rest a Kalshi ask one tick inside the competing ask; when it fills, close the PM NO one tick through its ask (the runner's maker-unwind pricing). Above the 0-line = a passive exit locks money today. The runner only RESTS an exit when the position is also unwind-flagged (soft/hard) and mark-positive — capital policy, not price, is usually the binding gate. Sampled every ~2 min by the marks timer.">how far each open position is from a profitable passive exit — top-5 series, samples every ~2 min</div>
+      <div id="exits-chart" style="margin-top:8px"></div>
+      <div style="overflow-x:auto;margin-top:10px"><table id="exits-table">
+        <thead><tr>
+          <th>position</th>
+          <th class="num" data-tip="Contracts remaining in the basket.">qty</th>
+          <th class="num" data-tip="Per-contract profit of the passive exit right now (Kalshi ask − 1 tick + PM close), net of the Kalshi maker fee and the PM US taker fee on the close. Positive = exit locks money today.">exit Δ /ct</th>
+          <th class="num" data-tip="Mark-to-market of the whole basket (liquidation vs cost).">mark $</th>
+          <th class="num" data-tip="Forward hold APR — what the remaining capital earns by holding to resolution.">fwd APR</th>
+          <th data-tip="FLAGGED = the unwind policy wants out (soft/hard). ELIGIBLE = the passive exit locks ≥0.5c/ct vs basis AND holding is no longer the better trade (flagged, or fwd APR < 12% hurdle): the runner rests a live exit ask on it.">state</th>
+        </tr></thead><tbody></tbody></table></div>
+      <div id="exits-empty" style="display:none;color:var(--ink-mut);font-size:12px;padding:20px 4px">Collecting samples — the marks timer appends a point every ~2 minutes.</div>
+    </section>
+  </div><!-- /view-exits -->
 </main>
 
 <div id="tip" role="status"></div>
@@ -871,6 +893,8 @@ function render(d) {
   renderMakerProbe(d);
   renderCapacity(d.capacity);
   renderPositions(d.positions);
+  renderExits(d.exits);
+  renderUnwindGate(d.unwind_gate);
   /* accumulating counters get FULL digits — the tick is the signal that
      the instrument is alive; compact notation hides it */
   $("#hero-val").textContent = d.hero.observations.toLocaleString("en-US");
@@ -1318,6 +1342,7 @@ function renderActivity(d) {
     const parts = [
       `<span class="t">${relTime(e.ts)}</span>`,
       `<span class="abadge ${e.action}">${e.action}</span>`,
+      e.tag ? `<span class="abadge" style="background:#7c3aed26;color:#a78bfa">${e.tag}</span>` : "",
       `<span class="vchip ${vc}">${vn}</span>`,
       e.side ? `<span class="side-tag ${e.side}">${e.side.toUpperCase()}</span>` : `<span class="side-tag" style="visibility:hidden">—</span>`,
       `<span class="mk" title="${e.market} · ${e.rel || ""}">${e.market}</span>`,
@@ -1467,6 +1492,21 @@ function renderSports(d) {
   renderMtProbe(d.sports && d.sports.mt_probe);
 }
 
+function renderUnwindGate(g) {
+  const el = $("#gate-line");
+  if (!el) return;
+  if (!g || g.open_notional == null) { el.textContent = ""; return; }
+  const state = g.constrained
+    ? "displacement gate OPEN — soft UNWIND flags execute"
+    : "displacement gate CLOSED — soft UNWIND flags hold (not capital-constrained)";
+  el.innerHTML =
+    `class capital <b>$${g.open_notional.toFixed(0)}</b> / $${g.class_budget.toFixed(0)} ` +
+    `(<b>${g.util_pct}%</b>) · ${state}` +
+    (g.soft_signals ? ` · ${g.soft_signals} soft` : "") +
+    (g.hard_signals ? ` · <span style="color:var(--delta-bad,#c33)">${g.hard_signals} hard</span>` : "");
+  el.style.color = g.constrained ? "var(--st-warn)" : "var(--ink-mut)";
+}
+
 function renderPositions(px) {
   const empty = $("#pos-empty");
   const rows = (px && px.rows) || [];
@@ -1520,6 +1560,13 @@ function renderPositions(px) {
       td.style.fontVariantNumeric = "tabular-nums"; td.textContent = v; tr.appendChild(td); });
     const tdl = document.createElement("td"); tdl.style.fontVariantNumeric = "tabular-nums";
     tdl.textContent = lockCell; if (lockColor) tdl.style.color = lockColor; tr.appendChild(tdl);
+    const tdx = document.createElement("td"); tdx.className = "num";
+    tdx.style.fontVariantNumeric = "tabular-nums";
+    if (r.mx_ct != null) {
+      tdx.textContent = `${r.mx_ct >= 0 ? "+" : ""}${(100 * r.mx_ct).toFixed(1)}c` + (r.mx_elig ? " ⚡" : "");
+      tdx.style.color = r.mx_ct >= 0 ? "var(--delta-good)" : "var(--st-crit)";
+    } else tdx.textContent = "—";
+    tr.appendChild(tdx);
     const td = document.createElement("td"); td.appendChild(status); tr.appendChild(td);
     tb.appendChild(tr);
   }
@@ -1640,6 +1687,94 @@ function renderMtProbe(mp) {
       `<td class="num ${naked > 0 ? "edge-neg" : "dim"}">${naked || "—"}</td>` +
       `<td>${f.picked_off ? "picked off — held" : "captured"}</td>`;
     tb.appendChild(tr);
+  }
+}
+
+function renderExits(ex) {
+  const hist = (ex && ex.history) || [], latest = (ex && ex.latest) || [];
+  const badge = $("#tab-exits-n");
+  const nElig = latest.filter(r => r.elig).length;
+  if (nElig) { badge.hidden = false; badge.textContent = nElig; badge.style.background = "var(--st-warn)"; }
+  else badge.hidden = true;
+  $("#exits-empty").style.display = hist.length >= 2 ? "none" : "block";
+  exitsChart($("#exits-chart"), hist);
+  const tb = $("#exits-table tbody"); tb.replaceChildren();
+  for (const r of latest) {
+    const tr = document.createElement("tr");
+    const state = r.elig
+      ? `<span class="role-badge" style="background:var(--st-warn);color:var(--surface)">ELIGIBLE</span>`
+      : (r.flagged
+        ? `<span class="role-badge" style="background:var(--ink-mut);color:var(--surface)" title="flagged but mark-negative — the runner won't exit at a loss">FLAGGED</span>`
+        : `<span class="role-badge" style="opacity:.55">holding</span>`);
+    const mxCol = r.mx_c >= 0 ? "var(--delta-good)" : "var(--st-crit)";
+    tr.innerHTML = [
+      `<td title="${r.rel}">${r.title || r.rel}</td>`,
+      `<td class="num">${r.qty ?? "—"}</td>`,
+      `<td class="num" style="color:${mxCol}">${r.mx_c >= 0 ? "+" : ""}${(+r.mx_c).toFixed(1)}c</td>`,
+      `<td class="num">${r.mark == null ? "—" : (r.mark >= 0 ? "+" : "") + (+r.mark).toFixed(2)}</td>`,
+      `<td class="num">${r.fwd_apr == null ? "—" : (+r.fwd_apr).toFixed(0) + "%"}</td>`,
+      `<td>${state}</td>`,
+    ].join("");
+    tb.appendChild(tr);
+  }
+}
+
+function exitsChart(host, data) {
+  host.replaceChildren();
+  const W = 1080, H = 220, m = { t: 12, r: 52, b: 26, l: 44 };
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+    "aria-label": "per-position passive-exit delta from profit over time (cents per contract)" });
+  host.appendChild(svg);
+  if (data.length < 2) return;
+  const ts = data.map(d => d.t);
+  const N = 5;
+  const ranks = [];
+  for (let k = 0; k < N; k++)
+    ranks.push(data.map(d => (d.tops && d.tops[k]) ? +d.tops[k].e : (k === 0 ? +d.best : null)));
+  const vals = ranks.flat().filter(v => v != null);
+  let lo = Math.min(...vals, 0), hi = Math.max(...vals, 0);
+  const span = (hi - lo) || 1; lo -= span * 0.12; hi += span * 0.12;
+  const px = i => m.l + i * (W - m.l - m.r) / (ts.length - 1);
+  const py = v => H - m.b - (v - lo) / (hi - lo) * (H - m.t - m.b);
+  for (let g = 0; g <= 4; g++) {
+    const val = lo + (hi - lo) * g / 4, y = py(val);
+    el("line", { x1: m.l, x2: W - m.r, y1: y, y2: y, stroke: css("--grid"), "stroke-width": 1 }, svg);
+    el("text", { x: m.l - 6, y: y + 3.5, "text-anchor": "end", class: "tick" }, svg)
+      .textContent = val.toFixed(1) + "c";
+  }
+  const yz = py(0);
+  el("line", { x1: m.l, x2: W - m.r, y1: yz, y2: yz, stroke: css("--st-warn"),
+    "stroke-width": 1.5, "stroke-dasharray": "5 4" }, svg);
+  el("text", { x: m.l + 4, y: yz - 4, "text-anchor": "start", class: "tick",
+    fill: css("--st-warn") }, svg).textContent = "profit";
+  const step = Math.max(1, Math.ceil(ts.length / 9));
+  ts.forEach((t, i) => { if (i % step === 0)
+    el("text", { x: px(i), y: H - m.b + 15, "text-anchor": "middle", class: "tick" }, svg)
+      .textContent = new Date(t * 1000).toLocaleTimeString("en-US",
+        { hour: "2-digit", minute: "2-digit", hour12: false }); });
+  el("line", { x1: m.l, x2: W - m.r, y1: H - m.b, y2: H - m.b, stroke: css("--baseline") }, svg);
+  for (let k = N - 1; k >= 1; k--) {
+    let d = "", on = false;
+    ranks[k].forEach((v, i) => { if (v == null) { on = false; return; }
+      d += `${on ? "L" : "M"}${px(i)},${py(v)}`; on = true; });
+    if (d) el("path", { d, fill: "none", stroke: css("--series-1"),
+      "stroke-width": 1, opacity: 0.16 + 0.09 * (N - 1 - k), "stroke-linejoin": "round" }, svg);
+  }
+  const ys = ranks[0];
+  const path = ys.map((v, i) => v == null ? "" : `${i && ys[i-1] != null ? "L" : "M"}${px(i)},${py(v)}`).join("");
+  el("path", { d: path, fill: "none", stroke: css("--series-1"), "stroke-width": 2,
+    "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+  ys.forEach((v, i) => { if (v != null && v >= 0)
+    el("circle", { cx: px(i), cy: py(v), r: 3.5, fill: css("--delta-good"),
+      stroke: css("--surface"), "stroke-width": 1.5 }, svg); });
+  const lastIdx = ys.length - 1;
+  if (ys[lastIdx] != null) {
+    const lbl = data[lastIdx].tops && data[lastIdx].tops[0] ? data[lastIdx].tops[0].n : "";
+    el("text", { x: W - m.r + 4, y: py(ys[lastIdx]) + 3.5, "text-anchor": "start",
+      class: "tick", fill: css("--series-1") }, svg)
+      .textContent = ys[lastIdx].toFixed(1) + "c";
+    if (lbl) el("text", { x: W - m.r + 4, y: py(ys[lastIdx]) + 15, "text-anchor": "start",
+      class: "tick", opacity: 0.7 }, svg).textContent = lbl.slice(0, 14);
   }
 }
 
@@ -1787,6 +1922,7 @@ for (const tab of document.querySelectorAll(".tab")) {
     $("#view-maker").hidden = tab.id !== "tab-maker";
     $("#view-capacity").hidden = tab.id !== "tab-capacity";
     $("#view-positions").hidden = tab.id !== "tab-positions";
+    $("#view-exits").hidden = tab.id !== "tab-exits";
   });
 }
 load();

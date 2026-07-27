@@ -269,7 +269,10 @@ class Quoter:
                                              "venue": leg.venue.value, "side": side,
                                              "price": str(cur.price), "order_id": cur.order_id})
                         del self._resting[key]
-                        self._last_quote_ts.pop(key, None)
+                        # KEEP _last_quote_ts: re-entry on this side is throttled
+                        # like a reprice. Popping it made a cancelled side
+                        # re-postable on the very next book event, which is the
+                        # engine behind the fraalb sawtooth (card 6fb469da).
                     continue
                 # hysteresis: hold a still-profitable resting quote until the
                 # improvement available exceeds its RANDOMIZED deadband — cuts
@@ -277,11 +280,16 @@ class Quoter:
                 # off => exact-match, the original behavior.)
                 if cur is not None and self._hold_in_deadband(cur, target, side, key):
                     continue
-                # reprice throttle: an existing quote is still PROFITABLE (target
-                # not None), so don't churn cancel/replace on every tick — keep
-                # it until min_requote_s elapses. (target None already cancels
-                # promptly above, so an unviable quote is never held.)
-                if cur and (time.monotonic() - self._last_quote_ts.get(key, 0.0)) < self.min_requote_s:
+                # requote throttle, on BOTH paths: repricing a still-profitable
+                # quote AND re-entering a side we recently cancelled. Cancels
+                # stay prompt (target None returns above); what this stops is
+                # the re-post half of a cancel/re-post loop — on fraalb a
+                # 500-1000 lot maker walks the ask down 1c at a time, we chase
+                # to our floor, cancel, they pull, and we re-posted on the next
+                # event: 961 places + 420 cancels in 24h on one relationship,
+                # 74% of all order traffic (card 6fb469da). A fill still
+                # re-quotes immediately — on_fill clears the timestamp.
+                if (time.monotonic() - self._last_quote_ts.get(key, 0.0)) < self.min_requote_s:
                     continue
                 # back off a side whose last placement FAILED — without this a
                 # rejected order (no resting quote to throttle on) retries every

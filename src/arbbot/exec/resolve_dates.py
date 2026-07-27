@@ -16,6 +16,7 @@ _RULES = [
     ("xvus-brazil-pres-26",  "2026-10-25", True),   # Brazil general; runoff ~last Sun of Oct
     ("xvus-nobel-peace-26",  "2026-10-09", True),   # Nobel Peace Prize announced early Oct
     ("xvus-fedcut-26",       "2026-12-31", False),  # hard bound: resolves by year-end per market def
+    ("xvus-btcmax-26-31",    "2026-12-31", False),  # hard bound: BTC year-high window ends Dec 31
 ]
 
 

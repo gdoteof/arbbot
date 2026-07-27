@@ -320,3 +320,87 @@ def test_cross_venue_quote_on_pm_hedge_on_kalshi(tmp_path):
     res = q.on_fill(1, "bid", bb)
     assert res["hedged"] is True and res["state"] == "hedged"
     assert any(r.get("body", {}).get("ticker") == "KX" for r in kgw.sent)
+
+
+def test_apr_hurdle_tightens_and_blocks(tmp_path):
+    """card 80ff7987: with min_apr set, the maker price cap tightens by the
+    per-contract lock needed to annualize >= min_apr over the hold; a thin
+    edge on a long-dated market stops quoting entirely."""
+    base = mk(tmp_path)
+    bb = BookBuilder()
+    bb.apply_snapshot(snap("T375", [("0.70", "500")], [("0.99", "1")]))
+    bb.apply_snapshot(snap("T350", [("0.55", "500")], [("0.99", "1")]))
+    base.on_book(bb)
+    base_px = D([i for i in base.intents if "place" in i][0]["price"])
+
+    # hurdle on but not binding (edge >> margin): price unchanged — the
+    # margin tightens the CAP, it never walks a joining quote lower
+    q = mk(tmp_path)
+    q.min_apr, q.resolve_years = 12.0, 1.0
+    assert q._apr_margin() > 0
+    q.on_book(bb)
+    placed = [i for i in q.intents if "place" in i]
+    assert placed and D(placed[0]["price"]) == base_px
+
+    # extreme hurdle: nothing rests
+    q2 = mk(tmp_path)
+    q2.min_apr, q2.resolve_years = 500.0, 1.0
+    q2.on_book(bb)
+    assert not [i for i in q2.intents if "place" in i]
+
+    # no resolve date => hurdle disabled, identical to base behavior
+    q3 = mk(tmp_path)
+    q3.min_apr, q3.resolve_years = 12.0, None
+    assert q3._apr_margin() == 0
+
+
+def test_no_instant_repost_after_cancel(tmp_path, monkeypatch):
+    """fraalb sawtooth (card 6fb469da): a side we just cancelled must not be
+    re-posted on the next book event. A 500-1000 lot maker walks the ask down a
+    tick at a time; we chase to our floor, cancel, they pull, and the re-post
+    was unthrottled — 961 places + 420 cancels in 24h on one relationship."""
+    import arbbot.exec.quoter as qm
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(qm.time, "monotonic", lambda: clock["t"])
+    q = mk(tmp_path)
+    bb = BookBuilder()
+    bb.apply_snapshot(snap("T375", [("0.70", "500")], [("0.99", "1")]))
+    bb.apply_snapshot(snap("T350", [("0.55", "500")], [("0.99", "1")]))
+    q.on_book(bb)
+    assert len(q._resting) == 1
+    placed = lambda: sum(1 for i in q.intents if "place" in i)
+    n = placed()
+
+    # hedge collapses -> unviable -> prompt cancel (cancels must stay immediate)
+    bb.apply_snapshot(snap("T375", [("0.30", "500")], [("0.99", "1")], seq=2))
+    clock["t"] += 1
+    q.on_book(bb)
+    assert len(q._resting) == 0
+
+    # ...and recovers a second later: the old code re-posted on this very event
+    bb.apply_snapshot(snap("T375", [("0.70", "500")], [("0.99", "1")], seq=3))
+    clock["t"] += 1
+    q.on_book(bb)
+    assert placed() == n, "re-entry within min_requote_s must be throttled"
+    assert not q._resting
+
+    # past the throttle it re-enters normally
+    clock["t"] += q.min_requote_s
+    q.on_book(bb)
+    assert placed() == n + 1
+    assert len(q._resting) == 1
+
+
+def test_fill_clears_the_requote_throttle(tmp_path):
+    """The re-entry throttle must not outlive a FILL: on_fill drops the
+    timestamp so the side can re-quote fresh next tick (whether it actually
+    does is then the risk manager's call, not the throttle's)."""
+    q = mk(tmp_path)
+    bb = BookBuilder()
+    bb.apply_snapshot(snap("T375", [("0.70", "500")], [("0.99", "1")]))
+    bb.apply_snapshot(snap("T350", [("0.55", "500")], [("0.99", "1")]))
+    q.on_book(bb)
+    key = next(iter(q._resting))
+    assert key in q._last_quote_ts
+    q.on_fill(key[0], key[1], bb)
+    assert key not in q._last_quote_ts, "a fill must not leave the side throttled"

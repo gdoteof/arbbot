@@ -393,8 +393,68 @@ class DashboardData:
             "sports": self._sports(),
             "maker_probe": self._maker_probe(),
             "capacity": self._read_json(self.raw_dir.parent / "reports" / "capacity.json"),
-            "positions": self._read_json(self.raw_dir.parent / "exec" / "positions.json"),
+            "positions": self._positions_enriched(),
+            "exits": self._exits(),
         }
+
+    def _positions_enriched(self) -> dict:
+        """Recon snapshot rows + the maker-exit delta from marks (by rel)."""
+        doc = self._read_json(self.raw_dir.parent / "exec" / "positions.json") or {}
+        marks = self._read_json(self.raw_dir.parent / "exec" / "marks.json") or {}
+        by_kt: dict = {}   # a pair can hold several baskets — keep the BEST exit
+        for m in marks.get("positions", []):
+            kt = m.get("kalshi_ticker")
+            if kt is None or m.get("maker_exit_ct") is None:
+                continue
+            cur = by_kt.get(kt)
+            if cur is None or m["maker_exit_ct"] > cur["maker_exit_ct"]:
+                by_kt[kt] = m
+        for row in doc.get("rows", []):
+            m = by_kt.get(row.get("kt"))
+            if m is not None:
+                row["mx_ct"] = m.get("maker_exit_ct")
+                row["mx_elig"] = m.get("maker_exit_eligible")
+        return doc
+
+    def _exits(self) -> dict:
+        """Opportunistic maker-exit timeline (Geoff 2026-07-24): per-2-min
+        samples of each open basket's passive-exit delta from profit, appended
+        by mark_positions to marks_history.jsonl. Shaped like the sports
+        history (t / best / tops) so the chart pattern transfers."""
+        p = self.raw_dir.parent / "exec" / "marks_history.jsonl"
+        try:
+            lines = p.read_text().splitlines()[-1500:]  # ~2 days at 2-min cadence
+        except OSError:
+            return {"history": [], "latest": []}
+        history = []
+        latest_rows: list = []
+        for line in lines:
+            try:
+                s = json.loads(line)
+            except ValueError:
+                continue
+            rows = [r for r in s.get("rows", []) if r.get("mx") is not None]
+            if not rows:
+                continue
+            rows.sort(key=lambda r: -r["mx"])
+            history.append({"t": s["t"],
+                            "best": round(rows[0]["mx"] * 100, 2),
+                            "n_elig": sum(1 for r in rows if r.get("elig")),
+                            "tops": [{"e": round(r["mx"] * 100, 2),
+                                      "n": str(r["rel"])[:40]} for r in rows[:5]]})
+            latest_rows = rows
+        marks = self._read_json(self.raw_dir.parent / "exec" / "marks.json") or {}
+        by_key = {(m["relationship_id"], m.get("ts")): m for m in marks.get("positions", [])}
+        latest = []
+        for r in latest_rows:
+            m = by_key.get((r["rel"], r.get("ts0"))) or {}
+            latest.append({"rel": r["rel"], "ts0": r.get("ts0"), "qty": r.get("qty"),
+                           "mx_c": round(r["mx"] * 100, 2), "elig": bool(r.get("elig")),
+                           "mark": r.get("mark"), "title": m.get("title"),
+                           "fwd_apr": m.get("forward_hold_apr"),
+                           "flagged": bool(m.get("unwind_signal") or m.get("unwind_hard"))})
+        latest.sort(key=lambda r: -r["mx_c"])
+        return {"history": history, "latest": latest}
 
     def _sports(self) -> dict:
         """Real-time cross-venue sports lines written by the WS engine
