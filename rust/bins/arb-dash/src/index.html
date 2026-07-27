@@ -74,8 +74,18 @@ const money = (s) => {
 const sign = (s) => Number(s) < 0 ? 'bad' : 'ok';
 const esc = (s) => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
-function statement(st){
+function statement(st, accounts){
   const net = Number(st.net_vs_capital);
+  // The realized line is a NET of several accounts, and one of them is an
+  // unitemized plug an order of magnitude bigger than the total. Showing only
+  // the net let a +$7 headline stand on a −$49 residual nobody had explained.
+  const parts = (accounts||[]).filter(a=>a.account.startsWith('pnl:realized'));
+  const breakdown = parts.length > 1 ? `<div class="sub" style="margin:2px 0 8px 12px">` +
+    parts.map(a=>`<div class="kv" style="border:0;padding:2px 0">
+      <span>${esc(a.account.replace('pnl:realized:',''))}</span>
+      <b class="${sign(a.balance)}">$${money(a.balance)}</b></div>`).join('') +
+    `<div style="margin-top:4px">an <b>unitemized</b> component is a residual, not a
+      trade — the realized figure is only as good as that plug is small.</div></div>` : '';
   return $(`<section>
     <h2>Statement of position &middot; cost basis</h2>
     <div class="big ${net<0?'bad':'ok'}">${net<0?'−':'+'}$${money(Math.abs(net))}</div>
@@ -87,6 +97,7 @@ function statement(st){
     <div class="rule"></div>
     <div class="kv"><span>trading (realized)</span>
       <b class="${sign(st.trading_realized)}">$${money(st.trading_realized)}</b></div>
+    ${breakdown}
     <div class="kv"><span>fees</span><b class="bad">−$${money(st.fees)}</b></div>
   </section>`);
 }
@@ -108,7 +119,10 @@ function integrityPanel(iv){
   </section>`);
 }
 
-function reconPanel(rs){
+/* "vs venue truth" was a promise the page could not keep: the Kalshi side is a
+   number passed on the command line, so it cannot drift and the row read EXACT
+   forever. Every input now carries where it came from and how old it is. */
+function reconPanel(rs, sources){
   if(!rs || !rs.length) return $(`<section><h2>Reconciliation</h2>
     <div class="dim">no venue balances supplied</div></section>`);
   const rows = rs.map(r=>`<tr>
@@ -117,11 +131,25 @@ function reconPanel(rs){
       <td class="num">$${money(r.venue)}</td>
       <td class="num ${r.exact?'ok':'bad'}">${r.exact?'EXACT':money(r.diff)}</td>
     </tr>`).join('');
+  const src = (sources||[]).map(s=>`<tr>
+      <td>${esc(s.what)}</td>
+      <td class="dim" style="font-size:11px">${esc(String(s.from).replace(/^.*\//,''))}</td>
+      <td class="num ${s.frozen?'warn':(s.age_s>3600?'warn':'dim')}">${dur(s.age_s)}${s.frozen?' fixed':''}</td>
+    </tr>`).join('');
+  const anyFrozen = (sources||[]).some(s=>s.frozen);
   return $(`<section>
-    <h2>Reconciliation vs venue truth</h2>
+    <h2>Reconciliation vs the last venue snapshot</h2>
     <table><thead><tr><th>account</th><th class="num">books</th>
-      <th class="num">venue</th><th class="num">diff</th></tr></thead>
+      <th class="num">snapshot</th><th class="num">diff</th></tr></thead>
     <tbody>${rows}</tbody></table>
+    <div class="rule"></div>
+    <h2>Where those numbers came from</h2>
+    <table><thead><tr><th>input</th><th>source</th><th class="num">age</th></tr></thead>
+      <tbody>${src}</tbody></table>
+    ${anyFrozen ? `<div class="warn" style="margin-top:8px">▲ Rows marked <b>fixed</b> were
+      set on the command line when this process started. They cannot move, so matching
+      them is not evidence the venue agrees — re-pull the snapshot and restart to
+      actually check.</div>` : ''}
   </section>`);
 }
 
@@ -732,8 +760,8 @@ const ROUTES = {
     if(b.error) throw new Error(b.error);
     setMeta(`${b.entries} entries &middot; trial balance ` +
       `<span class="badge ${b.balanced?'ok':'bad'}">${b.balanced?'ZERO':'NOT ZERO'}</span>`);
-    root.append(statement(b.statement));
-    root.append(reconPanel(b.reconciliations));
+    root.append(statement(b.statement, b.accounts||[]));
+    root.append(reconPanel(b.reconciliations, b.sources));
     root.append(positionsPanel(b.positions||[]));
     root.append(accountsPanel(b.accounts||[]));
   },

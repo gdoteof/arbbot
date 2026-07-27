@@ -62,6 +62,9 @@ struct Args {
     registry: String,
     tradable: String,
     port: u16,
+    /// Epoch seconds at startup — the age of anything passed on the command
+    /// line rather than read from a file.
+    started_at: u64,
 }
 
 /// The one piece of mutable state in the process, and it exists only so a
@@ -224,9 +227,27 @@ fn stream(mut s: TcpStream, a: &Args, sh: &Shared) {
     }
 }
 
-fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+/// A missing or unparseable snapshot is an ERROR, never an empty list. Books
+/// built from files that are not there balance perfectly and mean nothing: the
+/// old `unwrap_or_default()` turned "the fills file is gone" into a clean,
+/// zeroed, trial-balance-ZERO statement — the most convincing possible way to
+/// show numbers that are not true.
+fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))
+}
+
+fn age_secs(path: &str) -> Option<u64> {
+    let m = std::fs::metadata(path).ok()?;
+    let mtime = m.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(now_secs().saturating_sub(mtime))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Rebuild the books from venue snapshots on every request. The whole import is
@@ -236,30 +257,53 @@ fn books_json(a: &Args) -> String {
     let mut cx = Cx::default();
     let mut j = Journal::new();
 
-    let deposits: Vec<Deposit> =
-        read_json(&format!("{}/kalshi_deposits.json", a.kalshi_dir)).unwrap_or_default();
-    let fills: Vec<Fill> =
-        read_json(&format!("{}/kalshi_fills.json", a.kalshi_dir)).unwrap_or_default();
-    let settlements: Vec<Settlement> =
-        read_json(&format!("{}/kalshi_settlements.json", a.kalshi_dir)).unwrap_or_default();
+    let kd = format!("{}/kalshi_deposits.json", a.kalshi_dir);
+    let kf = format!("{}/kalshi_fills.json", a.kalshi_dir);
+    let ks = format!("{}/kalshi_settlements.json", a.kalshi_dir);
+    let (deposits, fills, settlements): (Vec<Deposit>, Vec<Fill>, Vec<Settlement>) =
+        match (read_json(&kd), read_json(&kf), read_json(&ks)) {
+            (Ok(d), Ok(f), Ok(s)) => (d, f, s),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                return format!("{{\"error\":\"kalshi snapshot unreadable — {}\"}}",
+                               e.replace('"', "'"))
+            }
+        };
     if let Err(e) = (KalshiImport { deposits, fills, settlements }).apply(&mut cx, &mut j) {
         return format!("{{\"error\":\"kalshi import: {e}\"}}");
     }
 
+    // Provenance, one row per number the reconciliation leans on.
+    let mut sources = vec![
+        serde_json::json!({ "what": "kalshi fills", "from": kf, "age_s": age_secs(&kf) }),
+        serde_json::json!({ "what": "kalshi settlements", "from": ks, "age_s": age_secs(&ks) }),
+        serde_json::json!({ "what": "kalshi deposits", "from": kd, "age_s": age_secs(&kd) }),
+    ];
+
     let mut pmus_buying_power: Option<String> = None;
     if !a.pmus_dir.is_empty() {
-        if let Some(balances) =
-            read_json::<Balances>(&format!("{}/pmus_balances.json", a.pmus_dir))
+        let pb = format!("{}/pmus_balances.json", a.pmus_dir);
+        let pp = format!("{}/pmus_positions.json", a.pmus_dir);
+        let (balances, positions): (Balances, Vec<Position>) =
+            match (read_json(&pb), read_json(&pp)) {
+                (Ok(b), Ok(p)) => (b, p),
+                (Err(e), _) | (_, Err(e)) => {
+                    // Silently skipping this used to drop half the portfolio
+                    // and its reconciliation row, leaving a statement that
+                    // looked complete.
+                    return format!("{{\"error\":\"pmus snapshot unreadable — {}\"}}",
+                                   e.replace('"', "'"))
+                }
+            };
+        pmus_buying_power = Some(balances.buying_power_str());
+        sources.push(serde_json::json!({ "what": "pm-us balances", "from": pb,
+                                         "age_s": age_secs(&pb) }));
+        sources.push(serde_json::json!({ "what": "pm-us positions", "from": pp,
+                                         "age_s": age_secs(&pp) }));
+        if let Err(e) =
+            (PmusImport { deposits_usd: a.pmus_deposits.clone(), balances, positions })
+                .apply(&mut cx, &mut j)
         {
-            pmus_buying_power = Some(balances.buying_power_str());
-            let positions: Vec<Position> =
-                read_json(&format!("{}/pmus_positions.json", a.pmus_dir)).unwrap_or_default();
-            if let Err(e) =
-                (PmusImport { deposits_usd: a.pmus_deposits.clone(), balances, positions })
-                    .apply(&mut cx, &mut j)
-            {
-                return format!("{{\"error\":\"pmus import: {e}\"}}");
-            }
+            return format!("{{\"error\":\"pmus import: {e}\"}}");
         }
     }
 
@@ -267,12 +311,29 @@ fn books_json(a: &Args) -> String {
     if let Some(kb) = &a.kalshi_balance {
         rep.reconciliations
             .push(report::reconcile(&mut cx, &j, accounts::CASH_KALSHI, kb));
+        // NOT a venue read. A number typed on the command line cannot drift,
+        // so this row reads EXACT forever whatever the account does.
+        sources.push(serde_json::json!({
+            "what": "kalshi cash balance",
+            "from": "--kalshi-balance (fixed at startup)",
+            "age_s": now_secs().saturating_sub(a.started_at),
+            "frozen": true,
+        }));
     }
     if let Some(bp) = &pmus_buying_power {
         rep.reconciliations
             .push(report::reconcile(&mut cx, &j, accounts::CASH_PMUS, bp));
     }
-    serde_json::to_string(&rep).unwrap_or_else(|_| "{}".into())
+    sources.push(serde_json::json!({
+        "what": "pm-us capital in",
+        "from": "--pmus-deposits (fixed at startup)",
+        "age_s": now_secs().saturating_sub(a.started_at),
+        "frozen": true,
+    }));
+
+    let mut v = serde_json::to_value(&rep).unwrap_or_else(|_| serde_json::json!({}));
+    v["sources"] = serde_json::Value::Array(sources);
+    v.to_string()
 }
 
 fn query_param(query: &str, key: &str) -> Option<String> {
@@ -1134,6 +1195,7 @@ fn main() {
         registry: "config/registry.yaml".into(),
         tradable: "config/tradable.yaml".into(),
         port: 4749,
+        started_at: now_secs(),
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
