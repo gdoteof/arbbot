@@ -24,7 +24,7 @@ Wants=arbbot-recorder.service
 [Service]
 Type=simple
 WorkingDirectory=%h/claude/arbbot
-ExecStart=%h/claude/arbbot/.claude/worktrees/rust-rewrite/rust/target/release/arb-trader \
+ExecStart=%h/claude/arbbot/rust/target/release/arb-trader \
     --socket data/arbbot.sock \
     --registry config/registry.yaml \
     --out data/trader-rs/intents.jsonl \

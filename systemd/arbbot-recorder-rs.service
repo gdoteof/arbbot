@@ -36,7 +36,7 @@ WorkingDirectory=%h/claude/arbbot
 # rs-suffixed READ-ONLY key only; the trade-capable keys are never loaded
 # (--pmus-poll-only) even though the dir contains them
 Environment=ARBBOT_CREDENTIALS_DIR=%h/.arbbot-credentials
-ExecStart=%h/claude/arbbot/.claude/worktrees/rust-rewrite/rust/target/release/arb-recorder \
+ExecStart=%h/claude/arbbot/rust/target/release/arb-recorder \
     --config config/recorder.yaml \
     --data-dir data/raw-rs \
     --socket data/arbbot-rs.sock \
