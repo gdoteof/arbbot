@@ -331,7 +331,9 @@ impl Quoter {
                                     "order_id": curq.order_id})
                             .to_string(),
                         );
-                        self.last_quote_ts.remove(&key);
+                        // KEEP last_quote_ts: re-entry on this side is throttled
+                        // like a reprice (card 6fb469da). Dropping it made a
+                        // cancelled side re-postable on the very next book event.
                     }
                     continue;
                 };
@@ -340,10 +342,27 @@ impl Quoter {
                     if cx.cmp(curq.price, target) == Ordering::Equal {
                         continue;
                     }
-                    // reprice throttle
-                    if now - self.last_quote_ts.get(&key).copied().unwrap_or(0.0)
-                        < self.min_requote_s
-                    {
+                }
+                // requote throttle, on BOTH paths: repricing a still-profitable
+                // quote AND re-entering a side we recently cancelled. Cancels stay
+                // prompt (target None returns above); what this stops is the
+                // re-post half of a cancel/re-post loop — on fraalb a 500-1000 lot
+                // maker walks the ask down 1c at a time, we chase to our floor,
+                // cancel, they pull, and we re-posted on the next event: 961 places
+                // + 420 cancels in 24h on one relationship, 74% of all order
+                // traffic, for ZERO fills (card 6fb469da).
+                //
+                // A side never quoted has NO timestamp and is never throttled. That
+                // is why this is an Option check and not `unwrap_or(0.0)`: `now` is
+                // TAPE time, which starts near zero, so a 0.0 default would throttle
+                // the very first quote of every side.
+                //
+                // INVARIANT for the P4 fill path: a FILL must clear last_quote_ts
+                // for its key, so a filled side re-quotes at once instead of
+                // serving out a re-entry throttle. The quoter has no fill path
+                // today; whoever adds one owns this.
+                if let Some(&last) = self.last_quote_ts.get(&key) {
+                    if now - last < self.min_requote_s {
                         continue;
                     }
                 }
@@ -370,5 +389,92 @@ impl Quoter {
                 self.last_quote_ts.insert(key, now);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Level;
+    use crate::scan::RelLeg;
+
+    fn lvl(p: &str, s: &str) -> Level {
+        Level { price: p.into(), size: s.into() }
+    }
+
+    /// The fixture from tests/test_intent_replay.py: a cross-venue pair whose
+    /// Kalshi bid funds a PM-US maker YES-bid one tick inside.
+    fn fixture() -> (Cx, FeeSchedule, BookBuilder, Quoter) {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let mut bb = BookBuilder::new();
+        // K deep bid 0.60 => hedging NO costs 0.40
+        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.60", "500")],
+                          vec![lvl("0.99", "1")], 1, 1_000_000_000, None);
+        let rel = Rel {
+            id: "xv-test".into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: "K".into() },
+                RelLeg { venue: Venue::PolymarketUs, market_id: "P".into() },
+            ],
+        };
+        (cx, fees, bb, Quoter::new(rel))
+    }
+
+    fn pm_bid(bb: &mut BookBuilder, px: &str, seq: u64, ts_ns: i64) {
+        bb.apply_snapshot(Venue::PolymarketUs, "P", vec![lvl(px, "500")],
+                          vec![lvl("0.99", "1")], seq, ts_ns, None);
+    }
+
+    /// `now` is TAPE time, which starts near zero. A side that has never been
+    /// quoted has no timestamp and must not be throttled — an `unwrap_or(0.0)`
+    /// default would suppress the very first quote of every side.
+    #[test]
+    fn the_first_quote_of_a_side_is_never_throttled() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0u64;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        // tape time 2.0 is well inside min_requote_s (15.0)
+        q.on_book(&mut cx, &fees, &bb, 2.0, &mut oid, &mut intents);
+        assert_eq!(intents.len(), 1, "first quote suppressed: {intents:?}");
+        assert!(intents[0].contains(r#""place":"P""#), "{}", intents[0]);
+    }
+
+    /// card 6fb469da (the fraalb sawtooth): the throttle applies to RE-ENTRY
+    /// after a cancel, not just to repricing a resting quote.
+    #[test]
+    fn re_entry_after_a_cancel_is_throttled_then_allowed() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0u64;
+
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(intents.len(), 1, "expected the entry place: {intents:?}");
+
+        // K bid collapses => the PM maker quote is unviable => prompt cancel
+        intents.clear();
+        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.30", "500")],
+                          vec![lvl("0.99", "1")], 2, 101_000_000_000, None);
+        q.on_book(&mut cx, &fees, &bb, 101.0, &mut oid, &mut intents);
+        assert!(intents.iter().any(|i| i.contains(r#""cancel":"P""#)),
+                "cancel must stay prompt: {intents:?}");
+
+        // K recovers 1s later: viable again, but re-entry is inside the throttle
+        intents.clear();
+        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.60", "500")],
+                          vec![lvl("0.99", "1")], 3, 102_000_000_000, None);
+        q.on_book(&mut cx, &fees, &bb, 102.0, &mut oid, &mut intents);
+        assert!(intents.is_empty(), "re-entry must be throttled: {intents:?}");
+
+        // past min_requote_s from the last placement, re-entry is allowed
+        intents.clear();
+        pm_bid(&mut bb, "0.30", 2, 120_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 120.0, &mut oid, &mut intents);
+        assert!(intents.iter().any(|i| i.contains(r#""place":"P""#)),
+                "re-entry must resume after the throttle: {intents:?}");
     }
 }
