@@ -3,7 +3,7 @@
 //! chunked 150-slug subscriptions, or credential-free REST polling.
 //! Transliteration of record/polymarket_us.py + the recorder tasks.
 
-use crate::core::{dec_string, Core, SeqCounter};
+use crate::core::{dec_string, Core, SeqCounter, STALL_RECONNECT_S};
 use crate::health::Liveness;
 use crate::sign::PmusSigner;
 use anyhow::Result;
@@ -195,15 +195,22 @@ async fn ws_session(
     }
     liveness.beat("polymarket_us-ws");
     let mut seq = SeqCounter::default();
+    let mut last_frame = tokio::time::Instant::now();
     loop {
         let frame = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
             Err(_) => {
-                liveness.beat("polymarket_us-ws"); // connection health
+                // Deliberately NOT a liveness beat — see STALL_RECONNECT_S.
+                if last_frame.elapsed() > Duration::from_secs(STALL_RECONNECT_S) {
+                    anyhow::bail!(
+                        "no frame in {STALL_RECONNECT_S}s — socket is half-open, reconnecting"
+                    );
+                }
                 continue;
             }
             Ok(None) => anyhow::bail!("ws closed"),
             Ok(Some(f)) => f?,
         };
+        last_frame = tokio::time::Instant::now();
         liveness.beat("polymarket_us-ws");
         let text = match frame {
             tokio_tungstenite::tungstenite::Message::Text(t) => t,

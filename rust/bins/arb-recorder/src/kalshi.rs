@@ -10,7 +10,7 @@
 //!   for the shared BookBuilder (2026-07-20 incident).
 //! - trades get their own `|tape` seq stream (traded-markets-die bug).
 
-use crate::core::{dec_string, Core, SeqCounter};
+use crate::core::{dec_string, Core, SeqCounter, STALL_RECONNECT_S};
 use crate::health::Liveness;
 use crate::sign::KalshiSigner;
 use anyhow::Result;
@@ -259,6 +259,7 @@ async fn ws_session(
     let mut sid_seq: HashMap<i64, i64> = HashMap::new();
     let mut mseq = SeqCounter::default();
     let mut last_resnap = tokio::time::Instant::now();
+    let mut last_frame = tokio::time::Instant::now();
 
     loop {
         if last_resnap.elapsed() > Duration::from_secs(300) && !sid_seq.is_empty() {
@@ -268,13 +269,20 @@ async fn ws_session(
         }
         let frame = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
             Err(_) => {
-                // quiet market, connection healthy (tungstenite answers pings)
-                liveness.beat("kalshi-ws");
+                // Deliberately NOT a liveness beat. Beating here made a dead
+                // socket look healthy forever; the tracker must report what the
+                // feed actually delivered.
+                if last_frame.elapsed() > Duration::from_secs(STALL_RECONNECT_S) {
+                    anyhow::bail!(
+                        "no frame in {STALL_RECONNECT_S}s — socket is half-open, reconnecting"
+                    );
+                }
                 continue;
             }
             Ok(None) => anyhow::bail!("ws closed"),
             Ok(Some(f)) => f?,
         };
+        last_frame = tokio::time::Instant::now();
         liveness.beat("kalshi-ws");
         let text = match frame {
             tokio_tungstenite::tungstenite::Message::Text(t) => t,

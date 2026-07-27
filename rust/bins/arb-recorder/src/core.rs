@@ -98,3 +98,22 @@ impl Core {
         self.inner.lock().expect("core lock").gap_count
     }
 }
+
+/// Reconnect if the socket delivers NOTHING for this long.
+///
+/// Two bugs made this necessary, and they hid each other:
+///
+///  1. A 5s read timeout returned "no frame" and the loop continued forever.
+///     On a HALF-OPEN socket — TCP alive, server silent, writes still
+///     succeeding into the void — nothing ever errored, so the session never
+///     reconnected. That is the 959-second PM-intl outage on 2026-07-25.
+///
+///  2. Kalshi and PM-US additionally beat the liveness tracker ON THE TIMEOUT,
+///     reasoning that a quiet market is healthy. That makes a dead socket
+///     report perfectly healthy forever and is why those two venues showed a
+///     spotless zero-stale record that could not be trusted.
+///
+/// Silence is only ambiguous on a quiet feed, and these are not quiet: the
+/// recorded days run ~7 events/s on Kalshi, ~87/s on PM-intl and ~140/s on
+/// PM-US. A full minute of nothing is a dead socket, not a lull.
+pub const STALL_RECONNECT_S: u64 = 60;

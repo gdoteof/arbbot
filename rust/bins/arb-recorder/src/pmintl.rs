@@ -3,7 +3,7 @@
 //! REST re-snapshot, periodic 300s integrity re-snapshot.
 //! Transliteration of record/polymarket.py + polymarket_ws_task.
 
-use crate::core::{dec_string, Core, SeqCounter};
+use crate::core::{dec_string, Core, SeqCounter, STALL_RECONNECT_S};
 use crate::health::Liveness;
 use anyhow::Result;
 use arb_core::dec::Dec;
@@ -194,6 +194,8 @@ impl ClobRest {
     }
 }
 
+
+
 pub async fn ws_task(
     core: Arc<Core>,
     liveness: Arc<Liveness>,
@@ -226,9 +228,17 @@ async fn ws_session(
     let mut seq = SeqCounter::default();
     let mut last_ping = tokio::time::Instant::now();
     let mut last_resnap = tokio::time::Instant::now();
+    let mut last_frame = tokio::time::Instant::now();
     loop {
         let frame = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
-            Err(_) => None,
+            Err(_) => {
+                if last_frame.elapsed() > Duration::from_secs(STALL_RECONNECT_S) {
+                    anyhow::bail!(
+                        "no frame in {STALL_RECONNECT_S}s — socket is half-open, reconnecting"
+                    );
+                }
+                None
+            }
             Ok(None) => anyhow::bail!("ws closed"),
             Ok(Some(f)) => Some(f?),
         };
@@ -237,6 +247,7 @@ async fn ws_session(
             last_ping = tokio::time::Instant::now();
         }
         if let Some(frame) = frame {
+            last_frame = tokio::time::Instant::now();
             liveness.beat("polymarket-ws");
             let text = match frame {
                 Message::Text(t) => t,
