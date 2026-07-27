@@ -1092,18 +1092,34 @@ function render(){
 /* --------------------------------------------------------------------------
    ACTIONS — asynchronous, and they write to S, never to the document
    -------------------------------------------------------------------------- */
+const series_url = (rel) => '/api/intent-series?rel=' + encodeURIComponent(rel);
+const fetchOr = (u) => json(u).catch(e => ({error: String(e.message || e)}));
+
+/* Everything this page shows lands in ONE commit, including an open
+   drill-down. Refreshing the chart separately made the table and the chart
+   change at different moments; refreshing it through a loading state made it
+   blank for the length of the request, ~45ms every 3s, which is a flicker you
+   can see. What is on screen stays on screen until its replacement is ready. */
 async function refresh(){
   const needs = NEEDS[page()]();
   const keys = Object.keys(needs);
-  const got = await Promise.all(
-    keys.map(k => json(needs[k]).catch(e => ({error: String(e.message || e)}))));
-  set(st => { keys.forEach((k,i) => { st.data[k] = got[i]; }); });
+  const open = S.expanded;
+  const jobs = keys.map(k => fetchOr(needs[k]));
+  if(open) jobs.push(fetchOr(series_url(open)));
+  const got = await Promise.all(jobs);
+  set(st => {
+    keys.forEach((k,i) => { st.data[k] = got[i]; });
+    // Only if it is still the open one — the row may have been switched while
+    // this was in flight.
+    if(open && st.expanded === open) st.series[open] = got[keys.length];
+  });
 }
 
+/* The loading state is for the FIRST open, where there is genuinely nothing to
+   show. A refresh of something already on screen must never pass through it. */
 async function loadSeries(rel){
-  set(st => { st.series[rel] = {loading:true}; });
-  const d = await json('/api/intent-series?rel=' + encodeURIComponent(rel))
-              .catch(e => ({error: String(e.message || e)}));
+  if(!S.series[rel]) set(st => { st.series[rel] = {loading:true}; });
+  const d = await fetchOr(series_url(rel));
   set(st => { st.series[rel] = d; });
 }
 
@@ -1135,10 +1151,7 @@ function connect(){
     // The first frame is not news: the initial refresh() already read everything.
     if(!Object.keys(prev).length) return;
     const topic = TOPIC[page()] || 'books';
-    if(prev[topic] !== frame[topic]){
-      refresh();
-      if(S.expanded) loadSeries(S.expanded);   // keep an open chart honest
-    }
+    if(prev[topic] !== frame[topic]) refresh();   // refresh() carries the open chart
   };
   es.onerror = () => set(st => { st.link =
     {cls:'bad', text:'● reconnecting…', title:'the dashboard cannot reach the server'}; });
