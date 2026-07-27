@@ -491,7 +491,32 @@ fn intents_json(a: &Args) -> String {
         const MAX_REST_SPREAD: f64 = 0.05;
         let fillable = rest_spread.map_or(true, |s| s <= MAX_REST_SPREAD);
         let have_books = qa.is_some() && qb.is_some();
-        let actionable = fillable && have_books && rollup_current && best_edge > 0.0;
+
+        // Depth at the touch on the legs this route CROSSES. A rested leg
+        // needs none — we are the size there — but a taken leg is only good
+        // for what is actually resting behind the price. `None` means the
+        // tape carried no size for a leg we would have to cross, which is not
+        // permission to assume it is deep.
+        let sz = |s: Option<&arb_tob::TobSample>, ask: bool| -> Option<f64> {
+            let s = s?;
+            let v = if ask { s.ask_size.as_ref() } else { s.bid_size.as_ref() };
+            v?.parse::<f64>().ok()
+        };
+        let takes: &[Option<f64>] = match best_route {
+            "take-take" => &[sz(qa, true), sz(qb, false)],
+            "make-a-take-b" => &[sz(qb, false)],
+            "take-a-make-b" => &[sz(qa, true)],
+            _ => &[],
+        };
+        let take_depth = takes
+            .iter()
+            .try_fold(f64::INFINITY, |m: f64, d| d.map(|d| m.min(d)))
+            .filter(|d| d.is_finite());
+        const CLIP: f64 = 25.0;
+        let deep_enough = take_depth.is_some_and(|d| d >= CLIP);
+
+        let actionable =
+            fillable && deep_enough && have_books && rollup_current && best_edge > 0.0;
 
         rows.push(serde_json::json!({
             "relationship_id": rel_id,
@@ -520,6 +545,8 @@ fn intents_json(a: &Args) -> String {
             "edge_f": best_edge,
             "rest_spread": rest_spread,
             "fillable": fillable,
+            "take_depth": take_depth,
+            "deep_enough": deep_enough,
             "have_books": have_books,
             // Time since this market's book last MOVED — information about how
             // quiet it is, deliberately not a staleness flag.
@@ -545,6 +572,7 @@ fn intents_json(a: &Args) -> String {
     serde_json::json!({
         "actionable": actionable,
         "max_rest_spread": 0.05,
+        "min_take_depth": 25,
         "rollup_current": rollup_current,
         "rollup_coverage_age_s": if coverage_age_s == i64::MAX { -1 } else { coverage_age_s },
         "max_coverage_age_s": MAX_COVERAGE_AGE_S,
@@ -859,6 +887,16 @@ fn current_json(a: &Args, query: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0);
+    // How far the rollup COVERS — the same gate the intents view applies, and
+    // for the same reason. Ranking today's board off a rollup built this
+    // morning is ranking this morning's board. Per-market sample age cannot
+    // stand in for it: the series emits on change, so a quiet market's old
+    // sample is still the current book.
+    let coverage_ns = latest.values().map(|s| s.ts_local_ns).max().unwrap_or(0);
+    let coverage_age_s =
+        if coverage_ns > 0 { (now_ns - coverage_ns) / 1_000_000_000 } else { i64::MAX };
+    const MAX_COVERAGE_AGE_S: i64 = 1800;
+    let rollup_current = coverage_age_s <= MAX_COVERAGE_AGE_S;
 
     let mut cx = Cx::default();
     let sched = FeeSchedule::new(&mut cx);
@@ -876,8 +914,14 @@ fn current_json(a: &Args, query: &str) -> String {
         let ka = (la.venue.clone(), la.market_id.clone());
         let kb = (lb.venue.clone(), lb.market_id.clone());
         let (Some(sa), Some(sb)) = (latest.get(&ka), latest.get(&kb)) else { continue };
-        let qa = Quote { bid: sa.bid.clone(), ask: sa.ask.clone() };
-        let qb = Quote { bid: sb.bid.clone(), ask: sb.ask.clone() };
+        let qa = Quote {
+            bid: sa.bid.clone(), bid_size: sa.bid_size.clone(),
+            ask: sa.ask.clone(), ask_size: sa.ask_size.clone(),
+        };
+        let qb = Quote {
+            bid: sb.bid.clone(), bid_size: sb.bid_size.clone(),
+            ask: sb.ask.clone(), ask_size: sb.ask_size.clone(),
+        };
 
         let mut by_scenario = serde_json::Map::new();
         let mut chosen: Option<arb_scenario::Priced> = None;
@@ -925,10 +969,14 @@ fn current_json(a: &Args, query: &str) -> String {
         .iter()
         .filter(|v| v["priced"]["profitable"].as_bool().unwrap_or(false))
         .count();
+    // Actionable is a claim about NOW, so a rollup that stopped covering hours
+    // ago cannot produce one. Without this the board happily reported "10
+    // actionable" off 22-hour-old quotes.
     let actionable = rows
         .iter()
         .filter(|v| {
-            v["priced"]["profitable"].as_bool().unwrap_or(false)
+            rollup_current
+                && v["priced"]["profitable"].as_bool().unwrap_or(false)
                 && v["priced"]["fill_plausible"].as_bool().unwrap_or(false)
         })
         .count();
@@ -941,6 +989,9 @@ fn current_json(a: &Args, query: &str) -> String {
         "priced_pairs": total,
         "profitable": profitable,
         "actionable": actionable,
+        "rollup_current": rollup_current,
+        "rollup_coverage_age_s": if coverage_age_s == i64::MAX { -1 } else { coverage_age_s },
+        "max_coverage_age_s": MAX_COVERAGE_AGE_S,
         "max_spread": max_spread_s,
         "only_tradable": only_tradable,
         "shown": rows.len(),

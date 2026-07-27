@@ -64,10 +64,16 @@ impl Scenario {
 }
 
 /// Top of book on the YES axis for one leg.
+///
+/// Sizes are part of the quote, not decoration. A price with no size behind it
+/// is not a price you can trade: lifting a 25-lot against an ask good for 3
+/// contracts fills 3 at that price and the rest wherever the book goes.
 #[derive(Debug, Clone, Default)]
 pub struct Quote {
     pub bid: Option<String>,
+    pub bid_size: Option<String>,
     pub ask: Option<String>,
+    pub ask_size: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,14 +95,23 @@ pub struct Priced {
     /// Widest spread across the legs we intend to REST on. `None` for
     /// take-take, which rests nothing.
     pub maker_spread: Option<String>,
-    /// Whether resting at that price is a realistic fill.
+    /// Contracts resting at the touch on the legs we would TAKE — the binding
+    /// one, i.e. the smaller of the two when both legs are taken. `None` when
+    /// the tape carried no size.
+    pub take_depth: Option<String>,
+    /// Whether this basket is a realistic fill at `clip`. Two independent ways
+    /// it is not, and both have burned us:
     ///
-    /// Making is priced at the far touch, which is the OPTIMISTIC bound: you
-    /// capture the whole spread. On a tight book that is roughly right. On a
-    /// wide one it is fiction — resting an ask at 0.99 against a 0.40 bid does
-    /// not fill, and the "edge" it produces was never obtainable. Observed
-    /// 2026-07-26: the top five take-a-make-b baskets had leg-B spreads of
-    /// 0.59, 0.48, 0.39, 0.32 and 0.48, showing edges up to +0.54.
+    /// 1. MAKING is priced at the far touch, the OPTIMISTIC bound: you capture
+    ///    the whole spread. On a tight book that is roughly right. On a wide
+    ///    one it is fiction — resting an ask at 0.99 against a 0.40 bid does
+    ///    not fill. Observed 2026-07-26: the top five take-a-make-b baskets had
+    ///    leg-B spreads of 0.59, 0.48, 0.39, 0.32 and 0.48, showing edges up
+    ///    to +0.54.
+    /// 2. TAKING was treated as a certain fill at any size. It is not: the
+    ///    price is only good for the quantity resting behind it, so a clip
+    ///    larger than the touch walks the book and the edge shown was never
+    ///    available for the size shown.
     ///
     /// Ranking must not put fiction first, so callers should sort implausible
     /// rows below plausible ones rather than by raw edge.
@@ -151,6 +166,7 @@ pub fn price_at(
         edge_per_contract: edge.to_string(),
         profitable: cx.cmp(edge, zero) == std::cmp::Ordering::Greater,
         maker_spread: None,
+        take_depth: None,
         fill_plausible: true,
     })
 }
@@ -223,13 +239,46 @@ pub fn price(
     if role_b == Role::Maker {
         widest(qb, cx, &mut maker_spread);
     }
-    let fill_plausible = match maker_spread {
-        None => true, // nothing rested: take-take always fills
+    let spread_ok = match maker_spread {
+        None => true, // nothing rested
         Some(sp) => cx.cmp(sp, max_maker_spread) != std::cmp::Ordering::Greater,
     };
 
+    // Size at the touch we would cross, on each leg we TAKE. The binding
+    // constraint is the smaller one: a basket needs both fills. A leg whose
+    // size the tape did not carry is UNKNOWN, not deep — silence about size is
+    // not evidence of size, and letting the other leg's depth stand in for it
+    // is how a thin book passes for a fillable one.
+    let mut needed: Vec<Option<&String>> = Vec::new();
+    if role_a == Role::Taker {
+        needed.push(qa.ask_size.as_ref());
+    }
+    if role_b == Role::Taker {
+        needed.push(qb.bid_size.as_ref());
+    }
+    let mut take_depth: Option<D> = None;
+    let mut all_known = true;
+    for sz in needed {
+        match sz.and_then(|s| cx.parse(s)) {
+            Some(d) => {
+                take_depth = Some(match take_depth {
+                    Some(prev) if cx.cmp(prev, d) != std::cmp::Ordering::Greater => prev,
+                    _ => d,
+                })
+            }
+            None => all_known = false,
+        }
+    }
+    let depth_ok = all_known
+        && match take_depth {
+            Some(d) => cx.cmp(d, clip) != std::cmp::Ordering::Less,
+            None => false,
+        };
+    let fill_plausible = spread_ok && depth_ok;
+
     Some(Priced {
         maker_spread: maker_spread.map(|d| d.to_string()),
+        take_depth: take_depth.map(|d| d.to_string()),
         fill_plausible,
         scenario: scenario.as_str(),
         entry_a: entry_a.clone(),
@@ -247,8 +296,18 @@ pub fn price(
 mod tests {
     use super::*;
 
+    /// A book deep enough that size is not what the test is about.
     fn q(bid: &str, ask: &str) -> Quote {
-        Quote { bid: Some(bid.into()), ask: Some(ask.into()) }
+        qs(bid, "1000", ask, "1000")
+    }
+
+    fn qs(bid: &str, bid_size: &str, ask: &str, ask_size: &str) -> Quote {
+        Quote {
+            bid: Some(bid.into()),
+            bid_size: Some(bid_size.into()),
+            ask: Some(ask.into()),
+            ask_size: Some(ask_size.into()),
+        }
     }
 
     fn setup() -> (Cx, FeeSchedule, D) {
@@ -323,7 +382,7 @@ mod tests {
         assert!(!r.fill_plausible, "0.59 spread must not read as a fillable rest");
         assert!(r.profitable, "and it still LOOKS profitable, which is the trap");
 
-        // take-take rests nothing, so it is always fillable
+        // take-take rests nothing, so the spread cannot disqualify it
         let tt = price(&mut cx, &sched, Scenario::TakeTake, Venue::Kalshi,
                        Venue::PolymarketUs, &qa, &qb, clip, "politics", tight).unwrap();
         assert!(tt.maker_spread.is_none());
@@ -357,12 +416,63 @@ mod tests {
                    "posting inside the touch must show a better edge");
     }
 
+    /// Regression: ISSUE-002 — take-take claimed a certain fill at any size.
+    /// Found by /qa on 2026-07-27.
+    /// Report: .gstack/qa-reports/qa-report-arb-dash-2026-07-27.md
+    ///
+    /// The tape carries bid_size/ask_size and the pricer ignored them, so a
+    /// 25-lot "crossing" against an ask good for 3 contracts ranked top of the
+    /// board as actionable.
+    #[test]
+    fn a_thin_touch_cannot_fill_the_clip() {
+        let (mut cx, sched, wide) = setup();
+        let clip = cx.parse_exact("25");
+        // prices identical to the deep case; only the size behind them differs
+        let thin_a = qs("0.20", "1000", "0.22", "3");
+        let deep_b = q("0.80", "0.83");
+
+        let tt = price(&mut cx, &sched, Scenario::TakeTake, Venue::Kalshi,
+                       Venue::PolymarketUs, &thin_a, &deep_b, clip, "politics", wide).unwrap();
+        assert_eq!(tt.take_depth.as_deref(), Some("3"), "the binding leg is A's 3");
+        assert!(tt.profitable, "and it still LOOKS profitable, which is the trap");
+        assert!(!tt.fill_plausible, "3 contracts cannot fill a 25 clip");
+
+        // resting on A instead never crosses it, so A's thin ask is irrelevant
+        let ma = price(&mut cx, &sched, Scenario::MakeATakeB, Venue::Kalshi,
+                       Venue::PolymarketUs, &thin_a, &deep_b, clip, "politics", wide).unwrap();
+        assert_eq!(ma.take_depth.as_deref(), Some("1000"), "only leg B is taken");
+        assert!(ma.fill_plausible);
+
+        // exactly the clip is enough; one short is not
+        let exact = qs("0.20", "1000", "0.22", "25");
+        let short = qs("0.20", "1000", "0.22", "24");
+        assert!(price(&mut cx, &sched, Scenario::TakeTake, Venue::Kalshi, Venue::PolymarketUs,
+                      &exact, &deep_b, clip, "politics", wide).unwrap().fill_plausible);
+        assert!(!price(&mut cx, &sched, Scenario::TakeTake, Venue::Kalshi, Venue::PolymarketUs,
+                       &short, &deep_b, clip, "politics", wide).unwrap().fill_plausible);
+    }
+
+    /// A tape with no size cannot be used to assert a fill.
+    #[test]
+    fn unknown_depth_is_not_a_pass() {
+        let (mut cx, sched, wide) = setup();
+        let clip = cx.parse_exact("25");
+        let sizeless = Quote { bid: Some("0.20".into()), bid_size: None,
+                               ask: Some("0.22".into()), ask_size: None };
+        // leg B IS deep — the missing size on A must not be papered over by it
+        let r = price(&mut cx, &sched, Scenario::TakeTake, Venue::Kalshi,
+                      Venue::PolymarketUs, &sizeless, &q("0.80", "0.83"), clip,
+                      "politics", wide).unwrap();
+        assert!(!r.fill_plausible, "silence about size is not evidence of size");
+    }
+
     #[test]
     fn a_missing_side_yields_no_price_rather_than_a_guess() {
         let (mut cx, sched, wide) = setup();
         let clip = cx.parse_exact("25");
         // no ask on A: cannot TAKE leg A
-        let qa = Quote { bid: Some("0.20".into()), ask: None };
+        let qa = Quote { bid: Some("0.20".into()), bid_size: Some("1000".into()),
+                         ask: None, ask_size: None };
         let qb = q("0.80", "0.83");
         assert!(price(&mut cx, &sched, Scenario::TakeTake, Venue::Kalshi,
                       Venue::PolymarketUs, &qa, &qb, clip, "politics", wide).is_none());

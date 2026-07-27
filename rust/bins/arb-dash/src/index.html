@@ -467,6 +467,7 @@ const COLS=[
   ['fee_b','fee B','Per-contract fee on leg B. PM-US makers pay nothing.','n'],
   ['edge_f','post-fee edge','$1.00 − total cost, per contract. This is the number that matters.','n'],
   ['rest_spread','rest spread','Spread on the leg we rest on. A wide book means the fill is a coin flip, so the edge is not obtainable.','n'],
+  ['take_depth','take depth','Contracts resting at the touch on the leg(s) this route CROSSES. Below the clip, the price shown is only good for part of the order. "?" means the tape carried no size.','n'],
   ['reprices','reprices','Times the quote has been moved. High means the quoter is chasing, which is a cost.','n'],
   ['since_change_s','since move','Time since this book last MOVED. Not staleness — the series emits on change, so a quiet market has an old sample and a valid quote.','n'],
 ];
@@ -484,7 +485,8 @@ function intentsPanel(d){
     venue_b:r.leg_b.venue_bid,
     gross:r.priced?+r.priced.gross_cost:null, fee_a:r.priced?+r.priced.fee_a:null,
     fee_b:r.priced?+r.priced.fee_b:null, edge_f:r.edge_f,
-    rest_spread:r.rest_spread, reprices:(r.leg_a.reprices??0)+(r.leg_b.reprices??0),
+    rest_spread:r.rest_spread, take_depth:r.take_depth,
+    reprices:(r.leg_a.reprices??0)+(r.leg_b.reprices??0),
     since_change_s:r.since_change_s,
   })[k];
 
@@ -521,6 +523,7 @@ function intentsPanel(d){
       <td class="num ${e==null?'dim':(e>0?(r.actionable?'ok':'warn'):'bad')}">
         <b>${e==null?'—':(e>0?'+':'')+e.toFixed(4)}</b></td>
       <td class="num ${r.fillable?'dim':'warn'}">${r.rest_spread==null?'—':r.rest_spread.toFixed(3)}</td>
+      <td class="num ${r.deep_enough?'dim':'warn'}">${r.take_depth==null?'?':Math.floor(r.take_depth).toLocaleString()}</td>
       <td class="num dim">${(r.leg_a.reprices??0)+(r.leg_b.reprices??0)}</td>
       <td class="num dim">${dur(r.since_change_s)}</td>
     </tr>`;}).join('');
@@ -545,7 +548,8 @@ function intentsPanel(d){
       cross-now alternative. Resting on BOTH legs is not make/make: it is two entry
       points, whichever side gets hit first.<br>
       <b>Actionable</b> = positive edge, the rested leg's book within ${d.max_rest_spread},
-      both books known, and the rollup covering the last ${(d.max_coverage_age_s/60)|0} minutes.</div>
+      at least ${d.min_take_depth} contracts resting at the touch we would cross, both
+      books known, and the rollup covering the last ${(d.max_coverage_age_s/60)|0} minutes.</div>
     <div id="series-host" style="margin-top:14px"></div>
   </section>`);
 
@@ -628,7 +632,9 @@ function currentPanel(d){
       <td class="num ${e>0?(p.fill_plausible?'ok':'warn'):'bad'}">
         <b>${e>0?'+':''}${e.toFixed(4)}</b></td>
       <td class="num ${p.fill_plausible?'dim':'warn'}">${p.maker_spread!=null?Number(p.maker_spread).toFixed(3):'—'}</td>
-      <td class="num ${stale>3600?'warn':'dim'}">${stale}s</td>
+      <td class="num ${p.take_depth==null||Number(p.take_depth)<Number(d.clip)?'warn':'dim'}">
+        ${p.take_depth==null?'?':Math.floor(Number(p.take_depth)).toLocaleString()}</td>
+      <td class="num ${stale>3600?'warn':'dim'}">${dur(stale)}</td>
       <td class="dim" style="font-size:11px">${esc(alt)}</td>
     </tr>`;
   }).join('');
@@ -636,9 +642,14 @@ function currentPanel(d){
   return $(`<section class="wide">
     <h2>Current opportunities &middot; ${esc(d.day)}
       &middot; ${d.priced_pairs} priced
-      &middot; <span class="${d.profitable?'dim':'dim'}">${d.profitable} profitable</span>
+      &middot; <span class="dim">${d.profitable} profitable</span>
       &middot; <span class="${d.actionable?'ok':'warn'}">${d.actionable} actionable</span>
+      &middot; <span class="badge ${d.rollup_current?'ok':'bad'}">${d.rollup_current
+          ? 'ROLLUP CURRENT' : 'ROLLUP STALE '+dur(d.rollup_coverage_age_s)}</span>
       &middot; <span class="dim">${d.only_tradable?'tradable only':'all pairs'}</span></h2>
+    ${d.rollup_current ? '' : `<div class="warn" style="margin-bottom:8px">▲ These prices
+      are ${dur(d.rollup_coverage_age_s)} old — the rollup stopped covering then, so nothing
+      here is actionable until it is rebuilt.</div>`}
     <nav style="padding:0;border:0;margin-bottom:6px">${SCENARIOS.map(([k,l])=>tab(k,l)).join('')}</nav>
     <div class="sub" style="margin-bottom:10px">clip size:
       <nav style="display:inline-flex;padding:0;border:0">${clips}</nav>
@@ -647,7 +658,9 @@ function currentPanel(d){
     <div class="scroll"><table>
       <thead><tr><th>relationship</th><th class="num">entry A</th><th class="num">exit B</th>
         <th class="num">gross</th><th class="num">fees</th><th class="num">total</th>
-        <th class="num">edge/ct</th><th class="num">rest spread</th><th class="num">quote age</th>
+        <th class="num">edge/ct</th><th class="num">rest spread</th>
+        <th class="num" title="Contracts resting at the touch on the leg(s) this route crosses. '?' means the tape carried no size.">take depth</th>
+        <th class="num">quote age</th>
         <th>other scenarios</th></tr></thead>
       <tbody>${rows}</tbody></table></div>
     <div class="sub" style="margin-top:8px">Edge = $1.00 &minus; total cost, per contract.
@@ -655,11 +668,15 @@ function currentPanel(d){
       Making rests on the near side and pays the maker fee (Kalshi 0.0175 vs 0.07
       taker; PM-US makers pay nothing) but is not a certain fill.
       Quotes are as fresh as the ToB rollup, not as fresh as the venue.<br>
-      <b>Actionable</b> = profitable AND the leg we would rest on has a spread within
-      ${esc(d.max_spread)}. Making is priced at the FAR touch, the optimistic bound:
-      on a tight book that is about right, on a wide one it is fiction — resting an
-      ask at 0.99 against a 0.40 bid does not fill. Amber rows are profitable but
-      not plausibly fillable, and they sort below the actionable ones.</div>
+      <b>Actionable</b> = profitable, the rollup still covering the last
+      ${(d.max_coverage_age_s/60)|0} minutes, the leg we would rest on inside a spread of
+      ${esc(d.max_spread)}, AND at least ${esc(d.clip)} contracts resting at the touch we
+      would cross. Making is priced at the FAR touch, the optimistic bound: on a tight
+      book that is about right, on a wide one it is fiction — resting an ask at 0.99
+      against a 0.40 bid does not fill. Taking is not free either: the price is only
+      good for the size behind it, so a clip bigger than the touch walks the book.
+      Amber rows are profitable but not plausibly fillable, and they sort below the
+      actionable ones.</div>
   </section>`);
 }
 
