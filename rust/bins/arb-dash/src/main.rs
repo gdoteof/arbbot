@@ -48,6 +48,21 @@ use arb_tob::{build_day, series, DEFAULT_INTERVAL_NS};
 
 const PAGE: &str = include_str!("index.html");
 
+/// Polymarket INTERNATIONAL charges a taker fee that depends on the market's
+/// category: 0.00 geopolitics, 0.04 politics/finance/tech, 0.05
+/// sports/economics/culture/weather, 0.07 crypto. The scanner reads that
+/// category off the market metadata; this dashboard does not have it, and was
+/// hardcoding "politics" — which is not a neutral guess. On the 43 registry
+/// pairs with an intl leg it OVERSTATES edge on the crypto ones (btc-1m,
+/// btc-dip-10k) and the sports/weather ones (f1, earthquake, volcano, meteor),
+/// and UNDERSTATES it on the geopolitics ones (taiwan, iran, nato, putin).
+///
+/// Priced at the documented default instead, which is the same 0.04 but says
+/// what it is, and rows with an intl leg are flagged so the number is read
+/// with that caveat. The real fix is plumbing per-market category through to
+/// the dashboard.
+const FEE_CATEGORY: &str = "default";
+
 struct Args {
     kalshi_dir: String,
     pmus_dir: String,
@@ -77,11 +92,25 @@ struct Rollup {
 
 type Shared = Arc<Mutex<Rollup>>;
 
-fn rollup_status(sh: &Shared) -> String {
+/// Status of the rollup, including the part that outlives this process. The
+/// old version reported only builds from THIS session, so a fresh restart said
+/// "no build this session" over a series that had been on disk since noon —
+/// and a completed build showed its duration but never when it finished. The
+/// series is written atomically at the end of a build, so the file's mtime IS
+/// the build's completion time.
+fn rollup_status(a: &Args, sh: &Shared) -> String {
     let g = sh.lock().unwrap_or_else(|e| e.into_inner());
+    let day = integrity::build(&a.data_dir).today;
+    let built_age_s = ["kalshi", "polymarket", "polymarket_us"]
+        .iter()
+        .filter_map(|v| age_secs(&format!("{}/tob-{v}-{day}.jsonl", a.rollup_dir)))
+        .max();
     serde_json::json!({
         "running": g.running_day,
         "last": g.last,
+        "day": day,
+        "on_disk": built_age_s.is_some(),
+        "built_age_s": built_age_s,
     })
     .to_string()
 }
@@ -185,7 +214,7 @@ fn state_json(a: &Args, sh: &Shared) -> String {
         "{{\"today\":\"{day}\",\"books\":{books},\"recording\":{recording},\
          \"rollup\":{rollup},\"intents\":{intents},\"opportunities\":{opps},\
          \"pairs\":{registry},\"rollup_status\":{}}}",
-        rollup_status(sh)
+        rollup_status(a, sh)
     )
 }
 
@@ -502,7 +531,7 @@ fn intents_json(a: &Args) -> String {
                             routes: &mut serde_json::Map<String, serde_json::Value>,
                             best: &mut Option<(f64, &'static str)>| {
             let (Some(ea), Some(eb)) = (ea, eb) else { return };
-            let Some(p) = price_at(cx, &sched, label, va, vb, ra, rb, &ea, &eb, clip, "politics")
+            let Some(p) = price_at(cx, &sched, label, va, vb, ra, rb, &ea, &eb, clip, FEE_CATEGORY)
             else {
                 return;
             };
@@ -582,6 +611,9 @@ fn intents_json(a: &Args) -> String {
         rows.push(serde_json::json!({
             "relationship_id": rel_id,
             "tradable": r.tradable(&allow),
+            // Polymarket international's taker fee is category-dependent and we
+            // price it at the default; see FEE_CATEGORY.
+            "intl_leg": la.venue == "polymarket" || lb.venue == "polymarket",
             "best_route": best_route,
             "routes": routes,
             "leg_a": {
@@ -644,6 +676,7 @@ fn intents_json(a: &Args) -> String {
         "opens": st.opens, "reprices": st.reprices, "cancels": st.cancels,
         "total": st.total,
         "clip": "25",
+        "fee_category": FEE_CATEGORY,
         "maker_only": true,
         "rows": rows,
     })
@@ -717,7 +750,7 @@ fn edge_series(a: &Args, rel: &arb_registry::Relationship) -> Vec<serde_json::Va
                         cx: &mut Cx, row: &mut serde_json::Map<String, serde_json::Value>| {
             if let (Some(ea), Some(eb)) = (ea, eb) {
                 if let Some(p) =
-                    price_at(cx, &sched, "s", va, vb, ra, rb, ea, eb, clip, "politics")
+                    price_at(cx, &sched, "s", va, vb, ra, rb, ea, eb, clip, FEE_CATEGORY)
                 {
                     if let Ok(v) = p.edge_per_contract.parse::<f64>() {
                         row.insert(label.into(), serde_json::json!(v));
@@ -988,7 +1021,7 @@ fn current_json(a: &Args, query: &str) -> String {
         let mut chosen: Option<arb_scenario::Priced> = None;
         for sc in Scenario::all() {
             if let Some(p) =
-                price(&mut cx, &sched, sc, va, vb, &qa, &qb, clip, "politics", max_spread)
+                price(&mut cx, &sched, sc, va, vb, &qa, &qb, clip, FEE_CATEGORY, max_spread)
             {
                 if sc == scenario {
                     chosen = Some(p.clone());
@@ -1005,6 +1038,7 @@ fn current_json(a: &Args, query: &str) -> String {
             "relationship_id": r.id,
             "tradable": tradable,
             "verdict": r.verdict,
+            "intl_leg": la.venue == "polymarket" || lb.venue == "polymarket",
             "leg_a": format!("{}:{}", la.venue, la.market_id),
             "leg_b": format!("{}:{}", lb.venue, lb.market_id),
             "quote_age_a_s": (now_ns - sa.ts_local_ns) / 1_000_000_000,
@@ -1054,6 +1088,7 @@ fn current_json(a: &Args, query: &str) -> String {
         "rollup_coverage_age_s": if coverage_age_s == i64::MAX { -1 } else { coverage_age_s },
         "max_coverage_age_s": MAX_COVERAGE_AGE_S,
         "max_spread": max_spread_s,
+        "fee_category": FEE_CATEGORY,
         "only_tradable": only_tradable,
         "shown": rows.len(),
         "rows": rows,
@@ -1171,7 +1206,7 @@ fn handle(s: TcpStream, a: &Args, sh: &Shared) {
             if method == "POST" {
                 respond(s, "200 OK", "application/json", &rollup_start(a, sh, &query))
             } else {
-                respond(s, "200 OK", "application/json", &rollup_status(sh))
+                respond(s, "200 OK", "application/json", &rollup_status(a, sh))
             }
         }
         "/api/current" => respond(s, "200 OK", "application/json", &current_json(a, &query)),

@@ -252,17 +252,30 @@ function costChart(points, maxAgeS){
 function pairPanels(d, root){
   const r = d.relationship || {};
   const caveats = (r.caveats||[]).map(c=>`<div class="warn">▲ ${esc(c)}</div>`).join('');
+  // The badge and the footnote used to contradict each other on this very
+  // page: TRADABLE in green above "only a HUMAN verdict makes a pair
+  // tradable", on a pair vetted by an agent. The allowlist is the third
+  // possibility and it has to be named.
+  const gate = d.tradable
+    ? (d.human_vetted ? 'TRADABLE · HUMAN' : 'TRADABLE · ALLOWLIST')
+    : 'NOT TRADABLE';
   root.append($(`<section class="wide">
     <h2>${esc(d.relationship.id)}
-      &middot; <span class="badge ${d.tradable?'ok':'warn'}">${d.tradable?'TRADABLE':'NOT TRADABLE'}</span></h2>
+      &middot; <span class="badge ${d.tradable?(d.human_vetted?'ok':'warn'):'warn'}">${gate}</span></h2>
     <div class="kv"><span>direction</span><b style="font-weight:400">${esc(r.direction||'—')}</b></div>
     <div class="kv"><span>verdict</span><b>${esc(r.verdict||'—')} &middot; vetted by ${esc(r.vetted_by||'—')}</b></div>
     <div class="kv"><span>leg A</span><b>${esc(d.leg_a)} &middot; ${d.samples_a} samples</b></div>
     <div class="kv"><span>leg B</span><b>${esc(d.leg_b)} &middot; ${d.samples_b} samples</b></div>
     <div class="kv"><span>oracle risk / tranche</span><b>${esc(r.oracle_risk||'—')} / ${esc(r.tranche||'—')}</b></div>
     ${caveats}
-    <div class="sub" style="margin-top:8px">Only a HUMAN verdict makes a pair tradable;
-      agent-vetted pairs are recorded and scanned but the runner refuses to quote them.</div>
+    <div class="sub" style="margin-top:8px">${d.human_vetted
+      ? 'A HUMAN verdict opens the gate; the runner will quote this pair.'
+      : (d.tradable
+        ? 'Vetted by an AGENT, so the registry alone would not open the gate — this pair '
+          + 'is quotable only because its id is in config/tradable.yaml, which records a '
+          + 'human approval made elsewhere.'
+        : 'Agent-vetted and not allowlisted: recorded and scanned, but the runner '
+          + 'refuses to quote it.')}</div>
   </section>`));
 
   root.append($(`<section class="wide">
@@ -276,6 +289,12 @@ function pairPanels(d, root){
       <b class="${d.fresh_points_under_1?'ok':'dim'}">${d.fresh_points_under_1}</b></div>
     <div class="kv"><span>best fresh basket cost</span>
       <b>${d.best_fresh_cost!=null?'$'+d.best_fresh_cost.toFixed(4):'—'}</b></div>
+    ${d.fresh_points < 2 ? `<div class="warn" style="margin-top:8px">▲ ${d.fresh_points === 0
+        ? 'No point in this range had both legs quoting inside ' + d.fresh_max_age_s + 's,'
+        : 'Exactly one point in this range had both legs quoting inside ' + d.fresh_max_age_s
+          + 's, so there is nothing to shade between —'}
+      the line you see is entirely forward-fill. It is a picture of two books that moved
+      at different times, not of a cost anything could have been bought at.</div>` : ''}
     <div class="sub" style="margin-top:8px">Cost to open, gross of fees: lift leg A's
       ask and take the opposite side of leg B. Shading marks only points where BOTH
       legs quoted recently — grey dots are forward-filled, where one leg's quote is
@@ -320,16 +339,37 @@ const SCENARIOS = [
   ['take-a-make-b', 'take A / make B'],
 ];
 
+/* Polymarket INTERNATIONAL taker fees run 0.00 (geopolitics) to 0.07 (crypto)
+   by market category. The scanner reads that category off market metadata;
+   this dashboard has no access to it and prices every intl leg at the 0.04
+   default. That is not a neutral assumption, so rows it applies to say so. */
+function intlNote(rows){
+  const n = (rows||[]).filter(r=>r.intl_leg).length;
+  if(!n) return '';
+  return `<b>${n} row(s) have a Polymarket <i>international</i> leg (marked ⌁).</b> Its taker
+    fee depends on the market's category — 0.00 geopolitics, 0.04 politics/finance/tech,
+    0.05 sports/economics/weather, 0.07 crypto — and this view does not have the
+    per-market category, so it prices them all at the 0.04 default. Edge on a crypto or
+    sports pair is therefore overstated, and on a geopolitics pair understated.`;
+}
+
 /* The dashboard's ONLY write. POST so nothing fires it by loading a page;
    the server refuses a second concurrent build and writes atomically. */
 function rollupPanel(st, day){
   const running = st.running;
   const l = st.last;
+  // What is ON DISK is the fact that matters; "no build this session" said
+  // nothing about the series every other view is reading.
+  const age = st.built_age_s;
+  const onDisk = st.on_disk
+    ? `<span class="${age>1800?'warn':'ok'}">series for ${esc(st.day||'')} built
+       ${dur(age)} ago</span>`
+    : `<span class="bad">no series on disk for ${esc(st.day||'today')}</span>`;
   const summary = l ? (l.ok
-    ? `<span class="ok">✓ ${esc(l.day)} &middot; ${l.samples.toLocaleString()} samples from
-       ${l.events.toLocaleString()} events in ${l.elapsed_s}s</span>`
-    : `<span class="bad">✗ ${esc(l.day)}: ${esc(l.error||'failed')}</span>`)
-    : '<span class="dim">no build this session</span>';
+    ? `${onDisk} <span class="dim">&middot; last build here: ${l.samples.toLocaleString()}
+       samples from ${l.events.toLocaleString()} events in ${l.elapsed_s}s</span>`
+    : `${onDisk} <span class="bad">&middot; last build here failed: ${esc(l.error||'')}</span>`)
+    : onDisk;
   const el = $(`<section class="wide">
     <h2>Top-of-book rollup</h2>
     <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
@@ -539,6 +579,7 @@ function intentsPanel(d){
     const e=r.edge_f, p=r.priced;
     return `<tr class="irow" data-rel="${esc(r.relationship_id)}" style="cursor:pointer">
       <td><span class="rel">${esc(r.relationship_id)}</span>
+        ${r.intl_leg?'<span class="warn" title="Polymarket international leg: fee priced at the 0.04 default, not this market\'s category">⌁</span>':''}
         ${r.tradable?'':'<span class="dim">(not tradable)</span>'}</td>
       <td class="dim">${esc(ROUTE_LABEL[r.best_route]||r.best_route)}</td>
       <td class="num">${n(r.leg_a.our_bid)}</td>
@@ -577,7 +618,8 @@ function intentsPanel(d){
       points, whichever side gets hit first.<br>
       <b>Actionable</b> = positive edge, the rested leg's book within ${d.max_rest_spread},
       at least ${d.min_take_depth} contracts resting at the touch we would cross, both
-      books known, and the rollup covering the last ${(d.max_coverage_age_s/60)|0} minutes.</div>
+      books known, and the rollup covering the last ${(d.max_coverage_age_s/60)|0} minutes.<br>
+      ${intlNote(d.rows)}</div>
     <div id="series-host" style="margin-top:14px"></div>
   </section>`);
 
@@ -651,6 +693,7 @@ function currentPanel(d){
       .map(([k,l])=>`${l} ${Number(r.scenarios[k].edge_per_contract).toFixed(4)}`).join('   ');
     return `<tr>
       <td><a class="rel" href="/pair/${encodeURIComponent(r.relationship_id)}">${esc(r.relationship_id)}</a>
+          ${r.intl_leg?'<span class="warn" title="Polymarket international leg: fee priced at the 0.04 default, not this market\'s category">⌁</span>':''}
           ${r.tradable?'':'<span class="dim">(not tradable)</span>'}</td>
       <td class="num">${Number(p.entry_a).toFixed(4)}</td>
       <td class="num">${Number(p.exit_b).toFixed(4)}</td>
@@ -704,7 +747,8 @@ function currentPanel(d){
       against a 0.40 bid does not fill. Taking is not free either: the price is only
       good for the size behind it, so a clip bigger than the touch walks the book.
       Amber rows are profitable but not plausibly fillable, and they sort below the
-      actionable ones.</div>
+      actionable ones.<br>
+      ${intlNote(d.rows)}</div>
   </section>`);
 }
 
@@ -712,7 +756,9 @@ function oppsPanel(o){
   if(o.error) return $(`<section class="wide"><h2>Opportunity coverage</h2>
     <div class="err">${esc(o.error)}</div></section>`);
   const range = (o.from && o.to) ? `?from=${encodeURIComponent(o.from)}&to=${encodeURIComponent(o.to)}` : '';
-  const rows = (o.rows||[]).slice(0,25).map(r=>`<tr>
+  const SHOWN = 25;
+  const total = (o.rows||[]).length;
+  const rows = (o.rows||[]).slice(0,SHOWN).map(r=>`<tr>
       <td><a class="rel" href="/pair/${encodeURIComponent(r.relationship_id)}${range}">${esc(r.relationship_id)}</a></td>
       <td class="num">${r.observations.toLocaleString()}</td>
       <td class="num">${r.minutes_seen.toLocaleString()}</td>
@@ -721,8 +767,11 @@ function oppsPanel(o){
     </tr>`).join('');
   return $(`<section class="wide">
     <h2>Opportunity coverage &middot; ${esc(o.from)} → ${esc(o.to)}
-      &middot; ${o.days} day(s) &middot; ${o.relationships} pairs
+      &middot; ${o.days} day(s)
+      &middot; ${total>SHOWN?`top ${SHOWN} of ${o.relationships}`:`${o.relationships}`} pairs
       &middot; <span class="dim">${o.observations.toLocaleString()} obs in ${o.query_ms} ms</span></h2>
+    ${total>SHOWN?`<div class="sub" style="margin-bottom:8px">${total-SHOWN} lower-edge
+      pair(s) are not shown.</div>`:''}
     <div class="scroll"><table>
       <thead><tr><th>relationship</th><th class="num">observations</th>
         <th class="num">minutes seen</th><th class="num">best edge/ct</th>
