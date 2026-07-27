@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/arb-core", "crates/arb-tape", "crates/arb-venue", "crates/arb-ledger", "bins/bench-replay", "bins/arb-recorder", "bins/arb-golden", "bins/arb-intent", "bins/arb-trader", "bins/arb-books", "bins/arb-dash"]
+members = ["crates/arb-core", "crates/arb-tape", "crates/arb-venue", "crates/arb-ledger", "crates/arb-query", "bins/bench-replay", "bins/arb-recorder", "bins/arb-golden", "bins/arb-intent", "bins/arb-trader", "bins/arb-books", "bins/arb-dash"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

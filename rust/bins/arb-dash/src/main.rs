@@ -20,6 +20,7 @@ use arb_core::scan::Cx;
 use arb_ledger::kalshi::{Deposit, Fill, KalshiImport, Settlement};
 use arb_ledger::pmus::{Balances, PmusImport, Position};
 use arb_ledger::{accounts, report, Journal};
+use arb_query::{opps, sources_for_range};
 
 const PAGE: &str = include_str!("index.html");
 
@@ -29,6 +30,8 @@ struct Args {
     pmus_deposits: String,
     kalshi_balance: Option<String>,
     data_dir: String,
+    scan_dir: String,
+    parquet_dir: String,
     port: u16,
 }
 
@@ -83,6 +86,45 @@ fn books_json(a: &Args) -> String {
     serde_json::to_string(&rep).unwrap_or_else(|_| "{}".into())
 }
 
+fn query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key && !v.is_empty() {
+                return Some(v.replace("%3A", ":").replace('+', " "));
+            }
+        }
+    }
+    None
+}
+
+/// Opportunity coverage per vetted pair, read straight off the tape —
+/// Parquet for closed days, today's JSONL for the live one, resolved by
+/// `arb_query::source_for`. Timed and reported so a slow range is visible
+/// rather than mysterious.
+fn opps_json(a: &Args, query: &str) -> String {
+    let to = query_param(query, "to").unwrap_or_else(|| integrity::build(&a.data_dir).today);
+    let from = query_param(query, "from").unwrap_or_else(|| to.clone());
+    let rel = query_param(query, "rel");
+
+    let t0 = std::time::Instant::now();
+    let sources = sources_for_range(&a.scan_dir, &a.parquet_dir, "opportunities", &from, &to);
+    let n_sources = sources.len();
+    match opps::summarize(&sources, rel.as_deref()) {
+        Ok(rows) => {
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let obs: u64 = rows.iter().map(|r| r.observations).sum();
+            format!(
+                "{{\"from\":\"{from}\",\"to\":\"{to}\",\"days\":{n_sources},\
+                 \"relationships\":{},\"observations\":{obs},\"query_ms\":{ms:.1},\
+                 \"rows\":{}}}",
+                rows.len(),
+                serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
+            )
+        }
+        Err(e) => format!("{{\"error\":\"{}\"}}", e.replace('"', "'")),
+    }
+}
+
 fn respond(mut s: TcpStream, status: &str, ctype: &str, body: &str) {
     let out = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
@@ -104,8 +146,9 @@ fn handle(s: TcpStream, a: &Args) {
             return;
         }
     }
-    let path = line.split_whitespace().nth(1).unwrap_or("/");
-    let path = path.split('?').next().unwrap_or("/");
+    let full = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+    let path = full.split('?').next().unwrap_or("/");
+    let query = full.split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
     match path {
         "/" => respond(s, "200 OK", "text/html; charset=utf-8", PAGE),
         "/api/books" => respond(s, "200 OK", "application/json", &books_json(a)),
@@ -114,6 +157,7 @@ fn handle(s: TcpStream, a: &Args) {
             let body = serde_json::to_string(&i).unwrap_or_else(|_| "{}".into());
             respond(s, "200 OK", "application/json", &body)
         }
+        "/api/opportunities" => respond(s, "200 OK", "application/json", &opps_json(a, &query)),
         _ => respond(s, "404 Not Found", "text/plain", "not found"),
     }
 }
@@ -125,6 +169,8 @@ fn main() {
         pmus_deposits: String::new(),
         kalshi_balance: None,
         data_dir: "data".into(),
+        scan_dir: "data/scan".into(),
+        parquet_dir: "data/parquet".into(),
         port: 4749,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -137,6 +183,8 @@ fn main() {
             "--pmus-deposits" => a.pmus_deposits = v,
             "--kalshi-balance" => a.kalshi_balance = Some(v),
             "--data-dir" => a.data_dir = v,
+            "--scan-dir" => a.scan_dir = v,
+            "--parquet-dir" => a.parquet_dir = v,
             "--port" => a.port = v.parse().unwrap_or(4749),
             other => {
                 eprintln!("unknown arg: {other}");

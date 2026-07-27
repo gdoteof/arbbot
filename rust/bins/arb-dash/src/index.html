@@ -142,12 +142,39 @@ function accountsPanel(as_){
   </section>`);
 }
 
+function oppsPanel(o){
+  if(o.error) return $(`<section class="wide"><h2>Opportunity coverage</h2>
+    <div class="err">${esc(o.error)}</div></section>`);
+  const rows = (o.rows||[]).slice(0,25).map(r=>`<tr>
+      <td>${esc(r.relationship_id)}</td>
+      <td class="num">${r.observations.toLocaleString()}</td>
+      <td class="num">${r.minutes_seen.toLocaleString()}</td>
+      <td class="num ok">${r.best_edge_per_contract.toFixed(4)}</td>
+      <td class="num dim">${Math.round(r.best_size).toLocaleString()}</td>
+    </tr>`).join('');
+  return $(`<section class="wide">
+    <h2>Opportunity coverage &middot; ${esc(o.from)} → ${esc(o.to)}
+      &middot; ${o.days} day(s) &middot; ${o.relationships} pairs
+      &middot; <span class="dim">${o.observations.toLocaleString()} obs in ${o.query_ms} ms</span></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>relationship</th><th class="num">observations</th>
+        <th class="num">minutes seen</th><th class="num">best edge/ct</th>
+        <th class="num">best size</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <div class="sub" style="margin-top:8px">Read straight off the tape — Parquet for
+      closed days, live JSONL for today. Observations are logged ticks, not distinct
+      episodes: the scan log only records ticks already past the edge bar, so a
+      standing dislocation counts many times.</div>
+  </section>`);
+}
+
 async function load(){
   const root = document.getElementById('root');
   try{
-    const [b, iv] = await Promise.all([
+    const [b, iv, op] = await Promise.all([
       fetch('/api/books').then(r=>r.json()),
-      fetch('/api/integrity').then(r=>r.json()).catch(()=>({}))
+      fetch('/api/integrity').then(r=>r.json()).catch(()=>({})),
+      fetch('/api/opportunities').then(r=>r.json()).catch(e=>({error:String(e)}))
     ]);
     if(b.error){ root.innerHTML = `<section class="wide err">${esc(b.error)}</section>`; return; }
     document.getElementById('meta').innerHTML =
@@ -158,6 +185,7 @@ async function load(){
     root.append(statement(b.statement));
     root.append(reconPanel(b.reconciliations));
     root.append(integrityPanel(iv));
+    root.append(oppsPanel(op));
     root.append(positionsPanel(b.positions||[]));
     root.append(accountsPanel(b.accounts||[]));
   }catch(e){
