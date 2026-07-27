@@ -208,3 +208,31 @@ mod tests {
         let _ = std::fs::remove_file(p);
     }
 }
+
+/// Latest sample per (venue, market) across the given files — the "current"
+/// book as of the last rollup build. Callers MUST surface the sample age: this
+/// is as fresh as the rollup, not as fresh as the venue.
+pub fn latest_by_market(
+    paths: &[String],
+) -> std::collections::HashMap<(String, String), TobSample> {
+    let mut out: std::collections::HashMap<(String, String), TobSample> =
+        std::collections::HashMap::new();
+    for p in paths {
+        let Ok(text) = std::fs::read_to_string(p) else { continue };
+        for line in text.lines() {
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let Ok(s) = serde_json::from_str::<TobSample>(t) else { continue };
+            let key = (s.venue.clone(), s.market_id.clone());
+            match out.get(&key) {
+                Some(cur) if cur.ts_local_ns >= s.ts_local_ns => {}
+                _ => {
+                    out.insert(key, s);
+                }
+            }
+        }
+    }
+    out
+}

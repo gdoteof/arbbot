@@ -11,3 +11,4 @@ arb-ledger = { path = "../../crates/arb-ledger" }
 arb-query = { path = "../../crates/arb-query" }
 arb-tob = { path = "../../crates/arb-tob" }
 arb-registry = { path = "../../crates/arb-registry" }
+arb-scenario = { path = "../../crates/arb-scenario" }

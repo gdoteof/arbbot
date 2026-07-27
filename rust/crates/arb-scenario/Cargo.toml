@@ -1,0 +1,8 @@
+[package]
+name = "arb-scenario"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+arb-core = { path = "../arb-core" }

@@ -41,6 +41,8 @@
   .scroll{overflow-x:auto}
   .err{color:var(--bad);padding:12px}
   code{color:var(--accent)}
+  a.rel{color:var(--accent);text-decoration:none}
+  a.rel:hover{text-decoration:underline}
   nav{display:flex;gap:2px;padding:0 24px;border-bottom:1px solid var(--line);flex-wrap:wrap}
   nav a{color:var(--dim);text-decoration:none;padding:8px 14px;font-size:12px;
     letter-spacing:.06em;text-transform:uppercase;border-bottom:2px solid transparent}
@@ -261,7 +263,7 @@ function pairPanels(d, root){
 function pairsPanel(d){
   if(d.error) return $(`<section class="wide"><h2>Pairs</h2><div class="err">${esc(d.error)}</div></section>`);
   const rows=(d.rows||[]).map(r=>`<tr>
-      <td><a href="/pair/${encodeURIComponent(r.id)}" style="color:var(--accent)">${esc(r.id)}</a></td>
+      <td><a class="rel" href="/pair/${encodeURIComponent(r.id)}">${esc(r.id)}</a></td>
       <td>${esc(r.verdict||'—')}</td>
       <td>${esc(r.vetted_by||'—')}${r.tradable && !r.human_vetted ? ' <span class="dim">+allowlist</span>' : ''}</td>
       <td class="num ${r.tradable?'ok':'dim'}">${r.tradable?'yes':'no'}</td>
@@ -277,11 +279,87 @@ function pairsPanel(d){
   </section>`);
 }
 
+
+const SCENARIOS = [
+  ['take-take',     'take / take'],
+  ['make-a-take-b', 'make A / take B'],
+  ['take-a-make-b', 'take A / make B'],
+];
+
+function currentPanel(d){
+  if(d.error) return $(`<section class="wide"><h2>Current opportunities</h2>
+    <div class="err">${esc(d.error)}</div></section>`);
+  const qs = new URLSearchParams(location.search);
+  const tab = (k,l) => {
+    const q = new URLSearchParams(qs); q.set('scenario', k);
+    return `<a href="/current?${q}" class="${d.scenario===k?'on':''}">${l}</a>`;
+  };
+  const uq = new URLSearchParams(qs);
+  if(d.only_tradable) uq.set('all','1'); else uq.delete('all');
+  const universe = `<a href="/current?${uq}">${d.only_tradable?'show non-tradable too':'tradable only'}</a>`;
+  const clips = [1,5,25,100].map(c=>{
+    const q = new URLSearchParams(qs); q.set('clip', c);
+    return `<a href="/current?${q}" class="${String(d.clip)===String(c)?'on':''}">${c}</a>`;
+  }).join('');
+
+  const rows = (d.rows||[]).map(r=>{
+    const p = r.priced, e = Number(p.edge_per_contract);
+    const stale = Math.max(r.quote_age_a_s, r.quote_age_b_s);
+    // every scenario priced, so the alternatives are visible on the same row
+    const alt = SCENARIOS.filter(([k])=>k!==d.scenario && r.scenarios[k])
+      .map(([k,l])=>`${l} ${Number(r.scenarios[k].edge_per_contract).toFixed(4)}`).join('   ');
+    return `<tr>
+      <td><a class="rel" href="/pair/${encodeURIComponent(r.relationship_id)}">${esc(r.relationship_id)}</a>
+          ${r.tradable?'':'<span class="dim">(not tradable)</span>'}</td>
+      <td class="num">${Number(p.entry_a).toFixed(4)}</td>
+      <td class="num">${Number(p.exit_b).toFixed(4)}</td>
+      <td class="num dim">${Number(p.gross_cost).toFixed(4)}</td>
+      <td class="num dim">${(Number(p.fee_a)+Number(p.fee_b)).toFixed(4)}</td>
+      <td class="num">${Number(p.total_cost).toFixed(4)}</td>
+      <td class="num ${e>0?(p.fill_plausible?'ok':'warn'):'bad'}">
+        <b>${e>0?'+':''}${e.toFixed(4)}</b></td>
+      <td class="num ${p.fill_plausible?'dim':'warn'}">${p.maker_spread!=null?Number(p.maker_spread).toFixed(3):'—'}</td>
+      <td class="num ${stale>3600?'warn':'dim'}">${stale}s</td>
+      <td class="dim" style="font-size:11px">${esc(alt)}</td>
+    </tr>`;
+  }).join('');
+
+  return $(`<section class="wide">
+    <h2>Current opportunities &middot; ${esc(d.day)}
+      &middot; ${d.priced_pairs} priced
+      &middot; <span class="${d.profitable?'dim':'dim'}">${d.profitable} profitable</span>
+      &middot; <span class="${d.actionable?'ok':'warn'}">${d.actionable} actionable</span>
+      &middot; <span class="dim">${d.only_tradable?'tradable only':'all pairs'}</span></h2>
+    <nav style="padding:0;border:0;margin-bottom:6px">${SCENARIOS.map(([k,l])=>tab(k,l)).join('')}</nav>
+    <div class="sub" style="margin-bottom:10px">clip size:
+      <nav style="display:inline-flex;padding:0;border:0">${clips}</nav>
+      &mdash; Kalshi ceils its fee to the cent PER ORDER, so per-contract cost
+      genuinely changes with clip. &nbsp;&middot;&nbsp; ${universe}</div>
+    <div class="scroll"><table>
+      <thead><tr><th>relationship</th><th class="num">entry A</th><th class="num">exit B</th>
+        <th class="num">gross</th><th class="num">fees</th><th class="num">total</th>
+        <th class="num">edge/ct</th><th class="num">rest spread</th><th class="num">quote age</th>
+        <th>other scenarios</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+    <div class="sub" style="margin-top:8px">Edge = $1.00 &minus; total cost, per contract.
+      Buy YES on leg A, buy NO on leg B; the basket pays $1.00 either way.
+      Making rests on the near side and pays the maker fee (Kalshi 0.0175 vs 0.07
+      taker; PM-US makers pay nothing) but is not a certain fill.
+      Quotes are as fresh as the ToB rollup, not as fresh as the venue.<br>
+      <b>Actionable</b> = profitable AND the leg we would rest on has a spread within
+      ${esc(d.max_spread)}. Making is priced at the FAR touch, the optimistic bound:
+      on a tight book that is about right, on a wide one it is fiction — resting an
+      ask at 0.99 against a 0.40 bid does not fill. Amber rows are profitable but
+      not plausibly fillable, and they sort below the actionable ones.</div>
+  </section>`);
+}
+
 function oppsPanel(o){
   if(o.error) return $(`<section class="wide"><h2>Opportunity coverage</h2>
     <div class="err">${esc(o.error)}</div></section>`);
+  const range = (o.from && o.to) ? `?from=${encodeURIComponent(o.from)}&to=${encodeURIComponent(o.to)}` : '';
   const rows = (o.rows||[]).slice(0,25).map(r=>`<tr>
-      <td>${esc(r.relationship_id)}</td>
+      <td><a class="rel" href="/pair/${encodeURIComponent(r.relationship_id)}${range}">${esc(r.relationship_id)}</a></td>
       <td class="num">${r.observations.toLocaleString()}</td>
       <td class="num">${r.minutes_seen.toLocaleString()}</td>
       <td class="num ok">${r.best_edge_per_contract.toFixed(4)}</td>
@@ -308,6 +386,7 @@ const VIEWS = [
   {path:'/recording',     label:'Recording'},
   {path:'/opportunities', label:'Opportunities'},
   {path:'/pairs',         label:'Pairs'},
+  {path:'/current',       label:'Current'},
 ];
 
 function renderNav(active){
@@ -336,6 +415,12 @@ const ROUTES = {
     setMeta(`recording integrity &middot; ${esc(iv.today)}`);
     root.append(integrityPanel(iv));
     root.append(coveragePanel(iv));
+  },
+  '/current': async (root) => {
+    const d = await json('/api/current' + (location.search || ''));
+    setMeta(d.error ? 'no rollup' :
+      `${d.scenario} &middot; clip ${d.clip} &middot; ${d.profitable}/${d.priced_pairs} profitable`);
+    root.append(currentPanel(d));
   },
   '/pairs': async (root) => {
     const d = await json('/api/pairs');

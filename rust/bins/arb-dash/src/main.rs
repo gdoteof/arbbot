@@ -16,12 +16,15 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::exit;
 
+use arb_core::fees::FeeSchedule;
+use arb_core::model::Venue;
 use arb_core::scan::Cx;
 use arb_ledger::kalshi::{Deposit, Fill, KalshiImport, Settlement};
 use arb_ledger::pmus::{Balances, PmusImport, Position};
 use arb_ledger::{accounts, report, Journal};
 use arb_query::{opps, sources_for_range};
 use arb_registry::{Allowlist, Registry};
+use arb_scenario::{price, Quote, Scenario};
 use arb_tob::series;
 
 const PAGE: &str = include_str!("index.html");
@@ -235,6 +238,147 @@ fn pair_json(a: &Args, query: &str) -> String {
     .to_string()
 }
 
+fn venue_of(s: &str) -> Option<Venue> {
+    match s {
+        "kalshi" => Some(Venue::Kalshi),
+        "polymarket" => Some(Venue::Polymarket),
+        "polymarket_us" => Some(Venue::PolymarketUs),
+        _ => None,
+    }
+}
+
+/// Top N baskets by edge under a chosen execution style.
+///
+/// Ranked on CURRENT quotes — the latest sample in the ToB rollup — so every
+/// row carries its quote age. This is as fresh as the rollup, not as fresh as
+/// the venue, and saying so is the difference between an instrument and a lie.
+///
+/// Every scenario is priced for every pair, so switching the view is a re-sort
+/// rather than a re-read, and a pair that is unprofitable to take but
+/// profitable to make is visible as such.
+fn current_json(a: &Args, query: &str) -> String {
+    let scenario = query_param(query, "scenario")
+        .and_then(|s| Scenario::parse(&s))
+        .unwrap_or(Scenario::TakeTake);
+    let clip_s = query_param(query, "clip").unwrap_or_else(|| "25".into());
+    let n: usize = query_param(query, "n").and_then(|s| s.parse().ok()).unwrap_or(25);
+    let day = query_param(query, "day").unwrap_or_else(|| integrity::build(&a.data_dir).today);
+    // Default to the permitted universe. Detected-but-not-permitted edge is
+    // genuinely worth seeing (it is the case for vetting a pair), but it should
+    // be asked for, not ranked first by default.
+    let only_tradable = query_param(query, "all").as_deref() != Some("1");
+
+    let reg = match Registry::load(&a.registry) {
+        Ok(r) => r,
+        Err(e) => return format!("{{\"error\":\"{}\"}}", e.replace('"', "'")),
+    };
+    let allow = Allowlist::load(&a.tradable);
+
+    let paths: Vec<String> = ["kalshi", "polymarket", "polymarket_us"]
+        .iter()
+        .map(|v| format!("{}/tob-{v}-{day}.jsonl", a.rollup_dir))
+        .filter(|p| std::path::Path::new(p).is_file())
+        .collect();
+    if paths.is_empty() {
+        return format!(
+            "{{\"error\":\"no ToB rollup for {day} — run arb-tob --day {day}\"}}"
+        );
+    }
+    let latest = series::latest_by_market(&paths);
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+
+    let mut cx = Cx::default();
+    let sched = FeeSchedule::new(&mut cx);
+    let clip = cx.parse_exact(&clip_s);
+    let max_spread_s = query_param(query, "max_spread").unwrap_or_else(|| "0.05".into());
+    let max_spread = cx.parse_exact(&max_spread_s);
+
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for r in &reg.relationships {
+        if r.legs.len() != 2 {
+            continue;
+        }
+        let (la, lb) = (&r.legs[0], &r.legs[1]);
+        let (Some(va), Some(vb)) = (venue_of(&la.venue), venue_of(&lb.venue)) else { continue };
+        let ka = (la.venue.clone(), la.market_id.clone());
+        let kb = (lb.venue.clone(), lb.market_id.clone());
+        let (Some(sa), Some(sb)) = (latest.get(&ka), latest.get(&kb)) else { continue };
+        let qa = Quote { bid: sa.bid.clone(), ask: sa.ask.clone() };
+        let qb = Quote { bid: sb.bid.clone(), ask: sb.ask.clone() };
+
+        let mut by_scenario = serde_json::Map::new();
+        let mut chosen: Option<arb_scenario::Priced> = None;
+        for sc in Scenario::all() {
+            if let Some(p) =
+                price(&mut cx, &sched, sc, va, vb, &qa, &qb, clip, "politics", max_spread)
+            {
+                if sc == scenario {
+                    chosen = Some(p.clone());
+                }
+                by_scenario.insert(sc.as_str().into(), serde_json::to_value(&p).unwrap());
+            }
+        }
+        let Some(p) = chosen else { continue };
+        let tradable = r.tradable(&allow);
+        if only_tradable && !tradable {
+            continue;
+        }
+        rows.push(serde_json::json!({
+            "relationship_id": r.id,
+            "tradable": tradable,
+            "verdict": r.verdict,
+            "leg_a": format!("{}:{}", la.venue, la.market_id),
+            "leg_b": format!("{}:{}", lb.venue, lb.market_id),
+            "quote_age_a_s": (now_ns - sa.ts_local_ns) / 1_000_000_000,
+            "quote_age_b_s": (now_ns - sb.ts_local_ns) / 1_000_000_000,
+            "edge_per_contract": p.edge_per_contract,
+            "priced": p,
+            "scenarios": by_scenario,
+        }));
+    }
+
+    // Plausible fills first, THEN by edge. Sorting on raw edge alone puts
+    // un-fillable wide-spread rests at the top, which is exactly backwards for
+    // a view whose job is to say what to trade.
+    rows.sort_by(|x, y| {
+        let ok = |v: &serde_json::Value| v["priced"]["fill_plausible"].as_bool().unwrap_or(false);
+        let f = |v: &serde_json::Value| {
+            v["edge_per_contract"].as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(f64::MIN)
+        };
+        ok(y).cmp(&ok(x)).then(f(y).partial_cmp(&f(x)).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let total = rows.len();
+    let profitable = rows
+        .iter()
+        .filter(|v| v["priced"]["profitable"].as_bool().unwrap_or(false))
+        .count();
+    let actionable = rows
+        .iter()
+        .filter(|v| {
+            v["priced"]["profitable"].as_bool().unwrap_or(false)
+                && v["priced"]["fill_plausible"].as_bool().unwrap_or(false)
+        })
+        .count();
+    rows.truncate(n);
+
+    serde_json::json!({
+        "day": day,
+        "scenario": scenario.as_str(),
+        "clip": clip_s,
+        "priced_pairs": total,
+        "profitable": profitable,
+        "actionable": actionable,
+        "max_spread": max_spread_s,
+        "only_tradable": only_tradable,
+        "shown": rows.len(),
+        "rows": rows,
+    })
+    .to_string()
+}
+
 /// Inclusive YYYY-MM-DD range. Capped so a careless URL cannot ask the server
 /// to stat thousands of files.
 fn day_range(from: &str, to: &str) -> Vec<String> {
@@ -320,7 +464,7 @@ fn handle(s: TcpStream, a: &Args) {
         // router picks the view from the path and fetches ONLY that view's
         // endpoints, which is the point — a single page would fan out to
         // every endpoint on every load as views are added.
-        "/" | "/recording" | "/opportunities" | "/pairs" => {
+        "/" | "/recording" | "/opportunities" | "/pairs" | "/current" => {
             respond(s, "200 OK", "text/html; charset=utf-8", PAGE)
         }
         "/api/books" => respond(s, "200 OK", "application/json", &books_json(a)),
@@ -331,6 +475,7 @@ fn handle(s: TcpStream, a: &Args) {
         }
         "/api/opportunities" => respond(s, "200 OK", "application/json", &opps_json(a, &query)),
         "/api/pairs" => respond(s, "200 OK", "application/json", &pairs_json(a)),
+        "/api/current" => respond(s, "200 OK", "application/json", &current_json(a, &query)),
         "/api/pair" => respond(s, "200 OK", "application/json", &pair_json(a, &query)),
         _ => respond(s, "404 Not Found", "text/plain", "not found"),
     }

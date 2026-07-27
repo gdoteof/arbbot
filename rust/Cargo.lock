@@ -58,6 +58,7 @@ dependencies = [
  "arb-ledger",
  "arb-query",
  "arb-registry",
+ "arb-scenario",
  "arb-tob",
  "serde",
  "serde_json",
@@ -129,6 +130,14 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_yaml",
+]
+
+[[package]]
+name = "arb-scenario"
+version = "0.1.0"
+dependencies = [
+ "arb-core",
+ "serde",
 ]
 
 [[package]]
