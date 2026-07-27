@@ -167,6 +167,116 @@ function coveragePanel(iv){
   </section>`);
 }
 
+
+/* Hand-rolled inline SVG. A localhost instrument does not justify a charting
+   dependency, and the existing Python dash already draws this way. */
+function costChart(points, maxAgeS){
+  const maxAge = (maxAgeS||300) * 1e9;
+  const fresh = p => p.age_a_ns != null && p.age_b_ns != null &&
+                     p.age_a_ns <= maxAge && p.age_b_ns <= maxAge;
+  const pts = points.filter(p => p.basket_cost != null);
+  if(!pts.length) return '<div class="dim" style="padding:24px 0">no overlapping quotes in range</div>';
+  const W=1100, H=280, PL=54, PR=14, PT=14, PB=26;
+  const xs = pts.map(p=>p.ts_local_ns);
+  const ys = pts.map(p=>p.basket_cost);
+  const x0=Math.min(...xs), x1=Math.max(...xs);
+  let y0=Math.min(...ys, 1.0), y1=Math.max(...ys, 1.0);
+  const pad=(y1-y0)*0.08 || 0.02; y0-=pad; y1+=pad;
+  const sx = t => PL + (W-PL-PR) * (x1===x0 ? 0.5 : (t-x0)/(x1-x0));
+  const sy = v => PT + (H-PT-PB) * (1 - (v-y0)/(y1-y0));
+  const line = pts.map((p,i)=>`${i?'L':'M'}${sx(p.ts_local_ns).toFixed(1)},${sy(p.basket_cost).toFixed(1)}`).join('');
+  const yOne = sy(1.0);
+  // Shade below $1.00 — that band IS the arb, gross of fees.
+  // Shade only where BOTH legs were fresh. A forward-filled point is drawn as
+  // a line but never as claimed arbitrage.
+  const fp = pts.filter(fresh);
+  const area = fp.length ? `M${sx(fp[0].ts_local_ns).toFixed(1)},${yOne} ` +
+    fp.map(p=>`L${sx(p.ts_local_ns).toFixed(1)},${Math.max(sy(p.basket_cost),0).toFixed(1)}`).join('') +
+    ` L${sx(fp[fp.length-1].ts_local_ns).toFixed(1)},${yOne} Z` : '';
+  const dots = pts.filter(p=>!fresh(p)).map(p=>
+    `<circle cx="${sx(p.ts_local_ns).toFixed(1)}" cy="${sy(p.basket_cost).toFixed(1)}" r="1.6"
+       fill="var(--dim)" opacity="0.7"/>`).join('');
+  const ticks=[y0,(y0+y1)/2,y1,1.0].map(v=>
+    `<line x1="${PL}" x2="${W-PR}" y1="${sy(v).toFixed(1)}" y2="${sy(v).toFixed(1)}"
+       stroke="var(--line)" stroke-dasharray="${Math.abs(v-1)<1e-9?'0':'2,4'}"
+       stroke-width="${Math.abs(v-1)<1e-9?1.4:1}"/>
+     <text x="6" y="${(sy(v)+4).toFixed(1)}" fill="var(--dim)" font-size="11">$${v.toFixed(3)}</text>`).join('');
+  const t0=new Date(x0/1e6).toLocaleString(), t1=new Date(x1/1e6).toLocaleString();
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">
+    <clipPath id="below"><rect x="${PL}" y="${yOne}" width="${W-PL-PR}" height="${H}"/></clipPath>
+    ${ticks}
+    <path d="${area}" fill="var(--ok)" opacity="0.16" clip-path="url(#below)"/>
+    <path d="${line}" fill="none" stroke="var(--accent)" stroke-width="1.6"/>
+    ${dots}
+    <text x="${PL}" y="${H-6}" fill="var(--dim)" font-size="11">${esc(t0)}</text>
+    <text x="${W-PR}" y="${H-6}" fill="var(--dim)" font-size="11" text-anchor="end">${esc(t1)}</text>
+  </svg>`;
+}
+
+function pairPanels(d, root){
+  const r = d.relationship || {};
+  const caveats = (r.caveats||[]).map(c=>`<div class="warn">▲ ${esc(c)}</div>`).join('');
+  root.append($(`<section class="wide">
+    <h2>${esc(d.relationship.id)}
+      &middot; <span class="badge ${d.tradable?'ok':'warn'}">${d.tradable?'TRADABLE':'NOT TRADABLE'}</span></h2>
+    <div class="kv"><span>direction</span><b style="font-weight:400">${esc(r.direction||'—')}</b></div>
+    <div class="kv"><span>verdict</span><b>${esc(r.verdict||'—')} &middot; vetted by ${esc(r.vetted_by||'—')}</b></div>
+    <div class="kv"><span>leg A</span><b>${esc(d.leg_a)} &middot; ${d.samples_a} samples</b></div>
+    <div class="kv"><span>leg B</span><b>${esc(d.leg_b)} &middot; ${d.samples_b} samples</b></div>
+    <div class="kv"><span>oracle risk / tranche</span><b>${esc(r.oracle_risk||'—')} / ${esc(r.tranche||'—')}</b></div>
+    ${caveats}
+    <div class="sub" style="margin-top:8px">Only a HUMAN verdict makes a pair tradable;
+      agent-vetted pairs are recorded and scanned but the runner refuses to quote them.</div>
+  </section>`));
+
+  root.append($(`<section class="wide">
+    <h2>Basket cost &middot; ${esc(d.from)} → ${esc(d.to)}
+      &middot; <span class="dim">${d.points.length} aligned points</span></h2>
+    ${costChart(d.points, d.fresh_max_age_s)}
+    <div class="kv"><span>priced points</span><b>${d.priced_points}</b></div>
+    <div class="kv"><span>both legs fresh (&le; ${d.fresh_max_age_s}s)</span>
+      <b class="${d.fresh_points?'ok':'warn'}">${d.fresh_points}</b></div>
+    <div class="kv"><span>fresh &amp; under $1.00</span>
+      <b class="${d.fresh_points_under_1?'ok':'dim'}">${d.fresh_points_under_1}</b></div>
+    <div class="kv"><span>best fresh basket cost</span>
+      <b>${d.best_fresh_cost!=null?'$'+d.best_fresh_cost.toFixed(4):'—'}</b></div>
+    <div class="sub" style="margin-top:8px">Cost to open, gross of fees: lift leg A's
+      ask and take the opposite side of leg B. Shading marks only points where BOTH
+      legs quoted recently — grey dots are forward-filled, where one leg's quote is
+      stale and the cost was never simultaneously available. Trust the shaded band,
+      not the line.</div>
+  </section>`));
+
+  const o = d.opportunity;
+  root.append($(`<section class="wide">
+    <h2>Opportunity logged by the scanner</h2>
+    ${o ? `<div class="kv"><span>observations</span><b>${o.observations.toLocaleString()}</b></div>
+      <div class="kv"><span>minutes seen</span><b>${o.minutes_seen.toLocaleString()}</b></div>
+      <div class="kv"><span>best edge / contract</span><b class="ok">${o.best_edge_per_contract.toFixed(4)}</b></div>
+      <div class="kv"><span>best size</span><b>${Math.round(o.best_size).toLocaleString()}</b></div>`
+      : '<div class="dim">the scanner logged no opportunity for this pair in range</div>'}
+  </section>`));
+}
+
+function pairsPanel(d){
+  if(d.error) return $(`<section class="wide"><h2>Pairs</h2><div class="err">${esc(d.error)}</div></section>`);
+  const rows=(d.rows||[]).map(r=>`<tr>
+      <td><a href="/pair/${encodeURIComponent(r.id)}" style="color:var(--accent)">${esc(r.id)}</a></td>
+      <td>${esc(r.verdict||'—')}</td>
+      <td>${esc(r.vetted_by||'—')}${r.tradable && !r.human_vetted ? ' <span class="dim">+allowlist</span>' : ''}</td>
+      <td class="num ${r.tradable?'ok':'dim'}">${r.tradable?'yes':'no'}</td>
+      <td class="dim">${(r.legs||[]).length>2 ? (r.legs.length+' legs') : esc((r.legs||[]).map(l=>l.length>44?l.slice(0,44)+'…':l).join('  |  '))}</td>
+    </tr>`).join('');
+  return $(`<section class="wide">
+    <h2>Tracked pairs &middot; ${d.count} registered &middot; ${d.tradable} tradable
+      <span class="dim">(${d.human_vetted} human-vetted + ${d.allowlisted} allowlisted)</span></h2>
+    <div class="scroll"><table>
+      <thead><tr><th>relationship</th><th>verdict</th><th>vetted by</th>
+        <th class="num">tradable</th><th>legs</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>
+  </section>`);
+}
+
 function oppsPanel(o){
   if(o.error) return $(`<section class="wide"><h2>Opportunity coverage</h2>
     <div class="err">${esc(o.error)}</div></section>`);
@@ -197,6 +307,7 @@ const VIEWS = [
   {path:'/',              label:'Books'},
   {path:'/recording',     label:'Recording'},
   {path:'/opportunities', label:'Opportunities'},
+  {path:'/pairs',         label:'Pairs'},
 ];
 
 function renderNav(active){
@@ -226,6 +337,11 @@ const ROUTES = {
     root.append(integrityPanel(iv));
     root.append(coveragePanel(iv));
   },
+  '/pairs': async (root) => {
+    const d = await json('/api/pairs');
+    setMeta(`${d.count||0} pairs registered &middot; ${d.tradable||0} tradable`);
+    root.append(pairsPanel(d));
+  },
   '/opportunities': async (root) => {
     const qs = location.search || '';
     const o = await json('/api/opportunities' + qs);
@@ -241,10 +357,21 @@ function setMeta(html){
 async function load(){
   const root = document.getElementById('root');
   let path = location.pathname;
-  if(!ROUTES[path]) path = '/';
-  renderNav(path);
+  const isPair = path.startsWith('/pair/');
+  if(!isPair && !ROUTES[path]) path = '/';
+  renderNav(isPair ? '/pairs' : path);
   try{
     root.innerHTML='';
+    if(isPair){
+      const rel = decodeURIComponent(path.slice('/pair/'.length));
+      const qs = new URLSearchParams(location.search);
+      qs.set('rel', rel);
+      const d = await json('/api/pair?' + qs.toString());
+      if(d.error) throw new Error(d.error);
+      setMeta(`${d.samples_a + d.samples_b} quote samples across both legs`);
+      pairPanels(d, root);
+      return;
+    }
     await ROUTES[path](root);
   }catch(e){
     root.innerHTML = `<section class="wide err">${esc(e.message||e)}</section>`;

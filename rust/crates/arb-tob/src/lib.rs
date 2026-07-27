@@ -27,6 +27,7 @@ use arb_query::Source;
 use serde::{Deserialize, Serialize};
 
 pub mod raw;
+pub mod series;
 
 pub const DEFAULT_INTERVAL_NS: i64 = 60_000_000_000; // 60s
 

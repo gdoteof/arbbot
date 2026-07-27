@@ -9,3 +9,5 @@ serde_json = { workspace = true }
 arb-core = { path = "../../crates/arb-core" }
 arb-ledger = { path = "../../crates/arb-ledger" }
 arb-query = { path = "../../crates/arb-query" }
+arb-tob = { path = "../../crates/arb-tob" }
+arb-registry = { path = "../../crates/arb-registry" }

@@ -57,6 +57,8 @@ dependencies = [
  "arb-core",
  "arb-ledger",
  "arb-query",
+ "arb-registry",
+ "arb-tob",
  "serde",
  "serde_json",
 ]
@@ -119,6 +121,14 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-tungstenite",
+]
+
+[[package]]
+name = "arb-registry"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_yaml",
 ]
 
 [[package]]
