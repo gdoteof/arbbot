@@ -325,64 +325,83 @@ fn intents_json(a: &Args) -> String {
         if rest_a.is_none() && rest_b.is_none() {
             continue;
         }
-        let (style, role_a, role_b) = match (rest_a.is_some(), rest_b.is_some()) {
-            (true, true) => ("make-both", Role::Maker, Role::Maker),
-            (true, false) => ("make-a-take-b", Role::Maker, Role::Taker),
-            _ => ("take-a-make-b", Role::Taker, Role::Maker),
-        };
-
         let qa = latest.get(&(la.venue.clone(), la.market_id.clone()));
         let qb = latest.get(&(lb.venue.clone(), lb.market_id.clone()));
-        // Our posted price where we rest; the venue touch where we would take.
-        let entry_a = rest_a
-            .map(|o| o.price.clone())
-            .or_else(|| qa.and_then(|s| s.ask.clone()));
-        let exit_b = rest_b
-            .map(|o| o.price.clone())
-            .or_else(|| qb.and_then(|s| s.bid.clone()));
-        let priced = match (&entry_a, &exit_b) {
-            (Some(ea), Some(eb)) => price_at(
-                &mut cx, &sched, "posted", va, vb, role_a, role_b, ea, eb, clip, "politics",
-            ),
-            _ => None,
+
+        // ROUTES, not a single style. Resting on both legs is not "make/make
+        // hoping both fill" — it is TWO make-take entry points: whichever side
+        // gets hit, we immediately take the other. So price every route the
+        // pair currently supports and rank on the best one.
+        //
+        //   take-take      cross both books now (no resting needed)
+        //   make-a-take-b  our bid on A fills -> take B at its bid
+        //   take-a-make-b  our ask on B fills -> take A at its ask
+        let mut routes = serde_json::Map::new();
+        let mut best: Option<(f64, &'static str)> = None;
+        let mut consider = |label: &'static str,
+                            ra: Role, rb: Role,
+                            ea: Option<String>, eb: Option<String>,
+                            cx: &mut Cx,
+                            routes: &mut serde_json::Map<String, serde_json::Value>,
+                            best: &mut Option<(f64, &'static str)>| {
+            let (Some(ea), Some(eb)) = (ea, eb) else { return };
+            let Some(p) = price_at(cx, &sched, label, va, vb, ra, rb, &ea, &eb, clip, "politics")
+            else {
+                return;
+            };
+            if let Ok(e) = p.edge_per_contract.parse::<f64>() {
+                if best.map_or(true, |(b, _)| e > b) {
+                    *best = Some((e, label));
+                }
+            }
+            routes.insert(label.into(), serde_json::to_value(&p).unwrap());
         };
+
+        let va_ask = qa.and_then(|s| s.ask.clone());
+        let vb_bid = qb.and_then(|s| s.bid.clone());
+        // the immediate crossing — always available if both books are known
+        consider("take-take", Role::Taker, Role::Taker,
+                 va_ask.clone(), vb_bid.clone(), &mut cx, &mut routes, &mut best);
+        // our resting bid on A fills, then we take B
+        if let Some(o) = rest_a {
+            consider("make-a-take-b", Role::Maker, Role::Taker,
+                     Some(o.price.clone()), vb_bid.clone(), &mut cx, &mut routes, &mut best);
+        }
+        // our resting ask on B fills, then we take A
+        if let Some(o) = rest_b {
+            consider("take-a-make-b", Role::Taker, Role::Maker,
+                     va_ask.clone(), Some(o.price.clone()), &mut cx, &mut routes, &mut best);
+        }
+        if routes.is_empty() {
+            continue;
+        }
+        let (best_edge, best_route) = best.unwrap_or((f64::MIN, "none"));
+        let priced = routes.get(best_route).cloned();
+
+        // Fill plausibility applies to the leg we REST on, and only for the
+        // make-take routes; a take-take needs no rest at all.
         let q_age = |s: Option<&arb_tob::TobSample>| {
             s.map(|s| ((now * 1e9) as i64 - s.ts_local_ns) / 1_000_000_000)
         };
-
-        // Same guard as the scenario view, for the same reason: an edge is only
-        // real if the quote we rest on can actually fill. Two ways it cannot —
-        // the book is too wide to cross, or the quote we priced against is
-        // hours old. Observed: an ask posted at 0.98 against a 0.59 bid (a 40c
-        // book) showing +0.42, and a row priced off an 18-hour-old quote.
-        let spread_of = |s: Option<&arb_tob::TobSample>, cx: &mut Cx| -> Option<f64> {
+        let spread_of = |s: Option<&arb_tob::TobSample>| -> Option<f64> {
             let s = s?;
-            let (b, a2) = (s.bid.as_ref()?, s.ask.as_ref()?);
-            let _ = cx;
-            Some(a2.parse::<f64>().ok()? - b.parse::<f64>().ok()?)
+            Some(s.ask.as_ref()?.parse::<f64>().ok()? - s.bid.as_ref()?.parse::<f64>().ok()?)
         };
-        let mut rest_spread: Option<f64> = None;
-        if rest_a.is_some() {
-            if let Some(sp) = spread_of(qa, &mut cx) {
-                rest_spread = Some(rest_spread.map_or(sp, |c: f64| c.max(sp)));
-            }
-        }
-        if rest_b.is_some() {
-            if let Some(sp) = spread_of(qb, &mut cx) {
-                rest_spread = Some(rest_spread.map_or(sp, |c: f64| c.max(sp)));
-            }
-        }
+        let rest_spread: Option<f64> = match best_route {
+            "make-a-take-b" => spread_of(qa),
+            "take-a-make-b" => spread_of(qb),
+            _ => None,
+        };
         const MAX_REST_SPREAD: f64 = 0.05;
-        let fillable = rest_spread.map_or(false, |s| s <= MAX_REST_SPREAD);
-        // Both legs must be present in the rollup at all; beyond that,
-        // freshness is a property of the rollup, not of the market.
+        let fillable = rest_spread.map_or(true, |s| s <= MAX_REST_SPREAD);
         let have_books = qa.is_some() && qb.is_some();
-        let actionable = fillable && have_books && rollup_current;
+        let actionable = fillable && have_books && rollup_current && best_edge > 0.0;
 
         rows.push(serde_json::json!({
             "relationship_id": rel_id,
             "tradable": r.tradable(&allow),
-            "style": style,
+            "best_route": best_route,
+            "routes": routes,
             "leg_a": {
                 "venue": la.venue, "market": la.market_id,
                 "our_bid": rest_a.map(|o| o.price.clone()),
@@ -402,6 +421,7 @@ fn intents_json(a: &Args) -> String {
                 "quote_age_s": q_age(qb),
             },
             "priced": priced,
+            "edge_f": best_edge,
             "rest_spread": rest_spread,
             "fillable": fillable,
             "have_books": have_books,
@@ -409,7 +429,7 @@ fn intents_json(a: &Args) -> String {
             // quiet it is, deliberately not a staleness flag.
             "since_change_s": q_age(qa).unwrap_or(-1).max(q_age(qb).unwrap_or(-1)),
             "actionable": actionable,
-            "edge": priced.as_ref().map(|p| p.edge_per_contract.clone()),
+            "edge": priced.as_ref().and_then(|p| p["edge_per_contract"].as_str().map(String::from)),
             "last_ts": rest_a.map(|o| o.ts).into_iter()
                         .chain(rest_b.map(|o| o.ts)).fold(0.0f64, f64::max),
         }));
@@ -445,6 +465,123 @@ fn intents_json(a: &Args) -> String {
     .to_string()
 }
 
+/// Post-fee edge over time for one pair.
+///
+/// Joins two independent series: our own posted quote (from the intent stream)
+/// and the venue books (from the ToB rollup). Both forward-fill — a quote
+/// stands until replaced — and at every point where enough is known we price
+/// each available route. This is what makes "top N by spread" a time series
+/// rather than a snapshot.
+fn edge_series(a: &Args, rel: &arb_registry::Relationship) -> Vec<serde_json::Value> {
+    let (la, lb) = (&rel.legs[0], &rel.legs[1]);
+    let (Some(va), Some(vb)) = (venue_of(&la.venue), venue_of(&lb.venue)) else { return vec![] };
+
+    let day = integrity::build(&a.data_dir).today;
+    let path = |v: &str| format!("{}/tob-{v}-{day}.jsonl", a.rollup_dir);
+    let sa = series::load_market(&[path(&la.venue)], &la.venue, &la.market_id);
+    let sb = series::load_market(&[path(&lb.venue)], &lb.venue, &lb.market_id);
+
+    let text = std::fs::read_to_string(&a.intents_path).unwrap_or_default();
+    let markets = vec![
+        (la.venue.clone(), la.market_id.clone()),
+        (lb.venue.clone(), lb.market_id.clone()),
+    ];
+    let ours = intents::history_for(&text, &markets);
+
+    // One merged timeline in nanoseconds; intents carry seconds.
+    let mut ts: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    ts.extend(sa.iter().map(|s| s.ts_local_ns));
+    ts.extend(sb.iter().map(|s| s.ts_local_ns));
+    ts.extend(ours.iter().map(|e| (e.ts * 1e9) as i64));
+
+    let mut cx = Cx::default();
+    let sched = FeeSchedule::new(&mut cx);
+    let clip = cx.parse_exact("25");
+
+    let (mut ia, mut ib, mut io) = (0usize, 0usize, 0usize);
+    let (mut ca, mut cb) = (None::<&arb_tob::TobSample>, None::<&arb_tob::TobSample>);
+    let (mut our_a, mut our_b) = (None::<String>, None::<String>);
+    let mut out = Vec::new();
+
+    for t in ts {
+        while ia < sa.len() && sa[ia].ts_local_ns <= t {
+            ca = Some(&sa[ia]);
+            ia += 1;
+        }
+        while ib < sb.len() && sb[ib].ts_local_ns <= t {
+            cb = Some(&sb[ib]);
+            ib += 1;
+        }
+        while io < ours.len() && (ours[io].ts * 1e9) as i64 <= t {
+            let e = &ours[io];
+            let on_a = e.venue == la.venue && e.market == la.market_id;
+            // We rest a BID on leg A (buying YES) and an ASK on leg B.
+            let v = if e.kind == "cancel" { None } else { Some(e.price.clone()) };
+            if on_a && e.side == "bid" {
+                our_a = v;
+            } else if !on_a && e.side == "ask" {
+                our_b = v;
+            }
+            io += 1;
+        }
+
+        let va_ask = ca.and_then(|s| s.ask.clone());
+        let vb_bid = cb.and_then(|s| s.bid.clone());
+        let mut row = serde_json::Map::new();
+        let mut push = |label: &str, ra: Role, rb: Role, ea: &Option<String>, eb: &Option<String>,
+                        cx: &mut Cx, row: &mut serde_json::Map<String, serde_json::Value>| {
+            if let (Some(ea), Some(eb)) = (ea, eb) {
+                if let Some(p) =
+                    price_at(cx, &sched, "s", va, vb, ra, rb, ea, eb, clip, "politics")
+                {
+                    if let Ok(v) = p.edge_per_contract.parse::<f64>() {
+                        row.insert(label.into(), serde_json::json!(v));
+                    }
+                }
+            }
+        };
+        push("take_take", Role::Taker, Role::Taker, &va_ask, &vb_bid, &mut cx, &mut row);
+        push("make_a_take_b", Role::Maker, Role::Taker, &our_a, &vb_bid, &mut cx, &mut row);
+        push("take_a_make_b", Role::Taker, Role::Maker, &va_ask, &our_b, &mut cx, &mut row);
+        if row.is_empty() {
+            continue;
+        }
+        row.insert("ts".into(), serde_json::json!(t as f64 / 1e9));
+        out.push(serde_json::Value::Object(row));
+    }
+    out
+}
+
+/// Edge series for the top N pairs, so the intents page opens on a picture of
+/// where the money has been rather than a single instant.
+fn top_series_json(a: &Args, query: &str) -> String {
+    let n: usize = query_param(query, "n").and_then(|s| s.parse().ok()).unwrap_or(5);
+    let body = intents_json(a);
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return "{\"error\":\"intents unavailable\"}".into();
+    };
+    let Ok(reg) = Registry::load(&a.registry) else {
+        return "{\"error\":\"registry unavailable\"}".into();
+    };
+    let empty = vec![];
+    let rows = v["rows"].as_array().unwrap_or(&empty);
+    let mut out = Vec::new();
+    for r in rows.iter().filter(|r| r["actionable"].as_bool().unwrap_or(false)).take(n) {
+        let Some(id) = r["relationship_id"].as_str() else { continue };
+        let Some(rel) = reg.get(id) else { continue };
+        if rel.legs.len() != 2 {
+            continue;
+        }
+        out.push(serde_json::json!({
+            "relationship_id": id,
+            "best_route": r["best_route"],
+            "edge": r["edge"],
+            "series": edge_series(a, rel),
+        }));
+    }
+    serde_json::json!({ "n": out.len(), "rows": out }).to_string()
+}
+
 /// One pair's intent history — the engine's own quote, moving over time.
 fn intent_series_json(a: &Args, query: &str) -> String {
     let Some(rel_id) = query_param(query, "rel") else {
@@ -465,6 +602,7 @@ fn intent_series_json(a: &Args, query: &str) -> String {
         "relationship_id": rel_id,
         "legs": markets.iter().map(|(v, m)| format!("{v}:{m}")).collect::<Vec<_>>(),
         "events": events,
+        "edge_series": edge_series(a, r),
     })
     .to_string()
 }
@@ -813,6 +951,7 @@ fn handle(s: TcpStream, a: &Args, sh: &Shared) {
         "/api/opportunities" => respond(s, "200 OK", "application/json", &opps_json(a, &query)),
         "/api/pairs" => respond(s, "200 OK", "application/json", &pairs_json(a)),
         "/api/intents" => respond(s, "200 OK", "application/json", &intents_json(a)),
+        "/api/top-series" => respond(s, "200 OK", "application/json", &top_series_json(a, &query)),
         "/api/intent-series" => {
             respond(s, "200 OK", "application/json", &intent_series_json(a, &query))
         }

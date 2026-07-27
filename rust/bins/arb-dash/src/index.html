@@ -51,6 +51,8 @@
     letter-spacing:.06em;text-transform:uppercase;border-bottom:2px solid transparent}
   nav a:hover{color:var(--ink)}
   nav a.on{color:var(--accent);border-bottom-color:var(--accent)}
+  th.sortable{cursor:pointer;user-select:none}
+  th.sortable:hover{color:var(--ink)}
 </style>
 </head>
 <body>
@@ -330,64 +332,173 @@ async function poll(){
   if(st.running) setTimeout(poll, 1500);
 }
 
-function intentSeriesChart(ev){
-  if(!ev.length) return '<div class="dim" style="padding:16px 0">no intent history for this pair</div>';
-  const pts = ev.filter(e=>e.kind!=='cancel' && e.price);
-  if(!pts.length) return '<div class="dim">only cancels</div>';
-  const W=1100,H=200,PL=54,PR=14,PT=12,PB=24;
-  const xs=pts.map(p=>p.ts), ys=pts.map(p=>Number(p.price));
-  const x0=Math.min(...xs),x1=Math.max(...xs);
-  let y0=Math.min(...ys),y1=Math.max(...ys); const pad=(y1-y0)*0.15||0.02; y0-=pad;y1+=pad;
+/* Human-readable duration. "48054s" is a number; "13h 21m" is a fact. */
+function dur(sec){
+  if(sec==null||sec<0) return '—';
+  const s=Math.round(sec);
+  if(s<60) return s+'s';
+  const m=Math.floor(s/60), r=s%60;
+  if(m<60) return r?`${m}m ${r}s`:`${m}m`;
+  const h=Math.floor(m/60), rm=m%60;
+  if(h<24) return rm?`${h}h ${rm}m`:`${h}h`;
+  const d=Math.floor(h/24); return `${d}d ${h%24}h`;
+}
+
+const ROUTE_LABEL={'take-take':'take / take','make-a-take-b':'make A → take B',
+                   'take-a-make-b':'take A → make B','none':'—'};
+const SERIES_KEYS=[['take_take','take/take','var(--accent)'],
+                   ['make_a_take_b','make A → take B','var(--ok)'],
+                   ['take_a_make_b','take A → make B','var(--warn)']];
+
+/* Multi-series edge-over-time chart. Zero line drawn because the sign is the
+   whole question: above it the basket pays, below it we would be buying a loss. */
+function edgeChart(series, keys, height){
+  const H=height||190, W=1100, PL=58, PR=14, PT=12, PB=24;
+  const pts=[];
+  keys.forEach(([k],i)=>series.forEach(r=>{ if(r[k]!=null) pts.push([r.ts, r[k], i]); }));
+  if(!pts.length) return '<div class="dim" style="padding:16px 0">not enough overlap to price a route yet</div>';
+  const x0=Math.min(...pts.map(p=>p[0])), x1=Math.max(...pts.map(p=>p[0]));
+  let y0=Math.min(0,...pts.map(p=>p[1])), y1=Math.max(0,...pts.map(p=>p[1]));
+  const pad=(y1-y0)*0.1||0.01; y0-=pad; y1+=pad;
   const sx=t=>PL+(W-PL-PR)*(x1===x0?0.5:(t-x0)/(x1-x0));
   const sy=v=>PT+(H-PT-PB)*(1-(v-y0)/(y1-y0));
-  // one line per (venue, market, side) so both legs and both sides are distinct
-  const keys=[...new Set(pts.map(p=>`${p.venue}|${p.market}|${p.side}`))];
-  const cols=['var(--accent)','var(--ok)','var(--warn)','var(--bad)'];
-  const paths=keys.map((k,i)=>{
-    const sub=pts.filter(p=>`${p.venue}|${p.market}|${p.side}`===k);
-    const d=sub.map((p,j)=>`${j?'L':'M'}${sx(p.ts).toFixed(1)},${sy(Number(p.price)).toFixed(1)}`).join('');
-    const dots=sub.map(p=>`<circle cx="${sx(p.ts).toFixed(1)}" cy="${sy(Number(p.price)).toFixed(1)}" r="2"
-        fill="${cols[i%4]}" opacity="${p.kind==='reprice'?0.9:1}"/>`).join('');
-    return `<path d="${d}" fill="none" stroke="${cols[i%4]}" stroke-width="1.4"/>${dots}`;
+  const lines=keys.map(([k,,col],i)=>{
+    const sub=series.filter(r=>r[k]!=null);
+    if(!sub.length) return '';
+    const d=sub.map((r,j)=>`${j?'L':'M'}${sx(r.ts).toFixed(1)},${sy(r[k]).toFixed(1)}`).join('');
+    return `<path d="${d}" fill="none" stroke="${col}" stroke-width="1.5" opacity="0.95"/>`;
+  }).join('');
+  const zero=sy(0);
+  const tick=v=>`<line x1="${PL}" x2="${W-PR}" y1="${sy(v).toFixed(1)}" y2="${sy(v).toFixed(1)}"
+     stroke="var(--line)" stroke-dasharray="2,4"/><text x="4" y="${(sy(v)+4).toFixed(1)}"
+     fill="var(--dim)" font-size="11">${v>0?'+':''}${v.toFixed(3)}</text>`;
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">
+    ${tick(y0+pad)}${tick(y1-pad)}
+    <line x1="${PL}" x2="${W-PR}" y1="${zero}" y2="${zero}" stroke="var(--bad)" stroke-width="1.2" opacity="0.8"/>
+    <text x="4" y="${(zero+4).toFixed(1)}" fill="var(--bad)" font-size="11">0</text>
+    ${lines}
+    <text x="${PL}" y="${H-4}" fill="var(--dim)" font-size="11">${new Date(x0*1000).toLocaleTimeString()}</text>
+    <text x="${W-PR}" y="${H-4}" fill="var(--dim)" font-size="11" text-anchor="end">${new Date(x1*1000).toLocaleTimeString()}</text>
+  </svg>`;
+}
+
+function seriesLegend(keys){
+  return keys.map(([,l,c])=>`<span style="color:${c}">■</span> <span class="dim">${l}</span>`).join(' &nbsp; ');
+}
+
+/* Our posted quote over time, with post-fee edge on its OWN axis — the two
+   have different units and ranges, so sharing one axis would flatten both. */
+function quoteAndEdgeChart(ev, series){
+  const q=ev.filter(e=>e.kind!=='cancel' && e.price);
+  if(!q.length) return '<div class="dim">no quote history</div>';
+  const W=1100,H=210,PL=58,PR=58,PT=12,PB=24;
+  const xs=q.map(p=>p.ts).concat(series.map(r=>r.ts));
+  const x0=Math.min(...xs), x1=Math.max(...xs);
+  const sx=t=>PL+(W-PL-PR)*(x1===x0?0.5:(t-x0)/(x1-x0));
+  let qy0=Math.min(...q.map(p=>+p.price)), qy1=Math.max(...q.map(p=>+p.price));
+  const qp=(qy1-qy0)*0.15||0.02; qy0-=qp; qy1+=qp;
+  const syq=v=>PT+(H-PT-PB)*(1-(v-qy0)/(qy1-qy0));
+  const evals=[]; SERIES_KEYS.forEach(([k])=>series.forEach(r=>{if(r[k]!=null)evals.push(r[k]);}));
+  let ey0=evals.length?Math.min(0,...evals):0, ey1=evals.length?Math.max(0,...evals):0.01;
+  const ep=(ey1-ey0)*0.15||0.01; ey0-=ep; ey1+=ep;
+  const sye=v=>PT+(H-PT-PB)*(1-(v-ey0)/(ey1-ey0));
+  const keys=[...new Set(q.map(p=>`${p.venue}|${p.market}|${p.side}`))];
+  const cols=['var(--accent)','var(--ok)'];
+  const qlines=keys.map((k,i)=>{
+    const sub=q.filter(p=>`${p.venue}|${p.market}|${p.side}`===k);
+    const d=sub.map((p,j)=>`${j?'L':'M'}${sx(p.ts).toFixed(1)},${syq(+p.price).toFixed(1)}`).join('');
+    const dots=sub.map(p=>`<circle cx="${sx(p.ts).toFixed(1)}" cy="${syq(+p.price).toFixed(1)}" r="2" fill="${cols[i%2]}"/>`).join('');
+    return `<path d="${d}" fill="none" stroke="${cols[i%2]}" stroke-width="1.4"/>${dots}`;
+  }).join('');
+  const elines=SERIES_KEYS.map(([k,,col])=>{
+    const sub=series.filter(r=>r[k]!=null);
+    if(!sub.length) return '';
+    const d=sub.map((r,j)=>`${j?'L':'M'}${sx(r.ts).toFixed(1)},${sye(r[k]).toFixed(1)}`).join('');
+    return `<path d="${d}" fill="none" stroke="${col}" stroke-width="1.3" stroke-dasharray="4,3" opacity="0.9"/>`;
   }).join('');
   const legend=keys.map((k,i)=>{const[,m,side]=k.split('|');
-    return `<span style="color:${cols[i%4]}">■</span> <span class="dim">${esc(m.slice(0,30))} ${esc(side)}</span>`;
-  }).join(' &nbsp; ');
-  const tick=v=>`<line x1="${PL}" x2="${W-PR}" y1="${sy(v).toFixed(1)}" y2="${sy(v).toFixed(1)}"
-      stroke="var(--line)" stroke-dasharray="2,4"/><text x="6" y="${(sy(v)+4).toFixed(1)}"
-      fill="var(--dim)" font-size="11">${v.toFixed(3)}</text>`;
-  return `<div class="sub" style="margin-bottom:6px">${legend}</div>
-    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">
-      ${tick(y0+pad)}${tick((y0+y1)/2)}${tick(y1-pad)}${paths}
-      <text x="${PL}" y="${H-4}" fill="var(--dim)" font-size="11">${new Date(x0*1000).toLocaleTimeString()}</text>
-      <text x="${W-PR}" y="${H-4}" fill="var(--dim)" font-size="11" text-anchor="end">${new Date(x1*1000).toLocaleTimeString()}</text>
-    </svg>`;
+    return `<span style="color:${cols[i%2]}">■</span> <span class="dim">${esc(m.slice(0,26))} ${esc(side)}</span>`}).join(' &nbsp; ');
+  return `<div class="sub" style="margin-bottom:6px">${legend} &nbsp;|&nbsp; dashed = post-fee edge (right axis): ${seriesLegend(SERIES_KEYS)}</div>
+  <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">
+    <text x="4" y="${PT+10}" fill="var(--dim)" font-size="11">${qy1.toFixed(2)}</text>
+    <text x="4" y="${H-PB}" fill="var(--dim)" font-size="11">${qy0.toFixed(2)}</text>
+    <text x="${W-PR+6}" y="${PT+10}" fill="var(--dim)" font-size="11">${ey1>0?'+':''}${ey1.toFixed(3)}</text>
+    <text x="${W-PR+6}" y="${H-PB}" fill="var(--dim)" font-size="11">${ey0.toFixed(3)}</text>
+    <line x1="${PL}" x2="${W-PR}" y1="${sye(0)}" y2="${sye(0)}" stroke="var(--bad)" stroke-width="1" opacity="0.6"/>
+    ${qlines}${elines}
+    <text x="${PL}" y="${H-4}" fill="var(--dim)" font-size="11">${new Date(x0*1000).toLocaleTimeString()}</text>
+    <text x="${W-PR}" y="${H-4}" fill="var(--dim)" font-size="11" text-anchor="end">${new Date(x1*1000).toLocaleTimeString()}</text>
+  </svg>`;
 }
 
 async function showSeries(rel, host){
-  host.innerHTML = '<div class="dim">loading…</div>';
-  const d = await json('/api/intent-series?rel=' + encodeURIComponent(rel));
-  if(d.error){ host.innerHTML = `<div class="err">${esc(d.error)}</div>`; return; }
-  host.innerHTML = `<h2>${esc(rel)} &middot; ${d.events.length} intents</h2>
-    ${intentSeriesChart(d.events)}
-    <div class="sub" style="margin-top:6px">Our posted quote, moving. Each dot is a
-      place or reprice; the venue's own book is on the pair page.</div>`;
+  host.innerHTML='<div class="dim">loading…</div>';
+  const d=await json('/api/intent-series?rel='+encodeURIComponent(rel));
+  if(d.error){ host.innerHTML=`<div class="err">${esc(d.error)}</div>`; return; }
+  host.innerHTML=`<h2>${esc(rel)} &middot; ${d.events.length} intents &middot; ${d.edge_series.length} priced points</h2>
+    ${quoteAndEdgeChart(d.events, d.edge_series)}
+    <div class="sub" style="margin-top:6px">Solid = our posted quote (left axis).
+      Dashed = post-fee edge per route on its own right axis — different units, so a
+      shared axis would flatten both.</div>`;
   host.scrollIntoView({behavior:'smooth', block:'nearest'});
 }
 
-function intentsPanel(d){
+const COLS=[
+  ['relationship_id','relationship','The vetted pair. Click the row for its history.','s'],
+  ['best_route','route','Best available route now. take/take crosses both books immediately; make→take rests one leg and takes the other the moment it fills.','s'],
+  ['our_a','our bid A','Our resting BID on leg A — the price we would buy YES at if hit.','n'],
+  ['venue_a','venue A','Leg A book, bid/ask.','x'],
+  ['our_b','our ask B','Our resting ASK on leg B — the price we would sell YES at if hit.','n'],
+  ['venue_b','venue B','Leg B book, bid/ask.','x'],
+  ['gross','gross','Basket cost before fees: entry A + (1 − exit B). Below 1.00 is an arb gross.','n'],
+  ['fee_a','fee A','Per-contract fee on leg A at clip 25. Kalshi maker 0.0175 vs taker 0.07, ceiled per ORDER.','n'],
+  ['fee_b','fee B','Per-contract fee on leg B. PM-US makers pay nothing.','n'],
+  ['edge_f','post-fee edge','$1.00 − total cost, per contract. This is the number that matters.','n'],
+  ['rest_spread','rest spread','Spread on the leg we rest on. A wide book means the fill is a coin flip, so the edge is not obtainable.','n'],
+  ['reprices','reprices','Times the quote has been moved. High means the quoter is chasing, which is a cost.','n'],
+  ['since_change_s','since move','Time since this book last MOVED. Not staleness — the series emits on change, so a quiet market has an old sample and a valid quote.','n'],
+];
+
+let iSort={key:'edge_f',dir:-1}, iFilter={route:'', actionable:true, tradable:true};
+
+function intentsPanel(d, root){
   if(d.error) return $(`<section class="wide"><h2>Engine intents</h2>
     <div class="err">${esc(d.error)}</div>
     <div class="sub" style="margin-top:8px">${esc(d.hint||'')}</div></section>`);
-  const STYLE = {'make-both':'make / make','make-a-take-b':'make A → take B','take-a-make-b':'take A → make B'};
-  const n = (v,dp=4)=> v==null||v===''? '<span class="dim">—</span>' : Number(v).toFixed(dp);
-  const rows=(d.rows||[]).map(r=>{
-    const p=r.priced, e=p?Number(p.edge_per_contract):null;
-    const age=Math.max(r.leg_a.quote_age_s??0, r.leg_b.quote_age_s??0);
+  const n=(v,dp=4)=> v==null||v===''? '<span class="dim">—</span>' : Number(v).toFixed(dp);
+  const val=(r,k)=>({
+    relationship_id:r.relationship_id, best_route:r.best_route,
+    our_a:r.leg_a.our_bid, venue_a:r.leg_a.venue_bid, our_b:r.leg_b.our_ask,
+    venue_b:r.leg_b.venue_bid,
+    gross:r.priced?+r.priced.gross_cost:null, fee_a:r.priced?+r.priced.fee_a:null,
+    fee_b:r.priced?+r.priced.fee_b:null, edge_f:r.edge_f,
+    rest_spread:r.rest_spread, reprices:(r.leg_a.reprices??0)+(r.leg_b.reprices??0),
+    since_change_s:r.since_change_s,
+  })[k];
+
+  let rows=(d.rows||[]).slice();
+  if(iFilter.route) rows=rows.filter(r=>r.best_route===iFilter.route);
+  if(iFilter.actionable) rows=rows.filter(r=>r.actionable);
+  if(iFilter.tradable) rows=rows.filter(r=>r.tradable);
+  rows.sort((a,b)=>{
+    const x=val(a,iSort.key), y=val(b,iSort.key);
+    if(typeof x==='string'||typeof y==='string')
+      return String(x??'').localeCompare(String(y??''))*iSort.dir;
+    return (((y??-1e9)-(x??-1e9)))*(iSort.dir<0?1:-1);
+  });
+
+  const head=COLS.map(([k,l,tip])=>{
+    const on=iSort.key===k;
+    return `<th class="${['n','x'].includes(COLS.find(c=>c[0]===k)[3])?'num':''} sortable" data-key="${k}" title="${esc(tip)}">
+      ${l}${on?(iSort.dir<0?' ▾':' ▴'):''}</th>`;
+  }).join('');
+
+  const body=rows.map(r=>{
+    const e=r.edge_f, p=r.priced;
     return `<tr class="irow" data-rel="${esc(r.relationship_id)}" style="cursor:pointer">
       <td><span class="rel">${esc(r.relationship_id)}</span>
         ${r.tradable?'':'<span class="dim">(not tradable)</span>'}</td>
-      <td class="dim">${esc(STYLE[r.style]||r.style)}</td>
+      <td class="dim">${esc(ROUTE_LABEL[r.best_route]||r.best_route)}</td>
       <td class="num">${n(r.leg_a.our_bid)}</td>
       <td class="num dim">${n(r.leg_a.venue_bid,2)}/${n(r.leg_a.venue_ask,2)}</td>
       <td class="num">${n(r.leg_b.our_ask)}</td>
@@ -399,46 +510,74 @@ function intentsPanel(d){
         <b>${e==null?'—':(e>0?'+':'')+e.toFixed(4)}</b></td>
       <td class="num ${r.fillable?'dim':'warn'}">${r.rest_spread==null?'—':r.rest_spread.toFixed(3)}</td>
       <td class="num dim">${(r.leg_a.reprices??0)+(r.leg_b.reprices??0)}</td>
-      <td class="num dim">${age<0?'—':(age>3600?(age/3600).toFixed(1)+'h':age+'s')}</td>
-    </tr>`;
-  }).join('');
+      <td class="num dim">${dur(r.since_change_s)}</td>
+    </tr>`;}).join('');
+
+  const rbtn=(k,l)=>`<a href="#" data-route="${k}" class="rf ${iFilter.route===k?'on':''}">${l}</a>`;
   const el=$(`<section class="wide">
-    <h2>Engine intents &middot; ${d.resting_orders} resting across ${d.pairs} pairs
+    <h2>Engine intents &middot; ${d.resting_orders} resting &middot; ${rows.length}/${d.pairs} shown
       &middot; <span class="${d.actionable?'ok':'warn'}">${d.actionable} actionable</span>
-      &middot; <span class="badge ${d.rollup_current?'ok':'warn'}">rollup ${d.rollup_current?'current':(d.rollup_coverage_age_s<0?'missing':'stale '+(d.rollup_coverage_age_s/60|0)+'m')}</span>
       &middot; <span class="badge ${d.engine_live?'ok':'bad'}">${d.engine_live?'ENGINE LIVE':'NOT RUNNING'}</span>
-      <span class="dim">last ${d.last_intent_age_s}s ago &middot; clip ${d.clip}</span></h2>
+      <span class="dim">last ${dur(d.last_intent_age_s)} ago &middot; rollup ${d.rollup_current?'current':'stale '+dur(d.rollup_coverage_age_s)} &middot; clip ${d.clip}</span></h2>
+    <nav style="padding:0;border:0;margin-bottom:8px">
+      ${rbtn('','all routes')}${rbtn('take-take','take / take')}${rbtn('make-a-take-b','make A → take B')}${rbtn('take-a-make-b','take A → make B')}
+      <span style="flex:1"></span>
+      <a href="#" id="f-act" class="${iFilter.actionable?'on':''}">actionable only</a>
+      <a href="#" id="f-trd" class="${iFilter.tradable?'on':''}">tradable only</a>
+    </nav>
     <div class="scroll"><table>
-      <thead><tr><th>relationship</th><th>style</th>
-        <th class="num">our bid A</th><th class="num">venue A</th>
-        <th class="num">our ask B</th><th class="num">venue B</th>
-        <th class="num">gross</th><th class="num">fee A</th><th class="num">fee B</th>
-        <th class="num">post-fee edge</th><th class="num">rest spread</th><th class="num">reprices</th>
-        <th class="num">since move</th></tr></thead>
-      <tbody>${rows}</tbody></table></div>
-    <div class="sub" style="margin-top:8px">Click a row for that pair's intent history.
-      The stream is MAKER-ONLY — place, reprice, cancel — so a take-take crossing can
-      never appear here; it is an immediate execution, not a resting quote, and lives
-      in Current. Style is derived from which legs we rest on: one leg means we make
-      it and take the other, both means make/make. Fees are per contract at clip
-      ${d.clip} and separated so the maker/taker difference is visible. The take leg
-      is priced off the ToB rollup, so its age is the honesty column.<br>
-      <b>Actionable</b> = the leg we rest on has a book within ${d.max_rest_spread}, both legs
-      are in the rollup, and the rollup itself covers the last ${(d.max_coverage_age_s/60)|0} minutes.
-      Amber rows need an implausible fill — an ask at 0.98 against a 0.59 bid is a 40c
-      book — and sort below the actionable ones.<br>
-      <b>"Since move" is not staleness.</b> The series emits on CHANGE, so a quote from
-      hours ago on a market that has not moved is still the current book. What goes
-      stale is the rollup: rebuild it and every row is current again.<br>
-      A make/make edge is conditional on BOTH quotes filling, which is two
-      independent events, not one.</div>
+      <thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>
+    <div class="sub" style="margin-top:8px">Click a header to sort, a row for its history.
+      The stream is MAKER-ONLY — a take-take crossing is an immediate execution, never a
+      resting quote — so take/take here is priced off the venue books as the
+      cross-now alternative. Resting on BOTH legs is not make/make: it is two entry
+      points, whichever side gets hit first.<br>
+      <b>Actionable</b> = positive edge, the rested leg's book within ${d.max_rest_spread},
+      both books known, and the rollup covering the last ${(d.max_coverage_age_s/60)|0} minutes.</div>
     <div id="series-host" style="margin-top:14px"></div>
   </section>`);
-  const host=el.querySelector('#series-host');
-  el.querySelectorAll('.irow').forEach(tr=>{
-    tr.onclick=()=>showSeries(tr.dataset.rel, host);
+
+  el.querySelectorAll('.sortable').forEach(th=>th.onclick=()=>{
+    const k=th.dataset.key;
+    iSort = (iSort.key===k) ? {key:k,dir:-iSort.dir} : {key:k,dir:-1};
+    reloadIntents(root);
   });
+  el.querySelectorAll('.rf').forEach(a=>a.onclick=(e)=>{
+    e.preventDefault(); iFilter.route=a.dataset.route; reloadIntents(root);});
+  el.querySelector('#f-act').onclick=e=>{e.preventDefault(); iFilter.actionable=!iFilter.actionable; reloadIntents(root);};
+  el.querySelector('#f-trd').onclick=e=>{e.preventDefault(); iFilter.tradable=!iFilter.tradable; reloadIntents(root);};
+  const host=el.querySelector('#series-host');
+  el.querySelectorAll('.irow').forEach(tr=>tr.onclick=()=>showSeries(tr.dataset.rel, host));
   return el;
+}
+
+function topSeriesPanel(t){
+  if(!t.rows||!t.rows.length) return $(`<section class="wide">
+    <h2>Top opportunities over time</h2>
+    <div class="dim">nothing actionable to chart yet</div></section>`);
+  const blocks=t.rows.map(r=>`<div style="margin-bottom:14px">
+      <div class="sub"><a class="rel" href="/pair/${encodeURIComponent(r.relationship_id)}">${esc(r.relationship_id)}</a>
+        &middot; best ${esc(ROUTE_LABEL[r.best_route]||r.best_route)}
+        &middot; now ${r.edge!=null?(+r.edge>0?'+':'')+(+r.edge).toFixed(4):'—'}</div>
+      ${edgeChart(r.series, SERIES_KEYS, 130)}
+    </div>`).join('');
+  return $(`<section class="wide">
+    <h2>Top ${t.n} by post-fee edge &middot; over time</h2>
+    <div class="sub" style="margin-bottom:8px">${seriesLegend(SERIES_KEYS)}</div>
+    ${blocks}
+    <div class="sub">Our posted quote joined against the venue books, priced per route
+      at every point either moved. The red line is zero — below it the basket loses.</div>
+  </section>`);
+}
+
+async function reloadIntents(root){
+  const d=await json('/api/intents');
+  root.innerHTML='';
+  setMeta(d.error ? 'engine not running'
+    : `${d.resting_orders} resting &middot; ${d.pairs} pairs &middot; last ${dur(d.last_intent_age_s)} ago`);
+  const t=await json('/api/top-series?n=4').catch(()=>({rows:[]}));
+  root.append(topSeriesPanel(t));
+  root.append(intentsPanel(d, root));
 }
 
 function currentPanel(d){
@@ -584,12 +723,7 @@ const ROUTES = {
       `${d.scenario} &middot; clip ${d.clip} &middot; ${d.profitable}/${d.priced_pairs} profitable`);
     root.append(currentPanel(d));
   },
-  '/intents': async (root) => {
-    const d = await json('/api/intents');
-    setMeta(d.error ? 'engine not running' :
-      `${d.resting_orders} resting &middot; ${d.pairs} pairs &middot; last ${d.last_intent_age_s}s ago`);
-    root.append(intentsPanel(d));
-  },
+  '/intents': async (root) => { await reloadIntents(root); },
   '/pairs': async (root) => {
     const d = await json('/api/pairs');
     setMeta(`${d.count||0} pairs registered &middot; ${d.tradable||0} tradable`);
