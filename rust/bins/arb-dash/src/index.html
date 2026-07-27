@@ -59,6 +59,7 @@
 <header>
   <h1>arbbot books</h1>
   <span class="sub" id="meta">loading…</span>
+  <span class="sub" id="link" style="margin-left:auto">● connecting…</span>
 </header>
 <nav id="nav"></nav>
 <main id="root"></main>
@@ -291,8 +292,6 @@ const SCENARIOS = [
   ['take-a-make-b', 'take A / make B'],
 ];
 
-async function rollupStatus(){ return json('/api/rollup'); }
-
 /* The dashboard's ONLY write. POST so nothing fires it by loading a page;
    the server refuses a second concurrent build and writes atomically. */
 function rollupPanel(st, day){
@@ -320,16 +319,19 @@ function rollupPanel(st, day){
   btn.onclick = async () => {
     btn.disabled = true; btn.textContent = 'starting…';
     await fetch('/api/rollup?day=' + encodeURIComponent(day), {method:'POST'});
-    poll();
+    /* No poll loop: the build's progress arrives on the same stream that
+       carries everything else. */
   };
   return el;
 }
 
-async function poll(){
-  const st = await rollupStatus();
+/* Redraw the rollup panel in place from the pushed status. Called on every
+   stream frame, which is cheap and means the button reflects the server
+   without anyone asking it. */
+function paintRollup(st){
   const host = document.getElementById('rollup-host');
-  if(host){ host.innerHTML=''; host.append(rollupPanel(st, host.dataset.day)); }
-  if(st.running) setTimeout(poll, 1500);
+  if(!host) return;
+  host.innerHTML=''; host.append(rollupPanel(st, host.dataset.day));
 }
 
 /* Human-readable duration. "48054s" is a number; "13h 21m" is a fact. */
@@ -431,16 +433,26 @@ function quoteAndEdgeChart(ev, series){
   </svg>`;
 }
 
-async function showSeries(rel, host){
+/* The open drill-down survives a redraw: a push that arrives while you are
+   reading a pair's history must not close it. `scroll` is true only for a
+   click, so a background repaint never yanks the page. */
+let expandedRel = null;
+
+async function showSeries(rel, host, scroll){
+  expandedRel = rel;
   host.innerHTML='<div class="dim">loading…</div>';
   const d=await json('/api/intent-series?rel='+encodeURIComponent(rel));
   if(d.error){ host.innerHTML=`<div class="err">${esc(d.error)}</div>`; return; }
-  host.innerHTML=`<h2>${esc(rel)} &middot; ${d.events.length} intents &middot; ${d.edge_series.length} priced points</h2>
+  host.innerHTML=`<h2>${esc(rel)} &middot; ${d.events.length} intents &middot; ${d.edge_series.length} priced points
+      &middot; <a href="#" id="series-close" class="rel">close</a></h2>
     ${quoteAndEdgeChart(d.events, d.edge_series)}
     <div class="sub" style="margin-top:6px">Solid = our posted quote (left axis).
       Dashed = post-fee edge per route on its own right axis — different units, so a
       shared axis would flatten both.</div>`;
-  host.scrollIntoView({behavior:'smooth', block:'nearest'});
+  host.querySelector('#series-close').onclick = e => {
+    e.preventDefault(); expandedRel = null; host.innerHTML='';
+  };
+  if(scroll) host.scrollIntoView({behavior:'smooth', block:'nearest'});
 }
 
 const COLS=[
@@ -461,7 +473,7 @@ const COLS=[
 
 let iSort={key:'edge_f',dir:-1}, iFilter={route:'', actionable:true, tradable:true};
 
-function intentsPanel(d, root){
+function intentsPanel(d){
   if(d.error) return $(`<section class="wide"><h2>Engine intents</h2>
     <div class="err">${esc(d.error)}</div>
     <div class="sub" style="margin-top:8px">${esc(d.hint||'')}</div></section>`);
@@ -537,17 +549,20 @@ function intentsPanel(d, root){
     <div id="series-host" style="margin-top:14px"></div>
   </section>`);
 
+  // Through load(), never straight into reloadIntents: a redraw racing a
+  // pushed frame clears and re-appends the same root twice.
   el.querySelectorAll('.sortable').forEach(th=>th.onclick=()=>{
     const k=th.dataset.key;
     iSort = (iSort.key===k) ? {key:k,dir:-iSort.dir} : {key:k,dir:-1};
-    reloadIntents(root);
+    load();
   });
   el.querySelectorAll('.rf').forEach(a=>a.onclick=(e)=>{
-    e.preventDefault(); iFilter.route=a.dataset.route; reloadIntents(root);});
-  el.querySelector('#f-act').onclick=e=>{e.preventDefault(); iFilter.actionable=!iFilter.actionable; reloadIntents(root);};
-  el.querySelector('#f-trd').onclick=e=>{e.preventDefault(); iFilter.tradable=!iFilter.tradable; reloadIntents(root);};
+    e.preventDefault(); iFilter.route=a.dataset.route; load();});
+  el.querySelector('#f-act').onclick=e=>{e.preventDefault(); iFilter.actionable=!iFilter.actionable; load();};
+  el.querySelector('#f-trd').onclick=e=>{e.preventDefault(); iFilter.tradable=!iFilter.tradable; load();};
   const host=el.querySelector('#series-host');
-  el.querySelectorAll('.irow').forEach(tr=>tr.onclick=()=>showSeries(tr.dataset.rel, host));
+  el.querySelectorAll('.irow').forEach(tr=>tr.onclick=()=>showSeries(tr.dataset.rel, host, true));
+  if(expandedRel) showSeries(expandedRel, host, false);
   return el;
 }
 
@@ -577,7 +592,7 @@ async function reloadIntents(root){
     : `${d.resting_orders} resting &middot; ${d.pairs} pairs &middot; last ${dur(d.last_intent_age_s)} ago`);
   const t=await json('/api/top-series?n=4').catch(()=>({rows:[]}));
   root.append(topSeriesPanel(t));
-  root.append(intentsPanel(d, root));
+  root.append(intentsPanel(d));
 }
 
 function currentPanel(d){
@@ -711,14 +726,16 @@ const ROUTES = {
     root.append(integrityPanel(iv));
     const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
     host.dataset.day = iv.today || '';
-    root.append(host); poll();
+    root.append(host); paintRollup(lastState.rollup_status || {});
     root.append(coveragePanel(iv));
   },
   '/current': async (root) => {
     const d = await json('/api/current' + (location.search || ''));
     const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
-    host.dataset.day = d.day || '';
-    root.append(host); poll();
+    // On the error path `d.day` is absent — and that is exactly when the
+    // rebuild button matters, so fall back to the day the server reports.
+    host.dataset.day = d.day || lastState.today || '';
+    root.append(host); paintRollup(lastState.rollup_status || {});
     setMeta(d.error ? 'no rollup' :
       `${d.scenario} &middot; clip ${d.clip} &middot; ${d.profitable}/${d.priced_pairs} profitable`);
     root.append(currentPanel(d));
@@ -738,11 +755,27 @@ const ROUTES = {
 };
 
 function setMeta(html){
-  document.getElementById('meta').innerHTML = html + ` &middot; ${new Date().toLocaleTimeString()}`;
+  document.getElementById('meta').innerHTML = html;
 }
 
+/* Which stream key each view depends on. A frame that does not move THIS
+   view's key is not a reason to redraw it — which is the whole reason a push
+   beats a timer: an idle board redraws nothing at all. */
+const VIEW_TOPIC = {
+  '/':'books', '/recording':'recording', '/opportunities':'opportunities',
+  '/pairs':'pairs', '/current':'rollup', '/intents':'intents',
+};
+
+let lastState = {};       // most recent stream frame
+let rendering = false;    // one render at a time; a redraw mid-render duplicates panels
+let queued = false;
+
 async function load(){
+  if(rendering){ queued = true; return; }
+  rendering = true;
   const root = document.getElementById('root');
+  // A background redraw must not throw away where you were reading.
+  const wasAt = window.scrollY;
   let path = location.pathname;
   const isPair = path.startsWith('/pair/');
   if(!isPair && !ROUTES[path]) path = '/';
@@ -757,16 +790,57 @@ async function load(){
       if(d.error) throw new Error(d.error);
       setMeta(`${d.samples_a + d.samples_b} quote samples across both legs`);
       pairPanels(d, root);
-      return;
+    } else {
+      await ROUTES[path](root);
     }
-    await ROUTES[path](root);
   }catch(e){
-    root.innerHTML = `<section class="wide err">${esc(e.message||e)}</section>`;
+    const msg = e.message || String(e);
+    root.innerHTML = `<section class="wide err">${esc(msg)}</section>`;
+    // The header must never keep describing the view that worked while the
+    // body shows the one that did not.
+    setMeta(`<span class="bad">${esc(msg)}</span>`);
+  }finally{
+    rendering = false;
+    // The stream frame that carries the rollup can land while this render is
+    // still building the panel, so paint it once more on the way out.
+    paintRollup(lastState.rollup_status || {});
+    if(wasAt) window.scrollTo(0, wasAt);
+    if(queued){ queued = false; load(); }
   }
 }
 
+/* Server-pushed freshness. The old build re-ran the whole page on a 15s timer,
+   which meant an idle dashboard hammered the box, a change waited up to 15s to
+   appear, and anything you had opened was thrown away mid-read. */
+function setLink(cls, text, title){
+  const el = document.getElementById('link');
+  el.className = 'sub ' + cls;
+  el.textContent = text;
+  el.title = title || '';
+}
+
+function connect(){
+  const es = new EventSource('/api/stream');
+  es.onopen = () => setLink('ok', '● live', 'pushed by the server as files change');
+  es.onmessage = (ev) => {
+    let s; try{ s = JSON.parse(ev.data); }catch{ return; }
+    const prev = lastState; lastState = s;
+    setLink('ok', '● live ' + new Date().toLocaleTimeString(),
+            'time of the last change the server pushed');
+    paintRollup(s.rollup_status || {});
+    // The first frame is not news: the initial load() already read everything.
+    if(!Object.keys(prev).length) return;
+    // A pair drill-down is drawn from the ToB rollup, not the registry.
+    const topic = location.pathname.startsWith('/pair/')
+      ? 'rollup' : VIEW_TOPIC[location.pathname] || 'books';
+    if(prev[topic] !== s[topic]) load();
+  };
+  es.onerror = () => setLink('bad', '● reconnecting…',
+                             'the dashboard cannot reach the server');
+}
+
 load();
-setInterval(load, 15000);
+connect();
 </script>
 </body>
 </html>

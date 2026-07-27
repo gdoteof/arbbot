@@ -13,6 +13,15 @@
 //! No HTTP crate: the workspace's only dependencies are serde/serde_json, and a
 //! localhost read-only instrument does not justify pulling in a runtime.
 //!
+//! Updates are PUSHED, not polled: `GET /api/stream` is a Server-Sent Events
+//! connection that emits one line whenever the files a view reads actually
+//! change. An idle dashboard therefore makes zero requests, and a change shows
+//! up in about a second instead of on the next timer tick. SSE rather than a
+//! WebSocket because the traffic is one-directional and SSE is plain HTTP —
+//! no handshake, no framing, no dependency, and the browser reconnects on its
+//! own. That connection is long-lived, so the accept loop serves each
+//! connection on its own thread; serially, one stream would wedge the server.
+//!
 //!   arb-dash --kalshi-dir <dir> --pmus-dir <dir> --pmus-deposits <usd> \
 //!            [--data-dir data] [--port 4749] [--kalshi-balance <usd>]
 
@@ -23,6 +32,7 @@ use std::net::{TcpListener, TcpStream};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::process::exit;
+use std::time::{Duration, UNIX_EPOCH};
 
 use arb_core::fees::FeeSchedule;
 use arb_core::model::Venue;
@@ -126,6 +136,92 @@ fn rollup_start(a: &Args, sh: &Shared, query: &str) -> String {
     });
 
     serde_json::json!({ "started": true, "day": day }).to_string()
+}
+
+/// Length and mtime of one file, folded into a number. Never reads content:
+/// the point is to notice a change for the price of a `stat`, so the whole
+/// fingerprint can be recomputed once a second forever.
+fn stat_sig(path: &str) -> u64 {
+    let Ok(m) = std::fs::metadata(path) else { return 0 };
+    let mtime = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    m.len() ^ mtime.rotate_left(17)
+}
+
+fn stat_all(paths: &[String]) -> u64 {
+    paths.iter().fold(0u64, |acc, p| acc.rotate_left(7) ^ stat_sig(p))
+}
+
+/// What each view depends on, one number per view, plus the rollup's own
+/// status. The client re-renders ONLY the view whose number moved, which is
+/// what makes a push cheaper than a poll: an idle board redraws nothing.
+fn state_json(a: &Args, sh: &Shared) -> String {
+    let day = integrity::build(&a.data_dir).today;
+    let venues = ["kalshi", "polymarket", "polymarket_us"];
+    let books = stat_all(&[
+        format!("{}/kalshi_deposits.json", a.kalshi_dir),
+        format!("{}/kalshi_fills.json", a.kalshi_dir),
+        format!("{}/kalshi_settlements.json", a.kalshi_dir),
+        format!("{}/pmus_balances.json", a.pmus_dir),
+        format!("{}/pmus_positions.json", a.pmus_dir),
+    ]);
+    let recording = stat_all(
+        &venues.iter().map(|v| format!("{}/raw/{v}-{day}.jsonl", a.data_dir)).collect::<Vec<_>>(),
+    );
+    let rollup = stat_all(
+        &venues.iter().map(|v| format!("{}/tob-{v}-{day}.jsonl", a.rollup_dir)).collect::<Vec<_>>(),
+    );
+    let intents = stat_sig(&a.intents_path);
+    let opps = stat_sig(&format!("{}/opportunities-{day}.jsonl", a.scan_dir));
+    let registry = stat_all(&[a.registry.clone(), a.tradable.clone()]);
+    format!(
+        "{{\"today\":\"{day}\",\"books\":{books},\"recording\":{recording},\
+         \"rollup\":{rollup},\"intents\":{intents},\"opportunities\":{opps},\
+         \"pairs\":{registry},\"rollup_status\":{}}}",
+        rollup_status(sh)
+    )
+}
+
+/// One SSE connection. Sends a line only when something moved, and a comment
+/// heartbeat otherwise — which is also how a closed tab is detected, since the
+/// write is the only thing that fails.
+///
+/// The live tapes grow every second, so "push on any change" would redraw the
+/// recording and intents views continuously. Changes are therefore coalesced
+/// into at most one frame every `MIN_PUSH`: idle still costs nothing, and a
+/// moving market still shows up an order of magnitude sooner than the 15s
+/// timer this replaced.
+fn stream(mut s: TcpStream, a: &Args, sh: &Shared) {
+    const MIN_PUSH: u32 = 3;
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                Cache-Control: no-store\r\nConnection: keep-alive\r\n\r\n";
+    if s.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let mut last = String::new();
+    let (mut tick, mut since_push) = (0u32, MIN_PUSH);
+    loop {
+        let body = state_json(a, sh);
+        let out = if body != last && since_push >= MIN_PUSH {
+            last = body.clone();
+            since_push = 0;
+            format!("data: {body}\n\n")
+        } else if tick % 15 == 0 {
+            ": ping\n\n".to_string()
+        } else {
+            String::new()
+        };
+        if !out.is_empty() && (s.write_all(out.as_bytes()).is_err() || s.flush().is_err()) {
+            return;
+        }
+        tick = tick.wrapping_add(1);
+        since_push = since_push.saturating_add(1);
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
@@ -942,6 +1038,8 @@ fn handle(s: TcpStream, a: &Args, sh: &Shared) {
         "/" | "/recording" | "/opportunities" | "/pairs" | "/current" | "/intents" => {
             respond(s, "200 OK", "text/html; charset=utf-8", PAGE)
         }
+        // Long-lived: this call returns only when the client goes away.
+        "/api/stream" => stream(s, a, sh),
         "/api/books" => respond(s, "200 OK", "application/json", &books_json(a)),
         "/api/integrity" => {
             let i = integrity::build(&a.data_dir);
@@ -1026,7 +1124,12 @@ fn main() {
     };
     println!("arb-dash on http://{addr}  (read-only, 127.0.0.1 only)");
     let shared: Shared = Arc::new(Mutex::new(Rollup::default()));
+    // A thread per connection. Not for throughput — one person reads this —
+    // but because /api/stream never returns, and a serial loop would let the
+    // first subscriber wedge every later request.
+    let args = Arc::new(a);
     for s in l.incoming().flatten() {
-        handle(s, &a, &shared);
+        let (a, sh) = (Arc::clone(&args), Arc::clone(&shared));
+        std::thread::spawn(move || handle(s, &a, &sh));
     }
 }
