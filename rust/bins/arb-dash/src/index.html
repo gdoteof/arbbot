@@ -313,23 +313,47 @@ function pairPanels(d, root){
   </section>`));
 }
 
+/* 143 rows of registry, unsorted and unsearchable, with 78-digit Polymarket
+   token ids in the legs column. Finding one pair meant ctrl-F. */
+let pairQuery = '';
+
 function pairsPanel(d){
   if(d.error) return $(`<section class="wide"><h2>Pairs</h2><div class="err">${esc(d.error)}</div></section>`);
-  const rows=(d.rows||[]).map(r=>`<tr>
+  const q = pairQuery.trim().toLowerCase();
+  const match = r => !q || [r.id, r.verdict, r.vetted_by, ...(r.legs||[])]
+    .some(v => String(v||'').toLowerCase().includes(q));
+  const shown = (d.rows||[]).filter(match);
+  const rows=shown.map(r=>`<tr>
       <td><a class="rel" href="/pair/${encodeURIComponent(r.id)}">${esc(r.id)}</a></td>
       <td>${esc(r.verdict||'—')}</td>
       <td>${esc(r.vetted_by||'—')}${r.tradable && !r.human_vetted ? ' <span class="dim">+allowlist</span>' : ''}</td>
       <td class="num ${r.tradable?'ok':'dim'}">${r.tradable?'yes':'no'}</td>
       <td class="dim">${(r.legs||[]).length>2 ? (r.legs.length+' legs') : esc((r.legs||[]).map(l=>l.length>44?l.slice(0,44)+'…':l).join('  |  '))}</td>
     </tr>`).join('');
-  return $(`<section class="wide">
+  const el = $(`<section class="wide">
     <h2>Tracked pairs &middot; ${d.count} registered &middot; ${d.tradable} tradable
-      <span class="dim">(${d.human_vetted} human-vetted + ${d.allowlisted} allowlisted)</span></h2>
+      <span class="dim">(${d.human_vetted} by human verdict, ${d.allowlisted}
+        id(s) in the allowlist — the two overlap)</span>
+      ${q?`&middot; <span class="ok">${shown.length} match "${esc(q)}"</span>`:''}</h2>
+    <input id="pair-q" placeholder="filter by id, verdict, vetter or leg…"
+      value="${esc(pairQuery)}" style="width:100%;max-width:420px;margin-bottom:10px;
+      font:inherit;font-size:12px;padding:5px 9px;border-radius:6px;
+      background:var(--bg);color:var(--ink);border:1px solid var(--line)">
+    ${shown.length?'':'<div class="dim" style="padding:8px 0">no pair matches that.</div>'}
     <div class="scroll"><table>
       <thead><tr><th>relationship</th><th>verdict</th><th>vetted by</th>
         <th class="num">tradable</th><th>legs</th></tr></thead>
       <tbody>${rows}</tbody></table></div>
   </section>`);
+  const inp = el.querySelector('#pair-q');
+  inp.oninput = () => {
+    pairQuery = inp.value;
+    const at = inp.selectionStart;
+    repaintPairs();
+    const next = document.getElementById('pair-q');
+    if(next){ next.focus(); next.setSelectionRange(at, at); }
+  };
+  return el;
 }
 
 
@@ -558,15 +582,20 @@ function intentsPanel(d){
     since_change_s:r.since_change_s,
   })[k];
 
-  let rows=(d.rows||[]).slice();
+  const all=(d.rows||[]).slice();
+  let rows=all;
   if(iFilter.route) rows=rows.filter(r=>r.best_route===iFilter.route);
   if(iFilter.actionable) rows=rows.filter(r=>r.actionable);
   if(iFilter.tradable) rows=rows.filter(r=>r.tradable);
+  // Prices arrive as strings, so a plain typeof check sorted "our bid A" and
+  // both venue columns LEXICALLY: 0.09 above 0.1, and blanks first.
+  const numeric = (COLS.find(c=>c[0]===iSort.key)||[])[3] !== 's';
   rows.sort((a,b)=>{
     const x=val(a,iSort.key), y=val(b,iSort.key);
-    if(typeof x==='string'||typeof y==='string')
-      return String(x??'').localeCompare(String(y??''))*iSort.dir;
-    return (((y??-1e9)-(x??-1e9)))*(iSort.dir<0?1:-1);
+    if(!numeric) return String(x??'').localeCompare(String(y??''))*iSort.dir;
+    const nx=x==null||x===''?-Infinity:Number(x), ny=y==null||y===''?-Infinity:Number(y);
+    const fx=isFinite(nx)?nx:-Infinity, fy=isFinite(ny)?ny:-Infinity;
+    return (fy-fx)*(iSort.dir<0?1:-1);
   });
 
   const head=COLS.map(([k,l,tip])=>{
@@ -597,6 +626,20 @@ function intentsPanel(d){
       <td class="num dim">${dur(r.since_change_s)}</td>
     </tr>`;}).join('');
 
+  // An empty table is a claim, and it must say which claim. Filters hiding
+  // everything and a stale rollup hiding everything look identical otherwise —
+  // this view showed a bare header strip and nothing else for hours.
+  const hidden = all.length - rows.length;
+  const why = rows.length ? '' : `<div class="warn" style="padding:10px 0">▲ Nothing to show.
+    ${all.length === 0
+      ? 'The engine is resting ' + d.resting_orders + ' order(s), but none of them are on a '
+        + 'pair with both books in the rollup.'
+      : (!d.rollup_current
+        ? 'All ' + all.length + ' pair(s) are filtered out, and nothing can be actionable '
+          + 'while the rollup is ' + dur(d.rollup_coverage_age_s) + ' behind — rebuild it above, '
+          + 'or turn off <b>actionable only</b> to see the pairs as last priced.'
+        : 'All ' + all.length + ' pair(s) are hidden by the filters above.')}</div>`;
+
   const rbtn=(k,l)=>`<a href="#" data-route="${k}" class="rf ${iFilter.route===k?'on':''}">${l}</a>`;
   const el=$(`<section class="wide">
     <h2>Engine intents &middot; ${d.resting_orders} resting &middot; ${rows.length}/${d.pairs} shown
@@ -609,7 +652,8 @@ function intentsPanel(d){
       <a href="#" id="f-act" class="${iFilter.actionable?'on':''}">actionable only</a>
       <a href="#" id="f-trd" class="${iFilter.tradable?'on':''}">tradable only</a>
     </nav>
-    <div class="scroll"><table>
+    ${why}
+    <div class="scroll" style="${rows.length?'':'display:none'}"><table>
       <thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>
     <div class="sub" style="margin-top:8px">Click a header to sort, a row for its history.
       The stream is MAKER-ONLY — a take-take crossing is an immediate execution, never a
@@ -623,17 +667,17 @@ function intentsPanel(d){
     <div id="series-host" style="margin-top:14px"></div>
   </section>`);
 
-  // Through load(), never straight into reloadIntents: a redraw racing a
-  // pushed frame clears and re-appends the same root twice.
+  // Sort and filter are questions about data already in the browser. They
+  // repaint from cache; they do not go back to the server.
   el.querySelectorAll('.sortable').forEach(th=>th.onclick=()=>{
     const k=th.dataset.key;
     iSort = (iSort.key===k) ? {key:k,dir:-iSort.dir} : {key:k,dir:-1};
-    load();
+    repaintIntents();
   });
   el.querySelectorAll('.rf').forEach(a=>a.onclick=(e)=>{
-    e.preventDefault(); iFilter.route=a.dataset.route; load();});
-  el.querySelector('#f-act').onclick=e=>{e.preventDefault(); iFilter.actionable=!iFilter.actionable; load();};
-  el.querySelector('#f-trd').onclick=e=>{e.preventDefault(); iFilter.tradable=!iFilter.tradable; load();};
+    e.preventDefault(); iFilter.route=a.dataset.route; repaintIntents();});
+  el.querySelector('#f-act').onclick=e=>{e.preventDefault(); iFilter.actionable=!iFilter.actionable; repaintIntents();};
+  el.querySelector('#f-trd').onclick=e=>{e.preventDefault(); iFilter.tradable=!iFilter.tradable; repaintIntents();};
   const host=el.querySelector('#series-host');
   el.querySelectorAll('.irow').forEach(tr=>tr.onclick=()=>showSeries(tr.dataset.rel, host, true));
   if(expandedRel) showSeries(expandedRel, host, false);
@@ -659,14 +703,40 @@ function topSeriesPanel(t){
   </section>`);
 }
 
+/* Sorting a column used to REFETCH /api/intents AND /api/top-series, which
+   re-prices every actionable pair's whole day server-side to answer a question
+   the browser already had the data for. The payload is cached and re-sorted in
+   place; only a pushed change goes back to the server. */
+let intentsData = null, topData = null;
+
 async function reloadIntents(root){
-  const d=await json('/api/intents');
+  intentsData = await json('/api/intents');
+  topData = await json('/api/top-series?n=4').catch(()=>({rows:[]}));
+  paintIntents(root);
+}
+
+function paintIntents(root){
+  const d = intentsData;
+  if(!d) return;
   root.innerHTML='';
   setMeta(d.error ? 'engine not running'
     : `${d.resting_orders} resting &middot; ${d.pairs} pairs &middot; last ${dur(d.last_intent_age_s)} ago`);
-  const t=await json('/api/top-series?n=4').catch(()=>({rows:[]}));
-  root.append(topSeriesPanel(t));
+  // The rebuild control belongs where the problem is visible. With a stale
+  // rollup this view goes empty, and the fix used to live on two other pages.
+  if(!d.error && !d.rollup_current){
+    const host = $(`<div id="rollup-host" class="wide" style="grid-column:1/-1"></div>`);
+    host.dataset.day = lastState.today || '';
+    root.append(host); paintRollup(lastState.rollup_status || {});
+  }
+  root.append(topSeriesPanel(topData||{rows:[]}));
   root.append(intentsPanel(d));
+}
+
+/* Re-render from cache. Never mid-flight: load() clears and re-appends the
+   same root, so a synchronous repaint in between would interleave. */
+function repaintIntents(){
+  if(rendering){ queued = true; return; }
+  paintIntents(document.getElementById('root'));
 }
 
 function currentPanel(d){
@@ -752,6 +822,25 @@ function currentPanel(d){
   </section>`);
 }
 
+/* The range was reachable only by hand-editing the URL, and every nav link
+   dropped it. Rendered as markup rather than wired handlers so it survives the
+   repaints without rebinding. */
+function dateRange(base, from, to){
+  const back = (n) => {
+    const d = new Date((to||new Date().toISOString().slice(0,10)) + 'T00:00:00Z');
+    const t = d.toISOString().slice(0,10);
+    d.setUTCDate(d.getUTCDate() - (n-1));
+    return `${base}?from=${d.toISOString().slice(0,10)}&to=${t}`;
+  };
+  const span = (from && to)
+    ? Math.round((Date.parse(to+'T00:00:00Z') - Date.parse(from+'T00:00:00Z'))/86400000) + 1 : 1;
+  const btn = (n,l) => `<a href="${back(n)}" class="${span===n?'on':''}">${l}</a>`;
+  return `<div class="sub" style="margin-bottom:10px">range:
+    <nav style="display:inline-flex;padding:0;border:0">
+      ${btn(1,'today')}${btn(3,'3d')}${btn(7,'7d')}${btn(30,'30d')}</nav>
+    &nbsp;<code>?from=YYYY-MM-DD&amp;to=YYYY-MM-DD</code> for anything else</div>`;
+}
+
 function oppsPanel(o){
   if(o.error) return $(`<section class="wide"><h2>Opportunity coverage</h2>
     <div class="err">${esc(o.error)}</div></section>`);
@@ -770,6 +859,7 @@ function oppsPanel(o){
       &middot; ${o.days} day(s)
       &middot; ${total>SHOWN?`top ${SHOWN} of ${o.relationships}`:`${o.relationships}`} pairs
       &middot; <span class="dim">${o.observations.toLocaleString()} obs in ${o.query_ms} ms</span></h2>
+    ${dateRange('/opportunities', o.from, o.to)}
     ${total>SHOWN?`<div class="sub" style="margin-bottom:8px">${total-SHOWN} lower-edge
       pair(s) are not shown.</div>`:''}
     <div class="scroll"><table>
@@ -836,9 +926,8 @@ const ROUTES = {
   },
   '/intents': async (root) => { await reloadIntents(root); },
   '/pairs': async (root) => {
-    const d = await json('/api/pairs');
-    setMeta(`${d.count||0} pairs registered &middot; ${d.tradable||0} tradable`);
-    root.append(pairsPanel(d));
+    pairsData = await json('/api/pairs');
+    paintPairs(root);
   },
   '/opportunities': async (root) => {
     const qs = location.search || '';
@@ -847,6 +936,18 @@ const ROUTES = {
     root.append(oppsPanel(o));
   },
 };
+
+let pairsData = null;
+function paintPairs(root){
+  if(!pairsData) return;
+  root.innerHTML='';
+  setMeta(`${pairsData.count||0} pairs registered &middot; ${pairsData.tradable||0} tradable`);
+  root.append(pairsPanel(pairsData));
+}
+function repaintPairs(){
+  if(rendering){ queued = true; return; }
+  paintPairs(document.getElementById('root'));
+}
 
 function setMeta(html){
   document.getElementById('meta').innerHTML = html;
