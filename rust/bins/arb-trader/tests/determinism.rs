@@ -28,6 +28,10 @@ struct Run {
     digest: String,
     summary: serde_json::Value,
     intents: String,
+    /// The engine's operator-facing log. The ledger-booking and unattributed-fill
+    /// lines are only observable here: a bench run must never write the real
+    /// trade ledger, so what it BOOKED can only be read off stderr.
+    stderr: String,
 }
 
 /// Run the shell over `source` (`--bench-tape` or `--replay-wal`), returning
@@ -57,6 +61,7 @@ fn run(src_flag: &str, src: &Path, out: &Path, wal: Option<&Path>) -> Run {
         digest: summary["sha256"].as_str().expect("bench digest").to_owned(),
         summary,
         intents: std::fs::read_to_string(out).expect("read intents"),
+        stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
     }
 }
 
@@ -72,8 +77,13 @@ fn synthetic_tape_is_a_deterministic_fold() {
     assert_eq!(a.digest, b.digest, "same tape, same digest");
     assert_eq!(a.intents, b.intents, "same tape, byte-identical intent stream");
 
-    // the fill path actually ran (guards against a silently-skipped kind)
-    assert_eq!(a.summary["fills"], 5);
+    // the fill path actually ran (guards against a silently-skipped kind).
+    // FOUR, not five: the tape's 5th fill frame is for `ghost-oid`, which maps to
+    // no order of ours. `fills` counts frames attributable to a maker order of
+    // ours; counting a foreign fill there over-reported the gauge and would have
+    // double-counted any frame replayed out of the unattributed hold.
+    assert_eq!(a.summary["fills"], 4);
+    assert_eq!(a.summary["fills_unattributed"], 1, "the ghost is counted HERE");
     assert_eq!(a.summary["order_acks"], 2);
     assert_eq!(a.summary["hedge_obligations"], 3);
     assert_eq!(a.summary["dropped_unconsumed"], 0, "every obligation was consumed");
@@ -186,6 +196,104 @@ fn a_hedge_fill_never_mints_another_hedge() {
         r.summary["hedge_obligations"], 1,
         "the hedge's fills must not register as obligations"
     );
+}
+
+/// Every quantity the engine says it BOOKED, in order. Bench never writes the
+/// real ledger, so this line is the only place the booked size is visible.
+fn booked_quantities(stderr: &str) -> Vec<i64> {
+    stderr
+        .lines()
+        .filter(|l| l.starts_with("[ledger] booked "))
+        .filter_map(|l| l.split(" x").nth(1)?.split_whitespace().next()?.parse().ok())
+        .collect()
+}
+
+/// THE C3 regression, end to end. A 10-lot… here a 5-lot hedge fills 2 then 5
+/// (cumulative, two frames), which is the NORMAL shape: Kalshi sends one frame
+/// per trade and PM-US sends PARTIAL_FILL then FILL.
+///
+/// Before 2026-07-28 the engine did `hedge_orders.remove(oid)` on the FIRST
+/// frame, so frame two matched no hedge, fell through to the maker path, found
+/// nothing in the FillLedger (hedges are deliberately never registered there)
+/// and was dropped with no alarm. It booked 2 of 5, understated exposure
+/// forever, and the remaining 3 lost both its retry and its naked alarm.
+#[test]
+fn a_hedge_filling_in_two_frames_books_its_whole_size() {
+    let r = run(
+        "--bench-tape",
+        &data("synth-hedge-partial.jsonl"),
+        &tmp("hedge-partial.jsonl"),
+        None,
+    );
+    let booked = booked_quantities(&r.stderr);
+    assert_eq!(booked, vec![2, 3], "each frame books its own delta: {:?}", booked);
+    assert_eq!(booked.iter().sum::<i64>(), 5, "and they add up to the hedge that filled");
+    assert_eq!(
+        r.summary["hedges_pending"], 0,
+        "the obligation is retired only once it is really covered"
+    );
+    assert_eq!(r.summary["hedges_overfilled"], 0);
+    assert_eq!(
+        r.summary["fills_unattributed"], 0,
+        "no frame of a hedge we placed may read as unexplained money — including the \
+         duplicate third frame, which is idempotent"
+    );
+    assert_eq!(r.summary["hedge_obligations"], 1, "one maker fill, one obligation");
+}
+
+/// A fill that beats its own `order_ack` must not be lost. The ack is emitted
+/// once the place's HTTP response returns while the fill arrives on the venue's
+/// private socket, and Kalshi's fill channel carries only Kalshi's own order id —
+/// so for a moment the fill maps to nothing. The fixture uses the observed 48 ms
+/// margin.
+///
+/// Dropping it meant no hedge was minted, `record_open` never fired (so the
+/// concentration cap never bound), and on a hedge's own fill the 5-second retry
+/// bought the hedge a second time.
+#[test]
+fn a_fill_that_arrives_before_its_ack_is_still_hedged() {
+    let r = run(
+        "--bench-tape",
+        &data("synth-fill-before-ack.jsonl"),
+        &tmp("fill-before-ack.jsonl"),
+        None,
+    );
+    assert_eq!(
+        r.summary["hedge_obligations"], 1,
+        "the held fill is replayed the moment its ack names it"
+    );
+    let hedges = hedge_lines(&r.intents);
+    assert_eq!(hedges.len(), 1, "exactly one hedge, never zero and never two: {:?}", hedges);
+    assert_eq!(hedges[0]["count"], 2, "for the size that actually filled");
+    assert_eq!(hedges[0]["place"], "SYNTH-P-YES", "on the other leg");
+    assert_eq!(r.summary["fills_unclaimed"], 0, "nothing left holding");
+    assert_eq!(r.summary["fills_unattributed"], 0, "and nothing unexplained");
+    assert!(
+        r.stderr.contains("replaying the held fill"),
+        "the replay must be visible in the log: {}",
+        r.stderr
+    );
+}
+
+/// A fill the engine cannot attribute must be LOUD. The synthetic tape ends with
+/// a fill for `ghost-oid`; it used to be counted in `fills` and thrown away in
+/// silence, which is exactly the shape of a real naked position with zero
+/// detection (a place returns a parse error, the order rests anyway, no ack is
+/// ever emitted, and the fill arrives under the venue's id).
+#[test]
+fn an_unattributable_fill_alarms_instead_of_vanishing() {
+    let r = run("--bench-tape", &data("synth-tape.jsonl"), &tmp("ghost-fill.jsonl"), None);
+    assert_eq!(
+        r.summary["fills_unattributed"], 1,
+        "the ghost fill is counted as unexplained, not just counted"
+    );
+    assert!(r.stderr.contains("UNATTRIBUTED 1x on kalshi SYNTH-K-YES"), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("RECONCILE BY HAND"),
+        "an unexplained fill must name what a human has to do: {}",
+        r.stderr
+    );
+    assert_eq!(r.summary["dropped_unconsumed"], 0, "and it is not a dropped obligation");
 }
 
 /// A dry run must NEVER write to the accounting ledger. It would invent open

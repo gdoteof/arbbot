@@ -16,15 +16,57 @@ pub struct FeedMsg {
     pub t_read: Instant,
 }
 
+/// CONNECTION control lines. `kind` values no recorder ever emits, injected by
+/// `socket_feed` into the SAME ordered channel as book events so the engine
+/// learns about an outage exactly where the outage happened in its own event
+/// stream — not up to one health-tick later, and not never.
+///
+/// Never was the old answer: `socket_feed` logged "disconnected; reconnecting
+/// in 2s" and re-subscribed while the engine's `feed_pulled` stayed false, so
+/// the armed engine of 2026-07-28 quoted straight across every outage of the
+/// session believing its books were current. A dropped subscriber receives NO
+/// delta for the length of the outage; the welcome snapshot burst that repairs
+/// its books arrives AFTER the reconnect, not with it. See `engine::Link`.
+pub const FEED_DOWN: &str = "feed_down";
+pub const FEED_UP: &str = "feed_up";
+
+/// A control line, with a wall timestamp so the WAL's incident record can be
+/// lined up against the recorder's journal.
+fn control(kind: &str, note: &str) -> String {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    // Built through serde_json, not format!: `note` carries io::Error text.
+    serde_json::json!({"kind": kind, "note": note, "ts": ts}).to_string()
+}
+
+/// Send one control line. `Err` = the engine is gone.
+async fn send_control(tx: &Sender<FeedMsg>, kind: &str, note: &str) -> Result<(), ()> {
+    tx.send(FeedMsg { line: control(kind, note), t_read: Instant::now() })
+        .await
+        .map_err(|_| ())
+}
+
 /// Live shadow feed: subscribe to a recorder unix socket (line JSON, welcome
 /// snapshots first), reconnect on EOF/error. The old stream is dropped before
 /// reconnecting — never a zombie connection (xv-zombie-socket-on-reconnect).
+///
+/// The `FEED_UP`/`FEED_DOWN` control lines bracket each subscription, and their
+/// POSITION in the stream is the whole point: `FEED_UP` goes out before the
+/// first line of the welcome burst is read, so the burst is what proves the
+/// books current again, and `FEED_DOWN` goes out after the last line the old
+/// subscription delivered, so the pull covers exactly the gap.
 pub async fn socket_feed(path: String, tx: Sender<FeedMsg>) {
     loop {
         match tokio::net::UnixStream::connect(&path).await {
             Ok(stream) => {
                 eprintln!("[feed] connected {path}");
+                if send_control(&tx, FEED_UP, &format!("connected {path}")).await.is_err() {
+                    return; // engine gone
+                }
                 let mut lines = tokio::io::BufReader::new(stream).lines();
+                let mut note = "subscription ended (EOF)".to_string();
                 loop {
                     match lines.next_line().await {
                         Ok(Some(line)) => {
@@ -35,13 +77,24 @@ pub async fn socket_feed(path: String, tx: Sender<FeedMsg>) {
                         Ok(None) => break,
                         Err(e) => {
                             eprintln!("[feed] read error: {e}");
+                            note = format!("read error: {e}");
                             break;
                         }
                     }
                 }
                 eprintln!("[feed] disconnected; reconnecting in 2s");
+                if send_control(&tx, FEED_DOWN, &note).await.is_err() {
+                    return;
+                }
             }
-            Err(e) => eprintln!("[feed] connect {path}: {e}; retrying in 2s"),
+            Err(e) => {
+                eprintln!("[feed] connect {path}: {e}; retrying in 2s");
+                // Also a down edge: at startup this is the recorder not being
+                // there yet, and the engine must not quote on empty books.
+                if send_control(&tx, FEED_DOWN, &format!("connect failed: {e}")).await.is_err() {
+                    return;
+                }
+            }
         }
         if tx.is_closed() {
             return;

@@ -112,8 +112,10 @@ struct Args {
     marks: String,
 }
 
-fn parse_args() -> Args {
-    let mut a = Args {
+/// The default Args, factored out of `parse_args` so the precondition tests can
+/// build one without going through the command line.
+fn default_args() -> Args {
+    Args {
         socket: None,
         bench_tape: None,
         replay_wal: None,
@@ -145,7 +147,11 @@ fn parse_args() -> Args {
         tt_max_ct_per_rel: 50,
         tt_max_clip: 20,
         marks: "data/exec/marks.json".into(),
-    };
+    }
+}
+
+fn parse_args() -> Args {
+    let mut a = default_args();
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -220,8 +226,14 @@ fn parse_args() -> Args {
     }
     let sources =
         [&a.socket, &a.bench_tape, &a.replay_wal].iter().filter(|s| s.is_some()).count();
-    if sources != 1 {
-        eprintln!("exactly one of --socket, --bench-tape or --replay-wal is required");
+    // `--sweep-only` never quotes, so it needs no event source at all. Requiring
+    // one made the cancel tool harder to run than the trading path (2026-07-28:
+    // clearing a leaked order needed a socket AND two invented balances).
+    if sources > 1 || (sources == 0 && !a.sweep_only) {
+        eprintln!(
+            "exactly one of --socket, --bench-tape or --replay-wal is required \
+             (--sweep-only needs none)"
+        );
         std::process::exit(2);
     }
     a
@@ -306,49 +318,24 @@ fn load_quoters(
     (quoters, by_market, rel_meta)
 }
 
-/// Everything that must hold before this process may touch a venue.
+/// Everything that must hold before this process may CANCEL — credentials, and
+/// nothing else.
 ///
-/// Encoded here rather than in a runbook: a checklist that only exists in prose
-/// is one nobody runs. Returns the sinks on success, or the list of what is
-/// missing — never a partially-armed engine.
-fn order_preconditions(
+/// Split out from `order_preconditions` after a real incident (2026-07-28):
+/// clearing the order the shutdown sweep had leaked meant running
+/// `--sweep-only`, which refused without `--balance`, `--health`, `--socket` and
+/// a readable ledger. None of those has anything to do with cancelling, so two
+/// balance figures were INVENTED under time pressure in order to cancel a real
+/// order. A safety check that obstructs the safety tool is a bug: the cancel
+/// path must be the easiest thing in this binary to run.
+fn cancel_preconditions(
     args: &Args,
     bench: bool,
 ) -> Result<HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>, Vec<String>> {
     let mut missing: Vec<String> = Vec::new();
-
     if bench {
-        missing.push("bench/replay mode can never place orders".into());
+        missing.push("bench/replay mode can never touch a venue".into());
     }
-    if args.socket.is_none() {
-        missing.push("no --socket: orders require the live feed".into());
-    }
-    if args.balances.is_empty() {
-        missing.push(
-            "no --balance: the risk gate would see $0 cash and refuse everything anyway".into(),
-        );
-    }
-    if args.health.is_empty() {
-        missing.push("--health disabled: quoting on an unwatched feed".into());
-    }
-    // Exposure IS seeded from the ledger at startup — but only if it is
-    // readable. An engine that cannot see the open book must not size into it.
-    if let Err(e) = ledger::read(&args.ledger) {
-        missing.push(format!("trade ledger unreadable, so exposure is unknown: {e}"));
-    }
-    // Both venues now push fills over their private WS channels (src/fills.rs).
-    // Credentials are checked below when the sinks are built; a fill feed that
-    // cannot authenticate is the same failure as an order path that cannot.
-    //
-    // Startup reconciliation is handled by `startup_sweep`, not by a
-    // precondition: the engine starts from a clean book by CANCELLING whatever
-    // is resting (Geoff's call, 2026-07-28). Arming aborts if that sweep cannot
-    // be proven to have worked.
-
-    if !missing.is_empty() {
-        return Err(missing);
-    }
-
     let mut sinks: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> = HashMap::new();
     let suffix = |v: &str| {
         args.cred_suffix.iter().find(|(k, _)| k == v).map(|(_, s)| s.clone())
@@ -368,6 +355,57 @@ fn order_preconditions(
     if missing.is_empty() { Ok(sinks) } else { Err(missing) }
 }
 
+/// The extra conditions that only PLACING requires. Every one of these is about
+/// sizing or watching a new position; none of them is needed to take one off.
+fn place_preconditions(args: &Args) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    if args.socket.is_none() {
+        missing.push("no --socket: orders require the live feed".into());
+    }
+    if args.balances.is_empty() {
+        missing.push(
+            "no --balance: the risk gate would see $0 cash and refuse everything anyway".into(),
+        );
+    }
+    if args.health.is_empty() {
+        missing.push("--health disabled: quoting on an unwatched feed".into());
+    }
+    // Exposure IS seeded from the ledger at startup — but only if it is
+    // readable. An engine that cannot see the open book must not size into it.
+    if let Err(e) = ledger::read(&args.ledger) {
+        missing.push(format!("trade ledger unreadable, so exposure is unknown: {e}"));
+    }
+    missing
+}
+
+/// Everything that must hold before this process may PLACE an order.
+///
+/// Encoded here rather than in a runbook: a checklist that only exists in prose
+/// is one nobody runs. Returns the sinks on success, or the list of what is
+/// missing — never a partially-armed engine.
+///
+/// Both venues push fills over their private WS channels (src/fills.rs).
+/// Credentials are checked by `cancel_preconditions`; a fill feed that cannot
+/// authenticate is the same failure as an order path that cannot.
+///
+/// Startup reconciliation is handled by `startup_sweep`, not by a precondition:
+/// the engine starts from a clean book by CANCELLING whatever is resting
+/// (Geoff's call, 2026-07-28). Arming aborts if that sweep cannot be proven to
+/// have worked.
+fn order_preconditions(
+    args: &Args,
+    bench: bool,
+) -> Result<HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>, Vec<String>> {
+    // Place checks FIRST and short-circuit, as before the split: a report-only
+    // run that is already refused has no business reading credentials, and the
+    // dry-run posture is "loads no credentials" (see the module header).
+    let missing = place_preconditions(args);
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+    cancel_preconditions(args, bench)
+}
+
 /// Cancel resting orders on the way OUT, on SIGTERM or Ctrl-C.
 ///
 /// The engine had no signal handler and did not cancel on exit, so stopping an
@@ -379,10 +417,23 @@ fn order_preconditions(
 /// The startup sweep already covered the NEXT run; this covers the gap in
 /// between, which is the window where a fill goes unhedged.
 ///
-/// Best-effort by design: a venue that will not answer must not stop the
-/// process from dying, so each cancel is bounded and failures are reported
-/// rather than retried forever. The startup sweep remains the backstop.
-fn spawn_shutdown_sweep(sinks: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>) {
+/// It then leaked an order anyway, at 15:40 on 2026-07-28, in four composing
+/// ways — all four now live in `exec::halt_and_sweep` and `sink::SweepPolicy`:
+/// nothing latched the executors, so one placed a maker order ONE SECOND into
+/// the sweep; the verify could only observe it; the `Err` arm fell into the same
+/// `exit(0)`, so systemd recorded a clean stop; and the venues were swept
+/// sequentially against a 90s `TimeoutStopSec`.
+///
+/// The adversarial review then found three more ways to exit 0 with an order
+/// resting, all of them in the same shape as the original: an EMPTY resting
+/// list believed on one read, a place still on the wire when that list was
+/// read, and a discarded hedge leaving a filled leg naked. All three now feed
+/// `ShutdownOutcome::exit_code`.
+///
+/// Still bounded by design — a venue that will not answer must not stop the
+/// process from dying — but "bounded" now means a NON-ZERO exit and a shouting
+/// log line rather than a silent success. The startup sweep remains the backstop.
+fn spawn_shutdown_sweep() {
     tokio::spawn(async move {
         let mut term = match tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate(),
@@ -393,22 +444,46 @@ fn spawn_shutdown_sweep(sinks: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink
                 return;
             }
         };
-        tokio::select! {
-            _ = term.recv() => eprintln!("[exec] SIGTERM"),
+        let why = tokio::select! {
+            _ = term.recv() => "SIGTERM",
             r = tokio::signal::ctrl_c() => {
                 if r.is_err() { return; }
-                eprintln!("[exec] interrupt");
+                "interrupt"
             }
+        };
+        let out = exec::halt_and_sweep(why).await;
+        for l in out.report() {
+            eprintln!("{l}");
         }
-        eprintln!("[exec] shutdown: cancelling resting orders before exit");
-        for (venue, s) in sinks {
-            match sink::cancel_all_and_verify(s).await {
-                Ok(()) => eprintln!("[exec] {venue:?}: book clean at exit"),
-                Err(e) => eprintln!("[exec] {venue:?}: NOT CLEAN at exit — {e}"),
-            }
+        if out.already_halting {
+            // A WAL crash-stop or a ledger failure got here first and owns the
+            // exit. Exiting now would overwrite its verdict with ours — and ours
+            // is `0`, because we swept nothing.
+            return;
         }
-        std::process::exit(0);
+        std::process::exit(out.exit_code());
     });
+}
+
+/// What `--sweep-only` is about to destroy, and under whose key.
+///
+/// A pure function so it can be tested without credentials — proving the banner
+/// says "PRIMARY" when no suffix was given is the whole point, and doing it for
+/// real would mean a live venue call.
+fn sweep_only_blast_radius(cred_suffix: &[(String, String)]) -> Vec<String> {
+    let ident = |keys: &[&str]| {
+        cred_suffix
+            .iter()
+            .find(|(k, _)| keys.contains(&k.as_str()))
+            .map(|(_, s)| format!("suffix `{s}`"))
+            .unwrap_or_else(|| "PRIMARY key — SHARED WITH THE PYTHON STACK".into())
+    };
+    vec![
+        "[exec] --sweep-only CANCELS EVERY RESTING ORDER ON THE WHOLE ACCOUNT,".into(),
+        "[exec]   not just the ones this process placed. Keys in use:".into(),
+        format!("[exec]   kalshi        -> {}", ident(&["kalshi"])),
+        format!("[exec]   polymarket_us -> {}", ident(&["pmus", "polymarket_us"])),
+    ]
 }
 
 /// Cancel every resting order on every armed venue, then PROVE the book is
@@ -418,22 +493,38 @@ fn spawn_shutdown_sweep(sinks: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink
 /// behind — which is the point, and why it only ever runs behind
 /// `--enable-orders`. A 2xx from cancel-all is not proof; the resting list is,
 /// and both venues' lists lag a write, so it polls.
+///
+/// It sweeps UNCONDITIONALLY. There used to be a `before.is_empty()` fast path
+/// that skipped both the cancel-all and the polling, so ONE transiently empty
+/// read — a rate-limited page, a partial page, or the same write-lag this
+/// function's own contract is built around — armed the engine on top of a
+/// previous run's book. That is the worst possible place for a fail-open: this
+/// sweep is the last backstop for every leak the process cannot clean up itself
+/// (SIGKILL, an OOM kill under `MemoryMax=1G`, an abort, a double panic), and
+/// the engine holds no ids for those orders, so its own kill path can never
+/// reach them either. Two extra API calls per venue per start is the entire cost.
+///
+/// The pre-read survives only as a log line for the human, and is now
+/// best-effort: an unreadable list is a reason to sweep, not a reason to stop.
 async fn startup_sweep(
     sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
+    pol: &sink::SweepPolicy,
 ) -> Result<(), String> {
     for (venue, sink) in sinks {
         let s = sink.clone();
-        let before = tokio::task::spawn_blocking(move || s.resting_order_ids())
-            .await
-            .map_err(|e| format!("{venue:?}: sweep task panicked: {e}"))?
-            .map_err(|e| format!("{venue:?}: cannot list resting orders: {e}"))?;
-        if before.is_empty() {
-            eprintln!("[exec] {venue:?}: nothing resting");
-            continue;
+        match tokio::task::spawn_blocking(move || s.resting_order_ids()).await {
+            Ok(Ok(before)) if before.is_empty() => {
+                eprintln!("[exec] {venue:?}: nothing resting (unconfirmed) — sweeping anyway");
+            }
+            Ok(Ok(before)) => {
+                eprintln!("[exec] {venue:?}: CANCELLING {} resting order(s): {}", before.len(),
+                          before.join(" "));
+            }
+            Ok(Err(e)) => eprintln!("[exec] {venue:?}: cannot list resting orders ({e}) — \
+                                     sweeping blind, the sweep is the authority"),
+            Err(e) => eprintln!("[exec] {venue:?}: list task panicked ({e}) — sweeping anyway"),
         }
-        eprintln!("[exec] {venue:?}: CANCELLING {} resting order(s): {}", before.len(),
-                  before.join(" "));
-        sink::cancel_all_and_verify(sink.clone())
+        sink::cancel_all_and_verify_with(sink.clone(), pol.clone())
             .await
             .map_err(|e| format!("{venue:?}: {e}"))?;
         eprintln!("[exec] {venue:?}: book is clean");
@@ -616,8 +707,26 @@ async fn main() {
         }
         return;
     }
+    if args.sweep_only {
+        // BLAST RADIUS, said out loud, and said BEFORE the preconditions are
+        // even checked so it is on screen whether or not the run proceeds.
+        // `cancel_all_open` is account-wide — not per-relationship and not
+        // per-process — so with no `--cred-suffix` this is the PRIMARY key and it
+        // cancels the Python stack's resting orders too. Clearing the 15:40
+        // orphan was run exactly that way; it happened to find one order, which
+        // was luck, not safety.
+        for l in sweep_only_blast_radius(&args.cred_suffix) {
+            eprintln!("{l}");
+        }
+    }
     let sinks = if args.enable_orders {
-        match order_preconditions(&args, bench) {
+        // A pure cancel run is held to the CANCEL checklist, not the place one.
+        let checked = if args.sweep_only {
+            cancel_preconditions(&args, bench)
+        } else {
+            order_preconditions(&args, bench)
+        };
+        match checked {
             Ok(s) => {
                 if args.sweep_only {
                     eprintln!("[exec] sweep-only: reconciling the book, then exiting");
@@ -641,7 +750,13 @@ async fn main() {
     // previous run left resting, and it cannot cancel what it never had an id
     // for. Start from a book we know is empty.
     if !sinks.is_empty() {
-        if let Err(e) = startup_sweep(&sinks).await {
+        // Hand the sinks to the halt path and arm the panic hook BEFORE the
+        // first venue write, so every way out of this process — SIGTERM, a WAL
+        // crash-stop, a panic on any thread — cancels first. Previously only
+        // SIGTERM did, and only after the engine was already quoting.
+        exec::register_sinks(sinks.clone());
+        exec::install_armed_panic_hook();
+        if let Err(e) = startup_sweep(&sinks, &sink::SweepPolicy::default()).await {
             eprintln!("[exec] STARTUP SWEEP FAILED: {e}");
             eprintln!("[exec] refusing to arm: the book could not be proven clean");
             std::process::exit(10);
@@ -650,7 +765,7 @@ async fn main() {
             eprintln!("[exec] --sweep-only: book reconciled, exiting without quoting");
             return;
         }
-        spawn_shutdown_sweep(sinks.clone());
+        spawn_shutdown_sweep();
     }
     // The fill feed runs whenever the order path does: a live order with no
     // fill feed is an unhedged position waiting to happen.
@@ -739,6 +854,21 @@ async fn main() {
     };
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;
     println!("{summary}");
+    // `engine::run` returns when the feed channel closes, which in bench/replay
+    // is EOF and correct. ARMED it should be unreachable — `socket_feed`
+    // reconnects forever and holds its sender — but "unreachable" is not a reason
+    // to make it the one exit that does not cancel. Every other way out of this
+    // process sweeps; so does this one.
+    if armed {
+        eprintln!("[exec] the engine loop ended while ARMED — sweeping before exit");
+        let out = exec::halt_and_sweep("engine loop ended").await;
+        for l in out.report() {
+            eprintln!("{l}");
+        }
+        if !out.already_halting {
+            std::process::exit(out.exit_code());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -878,17 +1008,85 @@ mod sweep_tests {
         (h, m)
     }
 
+    /// Same shape as production, with the sleeps taken out.
+    fn fast() -> sink::SweepPolicy {
+        sink::SweepPolicy {
+            poll_delay: std::time::Duration::ZERO,
+            ..sink::SweepPolicy::default()
+        }
+    }
+
+    /// D2, the inverse of the test that used to be here. `a_clean_book_needs_no_
+    /// cancel` asserted the `before.is_empty()` fast path — and that fast path
+    /// was the fail-open. An empty-LOOKING book is still swept.
     #[tokio::test]
-    async fn a_clean_book_needs_no_cancel() {
+    async fn a_clean_looking_book_is_swept_anyway() {
         let (h, m) = sinks(&[], &[]);
-        startup_sweep(&h).await.unwrap();
-        assert!(!*m.cancelled.lock().unwrap(), "nothing resting => no cancel sent");
+        startup_sweep(&h, &fast()).await.unwrap();
+        assert!(
+            *m.cancelled.lock().unwrap(),
+            "an unconfirmed empty read is not a reason to skip the sweep"
+        );
+    }
+
+    /// **D2 — the startup sweep must not arm on a single empty read.** Ported
+    /// from the adversarial review, where it passed.
+    ///
+    /// This sweep is the last backstop for every leak the process cannot clean up
+    /// itself: SIGKILL, an OOM kill under `MemoryMax=1G`, an abort, a double
+    /// panic — precisely the cases the panic hook's own documented limits leave
+    /// open. One transiently empty read (a rate-limited page, a partial page, the
+    /// same write-lag the sweep is built around) used to arm the engine on top of
+    /// a previous run's book that it holds no ids for, so its own kill path could
+    /// never reach those orders either.
+    #[tokio::test]
+    async fn one_transiently_empty_read_does_not_arm_the_engine_on_a_dirty_book() {
+        /// First read empty, then the truth — and a cancel-all that works.
+        struct FirstReadEmpty {
+            reads: std::sync::Mutex<u32>,
+            resting: std::sync::Mutex<Vec<String>>,
+            cancelled: std::sync::Mutex<bool>,
+        }
+        impl sink::OrderSink for FirstReadEmpty {
+            fn place(&self, _r: &PlaceRequest) -> Result<String, VenueError> {
+                unreachable!("a sweep never places")
+            }
+            fn cancel(&self, _r: &CancelRequest) -> Result<(), VenueError> {
+                unreachable!("a sweep uses cancel_all_open")
+            }
+            fn cancel_all_open(&self) -> Result<(), VenueError> {
+                *self.cancelled.lock().unwrap() = true;
+                self.resting.lock().unwrap().clear();
+                Ok(())
+            }
+            fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+                let mut n = self.reads.lock().unwrap();
+                *n += 1;
+                Ok(if *n == 1 { Vec::new() } else { self.resting.lock().unwrap().clone() })
+            }
+        }
+        let m = std::sync::Arc::new(FirstReadEmpty {
+            reads: std::sync::Mutex::new(0),
+            resting: std::sync::Mutex::new(vec![
+                "66e1c799-507b-4a59-89aa-ec23ad14b990".to_string()
+            ]),
+            cancelled: std::sync::Mutex::new(false),
+        });
+        let mut h: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> = HashMap::new();
+        h.insert(Venue::Kalshi, m.clone());
+
+        startup_sweep(&h, &fast()).await.expect("the sweep clears it and proves it");
+        assert!(*m.cancelled.lock().unwrap(), "the cancel-all was issued despite read #1");
+        assert!(
+            m.resting.lock().unwrap().is_empty(),
+            "and the previous run's order is gone, not armed on top of"
+        );
     }
 
     #[tokio::test]
     async fn resting_orders_are_cancelled_and_the_book_verified_empty() {
         let (h, m) = sinks(&["a", "b"], &[]);
-        startup_sweep(&h).await.unwrap();
+        startup_sweep(&h, &fast()).await.unwrap();
         assert!(*m.cancelled.lock().unwrap());
     }
 
@@ -898,8 +1096,89 @@ mod sweep_tests {
     #[tokio::test]
     async fn a_sweep_that_leaves_orders_resting_is_an_error() {
         let (h, _m) = sinks(&["a", "b"], &["b"]);
-        let err = startup_sweep(&h).await.unwrap_err();
+        let err = startup_sweep(&h, &fast()).await.unwrap_err();
         assert!(err.contains("SURVIVED"), "{err}");
         assert!(err.contains('b'), "names what is left: {err}");
+    }
+}
+
+/// The cancel path must be the easiest thing in this binary to run. On
+/// 2026-07-28 it was the hardest: `--sweep-only` demanded --balance, --health,
+/// --socket and a readable ledger before it would cancel a real leaked order.
+#[cfg(test)]
+mod precondition_tests {
+    use super::*;
+
+    #[test]
+    fn placing_requires_a_feed_cash_health_and_a_readable_ledger() {
+        let mut a = default_args();
+        a.ledger = "/nonexistent/dir/trades.jsonl".into();
+        a.health = String::new();
+        let missing = place_preconditions(&a).join("\n");
+        assert!(missing.contains("--socket"), "{missing}");
+        assert!(missing.contains("--balance"), "{missing}");
+        assert!(missing.contains("--health"), "{missing}");
+        assert!(missing.contains("ledger"), "{missing}");
+    }
+
+    /// The split itself: NONE of the place-only conditions may block a cancel.
+    #[test]
+    fn cancelling_requires_none_of_them() {
+        let mut a = default_args();
+        a.ledger = "/nonexistent/dir/trades.jsonl".into();
+        a.health = String::new();
+        // No credentials in the test env, so this errors — the point is WHAT it
+        // complains about. It must be credentials and nothing else.
+        let missing = match cancel_preconditions(&a, false) {
+            Ok(_) => Vec::new(),
+            Err(m) => m,
+        };
+        let joined = missing.join("\n");
+        for forbidden in ["--socket", "--balance", "--health", "ledger"] {
+            assert!(
+                !joined.contains(forbidden),
+                "a cancel must not be gated on {forbidden}: {joined}"
+            );
+        }
+    }
+
+    /// A blanket cancel under the shared primary key has to announce itself. The
+    /// 15:40 orphan was cleared with exactly this command and no kalshi suffix,
+    /// which would have cancelled the Python stack's book too; it found one order,
+    /// so nothing was lost, but the command said nothing about the risk.
+    #[test]
+    fn sweep_only_names_the_key_it_will_cancel_under() {
+        let none = sweep_only_blast_radius(&[]).join("\n");
+        assert!(none.contains("WHOLE ACCOUNT"), "{none}");
+        assert_eq!(
+            none.matches("PRIMARY key").count(),
+            2,
+            "both venues warn when no suffix is given: {none}"
+        );
+        assert!(none.contains("SHARED WITH THE PYTHON STACK"), "{none}");
+
+        let both = sweep_only_blast_radius(&[
+            ("kalshi".into(), "rs_trader".into()),
+            ("pmus".into(), "rs_trader".into()),
+        ])
+        .join("\n");
+        assert!(!both.contains("PRIMARY key"), "a suffixed run is scoped: {both}");
+        assert_eq!(both.matches("suffix `rs_trader`").count(), 2);
+
+        // The real trap: a pmus suffix given, kalshi forgotten.
+        let half = sweep_only_blast_radius(&[("pmus".into(), "rs_trader".into())]).join("\n");
+        assert!(half.contains("kalshi        -> PRIMARY key"), "{half}");
+        assert!(half.contains("polymarket_us -> suffix `rs_trader`"), "{half}");
+    }
+
+    /// A bench/replay run may not touch a venue even to cancel: its "book" is a
+    /// tape, and the account it would cancel against is the live one.
+    #[test]
+    fn bench_can_never_touch_a_venue() {
+        let err = match cancel_preconditions(&default_args(), true) {
+            Ok(_) => panic!("bench must never be handed a live sink"),
+            Err(m) => m.join("\n"),
+        };
+        assert!(err.contains("bench/replay"), "{err}");
     }
 }

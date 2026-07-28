@@ -22,13 +22,21 @@
 //! bounded channel drained by a dedicated OS thread, so a slow disk backs up
 //! the WAL queue and nothing else. The engine's own loop does no file I/O.
 //!
-//! **Overflow policy: crash-stop.** If the bounded queue is full (or the
-//! writer thread has died), the process exits immediately instead of skipping
-//! the line. A WAL with silent holes is worse than no WAL: it replays
+//! **Overflow policy: crash-stop, but CLEAN.** If the bounded queue is full (or
+//! the writer thread has died), the process stops trading immediately instead of
+//! skipping the line. A WAL with silent holes is worse than no WAL: it replays
 //! "successfully" into a state the live engine never occupied, so an incident
 //! review draws conclusions from a fiction. Refusing to run is the honest
 //! failure. (The buffered tail is lost on that exit — but the hole that caused
 //! it is already unrecoverable, so there is nothing left worth saving.)
+//!
+//! What this used to do was `std::process::exit(70)` on the spot, which
+//! bypassed the shutdown sweep entirely: an armed engine died with its quotes
+//! resting on both venues and `Restart=no`. The intent was right and is kept —
+//! `exec::spawn_halt_and_exit` latches the effects boundary before it returns,
+//! so nothing further reaches a venue from the instant the hole appears — but
+//! the process now dies AFTER the book has been cancelled and proven empty, and
+//! exits `EXIT_ORDERS_LEFT_RESTING` instead of 70 if it could not be.
 
 use std::io::Write;
 use tokio::sync::mpsc;
@@ -85,12 +93,25 @@ impl Wal {
             serde_json::to_string(line).expect("json string")
         );
         if self.tx.try_send(rec).is_err() {
+            // The engine keeps folding events until the halt task exits the
+            // process, and every append after this one fails too. Say it once.
+            //
+            // The latch, not `halting()`: `begin()` happens synchronously inside
+            // `spawn_halt_and_exit`, whereas the claim is taken later inside the
+            // spawned sweep, so testing the latch closes the window in which a
+            // few thousand FATAL lines could still get out.
+            if crate::exec::halt().is_on() {
+                return;
+            }
             eprintln!(
                 "[wal] FATAL: queue full or writer dead at seq {} — crash-stop \
                  rather than continue with a WAL that has a silent hole",
                 self.next_seq
             );
-            std::process::exit(70);
+            crate::exec::spawn_halt_and_exit(
+                70,
+                format!("WAL hole at seq {}", self.next_seq),
+            );
         }
     }
 }
