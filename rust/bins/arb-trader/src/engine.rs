@@ -32,6 +32,9 @@ pub struct RunCfg {
     /// Recorder health feed to watch; None = check disabled (bench/replay,
     /// which have no live feed and must stay byte-deterministic).
     pub health_file: Option<String>,
+    /// Shared risk view. The quoters consult it per place; the engine feeds it
+    /// exposure on fills. None = risk off (bench/replay).
+    pub risk: Option<std::sync::Arc<crate::risk::RiskView>>,
 }
 
 /// Feeds whose staleness invalidates pricing. A cross-venue quote on EITHER
@@ -178,6 +181,10 @@ pub async fn run(
     let mut last_now: f64 = 0.0;
     let mut chan_hw: usize = 0;
     let mut fills = FillLedger::new();
+    // order id -> (relationship id, class). A fill arrives with our order id
+    // only, but exposure is booked per relationship, so the mapping is captured
+    // at place time when the rel is in hand.
+    let mut order_rel: HashMap<String, (String, &'static str)> = HashMap::new();
     let (mut n_ack, mut n_fill, mut n_hedge) = (0u64, 0u64, 0u64);
     let t_start = std::time::Instant::now();
     let mut wal = cfg.wal_path.as_deref().map(Wal::spawn);
@@ -229,6 +236,9 @@ pub async fn run(
                         let anchor = $rel
                             .and_then(|r| hedge_anchor(r, mkt, side, &books, ts_ev));
                         fills.register_order(oid, mkt, count, anchor);
+                        if let Some(r) = $rel {
+                            order_rel.insert(oid.to_string(), (r.id.clone(), r.rtype.as_str()));
+                        }
                         // an amend retires the old id, but a fill can still
                         // race it — observe_cancel KEEPS the record.
                         if let Some(roid) = v.get("replaces").and_then(|x| x.as_str()) {
@@ -275,6 +285,8 @@ pub async fn run(
                 "events": n_ev, "book_events": n_book, "intents": n_int,
                 "killed": killed,
                 "feed_pulled": feed_reason.is_some(),
+                "risk_allowed": cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
+                "risk_rejected": cfg.risk.as_ref().map(|r| r.stats().1).unwrap_or(0),
                 "order_acks": n_ack, "fills": n_fill, "hedge_obligations": n_hedge,
                 // programming-bug alarm: an obligation that was minted and
                 // never hedged (arb_core::fill) — must stay 0.
@@ -367,6 +379,13 @@ pub async fn run(
                         let now = ts_local_ns as f64 / 1e9;
                         last_now = now;
                         if let Some(ob) = fills.observe_cum_fill(oid, cum) {
+                            // Book the new exposure BEFORE the hedge intent, so
+                            // the next quote sees capital this fill just spent.
+                            if let (Some(rv), Some((rid, class))) =
+                                (cfg.risk.as_ref(), order_rel.get(oid))
+                            {
+                                rv.record_open(rid, class, ob.qty() as f64);
+                            }
                             // No anchor => no hedge target. The obligation is
                             // deliberately left unconsumed so the ledger's
                             // dropped_unconsumed() alarm surfaces it instead of

@@ -192,6 +192,22 @@ pub enum RelType {
 }
 
 impl RelType {
+    /// The registry spelling. This is the `by_class` key the risk manager
+    /// aggregates exposure under (Python `rel.type.value`), so it must stay
+    /// the exact inverse of `from_str`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RelType::CrossVenueEquivalent => "cross-venue-equivalent",
+            RelType::EquivalentPair => "equivalent-pair",
+            RelType::Bundle => "bundle",
+            RelType::Partition => "partition",
+            RelType::Exclusive => "exclusive",
+            RelType::DateLadder => "date-ladder",
+            RelType::Implies => "implies",
+            RelType::Rollup => "rollup",
+        }
+    }
+
     pub fn from_str(s: &str) -> Option<RelType> {
         Some(match s {
             "cross-venue-equivalent" => RelType::CrossVenueEquivalent,

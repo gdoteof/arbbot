@@ -26,6 +26,7 @@ mod engine;
 mod exec;
 mod feed;
 mod hist;
+mod risk;
 mod wal;
 
 use arb_core::model::Venue;
@@ -49,6 +50,13 @@ struct Args {
     /// cross-venue prices are hedge-priced against the other venue's book, so
     /// one stale feed invalidates BOTH sides. Empty string disables the check.
     health: String,
+    /// Capital config for the risk gate.
+    exec_yaml: String,
+    topics_yaml: String,
+    /// `--balance venue=usd`, repeatable. The dry-run engine holds no
+    /// credentials, so venue cash is supplied here; the per-venue cash check
+    /// sees $0 for any venue omitted, which refuses its orders.
+    balances: Vec<(String, String)>,
     out: Option<String>,
     max_events: u64,
     pace_x: f64,
@@ -71,6 +79,9 @@ fn parse_args() -> Args {
         registry: "config/registry.yaml".into(),
         tradable: "config/tradable.yaml".into(),
         health: "data/health.jsonl".into(),
+        exec_yaml: "config/exec.yaml".into(),
+        topics_yaml: "config/topics.yaml".into(),
+        balances: Vec::new(),
         out: None,
         max_events: 0,
         pace_x: 0.0,
@@ -89,6 +100,13 @@ fn parse_args() -> Args {
             "--registry" => a.registry = it.next().expect("--registry value"),
             "--tradable" => a.tradable = it.next().expect("--tradable value"),
             "--health" => a.health = it.next().expect("--health value"),
+            "--exec-config" => a.exec_yaml = it.next().expect("--exec-config value"),
+            "--topics" => a.topics_yaml = it.next().expect("--topics value"),
+            "--balance" => {
+                let kv = it.next().expect("--balance venue=usd");
+                let (v, amt) = kv.split_once('=').expect("--balance wants venue=usd");
+                a.balances.push((v.to_string(), amt.to_string()));
+            }
             "--out" => a.out = it.next(),
             "--max-events" => {
                 a.max_events = it.next().expect("n").parse().expect("int")
@@ -123,7 +141,7 @@ fn load_quoters(
     registry: &str,
     tradable: &str,
     rel_prefixes: &[String],
-) -> (Vec<Quoter>, HashMap<(Venue, String), Vec<usize>>) {
+) -> (Vec<Quoter>, HashMap<(Venue, String), Vec<usize>>, HashMap<String, String>) {
     let reg = arb_registry::Registry::load(registry).expect("read registry");
     // THE GATE (card c9ac7d1d, exec/main.py:131-146): a relationship is
     // tradable only if it is HUMAN-vetted in the registry or explicitly
@@ -133,6 +151,15 @@ fn load_quoters(
     let allow = arb_registry::Allowlist::load(tradable);
     let total = reg.relationships.len();
     let mut n_gated = 0usize;
+
+    // oracle_risk scales the per-relationship cap and is not carried on `Rel`,
+    // so keep it beside the quoters for the risk view to look up by id.
+    let mut oracle_risk: HashMap<String, String> = HashMap::new();
+    for r in &reg.relationships {
+        if let Some(o) = &r.oracle_risk {
+            oracle_risk.insert(r.id.clone(), o.clone());
+        }
+    }
 
     let quoters: Vec<Quoter> = reg
         .relationships
@@ -180,7 +207,7 @@ fn load_quoters(
             by_market.entry((leg.venue, leg.market_id.clone())).or_default().push(qi);
         }
     }
-    (quoters, by_market)
+    (quoters, by_market, oracle_risk)
 }
 
 #[tokio::main]
@@ -198,7 +225,38 @@ async fn main() {
         8.0
     };
 
-    let (quoters, by_market) = load_quoters(&args.registry, &args.tradable, &args.rel_prefixes);
+    let (mut quoters, by_market, oracle_risk) =
+        load_quoters(&args.registry, &args.tradable, &args.rel_prefixes);
+
+    // Risk is OFF in bench/replay: those pin a decision digest, and a capital
+    // gate is not part of that contract.
+    let risk = (!bench).then(|| {
+        let rv = std::sync::Arc::new(risk::RiskView::load(
+            &args.exec_yaml,
+            &args.topics_yaml,
+            args.balances.clone(),
+            oracle_risk,
+        ));
+        eprintln!("[risk] {}", rv.describe());
+        if args.balances.is_empty() {
+            eprintln!(
+                "[risk] NO --balance given: the per-venue cash check sees $0 and \
+                 will refuse every order. Pass --balance kalshi=<usd> etc."
+            );
+        }
+        // The Python runner seeded exposure from its open baskets at startup
+        // (exec/main.py:264). This engine does not yet, so it begins every run
+        // believing the whole book is free. Harmless while it cannot place an
+        // order; a hard blocker before it can (see --enable-orders).
+        eprintln!(
+            "[risk] exposure starts EMPTY — not seeded from open positions. \
+             Caps are measured from this run's own fills only."
+        );
+        for q in quoters.iter_mut() {
+            q.set_risk(Some(rv.clone() as std::sync::Arc<dyn arb_core::quoter::RiskGate>));
+        }
+        rv
+    });
     eprintln!(
         "arb-trader up: {} quoters, {} markets, mode={}",
         quoters.len(),
@@ -226,6 +284,7 @@ async fn main() {
         wal_path: args.wal,
         // bench/replay must stay byte-deterministic and have no live feed.
         health_file: (!bench && !args.health.is_empty()).then(|| args.health.clone()),
+        risk: risk.clone(),
     };
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;
     println!("{summary}");
@@ -277,7 +336,7 @@ relationships:
 "#;
 
     fn ids(reg: &str, allow: &str, prefixes: &[String]) -> Vec<String> {
-        let (qs, _) = load_quoters(reg, allow, prefixes);
+        let (qs, _, _) = load_quoters(reg, allow, prefixes);
         qs.into_iter().map(|q| q.rel.id).collect()
     }
 

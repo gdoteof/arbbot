@@ -24,6 +24,26 @@ const TOXGATE_MAX_AGE: f64 = 120.0;
 /// The research toxicity shadow feed (data/exec/toxgate.json), loaded by the
 /// caller (file I/O stays outside arb-core). Mirrors quoter.py `_toxgate`:
 /// stale feed (doc ts older than TOXGATE_MAX_AGE vs `now`) fails open.
+/// One risk consultation per would-be place.
+///
+/// The engine implements this: it owns the exposure fold, the balances and the
+/// caps, none of which belong in a pure quoter. `None` on a Quoter means ALWAYS
+/// ALLOW, which is what the golden/intent replays want — risk is not part of
+/// the decision contract they pin.
+pub trait RiskGate: Send + Sync {
+    /// `notional` is the clip in USD (a prediction-market contract is ~$1, so
+    /// contracts and dollars are the same number — Python passes
+    /// `Decimal(q)`). `venue` is the leg being quoted, which is the venue whose
+    /// cash the order would spend.
+    fn check(&self, rel: &Rel, venue: Venue, notional: i64) -> RiskVerdict;
+}
+
+pub struct RiskVerdict {
+    pub allowed: bool,
+    /// Human-readable cap breaches, surfaced verbatim in the `skip` intent.
+    pub reasons: Vec<String>,
+}
+
 pub struct Toxgate {
     pub ts: f64,
     /// market_id -> side ("bid"/"ask") -> expected adverse cost per contract
@@ -67,6 +87,7 @@ pub struct Quoter {
     suppress: HashSet<(String, &'static str)>,
     /// Toxicity gate feed; None => gate off (exact original behavior).
     toxgate: Option<Arc<Toxgate>>,
+    risk: Option<Arc<dyn RiskGate>>,
     resting: HashMap<(usize, &'static str), RestingQuote>,
     last_quote_ts: HashMap<(usize, &'static str), f64>,
 }
@@ -84,6 +105,7 @@ impl Quoter {
             apr_margin: None, // hurdle off
             suppress: HashSet::new(),
             toxgate: None,
+            risk: None,
             resting: HashMap::new(),
             last_quote_ts: HashMap::new(),
         }
@@ -117,6 +139,10 @@ impl Quoter {
 
     pub fn set_suppress(&mut self, pairs: HashSet<(String, &'static str)>) {
         self.suppress = pairs;
+    }
+
+    pub fn set_risk(&mut self, risk: Option<Arc<dyn RiskGate>>) {
+        self.risk = risk;
     }
 
     pub fn set_toxgate(&mut self, tox: Option<Arc<Toxgate>>) {
@@ -366,7 +392,18 @@ impl Quoter {
                         continue;
                     }
                 }
-                // risk always allows in the harness; mock place never fails
+                // RISK (quoter.py:302). Consulted BEFORE the cancel below, and
+                // that ordering is the point: a rejected REPLACEMENT leaves the
+                // existing quote resting instead of pulling a good one to make
+                // room for an order risk will not allow. Emits a `skip` intent
+                // naming the breached caps.
+                if let Some(gate) = &self.risk {
+                    let v = gate.check(&self.rel, self.rel.legs[i].venue, self.clip);
+                    if !v.allowed {
+                        intents.push(json!({"ts": now, "skip": v.reasons}).to_string());
+                        continue;
+                    }
+                }
                 let mut replaced: Option<(String, String)> = None;
                 if let Some(curq) = self.resting.remove(&key) {
                     replaced = Some((curq.order_id, Self::px(cx, curq.price)));
@@ -393,18 +430,18 @@ impl Quoter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests_support {
     use super::*;
     use crate::model::Level;
     use crate::scan::RelLeg;
 
-    fn lvl(p: &str, s: &str) -> Level {
+    pub(crate) fn lvl(p: &str, s: &str) -> Level {
         Level { price: p.into(), size: s.into() }
     }
 
     /// The fixture from tests/test_intent_replay.py: a cross-venue pair whose
     /// Kalshi bid funds a PM-US maker YES-bid one tick inside.
-    fn fixture() -> (Cx, FeeSchedule, BookBuilder, Quoter) {
+    pub(crate) fn fixture() -> (Cx, FeeSchedule, BookBuilder, Quoter) {
         let mut cx = Cx::default();
         let fees = FeeSchedule::new(&mut cx);
         let mut bb = BookBuilder::new();
@@ -423,7 +460,7 @@ mod tests {
         (cx, fees, bb, Quoter::new(rel))
     }
 
-    fn pm_bid(bb: &mut BookBuilder, px: &str, seq: u64, ts_ns: i64) {
+    pub(crate) fn pm_bid(bb: &mut BookBuilder, px: &str, seq: u64, ts_ns: i64) {
         bb.apply_snapshot(Venue::PolymarketUs, "P", vec![lvl(px, "500")],
                           vec![lvl("0.99", "1")], seq, ts_ns, None);
     }
@@ -476,5 +513,106 @@ mod tests {
         q.on_book(&mut cx, &fees, &bb, 120.0, &mut oid, &mut intents);
         assert!(intents.iter().any(|i| i.contains(r#""place":"P""#)),
                 "re-entry must resume after the throttle: {intents:?}");
+    }
+}
+
+#[cfg(test)]
+mod risk_gate_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    struct Always(bool);
+    impl RiskGate for Always {
+        fn check(&self, _rel: &Rel, _venue: Venue, _notional: i64) -> RiskVerdict {
+            RiskVerdict {
+                allowed: self.0,
+                reasons: if self.0 { vec![] } else { vec!["per-relationship tail cap".into()] },
+            }
+        }
+    }
+
+    /// No gate = always allow. The golden and intent replays run this way; risk
+    /// is not part of the decision contract they pin.
+    #[test]
+    fn no_gate_means_always_allow() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(intents.len(), 1);
+        assert!(intents[0].contains(r#""place":"P""#));
+    }
+
+    /// A refused ENTRY places nothing and says why.
+    #[test]
+    fn a_refused_entry_emits_a_skip_naming_the_reasons() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        q.set_risk(Some(std::sync::Arc::new(Always(false))));
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+
+        assert_eq!(intents.len(), 1, "{intents:?}");
+        assert!(intents[0].contains(r#""skip""#), "{}", intents[0]);
+        assert!(intents[0].contains("tail cap"), "{}", intents[0]);
+        assert!(!intents[0].contains("place"), "nothing may be placed: {}", intents[0]);
+        assert_eq!(oid, 0, "a refused order must not consume an order id");
+    }
+
+    /// THE ordering property (quoter.py:302): risk is consulted BEFORE the
+    /// cancel, so refusing a REPLACEMENT leaves the existing quote resting.
+    /// Checking after the cancel would pull a good quote to make room for an
+    /// order risk was never going to allow.
+    #[test]
+    fn a_refused_replacement_leaves_the_existing_quote_resting() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0;
+        let mut intents = Vec::new();
+
+        // entry lands while risk still allows
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert!(intents[0].contains(r#""place":"P""#), "{}", intents[0]);
+
+        // now risk refuses, and the book moves enough to want a reprice
+        q.set_risk(Some(std::sync::Arc::new(Always(false))));
+        intents.clear();
+        pm_bid(&mut bb, "0.34", 2, 130_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+
+        assert!(
+            intents.iter().any(|i| i.contains(r#""skip""#)),
+            "expected a skip: {intents:?}"
+        );
+        assert!(
+            !intents.iter().any(|i| i.contains(r#""cancel""#)),
+            "the resting quote must NOT be pulled: {intents:?}"
+        );
+    }
+
+    /// An UNVIABLE quote is still cancelled promptly when risk refuses — the
+    /// gate must never strand an order the book says is bad.
+    #[test]
+    fn risk_never_blocks_a_cancel() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert!(intents[0].contains(r#""place""#));
+
+        q.set_risk(Some(std::sync::Arc::new(Always(false))));
+        intents.clear();
+        // K collapses => the PM quote is unviable
+        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.30", "500")],
+                          vec![lvl("0.99", "1")], 2, 131_000_000_000, None);
+        q.on_book(&mut cx, &fees, &bb, 131.0, &mut oid, &mut intents);
+
+        assert!(
+            intents.iter().any(|i| i.contains(r#""cancel":"P""#)),
+            "an unviable quote must still cancel: {intents:?}"
+        );
     }
 }
