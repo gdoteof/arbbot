@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 arb-core = { path = "../../crates/arb-core" }
+arb-registry = { path = "../../crates/arb-registry" }
 serde_json = { workspace = true }
 serde = { workspace = true }
 serde_yaml = "0.9"

@@ -31,36 +31,7 @@ mod wal;
 use arb_core::model::Venue;
 use arb_core::quoter::Quoter;
 use arb_core::scan::{Rel, RelLeg, RelType};
-use serde::Deserialize;
 use std::collections::HashMap;
-
-#[derive(Deserialize)]
-struct RegistryDoc {
-    #[serde(default)]
-    relationships: Vec<RelDoc>,
-}
-#[derive(Deserialize)]
-struct RelDoc {
-    id: String,
-    #[serde(rename = "type")]
-    rtype: String,
-    #[serde(default = "default_verdict")]
-    verdict: String,
-    #[serde(default = "default_tranche")]
-    tranche: String,
-    legs: Vec<LegDoc>,
-}
-fn default_verdict() -> String {
-    "rejected".into()
-}
-fn default_tranche() -> String {
-    "long-tail".into()
-}
-#[derive(Deserialize)]
-struct LegDoc {
-    venue: String,
-    market_id: String,
-}
 
 struct Args {
     socket: Option<String>,
@@ -70,6 +41,14 @@ struct Args {
     /// Engine-sequenced write-ahead log path (see src/wal.rs).
     wal: Option<String>,
     registry: String,
+    /// Allowlist half of the tradable gate (config/tradable.yaml). A missing
+    /// file is an EMPTY allowlist — the gate then falls back to registry
+    /// human-vetting alone, which never widens it.
+    tradable: String,
+    /// Recorder health feed. Critical-feed staleness pulls ALL quotes, because
+    /// cross-venue prices are hedge-priced against the other venue's book, so
+    /// one stale feed invalidates BOTH sides. Empty string disables the check.
+    health: String,
     out: Option<String>,
     max_events: u64,
     pace_x: f64,
@@ -90,6 +69,8 @@ fn parse_args() -> Args {
         replay_wal: None,
         wal: None,
         registry: "config/registry.yaml".into(),
+        tradable: "config/tradable.yaml".into(),
+        health: "data/health.jsonl".into(),
         out: None,
         max_events: 0,
         pace_x: 0.0,
@@ -106,6 +87,8 @@ fn parse_args() -> Args {
             "--replay-wal" => a.replay_wal = it.next(),
             "--wal" => a.wal = it.next(),
             "--registry" => a.registry = it.next().expect("--registry value"),
+            "--tradable" => a.tradable = it.next().expect("--tradable value"),
+            "--health" => a.health = it.next().expect("--health value"),
             "--out" => a.out = it.next(),
             "--max-events" => {
                 a.max_events = it.next().expect("n").parse().expect("int")
@@ -138,22 +121,38 @@ fn parse_args() -> Args {
 
 fn load_quoters(
     registry: &str,
+    tradable: &str,
     rel_prefixes: &[String],
 ) -> (Vec<Quoter>, HashMap<(Venue, String), Vec<usize>>) {
-    let text = std::fs::read_to_string(registry).expect("read registry");
-    let doc: RegistryDoc = serde_yaml::from_str(&text).expect("parse registry");
-    let quoters: Vec<Quoter> = doc
+    let reg = arb_registry::Registry::load(registry).expect("read registry");
+    // THE GATE (card c9ac7d1d, exec/main.py:131-146): a relationship is
+    // tradable only if it is HUMAN-vetted in the registry or explicitly
+    // allowlisted in config/tradable.yaml. An agent verdict is not enough.
+    // A missing allowlist file is an empty allowlist, which is the
+    // conservative direction — it never widens the gate.
+    let allow = arb_registry::Allowlist::load(tradable);
+    let total = reg.relationships.len();
+    let mut n_gated = 0usize;
+
+    let quoters: Vec<Quoter> = reg
         .relationships
         .into_iter()
-        .filter(|r| r.legs.len() == 2 && r.verdict != "rejected")
+        .filter(|r| r.legs.len() == 2)
+        .filter(|r| {
+            let ok = r.tradable(&allow);
+            if !ok {
+                n_gated += 1;
+            }
+            ok
+        })
         .filter(|r| {
             rel_prefixes.is_empty() || rel_prefixes.iter().any(|p| r.id.starts_with(p.as_str()))
         })
         .filter_map(|r| {
             Some(Quoter::new(Rel {
                 id: r.id,
-                rtype: RelType::from_str(&r.rtype)?,
-                tranche: r.tranche,
+                rtype: RelType::from_str(r.kind.as_deref()?)?,
+                tranche: r.tranche.unwrap_or_else(|| "long-tail".into()),
                 legs: r
                     .legs
                     .into_iter()
@@ -167,6 +166,14 @@ fn load_quoters(
             }))
         })
         .collect();
+
+    eprintln!(
+        "[gate] {total} relationships -> {} quoting; {n_gated} blocked (not human-vetted \
+         and not in {tradable}, which lists {} ids)",
+        quoters.len(),
+        allow.len()
+    );
+
     let mut by_market: HashMap<(Venue, String), Vec<usize>> = HashMap::new();
     for (qi, q) in quoters.iter().enumerate() {
         for leg in &q.rel.legs {
@@ -191,7 +198,7 @@ async fn main() {
         8.0
     };
 
-    let (quoters, by_market) = load_quoters(&args.registry, &args.rel_prefixes);
+    let (quoters, by_market) = load_quoters(&args.registry, &args.tradable, &args.rel_prefixes);
     eprintln!(
         "arb-trader up: {} quoters, {} markets, mode={}",
         quoters.len(),
@@ -217,7 +224,101 @@ async fn main() {
         stats_every_s: args.stats_every_s,
         bench,
         wal_path: args.wal,
+        // bench/replay must stay byte-deterministic and have no live feed.
+        health_file: (!bench && !args.health.is_empty()).then(|| args.health.clone()),
     };
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;
     println!("{summary}");
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("arb-trader-gate-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// One entry per gate outcome: human-vetted, agent-vetted, rejected, and
+    /// an agent-vetted one that the allowlist rescues.
+    const REGISTRY: &str = r#"
+relationships:
+  - id: human-ok
+    type: cross-venue-equivalent
+    verdict: equivalent
+    vetted_by: human
+    legs:
+      - {venue: kalshi, market_id: K1}
+      - {venue: polymarket_us, market_id: P1}
+  - id: agent-only
+    type: cross-venue-equivalent
+    verdict: equivalent
+    vetted_by: agent
+    legs:
+      - {venue: kalshi, market_id: K2}
+      - {venue: polymarket_us, market_id: P2}
+  - id: rejected-one
+    type: cross-venue-equivalent
+    verdict: rejected
+    vetted_by: human
+    legs:
+      - {venue: kalshi, market_id: K3}
+      - {venue: polymarket_us, market_id: P3}
+  - id: allowlisted
+    type: cross-venue-equivalent
+    verdict: equivalent
+    vetted_by: agent
+    legs:
+      - {venue: kalshi, market_id: K4}
+      - {venue: polymarket_us, market_id: P4}
+"#;
+
+    fn ids(reg: &str, allow: &str, prefixes: &[String]) -> Vec<String> {
+        let (qs, _) = load_quoters(reg, allow, prefixes);
+        qs.into_iter().map(|q| q.rel.id).collect()
+    }
+
+    /// The gate (card c9ac7d1d): agent-vetted is NOT enough, and a `rejected`
+    /// verdict never quotes however it was vetted.
+    #[test]
+    fn only_human_vetted_or_allowlisted_relationships_quote() {
+        let d = scratch("basic");
+        let reg = d.join("registry.yaml");
+        std::fs::write(&reg, REGISTRY).unwrap();
+        let allow = d.join("tradable.yaml");
+        std::fs::write(&allow, "allow:\n  - allowlisted\n").unwrap();
+
+        let got = ids(reg.to_str().unwrap(), allow.to_str().unwrap(), &[]);
+        assert_eq!(got, vec!["human-ok".to_string(), "allowlisted".to_string()]);
+    }
+
+    /// A MISSING allowlist is an empty one — the gate narrows, never widens.
+    /// This is the direction that matters: a typo'd path must not open the gate.
+    #[test]
+    fn a_missing_allowlist_file_narrows_the_gate() {
+        let d = scratch("noallow");
+        let reg = d.join("registry.yaml");
+        std::fs::write(&reg, REGISTRY).unwrap();
+
+        let got = ids(reg.to_str().unwrap(), "/nonexistent/tradable.yaml", &[]);
+        assert_eq!(got, vec!["human-ok".to_string()], "only registry vetting survives");
+    }
+
+    /// The gate composes with --relationship rather than replacing it: the
+    /// prefix filter can only ever narrow what the gate already permitted.
+    #[test]
+    fn the_prefix_filter_cannot_widen_the_gate() {
+        let d = scratch("prefix");
+        let reg = d.join("registry.yaml");
+        std::fs::write(&reg, REGISTRY).unwrap();
+        let allow = d.join("tradable.yaml");
+        std::fs::write(&allow, "allow: []\n").unwrap();
+
+        // asking for an agent-only rel by prefix still does NOT quote it
+        let got = ids(reg.to_str().unwrap(), allow.to_str().unwrap(), &["agent".to_string()]);
+        assert!(got.is_empty(), "prefix must not bypass the gate, got {got:?}");
+    }
 }

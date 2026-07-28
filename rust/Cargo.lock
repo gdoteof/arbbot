@@ -173,6 +173,7 @@ name = "arb-trader"
 version = "0.1.0"
 dependencies = [
  "arb-core",
+ "arb-registry",
  "serde",
  "serde_json",
  "serde_yaml",

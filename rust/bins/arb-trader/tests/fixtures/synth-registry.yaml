@@ -1,10 +1,16 @@
 # Synthetic 2-leg relationship for the arb-trader determinism tests. Shape
 # only (cross-venue-equivalent, one Kalshi leg + one PM-US leg) — the ids are
 # invented, so nothing here mirrors the private live registry.
+#
+# It is human-vetted because the engine now hard-gates on that (card c9ac7d1d):
+# an unvetted relationship yields NO quoters, and these tests would then assert
+# determinism over an empty intent stream. The gate itself is tested in
+# arb-trader's gate_tests, not here.
 relationships:
   - id: synth-fill-rel
     type: cross-venue-equivalent
-    verdict: confirmed
+    verdict: equivalent
+    vetted_by: human
     tranche: core
     legs:
       - venue: kalshi

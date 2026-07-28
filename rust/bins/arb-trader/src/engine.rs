@@ -29,6 +29,68 @@ pub struct RunCfg {
     pub bench: bool,
     /// Engine-sequenced write-ahead log (crate::wal); None = off.
     pub wal_path: Option<String>,
+    /// Recorder health feed to watch; None = check disabled (bench/replay,
+    /// which have no live feed and must stay byte-deterministic).
+    pub health_file: Option<String>,
+}
+
+/// Feeds whose staleness invalidates pricing. A cross-venue quote on EITHER
+/// venue is hedge-priced against the OTHER venue's book, so one stale critical
+/// feed makes both sides wrong — which is why staleness pulls every quote, not
+/// just the stale venue's.
+const CRITICAL_FEEDS: [&str; 2] = ["kalshi-ws", "polymarket_us-ws"];
+
+/// The recorder writes a health line per tick; the file is large, so read a
+/// tail window rather than the whole thing.
+fn last_line(path: &str, window: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(window))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    // The window can start mid-codepoint; lossy is fine, we only parse JSON.
+    String::from_utf8_lossy(&buf).lines().last().map(|s| s.to_string())
+}
+
+/// `None` = feeds healthy; `Some(reason)` = pull the quotes.
+///
+/// FAIL-CLOSED, unlike the Python original (`exec/main.py` returned early and
+/// left the state unchanged when the file could not be read). Python's version
+/// caught the realistic failure — recorder dies, `ts` goes old — but a health
+/// file that is deleted or never appears would leave it quoting forever on a
+/// feed it cannot see. Refusing to quote when we cannot prove the feed is
+/// healthy is the direction that cannot lose money.
+fn feed_stale_reason(path: &str, now_wall: f64) -> Option<String> {
+    let Some(line) = last_line(path, 4096) else {
+        return Some(format!("health file {path} unreadable"));
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+        return Some(format!("health file {path} has no parseable line"));
+    };
+    let ts = v.get("ts").and_then(|t| t.as_f64()).unwrap_or(0.0);
+    let age = now_wall - ts;
+    if age > 30.0 {
+        // The health WRITER is silent, which means the recorder is down — a
+        // strictly worse condition than any single feed going quiet.
+        return Some(format!("recorder silent for {age:.0}s"));
+    }
+    let stale = v.get("stale");
+    let bad: Vec<&str> = CRITICAL_FEEDS
+        .iter()
+        .copied()
+        .filter(|f| {
+            stale.and_then(|s| s.get(*f)).and_then(|b| b.as_bool()).unwrap_or(false)
+        })
+        .collect();
+    (!bad.is_empty()).then(|| format!("{} stale", bad.join(", ")))
+}
+
+fn wall_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 pub fn parse_venue(s: &str) -> Option<Venue> {
@@ -107,6 +169,12 @@ pub async fn run(
     let mut next_oid: u64 = 0;
     let mut intents: Vec<String> = Vec::new();
     let mut killed = false;
+    // Feed-health pull (card 0a7e5478). Holds the REASON, not just a flag, so
+    // a pulled engine can always say why it is silent. Starts pulled when the
+    // check is on: we have not yet proven the feeds are healthy, and the first
+    // tick either clears it or names the problem.
+    let mut feed_reason: Option<String> =
+        cfg.health_file.is_some().then(|| "startup — feeds not yet proven healthy".to_string());
     let mut last_now: f64 = 0.0;
     let mut chan_hw: usize = 0;
     let mut fills = FillLedger::new();
@@ -128,6 +196,8 @@ pub async fn run(
     let mut stats_iv =
         tokio::time::interval(std::time::Duration::from_secs(cfg.stats_every_s.max(1)));
     stats_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut feed_iv = tokio::time::interval(std::time::Duration::from_secs(5));
+    feed_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // $rel: the relationship whose quoter emitted these intents (for the
     // hedge-anchor lookup at place time), or None for intents that rest
@@ -204,6 +274,7 @@ pub async fn run(
                 "mode": if cfg.bench { "bench" } else { "shadow" },
                 "events": n_ev, "book_events": n_book, "intents": n_int,
                 "killed": killed,
+                "feed_pulled": feed_reason.is_some(),
                 "order_acks": n_ack, "fills": n_fill, "hedge_obligations": n_hedge,
                 // programming-bug alarm: an obligation that was minted and
                 // never hedged (arb_core::fill) — must stay 0.
@@ -322,7 +393,7 @@ pub async fn run(
                 n_book += 1;
                 let now = ts_local_ns as f64 / 1e9;
                 last_now = now;
-                if !killed {
+                if !killed && feed_reason.is_none() {
                     if let Some(idxs) = by_market.get(&(venue, market_id)) {
                         for &qi in idxs {
                             quoters[qi].on_book(&mut cx, &fees, &books, now, &mut next_oid, &mut intents);
@@ -346,6 +417,31 @@ pub async fn run(
                     eprintln!("[engine] KILL switch cleared — quoting resumes");
                 }
             }
+            _ = feed_iv.tick(), if cfg.health_file.is_some() => {
+                let path = cfg.health_file.as_deref().expect("guarded above");
+                let was_stale = feed_reason.is_some();
+                let now_reason = feed_stale_reason(path, wall_now());
+                // Log on any CHANGE of reason, not just healthy<->stale: an
+                // engine that is silent must always be able to say why, and
+                // "unreadable path" vs "recorder silent" are different bugs.
+                if now_reason != feed_reason {
+                    match &now_reason {
+                        Some(why) => {
+                            eprintln!("[engine] FEED STALE ({why}) — quotes pulled");
+                            // Only sweep on the way IN; a stale->stale reason
+                            // change has nothing resting left to cancel.
+                            if !was_stale {
+                                for q in quoters.iter_mut() {
+                                    q.cancel_all(&mut cx, last_now, &mut intents);
+                                    drain_intents!(Some(&q.rel));
+                                }
+                            }
+                        }
+                        None => eprintln!("[engine] feeds healthy — quoting resumes"),
+                    }
+                    feed_reason = now_reason;
+                }
+            }
             _ = stats_iv.tick(), if !cfg.bench => {
                 println!("{}", summary!());
                 if let Some(o) = out.as_mut() { o.flush().expect("flush"); }
@@ -361,4 +457,124 @@ pub async fn run(
         s["sha256"] = serde_json::json!(format!("{:x}", digest.finalize()));
     }
     s
+}
+
+#[cfg(test)]
+mod feed_health_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn health_file(lines: &[&str]) -> (tempdir::Dir, String) {
+        let d = tempdir::Dir::new();
+        let p = d.path().join("health.jsonl");
+        let mut f = std::fs::File::create(&p).unwrap();
+        for l in lines {
+            writeln!(f, "{l}").unwrap();
+        }
+        let s = p.to_string_lossy().to_string();
+        (d, s)
+    }
+
+    const NOW: f64 = 1_000_000.0;
+
+    fn line(ts: f64, kalshi: bool, pmus: bool) -> String {
+        format!(
+            r#"{{"ts":{ts},"stale":{{"kalshi-ws":{kalshi},"polymarket_us-ws":{pmus},"polymarket-ws":true}}}}"#
+        )
+    }
+
+    #[test]
+    fn healthy_feeds_do_not_pull() {
+        let (_d, p) = health_file(&[&line(NOW - 1.0, false, false)]);
+        assert_eq!(feed_stale_reason(&p, NOW), None);
+    }
+
+    /// polymarket (INTL) is not a critical feed — the money path is Kalshi and
+    /// PM-US, so intl staleness must not pull quotes. The fixture always sets
+    /// polymarket-ws stale.
+    #[test]
+    fn a_non_critical_feed_going_stale_does_not_pull() {
+        let (_d, p) = health_file(&[&line(NOW - 1.0, false, false)]);
+        assert_eq!(feed_stale_reason(&p, NOW), None);
+    }
+
+    #[test]
+    fn either_critical_feed_pulls_all_quotes() {
+        for (k, pm, want) in [(true, false, "kalshi-ws"), (false, true, "polymarket_us-ws")] {
+            let (_d, p) = health_file(&[&line(NOW - 1.0, k, pm)]);
+            let why = feed_stale_reason(&p, NOW).expect("must pull");
+            assert!(why.contains(want), "{why}");
+        }
+    }
+
+    /// The health writer going quiet means the recorder is down — worse than
+    /// any single feed, and the flags in the last line are stale evidence.
+    #[test]
+    fn a_silent_recorder_is_stale_even_when_the_last_line_looked_healthy() {
+        let (_d, p) = health_file(&[&line(NOW - 120.0, false, false)]);
+        let why = feed_stale_reason(&p, NOW).expect("must pull");
+        assert!(why.contains("recorder silent"), "{why}");
+    }
+
+    /// Only the LAST line counts; an old healthy line must not rescue a new
+    /// stale one.
+    #[test]
+    fn only_the_last_line_is_read() {
+        let (_d, p) = health_file(&[&line(NOW - 5.0, false, false), &line(NOW - 1.0, true, false)]);
+        assert!(feed_stale_reason(&p, NOW).is_some(), "the newest line is stale");
+    }
+
+    /// FAIL-CLOSED: no file, no readable line, or garbage all pull the quotes.
+    /// Python left the state unchanged here, which would quote forever on a
+    /// feed it could not see.
+    #[test]
+    fn an_unreadable_health_file_pulls_quotes() {
+        assert!(feed_stale_reason("/nonexistent/health.jsonl", NOW).is_some());
+        let (_d, p) = health_file(&["not json at all"]);
+        assert!(feed_stale_reason(&p, NOW).is_some());
+        let (_d2, p2) = health_file(&[]);
+        assert!(feed_stale_reason(&p2, NOW).is_some(), "an empty file proves nothing");
+    }
+
+    /// A line with no `ts` is treated as infinitely old, not as ts=now.
+    #[test]
+    fn a_line_without_a_timestamp_is_stale() {
+        let (_d, p) = health_file(&[r#"{"stale":{"kalshi-ws":false,"polymarket_us-ws":false}}"#]);
+        assert!(feed_stale_reason(&p, NOW).is_some());
+    }
+
+    /// The tail window can start mid-codepoint; that must not panic or hide a
+    /// healthy line.
+    #[test]
+    fn a_large_file_reads_only_its_tail() {
+        let pad = format!(r#"{{"ts":1,"note":"{}"}}"#, "é".repeat(3000));
+        let (_d, p) = health_file(&[&pad, &line(NOW - 1.0, false, false)]);
+        assert_eq!(feed_stale_reason(&p, NOW), None);
+    }
+}
+
+/// Minimal scratch dir for tests (no dev-dependency needed).
+#[cfg(test)]
+mod tempdir {
+    pub struct Dir(std::path::PathBuf);
+    impl Dir {
+        pub fn new() -> Dir {
+            let base = std::env::temp_dir().join(format!(
+                "arb-trader-test-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&base).unwrap();
+            Dir(base)
+        }
+        pub fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 }
