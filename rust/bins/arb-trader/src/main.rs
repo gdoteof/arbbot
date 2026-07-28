@@ -29,6 +29,7 @@ mod fills;
 mod hist;
 mod ledger;
 mod risk;
+mod taketake;
 mod sink;
 mod wal;
 
@@ -98,6 +99,17 @@ struct Args {
     /// shadow mirror the live runner's --relationship universe so the daily
     /// decision gate compares like against like.
     rel_prefixes: Vec<String>,
+    /// Run the take-take detector on every book event.
+    take_take: bool,
+    /// Detect and log crossings without ever placing — the shadow step. Also
+    /// forced on whenever the order path is unarmed.
+    tt_detect_only: bool,
+    /// Per-relationship concentration cap for take-take, in contracts.
+    tt_max_ct_per_rel: i64,
+    /// Contracts per single take-take execution.
+    tt_max_clip: i64,
+    /// Marks file the blended-APR bar is derived from.
+    marks: String,
 }
 
 fn parse_args() -> Args {
@@ -127,6 +139,12 @@ fn parse_args() -> Args {
         stats_every_s: 60,
         rate_per_s: -1.0, // sentinel: default by mode below
         rel_prefixes: Vec::new(),
+        take_take: false,
+        tt_detect_only: false,
+        // Python's auto_take_take.py defaults: 50ct/rel, clip 20.
+        tt_max_ct_per_rel: 50,
+        tt_max_clip: 20,
+        marks: "data/exec/marks.json".into(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -181,6 +199,19 @@ fn parse_args() -> Args {
             "--rel-prefix" => {
                 a.rel_prefixes.push(it.next().expect("--rel-prefix value"))
             }
+            "--take-take" => a.take_take = true,
+            "--take-take-detect-only" => {
+                a.take_take = true;
+                a.tt_detect_only = true;
+            }
+            "--tt-max-ct-per-rel" => {
+                a.tt_max_ct_per_rel =
+                    it.next().and_then(|v| v.parse().ok()).expect("--tt-max-ct-per-rel value")
+            }
+            "--tt-max-clip" => {
+                a.tt_max_clip = it.next().and_then(|v| v.parse().ok()).expect("--tt-max-clip value")
+            }
+            "--marks" => a.marks = it.next().expect("--marks value"),
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(2);
@@ -666,6 +697,16 @@ async fn main() {
             interval_s: args.hedge_retry_s,
             max_slip: args.hedge_max_slip.clone(),
             alarm_after_s: args.hedge_alarm_s,
+        }),
+        // Off in bench/replay: it reads the wall clock and a marks file, and
+        // both would break byte-exact replay.
+        take_take: (!bench && args.take_take).then(|| engine::TakeTake {
+            max_ct_per_rel: args.tt_max_ct_per_rel,
+            max_clip: args.tt_max_clip,
+            marks_path: args.marks.clone(),
+            // Detection is free and unarmed; FIRING additionally requires the
+            // order path, so take-take can never place from a dry run.
+            detect_only: args.tt_detect_only || !armed,
         }),
     };
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;

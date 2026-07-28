@@ -23,6 +23,16 @@ use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Wall clock as epoch seconds. Only ever called on the take-take path, which
+/// is off in bench/replay — those must stay byte-deterministic, and a clock
+/// read is exactly the kind of thing that would break that.
+fn wall_now_s() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 pub struct RunCfg {
     pub out_path: Option<String>,
     pub kill_file: String,
@@ -43,6 +53,23 @@ pub struct RunCfg {
     /// Hedge-retry policy. `None` disables the deadline entirely (bench/replay,
     /// which must stay byte-deterministic).
     pub hedge_retry: Option<HedgeRetry>,
+    /// Take-take policy. `None` = the detector never runs.
+    pub take_take: Option<TakeTake>,
+}
+
+/// Immediately-executable crossings, tested on the book event that creates
+/// them rather than on a timer (Geoff 2026-07-28: milliseconds, not minutes).
+#[derive(Clone)]
+pub struct TakeTake {
+    /// Per-relationship concentration cap, in contracts.
+    pub max_ct_per_rel: i64,
+    /// Contracts per single execution.
+    pub max_clip: i64,
+    /// `data/exec/marks.json` — the blended-APR bar is derived from it. A
+    /// missing/unreadable file falls back to `DEFAULT_BAR_APR`, never to 0.
+    pub marks_path: String,
+    /// Detect and log, place nothing. The shadow step before arming.
+    pub detect_only: bool,
 }
 
 #[derive(Clone)]
@@ -291,6 +318,26 @@ pub async fn run(
     let mut digest = Sha256::new();
     let decision = Hist::new();
     let (mut n_ev, mut n_book, mut n_int) = (0u64, 0u64, 0u64);
+    // Crossings the detector found above the bar. In detect_only these are
+    // opportunities we DECLINED to take, which is the number worth watching
+    // before arming the taker path.
+    let mut n_tt: u64 = 0;
+    // The bar is re-derived from marks on the stats tick: it moves as the book
+    // turns over, and a stale bar is a wrong bar in both directions.
+    let mut tt_bar: f64 = crate::taketake::DEFAULT_BAR_APR;
+    if let Some(tt) = cfg.take_take.as_ref() {
+        tt_bar = std::fs::read_to_string(&tt.marks_path)
+            .ok()
+            .and_then(|s| crate::taketake::blended_apr(&s, &crate::taketake::today_iso(wall_now_s())))
+            .unwrap_or(crate::taketake::DEFAULT_BAR_APR);
+        eprintln!(
+            "[take-take] {} — bar {:.1}%/yr, cap {}ct/rel, clip {}",
+            if tt.detect_only { "DETECT ONLY (places nothing)" } else { "ARMED" },
+            tt_bar,
+            tt.max_ct_per_rel,
+            tt.max_clip
+        );
+    }
     let mut next_oid: u64 = 0;
     let mut intents: Vec<String> = Vec::new();
     let mut killed = false;
@@ -468,6 +515,7 @@ pub async fn run(
             serde_json::json!({
                 "mode": if cfg.bench { "bench" } else { "shadow" },
                 "events": n_ev, "book_events": n_book, "intents": n_int,
+                "take_take_found": n_tt, "take_take_bar_apr": tt_bar,
                 "killed": killed,
                 "feed_pulled": feed_reason.is_some(),
                 "risk_allowed": cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
@@ -705,6 +753,48 @@ pub async fn run(
                             quoters[qi].on_book(&mut cx, &fees, &books, now, &mut next_oid, &mut intents);
                             drain_intents!(Some(&quoters[qi].rel));
                         }
+                        // Take-take on the SAME event that moved the book: the
+                        // crossing exists for as long as the slower side takes
+                        // to react, which is not minutes.
+                        if let Some(tt) = cfg.take_take.as_ref() {
+                            let today = crate::taketake::today_iso(now);
+                            for &qi in idxs {
+                                let rel = &quoters[qi].rel;
+                                let open = cfg
+                                    .risk
+                                    .as_ref()
+                                    .map(|r| r.open_ct(&rel.id))
+                                    .unwrap_or(0.0) as i64;
+                                if let Ok(c) = crate::taketake::detect(
+                                    &mut cx,
+                                    rel,
+                                    &books,
+                                    &today,
+                                    tt_bar,
+                                    tt.max_ct_per_rel,
+                                    open,
+                                    tt.max_clip,
+                                ) {
+                                    n_tt += 1;
+                                    eprintln!(
+                                        "[take-take] {} {} x{} edge={} net={} apr={:.0}%/yr (bar {:.0}%) \
+                                         — buy {} @{} / sell {} @{}{}",
+                                        if tt.detect_only { "FOUND" } else { "FIRE" },
+                                        c.rel_id,
+                                        c.size,
+                                        c.edge,
+                                        c.net,
+                                        c.apr,
+                                        tt_bar,
+                                        c.kalshi_market,
+                                        c.kalshi_ask,
+                                        c.pmus_market,
+                                        c.pmus_bid,
+                                        if tt.detect_only { " [DETECT ONLY — nothing sent]" } else { "" },
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 decision.record(m.t_read.elapsed().as_nanos() as u64);
@@ -841,6 +931,16 @@ pub async fn run(
             _ = stats_iv.tick(), if !cfg.bench => {
                 println!("{}", summary!());
                 if let Some(o) = out.as_mut() { o.flush().expect("flush"); }
+                // Re-derive the bar: marks are rewritten by arbbot-marks.timer
+                // as the book turns over, and holding the startup value would
+                // let the engine trade against a stale definition of "good".
+                if let Some(tt) = cfg.take_take.as_ref() {
+                    tt_bar = std::fs::read_to_string(&tt.marks_path)
+                        .ok()
+                        .and_then(|s| crate::taketake::blended_apr(
+                            &s, &crate::taketake::today_iso(wall_now_s())))
+                        .unwrap_or(crate::taketake::DEFAULT_BAR_APR);
+                }
             }
         }
     }

@@ -134,6 +134,13 @@ impl RiskView {
         *e.by_topic.entry(topic).or_default() += qty;
     }
 
+    /// Open contracts on one relationship. The take-take concentration cap is
+    /// measured against this, so it must see the SAME exposure the caps do —
+    /// including what the startup ledger seed put there.
+    pub fn open_ct(&self, rel_id: &str) -> f64 {
+        self.exposure.lock().expect("exposure").by_rel.get(rel_id).copied().unwrap_or(0.0)
+    }
+
     pub fn stats(&self) -> (u64, u64) {
         *self.checked.lock().expect("checked")
     }
