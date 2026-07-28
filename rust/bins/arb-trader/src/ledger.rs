@@ -133,7 +133,7 @@ mod tests {
             v(r#"{"status":"open","relationship_id":"r1","ts":1.0,"qty":50}"#),
             v(r#"{"status":"unwound","relationship_id":"r1","closes_ts":1.0,"qty":50}"#),
         ];
-        assert!(open_exposure(recs).get("r1").is_none());
+        assert!(!open_exposure(recs).contains_key("r1"));
     }
 
     /// The case that makes this a fold rather than a filter.

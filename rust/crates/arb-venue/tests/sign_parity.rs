@@ -28,7 +28,9 @@ fn fixture() -> Value {
 }
 
 fn s<'a>(v: &'a Value, k: &str) -> &'a str {
-    v.get(k).and_then(Value::as_str).unwrap_or_else(|| panic!("missing str {k}"))
+    v.get(k)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("missing str {k}"))
 }
 
 // ------------------------------------------------------------------ Kalshi ---
@@ -50,7 +52,12 @@ fn kalshi_rust_verifies_python_pss_signature() {
     for case in fx["kalshi"]["cases"].as_array().unwrap() {
         let sig = B64.decode(s(case, "signature_b64")).unwrap();
         assert!(
-            verifier.verify(s(case, "timestamp_ms"), s(case, "method"), s(case, "path"), &sig),
+            verifier.verify(
+                s(case, "timestamp_ms"),
+                s(case, "method"),
+                s(case, "path"),
+                &sig
+            ),
             "Rust must verify the Python RSA-PSS signature for `{}`",
             s(case, "name"),
         );
@@ -62,9 +69,11 @@ fn kalshi_rust_verifies_python_pss_signature() {
 #[test]
 fn kalshi_rust_sign_then_self_verify() {
     let fx = fixture();
-    let signer =
-        KalshiSigner::from_pkcs8_pem(s(&fx["kalshi"], "api_key_id"), s(&fx["kalshi"], "private_key_pkcs8_pem"))
-            .unwrap();
+    let signer = KalshiSigner::from_pkcs8_pem(
+        s(&fx["kalshi"], "api_key_id"),
+        s(&fx["kalshi"], "private_key_pkcs8_pem"),
+    )
+    .unwrap();
     let verifier =
         KalshiVerifier::from_public_key_pem(s(&fx["kalshi"], "public_key_spki_pem")).unwrap();
     for case in fx["kalshi"]["cases"].as_array().unwrap() {
@@ -78,7 +87,8 @@ fn kalshi_rust_sign_then_self_verify() {
 fn kalshi_header_composition_matches_python() {
     let fx = fixture();
     let kid = s(&fx["kalshi"], "api_key_id");
-    let signer = KalshiSigner::from_pkcs8_pem(kid, s(&fx["kalshi"], "private_key_pkcs8_pem")).unwrap();
+    let signer =
+        KalshiSigner::from_pkcs8_pem(kid, s(&fx["kalshi"], "private_key_pkcs8_pem")).unwrap();
     let verifier =
         KalshiVerifier::from_public_key_pem(s(&fx["kalshi"], "public_key_spki_pem")).unwrap();
     for case in fx["kalshi"]["cases"].as_array().unwrap() {
@@ -88,8 +98,12 @@ fn kalshi_header_composition_matches_python() {
         let names: Vec<&str> = hdrs.iter().map(|(k, _)| *k).collect();
         assert_eq!(names, vec![KALSHI_HDR_KEY, KALSHI_HDR_TS, KALSHI_HDR_SIG]);
         // Python emitted the same header key set
-        let py_keys: BTreeSet<&str> =
-            case["headers"].as_object().unwrap().keys().map(String::as_str).collect();
+        let py_keys: BTreeSet<&str> = case["headers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         let rust_keys: BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(py_keys, rust_keys, "header name set matches Python");
         // KEY and TIMESTAMP values byte-match Python (signature is salted → verify)
@@ -123,8 +137,11 @@ fn kalshi_emit_rust_signature_for_python_crosscheck() {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     dir.push("../../target/tmp");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("rust_kalshi_sig.json"), serde_json::to_vec_pretty(&out).unwrap())
-        .unwrap();
+    std::fs::write(
+        dir.join("rust_kalshi_sig.json"),
+        serde_json::to_vec_pretty(&out).unwrap(),
+    )
+    .unwrap();
 }
 
 // ------------------------------------------------------------------- PM-US ---
@@ -169,9 +186,16 @@ fn pmus_header_composition_matches_python() {
         let (ts, m, p) = (s(case, "timestamp_ms"), s(case, "method"), s(case, "path"));
         let hdrs = signer.headers(ts, m, p);
         let names: Vec<&str> = hdrs.iter().map(|(k, _)| *k).collect();
-        assert_eq!(names, vec![PMUS_HDR_KEY, PMUS_HDR_TS, PMUS_HDR_SIG, PMUS_HDR_CT]);
-        let py_keys: BTreeSet<&str> =
-            case["headers"].as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            vec![PMUS_HDR_KEY, PMUS_HDR_TS, PMUS_HDR_SIG, PMUS_HDR_CT]
+        );
+        let py_keys: BTreeSet<&str> = case["headers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         let rust_keys: BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(py_keys, rust_keys, "header name set matches Python");
         // all four header values byte-match Python (Ed25519 is deterministic)

@@ -21,7 +21,7 @@
 
 use arb_core::book::BookBuilder;
 use arb_core::model::Venue;
-use arb_core::scan::{Cx, Rel, D};
+use arb_core::scan::{Cx, Rel};
 
 /// Conservative both-leg taker fee per contract. Port of `FEE_CT`.
 const FEE_CT: &str = "0.02";
@@ -350,9 +350,8 @@ mod tests {
         );
         // and with the REAL ask there is simply no trade, as it should be
         let good = books("0.1760", "0.1820", "305", "0.1700", "330", "0.1800");
-        assert_eq!(
+        assert!(
             detect(&mut cx, &r, &good, "2026-07-28", 10.0, 50, 0, 5).is_err(),
-            true,
             "true book offers no crossing"
         );
     }

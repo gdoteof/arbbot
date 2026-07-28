@@ -3,6 +3,9 @@ name = "arb-trader"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 arb-core = { path = "../../crates/arb-core" }
 arb-registry = { path = "../../crates/arb-registry" }

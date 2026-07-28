@@ -51,7 +51,8 @@ impl Hist {
 
     pub fn summary(&self) -> serde_json::Value {
         let count = self.count.load(Ordering::Relaxed);
-        let mean = if count > 0 { self.sum.load(Ordering::Relaxed) / count } else { 0 };
+        let sum = self.sum.load(Ordering::Relaxed);
+        let mean = sum.checked_div(count).unwrap_or(0);
         serde_json::json!({
             "count": count,
             "mean_ns": mean,
@@ -61,5 +62,45 @@ impl Hist {
             "p999_ns": self.percentile(0.999),
             "max_ns": self.max.load(Ordering::Relaxed),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An empty histogram reports zeroes rather than dividing by zero. These two
+    /// tests exist to pin the exact numbers `summary()` emits, so that reworking
+    /// the reporting cannot move them by accident.
+    #[test]
+    fn an_empty_histogram_reports_zeroes() {
+        let s = Hist::new().summary();
+        assert_eq!(s["count"], 0);
+        assert_eq!(s["mean_ns"], 0);
+        assert_eq!(s["p50_ns"], 0);
+        assert_eq!(s["max_ns"], 0);
+    }
+
+    /// `mean_ns` is the exact sum over the exact count (integer division);
+    /// percentiles are the midpoint `1.5 * 2^i` of the bucket the target sample
+    /// lands in, so they are only accurate to a factor of two; `max_ns` is exact.
+    ///
+    /// NOTE the `p99 > max` below (24576 > 20000). That is not a typo: a bucket
+    /// midpoint can exceed every sample in the bucket, so a percentile can report
+    /// higher than the exact maximum. This test pins TODAY's behaviour, warts
+    /// included. Whoever reworks the percentile reporting should change this
+    /// assertion deliberately, not assume it was describing something correct.
+    #[test]
+    fn mean_is_exact_and_percentiles_are_bucket_midpoints() {
+        let h = Hist::new();
+        for ns in [1_000u64, 2_000, 3_000, 20_000] {
+            h.record(ns);
+        }
+        let s = h.summary();
+        assert_eq!(s["count"], 4);
+        assert_eq!(s["mean_ns"], 6_500); // 26_000 / 4
+        assert_eq!(s["max_ns"], 20_000);
+        assert_eq!(s["p50_ns"], 1_536); // 2nd of 4 is in bucket 10 = [1024, 2048)
+        assert_eq!(s["p99_ns"], 24_576); // 4th of 4 is in bucket 14 = [16384, 32768)
     }
 }

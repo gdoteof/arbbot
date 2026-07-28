@@ -173,7 +173,9 @@ async fn ws_session(
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
 
-    let mut req = WS_MARKETS_URL.into_client_request()?;
+    // The signed headers below are computed over the compiled-in WS_MARKETS_PATH,
+    // not over this URL, so the override cannot disturb auth.
+    let mut req = ws_url("ARBBOT_WS_PMUS", WS_MARKETS_URL).into_client_request()?;
     for (k, v) in signer.headers("GET", WS_MARKETS_PATH) {
         req.headers_mut().insert(
             reqwest::header::HeaderName::from_bytes(k.as_bytes())?,
