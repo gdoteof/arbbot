@@ -122,3 +122,40 @@ def test_ownership_claim_and_lookup(tmp_path):
         assert ledgerdb.owned_by(conn, "rust-") == []
     finally:
         conn.close()
+
+
+def test_dual_append_heals_a_torn_tail_instead_of_welding(tmp_path):
+    """A crash leaves a final line with no newline. Appending onto it fuses two
+    records into one line that parses as neither — destroying both. The Rust
+    engine's writer heals and its reader refuses to arm on a fused line, and
+    arbbot-hedge.timer runs this path every 5 minutes, so this is the writer
+    most likely to meet a Rust stump.
+    """
+    ledger = tmp_path / "trades.jsonl"
+    ledger.write_text(
+        '{"status":"open","relationship_id":"r1","ts":1.0,"qty":50}\n'
+        '{"status":"open","relationship_id":"r2","ts":2.0,"qt'
+    )
+    rec = {"status": "open", "relationship_id": "r3", "ts": 3.0, "qty": 7}
+    ledgerdb.dual_append(rec, source="test", ledger_path=ledger,
+                         db_path=tmp_path / "trading.db")
+
+    lines = ledger.read_text().splitlines()
+    assert len(lines) == 3, f"the stump must not eat the new record: {lines}"
+    assert json.loads(lines[2]) == rec
+    # the torn line stays ONE bad line, recoverable, and r1 is untouched
+    assert json.loads(lines[0])["relationship_id"] == "r1"
+
+
+def test_dual_append_is_byte_identical_to_the_old_writer(tmp_path):
+    """The heal must not change what a normal append looks like: trades.jsonl is
+    SoR and several readers pin its exact bytes.
+    """
+    ledger = tmp_path / "trades.jsonl"
+    db = tmp_path / "trading.db"
+    recs = [{"status": "open", "relationship_id": "r1", "ts": 1.0, "qty": 5},
+            {"status": "unwound", "relationship_id": "r1", "closes_ts": 1.0, "qty": 5}]
+    for r in recs:
+        ledgerdb.dual_append(r, source="test", ledger_path=ledger, db_path=db)
+    want = "".join(json.dumps(r) + "\n" for r in recs)
+    assert ledger.read_bytes() == want.encode()

@@ -333,8 +333,20 @@ def dual_append(rec: dict, *, source: str, ledger_path: Path = LEDGER_PATH,
     and best-effort mirror it into the trading DB. DB failure never raises —
     trading must not die because the DB is locked; the backfill heals."""
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(ledger_path, "a") as f:
-        f.write(json.dumps(rec) + "\n")
+    with open(ledger_path, "a+b") as f:
+        # Heal a torn tail before appending. A crash can leave a final line with
+        # no newline; appending onto it WELDS two records into one line that
+        # parses as neither, destroying both. The Rust engine's writer heals
+        # (rust/bins/arb-trader/src/ledger.rs) and its reader now refuses to arm
+        # on a fused line — and arbbot-hedge.timer fires this path every 5
+        # minutes, so a Rust stump is more likely to be followed by a Python
+        # append than a Rust one. Costs one seek and one byte read per record.
+        f.seek(0, 2)
+        if f.tell():
+            f.seek(-1, 2)
+            if f.read(1) != b"\n":
+                f.write(b"\n")
+        f.write((json.dumps(rec) + "\n").encode())
     try:
         conn = connect(db_path)
         try:

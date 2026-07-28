@@ -265,9 +265,21 @@ def main():
     kb = kalshi_books(c, ktickers) if ktickers else {}
 
     positions, tot_cost, tot_mark, tot_locked = [], 0.0, 0.0, 0.0
+    unpriced = 0
     for t in open_t:
         if len(t.get("legs", [])) < 2:
             continue  # single-leg records (pm-lean riders) are directional — no basket mark
+        # The Rust engine books a basket at place time and never reads fill
+        # reports, so its records carry no cost_usd/profit_usd. Marking one
+        # needs a cost basis; without it the row would be a guess. Skip and
+        # COUNT, because a silent omission here is not cosmetic: this file is
+        # where the engine re-derives its take-take APR bar, and a wedged
+        # timer freezes that bar at a stale value the engine keeps trading on.
+        # 2026-07-28: the engine's first four live records hit the hard
+        # subscript below and killed this timer 8s after the last good run.
+        if t.get("cost_usd") is None or t.get("profit_usd") is None:
+            unpriced += 1
+            continue
         kleg = next(l for l in t["legs"] if l["venue"] == "kalshi")
         pleg = next(l for l in t["legs"] if l["venue"] == "polymarket_us")
         k_bid, k_ask = kb.get(kleg["market_id"], (None, None))
@@ -283,6 +295,7 @@ def main():
            "totals": {"cost_usd": round(tot_cost, 2), "mark_pnl_usd": round(tot_mark, 2),
                       "locked_profit_usd": round(tot_locked, 2),
                       "n_open": len(open_t),
+                      "unpriced_positions": unpriced,
                       "unwind_signals": sum(1 for p in positions if p.get("unwind_signal")),
                       "unwind_hard": sum(1 for p in positions if p.get("unwind_hard")),
                       "reverse_signals": sum(1 for p in positions if p.get("reverse_signal"))}}
