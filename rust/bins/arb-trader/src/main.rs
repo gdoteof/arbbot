@@ -597,6 +597,7 @@ async fn main() {
             }
         }
     }
+    let armed = !sinks.is_empty();
     let acks = if sinks.is_empty() { None } else { tx_acks.clone() };
     let (exec_txs, exec_stats) = exec::spawn_executors(rate, sinks, acks);
     let cfg = engine::RunCfg {
@@ -608,6 +609,9 @@ async fn main() {
         // bench/replay must stay byte-deterministic and have no live feed.
         health_file: (!bench && !args.health.is_empty()).then(|| args.health.clone()),
         risk: risk.clone(),
+        // Only an ARMED engine books baskets. A dry run writing here would
+        // invent exposure that the next startup would seed from as if real.
+        ledger_path: (!exec_txs.is_empty() && armed).then(|| args.ledger.clone()),
     };
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;
     println!("{summary}");

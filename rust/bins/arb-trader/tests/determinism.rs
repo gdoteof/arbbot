@@ -128,3 +128,96 @@ fn logging_a_wal_does_not_change_decisions() {
     assert_eq!(without.digest, with.digest, "--wal is decision-neutral");
     assert_eq!(without.intents, with.intents);
 }
+
+// ------------------------------------------------------------ hedge placing ---
+
+fn hedge_lines(intents: &str) -> Vec<serde_json::Value> {
+    intents
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v.get("tag").and_then(|t| t.as_str()) == Some("hedge"))
+        .collect()
+}
+
+/// A maker fill must produce a real hedge ORDER, not just an obligation line:
+/// on the OTHER venue, on the opposite side, marketable, for the fill's size.
+#[test]
+fn a_maker_fill_places_a_taker_hedge_on_the_other_leg() {
+    let tape = data("synth-tape.jsonl");
+    let r = run("--bench-tape", &tape, &tmp("hedge-place.jsonl"), None);
+    let hedges = hedge_lines(&r.intents);
+    assert_eq!(hedges.len(), 3, "one hedge per obligation: {:?}", hedges);
+
+    let h = &hedges[0];
+    assert_eq!(h["venue"], "polymarket_us", "the OTHER leg — the maker filled on kalshi");
+    assert_eq!(h["place"], "SYNTH-P-YES");
+    assert_eq!(h["side"], "ask", "a filled maker BID leaves us long, so the hedge SELLS");
+    assert_eq!(h["taker"], true, "a hedge crosses; it never rests");
+    assert_eq!(h["count"], 2, "the fill's size, not the resting size");
+    assert_eq!(h["order_id"], "h1", "hedge ids are their own series — never collide with makers");
+}
+
+/// The book at fill time is the book the filling burst just gapped, so a
+/// missing level falls back to the anchor captured at PLACE time.
+#[test]
+fn a_hedge_prices_at_the_touch_and_falls_back_to_the_anchor() {
+    let tape = data("synth-tape.jsonl");
+    let r = run("--bench-tape", &tape, &tmp("hedge-px.jsonl"), None);
+    let hedges = hedge_lines(&r.intents);
+    // PM's bid is 0.40 when the first two fire, and 0.36 by the third.
+    assert_eq!(hedges[0]["price"], "0.40");
+    assert_eq!(hedges[2]["price"], "0.36", "the CURRENT touch once the book moved");
+}
+
+/// THE loop guard. A hedge is not in the FillLedger, so its own fill mints
+/// nothing — otherwise every hedge would hedge itself, forever.
+#[test]
+fn a_hedge_fill_never_mints_another_hedge() {
+    let tape = data("synth-hedge-loop.jsonl");
+    let r = run("--bench-tape", &tape, &tmp("hedge-loop.jsonl"), None);
+    let hedges = hedge_lines(&r.intents);
+    assert_eq!(
+        hedges.len(),
+        1,
+        "one maker fill => exactly one hedge, and the hedge's own fills add none: {:?}",
+        hedges
+    );
+    assert_eq!(
+        r.summary["hedge_obligations"], 1,
+        "the hedge's fills must not register as obligations"
+    );
+}
+
+/// A dry run must NEVER write to the accounting ledger. It would invent open
+/// baskets that the next startup seeds exposure from, quietly shrinking the
+/// caps against positions that do not exist.
+#[test]
+fn a_dry_run_never_books_a_basket() {
+    let ledger = tmp("must-not-exist-ledger.jsonl");
+    let _ = std::fs::remove_file(&ledger);
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_arb-trader"));
+    let out = tmp("dryrun-ledger.jsonl");
+    let _ = std::fs::remove_file(&out);
+    let o = cmd
+        .arg("--bench-tape")
+        .arg(data("synth-tape.jsonl"))
+        .arg("--registry")
+        .arg(data("synth-registry.yaml"))
+        .arg("--out")
+        .arg(&out)
+        .arg("--ledger")
+        .arg(&ledger)
+        .arg("--kill-file")
+        .arg(out.with_extension("no-such-kill-file"))
+        .output()
+        .expect("run arb-trader");
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+    // the tape contains maker fills, so an armed engine WOULD have booked
+    assert!(
+        !ledger.exists(),
+        "an unarmed engine wrote to the trade ledger at {}",
+        ledger.display()
+    );
+}

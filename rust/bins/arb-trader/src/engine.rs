@@ -36,6 +36,48 @@ pub struct RunCfg {
     /// Shared risk view. The quoters consult it per place; the engine feeds it
     /// exposure on fills. None = risk off (bench/replay).
     pub risk: Option<std::sync::Arc<crate::risk::RiskView>>,
+    /// Append-only trade ledger to BOOK completed baskets into. `None` unless
+    /// the order path is armed — a dry run must never write into the accounting
+    /// ledger, or it would invent exposure that the next startup seeds from.
+    pub ledger_path: Option<String>,
+}
+
+/// Book a completed basket: the maker leg filled and its hedge filled, so the
+/// position is real and the next restart must see it.
+///
+/// Deliberately NOT fee-complete. The engine knows the prices it traded at, but
+/// venue fees arrive on the fill reports the reconciler reads, so writing a
+/// `cost_usd` here would be a guess in the accounting record. `fees_pending`
+/// says so out loud rather than shipping a confident wrong number.
+#[allow(clippy::too_many_arguments)]
+fn book_basket(path: &str, maker: &MakerOrder, hedge: &HedgeOrder, qty: i64, ts: f64) {
+    let rec = json!({
+        "ts": ts,
+        "relationship_id": maker.rel_id,
+        "title": format!("{} (rust maker-hedge)", maker.rel_id),
+        "qty": qty,
+        "strategy": "maker-hedge",
+        "status": "open",
+        "source": "arb-trader",
+        "fees_pending": true,
+        "legs": [
+            {"venue": maker.venue, "market_id": maker.market_id, "side": maker.side,
+             "role": "maker", "qty": qty, "yes_price": maker.price,
+             "order_id": hedge.maker_order_id},
+            {"venue": hedge.venue, "market_id": hedge.market_id, "side": hedge.side,
+             "role": "taker", "qty": qty, "yes_price": hedge.price},
+        ],
+    });
+    use std::io::Write as _;
+    let opened = std::fs::OpenOptions::new().create(true).append(true).open(path);
+    match opened {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{rec}") {
+                eprintln!("[ledger] WRITE FAILED ({e}) — basket {} is UNBOOKED", maker.rel_id);
+            }
+        }
+        Err(e) => eprintln!("[ledger] cannot open {path}: {e} — basket UNBOOKED"),
+    }
 }
 
 /// Feeds whose staleness invalidates pricing. A cross-venue quote on EITHER
@@ -88,6 +130,28 @@ fn feed_stale_reason(path: &str, now_wall: f64) -> Option<String> {
         })
         .collect();
     (!bad.is_empty()).then(|| format!("{} stale", bad.join(", ")))
+}
+
+/// The maker order behind a basket: everything the ledger record needs about
+/// the leg we rested.
+struct MakerOrder {
+    rel_id: String,
+    class: &'static str,
+    venue: String,
+    market_id: String,
+    side: String,
+    price: String,
+}
+
+/// A hedge we placed, kept so its fill can be recognised and booked.
+struct HedgeOrder {
+    /// The maker order whose fill created this hedge.
+    maker_order_id: String,
+    market_id: String,
+    venue: &'static str,
+    side: &'static str,
+    price: String,
+    qty: i64,
 }
 
 fn wall_now() -> f64 {
@@ -185,9 +249,13 @@ pub async fn run(
     // order id -> (relationship id, class). A fill arrives with our order id
     // only, but exposure is booked per relationship, so the mapping is captured
     // at place time when the rel is in hand.
-    let mut order_rel: HashMap<String, (String, &'static str)> = HashMap::new();
+    let mut order_rel: HashMap<String, MakerOrder> = HashMap::new();
     // venue's order id -> ours, learned from order_ack.
     let mut venue_oid: HashMap<String, String> = HashMap::new();
+    // Hedge orders we placed, by OUR id. Deliberately separate from the
+    // FillLedger: a hedge in the ledger would hedge its own fill.
+    let mut hedge_orders: HashMap<String, HedgeOrder> = HashMap::new();
+    let mut next_hedge_oid: u64 = 0;
     let (mut n_ack, mut n_fill, mut n_hedge) = (0u64, 0u64, 0u64);
     let t_start = std::time::Instant::now();
     let mut wal = cfg.wal_path.as_deref().map(Wal::spawn);
@@ -236,11 +304,27 @@ pub async fn run(
                         v.get("count").and_then(|x| x.as_i64()),
                     ) {
                         let side = v.get("side").and_then(|x| x.as_str()).unwrap_or("");
-                        let anchor = $rel
-                            .and_then(|r| hedge_anchor(r, mkt, side, &books, ts_ev));
-                        fills.register_order(oid, mkt, count, anchor);
+                        // A hedge is never registered: it has no hedge of its
+                        // own, and registering it would make its fill mint one.
+                        if v.get("tag").and_then(|x| x.as_str()) != Some("hedge") {
+                            let anchor = $rel
+                                .and_then(|r| hedge_anchor(r, mkt, side, &books, ts_ev));
+                            fills.register_order(oid, mkt, count, anchor);
+                        }
                         if let Some(r) = $rel {
-                            order_rel.insert(oid.to_string(), (r.id.clone(), r.rtype.as_str()));
+                            order_rel.insert(
+                                oid.to_string(),
+                                MakerOrder {
+                                    rel_id: r.id.clone(),
+                                    class: r.rtype.as_str(),
+                                    venue: v.get("venue").and_then(|x| x.as_str())
+                                        .unwrap_or("").to_string(),
+                                    market_id: mkt.to_string(),
+                                    side: side.to_string(),
+                                    price: v.get("price").and_then(|x| x.as_str())
+                                        .unwrap_or("").to_string(),
+                                },
+                            );
                         }
                         // an amend retires the old id, but a fill can still
                         // race it — observe_cancel KEEPS the record.
@@ -257,6 +341,7 @@ pub async fn run(
                     // fixed here; a taker hedge will carry its own.
                     // `client_order_id` is our own order id, which is what makes
                     // a retried place idempotent at the venue.
+                    let taker = v.get("taker").and_then(|x| x.as_bool()).unwrap_or(false);
                     let action = if let (Some(market), Some(oid)) = (
                         v.get("place").and_then(|x| x.as_str()),
                         v.get("order_id").and_then(|x| x.as_str()),
@@ -273,8 +358,8 @@ pub async fn run(
                                 .unwrap_or("0")
                                 .to_string(),
                             qty: v.get("count").and_then(|x| x.as_i64()).unwrap_or(0),
-                            tif: Tif::Gtc,
-                            post_only: true,
+                            tif: if taker { Tif::Ioc } else { Tif::Gtc },
+                            post_only: !taker,
                             client_order_id: oid.to_string(),
                         }))
                     } else if let (Some(market), Some(oid)) = (
@@ -430,16 +515,33 @@ pub async fn run(
                         // which looks orders up by our id).
                         let oid: &str =
                             venue_oid.get(reported).map(|s| s.as_str()).unwrap_or(reported);
+                        // A hedge fill completes a basket. Hedges are not in
+                        // the FillLedger (that would hedge the hedge), so they
+                        // are recognised here and booked exactly once.
+                        if let Some(h) = hedge_orders.remove(oid) {
+                            let filled = cum.min(h.qty);
+                            if let Some(mo) = order_rel.get(&h.maker_order_id) {
+                                if let Some(lp) = cfg.ledger_path.as_deref() {
+                                    book_basket(lp, mo, &h, filled, ts_local_ns as f64 / 1e9);
+                                }
+                                eprintln!(
+                                    "[ledger] booked {} x{} ({} maker / {} hedge)",
+                                    mo.rel_id, filled, mo.market_id, h.market_id
+                                );
+                            }
+                            decision.record(m.t_read.elapsed().as_nanos() as u64);
+                            continue;
+                        }
                         n_fill += 1;
                         let now = ts_local_ns as f64 / 1e9;
                         last_now = now;
                         if let Some(ob) = fills.observe_cum_fill(oid, cum) {
                             // Book the new exposure BEFORE the hedge intent, so
                             // the next quote sees capital this fill just spent.
-                            if let (Some(rv), Some((rid, class))) =
+                            if let (Some(rv), Some(mo)) =
                                 (cfg.risk.as_ref(), order_rel.get(oid))
                             {
-                                rv.record_open(rid, class, ob.qty() as f64);
+                                rv.record_open(&mo.rel_id, mo.class, ob.qty() as f64);
                             }
                             // No anchor => no hedge target. The obligation is
                             // deliberately left unconsumed so the ledger's
@@ -449,13 +551,60 @@ pub async fn run(
                                 let (f_oid, _order_market, qty, _) = ob.into_parts();
                                 n_hedge += 1;
                                 intents.push(
-                                    json!({"hedge_needed": a.market_id, "order_id": f_oid,
-                                           "qty": qty, "anchor_price": a.price, "ts": now})
+                                    json!({"hedge_needed": a.market_id, "order_id": f_oid.clone(),
+                                           "qty": qty, "anchor_price": a.price.clone(), "ts": now})
                                     .to_string(),
                                 );
-                                // The obligation surface only: this line IS the
-                                // exposure record. Hedge PLACEMENT policy
-                                // arrives with the venue write path.
+                                // The obligation says WHAT to hedge; this is the
+                                // order that does it. Marketable IOC, not a
+                                // resting quote: an unhedged leg is unbounded
+                                // directional risk until resolution, so the
+                                // hedge crosses rather than waits.
+                                //
+                                // `a.side` is the hedge-leg BOOK side we take.
+                                // Taking a bid means SELLING (an ask-side
+                                // order); taking an ask means BUYING.
+                                let order_side = if a.side == "bid" { "ask" } else { "bid" };
+                                // Price at the CURRENT touch so it actually
+                                // fills. The anchor is the fallback: it was
+                                // captured at place time precisely because the
+                                // burst that fills you is the burst that gaps
+                                // your book, so a missing level here is exactly
+                                // when it is needed.
+                                let px = parse_venue(a.venue)
+                                    .and_then(|v| books.get(v, &a.market_id))
+                                    .and_then(|b| {
+                                        if a.side == "bid" {
+                                            b.bids.first()
+                                        } else {
+                                            b.asks.first()
+                                        }
+                                    })
+                                    .map(|l| l.price.clone())
+                                    .unwrap_or_else(|| a.price.clone());
+                                next_hedge_oid += 1;
+                                let hoid = format!("h{next_hedge_oid}");
+                                // Remembered so the fill feed can tell a hedge
+                                // fill from a maker fill. Hedges are NOT in the
+                                // FillLedger: registering one would let its own
+                                // fill mint another hedge, forever.
+                                hedge_orders.insert(
+                                    hoid.clone(),
+                                    HedgeOrder {
+                                        maker_order_id: f_oid,
+                                        market_id: a.market_id.clone(),
+                                        venue: a.venue,
+                                        side: order_side,
+                                        price: px.clone(),
+                                        qty,
+                                    },
+                                );
+                                intents.push(
+                                    json!({"ts": now, "place": a.market_id, "venue": a.venue,
+                                           "side": order_side, "price": px, "count": qty,
+                                           "order_id": hoid, "tag": "hedge", "taker": true})
+                                    .to_string(),
+                                );
                                 drain_intents!(Option::<&Rel>::None);
                             }
                         }
@@ -650,5 +799,63 @@ mod tempdir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod ledger_write_tests {
+    use super::*;
+
+    /// The round trip that matters: a basket this engine books must be read
+    /// back as OPEN exposure by the same seeding path used at startup. If these
+    /// two disagree, an armed engine forgets its own positions on restart.
+    #[test]
+    fn a_booked_basket_seeds_exposure_on_the_next_startup() {
+        let dir = std::env::temp_dir().join(format!("arb-book-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trades.jsonl");
+        let p = path.to_str().unwrap();
+
+        let maker = MakerOrder {
+            rel_id: "xvus-demo".into(),
+            class: "cross-venue-equivalent",
+            venue: "kalshi".into(),
+            market_id: "KXDEMO".into(),
+            side: "bid".into(),
+            price: "0.31".into(),
+        };
+        let hedge = HedgeOrder {
+            maker_order_id: "m1".into(),
+            market_id: "demo-slug".into(),
+            venue: "polymarket_us",
+            side: "ask",
+            price: "0.40".into(),
+            qty: 5,
+        };
+        book_basket(p, &maker, &hedge, 5, 1_700_000_000.0);
+        book_basket(p, &maker, &hedge, 3, 1_700_000_100.0);
+
+        let recs = crate::ledger::read(p).unwrap();
+        let open = crate::ledger::open_exposure(recs);
+        assert_eq!(
+            open.get("xvus-demo"),
+            Some(&8.0),
+            "both baskets must read back as open exposure"
+        );
+
+        let first: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(p).unwrap().lines().next().unwrap())
+                .unwrap();
+        assert_eq!(first["status"], "open");
+        assert_eq!(first["qty"], 5);
+        assert_eq!(first["legs"][0]["venue"], "kalshi");
+        assert_eq!(first["legs"][0]["role"], "maker");
+        assert_eq!(first["legs"][1]["venue"], "polymarket_us");
+        assert_eq!(first["legs"][1]["role"], "taker");
+        assert_eq!(
+            first["fees_pending"], true,
+            "the engine does not know venue fees; the record must not pretend otherwise"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

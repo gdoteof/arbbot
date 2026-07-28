@@ -1,0 +1,5 @@
+{"kind":"snapshot","venue":"kalshi","market_id":"SYNTH-K-YES","seq":1,"ts_local_ns":1700000000000000000,"ts_venue":null,"bids":[{"price":"0.30","size":"50"}],"asks":[{"price":"0.45","size":"50"}]}
+{"kind":"snapshot","venue":"polymarket_us","market_id":"SYNTH-P-YES","seq":1,"ts_local_ns":1700000001000000000,"ts_venue":null,"bids":[{"price":"0.40","size":"100"}],"asks":[{"price":"0.42","size":"100"}]}
+{"kind":"fill","venue":"kalshi","market_id":"SYNTH-K-YES","order_id":"m1","cum":2,"ts_local_ns":1700000003000000000}
+{"kind":"fill","venue":"polymarket_us","market_id":"SYNTH-P-YES","order_id":"h1","cum":2,"ts_local_ns":1700000005000000000}
+{"kind":"fill","venue":"polymarket_us","market_id":"SYNTH-P-YES","order_id":"h1","cum":2,"ts_local_ns":1700000006000000000}
