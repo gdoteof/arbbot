@@ -161,9 +161,33 @@ pub fn kalshi_positions(body: &str) -> Result<KalshiPositions, VenueError> {
 
 // ------------------------------------------------------------------- PM-US ---
 
+/// PM-US sends money BOTH ways: order prices are strings
+/// (`{"value":"0.2600"}`) but `/v1/account/balances` sends bare JSON numbers
+/// (`"buyingPower":329.29805`, observed live 2026-07-27). Accept either and
+/// keep the string form, so nothing downstream ever sees a float.
+///
+/// A JSON number is rendered shortest-roundtrip, which reproduces the wire text
+/// exactly at account-balance magnitudes. This is the same coercion Python does
+/// (`Decimal(str(bal["buyingPower"]))`). PRICES stay strings end to end — those
+/// are the values decimal parity actually depends on.
+fn money_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        other => Err(D::Error::custom(format!(
+            "expected a money string or number, got {other}"
+        ))),
+    }
+}
+
 /// A PM-US money value: `{"value": "0.2600", "currency": "USD"}`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MoneyVal {
+    #[serde(deserialize_with = "money_string")]
     pub value: String,
     #[serde(default)]
     pub currency: Option<String>,
@@ -274,6 +298,7 @@ pub struct PmBalances {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PmBalance {
+    #[serde(deserialize_with = "money_string")]
     pub buying_power: String,
 }
 

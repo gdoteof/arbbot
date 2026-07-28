@@ -1,0 +1,387 @@
+//! The M2 gate for PM-US (QCX). Same contract as the Kalshi order-path tests:
+//! assert on what actually went on the wire.
+//!
+//! PM-US differs from Kalshi in ways that are easy to get wrong by analogy, so
+//! each difference gets its own test:
+//!   * create takes the BARE body; only /v1/order/preview wraps it
+//!   * cancel needs the marketSlug in the BODY, and it is REQUIRED
+//!   * a failed cancel is an ERROR — Kalshi's 404-is-success does NOT transfer
+//!   * cancel-all is one call, not a paginated sweep
+//!   * the create response carries no fill data at all
+
+use arb_venue::gateway::{CancelRequest, PlaceRequest, PmusGateway, Side, Tif, VenueGateway};
+use arb_venue::ratelimit::RateLimiter;
+use arb_venue::transport::{Response, Transport};
+use arb_venue::{PmusSigner, VenueError};
+use serde_json::Value;
+use std::sync::Mutex;
+
+#[derive(Debug, Clone)]
+struct Sent {
+    method: String,
+    path: String,
+    body: Option<Value>,
+    headers: Vec<(String, String)>,
+}
+
+struct MockTransport {
+    replies: Mutex<Vec<(u16, String)>>,
+    sent: Mutex<Vec<Sent>>,
+}
+
+impl MockTransport {
+    fn new(replies: Vec<(u16, &str)>) -> Self {
+        Self {
+            replies: Mutex::new(replies.into_iter().map(|(s, b)| (s, b.to_string())).collect()),
+            sent: Mutex::new(Vec::new()),
+        }
+    }
+    fn sent(&self) -> Vec<Sent> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+impl Transport for MockTransport {
+    fn send(
+        &self,
+        method: &str,
+        path: &str,
+        _query: Option<&str>,
+        headers: &[(&'static str, String)],
+        body: Option<&Value>,
+    ) -> Result<Response, VenueError> {
+        self.sent.lock().unwrap().push(Sent {
+            method: method.to_string(),
+            path: path.to_string(),
+            body: body.cloned(),
+            headers: headers.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+        });
+        let mut r = self.replies.lock().unwrap();
+        if r.is_empty() {
+            panic!("MockTransport: unexpected extra request {method} {path}");
+        }
+        let (status, body) = r.remove(0);
+        Ok(Response { status, body })
+    }
+}
+
+fn seed32() -> [u8; 32] {
+    let v: Value = serde_json::from_str(include_str!("fixtures/venue/sigs.json")).unwrap();
+    let raw = hex::decode(v["pmus"]["seed_hex"].as_str().unwrap()).unwrap();
+    let mut s = [0u8; 32];
+    s.copy_from_slice(&raw[..32]);
+    s
+}
+
+fn signer() -> PmusSigner {
+    let v: Value = serde_json::from_str(include_str!("fixtures/venue/sigs.json")).unwrap();
+    PmusSigner::from_seed(v["pmus"]["api_key_id"].as_str().unwrap(), &seed32())
+}
+
+fn gw(replies: Vec<(u16, &str)>) -> PmusGateway<MockTransport> {
+    PmusGateway::with_transport(
+        signer(),
+        RateLimiter::from_per_minute(600.0, 600.0, 0),
+        MockTransport::new(replies),
+    )
+    .with_settle(std::time::Duration::ZERO, 1)
+}
+
+const SLUG: &str = "will-x-happen";
+/// A create response: an id and `executions: []`, and NO fill data.
+const CREATED: &str = r#"{"id":"pm-1","marketSlug":"will-x-happen","state":"STATE_OPEN","executions":[]}"#;
+const OPEN_ORDER: &str = r#"{"id":"pm-1","marketSlug":"will-x-happen","state":"STATE_OPEN","cumQuantity":0}"#;
+
+fn place_req() -> PlaceRequest {
+    PlaceRequest {
+        market: SLUG.into(),
+        side: Side::Bid,
+        price: "0.0100".into(),
+        qty: 1,
+        tif: Tif::Gtc,
+        post_only: true,
+        client_order_id: String::new(),
+    }
+}
+
+// ---------------------------------------------------------------- quirks ---
+
+/// Create takes the BARE order body. Wrapping it in `{"request": ...}` — the
+/// shape preview wants — answers with a misleading "Market not found".
+#[test]
+fn create_posts_the_bare_order_body_not_the_preview_wrapper() {
+    let g = gw(vec![(200, CREATED)]);
+    let o = g.place(&place_req()).unwrap();
+    assert_eq!(o.id, "pm-1");
+
+    let s = &g.transport.sent()[0];
+    assert_eq!(s.method, "POST");
+    assert_eq!(s.path, "/v1/orders");
+    let b = s.body.as_ref().unwrap();
+    assert!(b.get("request").is_none(), "create must NOT be wrapped: {b}");
+    assert_eq!(b["marketSlug"], SLUG);
+    assert_eq!(b["type"], "ORDER_TYPE_LIMIT");
+    assert_eq!(b["price"]["value"], "0.0100");
+    assert_eq!(b["price"]["currency"], "USD");
+    assert_eq!(b["quantity"], 1);
+    assert_eq!(b["tif"], "TIME_IN_FORCE_GOOD_TILL_CANCEL");
+    assert_eq!(b["intent"], "ORDER_INTENT_BUY_LONG", "bid opens a long");
+    assert_eq!(b["participateDontInitiate"], true, "post-only");
+}
+
+/// ...and preview is the one endpoint that DOES wrap.
+#[test]
+fn preview_wraps_the_body_in_request() {
+    let g = gw(vec![(200, r#"{"fills":[]}"#)]);
+    g.preview(&place_req()).unwrap();
+    let s = &g.transport.sent()[0];
+    assert_eq!(s.path, "/v1/order/preview");
+    let b = s.body.as_ref().unwrap();
+    assert_eq!(b["request"]["marketSlug"], SLUG, "preview IS wrapped: {b}");
+}
+
+/// An ask opens a SHORT (buy NO) on the same YES price axis.
+#[test]
+fn an_ask_opens_a_short_on_the_yes_axis() {
+    let g = gw(vec![(200, CREATED)]);
+    let mut req = place_req();
+    req.side = Side::Ask;
+    g.place(&req).unwrap();
+    let b = g.transport.sent()[0].body.clone().unwrap();
+    assert_eq!(b["intent"], "ORDER_INTENT_BUY_SHORT");
+}
+
+/// The marketSlug rides in the cancel BODY (it is not in the path).
+#[test]
+fn cancel_carries_the_market_slug_in_the_body() {
+    let g = gw(vec![(200, "{}")]);
+    g.cancel(&CancelRequest {
+        order_id: "pm-1".into(),
+        market_slug: Some(SLUG.into()),
+    })
+    .unwrap();
+    let s = &g.transport.sent()[0];
+    assert_eq!(s.method, "POST");
+    assert_eq!(s.path, "/v1/order/pm-1/cancel");
+    assert_eq!(s.body.as_ref().unwrap()["marketSlug"], SLUG);
+}
+
+/// A cancel without the slug must fail LOCALLY. We deliberately do not
+/// self-resolve it from open_orders — doing that on every reprice hammered the
+/// API into 429s.
+#[test]
+fn a_cancel_without_a_slug_fails_before_reaching_the_wire() {
+    let g = gw(vec![]);
+    match g.cancel(&CancelRequest { order_id: "pm-1".into(), market_slug: None }) {
+        Err(VenueError::MissingField { field, .. }) => assert_eq!(field, "market_slug"),
+        other => panic!("expected a local MissingField, got {other:?}"),
+    }
+    assert!(g.transport.sent().is_empty(), "nothing may reach the wire");
+}
+
+/// Kalshi's "404 on cancel means already gone" does NOT transfer. On PM-US a
+/// failed cancel is an error — believing it succeeded is what accumulated
+/// stray orders.
+#[test]
+fn a_failed_pmus_cancel_is_an_error_unlike_kalshi() {
+    for status in [404u16, 400, 500] {
+        let g = gw(vec![(status, r#"{"message":"nope"}"#)]);
+        match g.cancel(&CancelRequest {
+            order_id: "pm-1".into(),
+            market_slug: Some(SLUG.into()),
+        }) {
+            Err(VenueError::Status { status: s, .. }) => assert_eq!(s, status),
+            other => panic!("HTTP {status} must be an error, got {other:?}"),
+        }
+    }
+}
+
+/// Cancel-all is ONE idempotent call — no listing, no pagination.
+#[test]
+fn cancel_all_open_is_a_single_call() {
+    let g = gw(vec![(200, "{}")]);
+    g.cancel_all_open().unwrap();
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 1, "exactly one request");
+    assert_eq!(sent[0].method, "POST");
+    assert_eq!(sent[0].path, "/v1/orders/open/cancel");
+}
+
+/// The create response carries no fill data at all, so it can never be read
+/// for a fill. Only the re-fetched order is authoritative.
+#[test]
+fn a_create_response_never_carries_fill_data() {
+    let g = gw(vec![(200, CREATED)]);
+    let o = g.place(&place_req()).unwrap();
+    assert_eq!(o.fill_state(), arb_venue::resp::PmFillState::NoFillData);
+    assert_eq!(o.filled_qty(), 0);
+    assert!(o.avg_px.is_none(), "avgPx must be absent on a create");
+}
+
+/// order_status unwraps `{"order": ...}` but also accepts a bare order.
+#[test]
+fn order_status_accepts_both_the_envelope_and_a_bare_order() {
+    for body in [
+        r#"{"order":{"id":"pm-1","cumQuantity":3,"avgPx":{"value":"0.4200","currency":"USD"}}}"#,
+        r#"{"id":"pm-1","cumQuantity":3,"avgPx":{"value":"0.4200","currency":"USD"}}"#,
+    ] {
+        let g = gw(vec![(200, body)]);
+        let o = g.order_status("pm-1").unwrap();
+        assert_eq!(o.id, "pm-1");
+        assert_eq!(
+            o.fill_state(),
+            arb_venue::resp::PmFillState::Filled { cum_quantity: 3, avg_px: "0.4200".into() }
+        );
+    }
+}
+
+/// open_orders accepts a bare array or an `{"orders": [...]}` envelope.
+#[test]
+fn open_orders_accepts_both_shapes() {
+    for body in [
+        r#"[{"id":"pm-1"},{"id":"pm-2"}]"#,
+        r#"{"orders":[{"id":"pm-1"},{"id":"pm-2"}]}"#,
+    ] {
+        let g = gw(vec![(200, body)]);
+        let os = g.open_orders().unwrap();
+        assert_eq!(os.len(), 2);
+        assert_eq!(os[0].id, "pm-1");
+    }
+}
+
+/// Positions are a dict KEYED BY SLUG with a string netPosition.
+#[test]
+fn positions_are_keyed_by_slug_with_string_quantities() {
+    let g = gw(vec![(
+        200,
+        r#"{"positions":{"will-x-happen":{"netPosition":"-25","avgPx":{"value":"0.3300"}}}}"#,
+    )]);
+    let p = g.positions().unwrap();
+    assert_eq!(p.positions["will-x-happen"].net_position, "-25");
+}
+
+/// Ed25519 signing is deterministic, so this verifies the exact bytes the
+/// venue will check: ts + METHOD + path, with the four headers present.
+#[test]
+fn the_request_is_signed_over_ts_method_and_path() {
+    let g = gw(vec![(200, CREATED)]);
+    g.place(&place_req()).unwrap();
+    let s = &g.transport.sent()[0];
+
+    let h = |k: &str| s.headers.iter().find(|(hk, _)| hk == k).map(|(_, v)| v.clone());
+    let ts = h("X-PM-Timestamp").expect("a timestamp header");
+    let sig = h("X-PM-Signature").expect("a signature header");
+    assert!(h("X-PM-Access-Key").is_some(), "a key-id header");
+    assert_eq!(
+        h("Content-Type").as_deref(),
+        Some("application/json"),
+        "PM-US requires the JSON content type"
+    );
+
+    use base64::Engine;
+    use ed25519_dalek::{Signature, Verifier};
+    let vk = ed25519_dalek::SigningKey::from_bytes(&seed32()).verifying_key();
+
+    let sig_bytes = base64::engine::general_purpose::STANDARD.decode(&sig).unwrap();
+    let sig = Signature::from_slice(&sig_bytes).unwrap();
+    assert!(
+        vk.verify(format!("{ts}POST/v1/orders").as_bytes(), &sig).is_ok(),
+        "signature must cover ts + METHOD + path"
+    );
+}
+
+// ------------------------------------------------ leave nothing behind ---
+
+#[test]
+fn rehearse_places_one_contract_at_a_penny_then_cancels() {
+    let g = gw(vec![(200, CREATED), (200, OPEN_ORDER), (200, "{}")]);
+    assert_eq!(g.rehearse(SLUG).unwrap(), "pm-1");
+
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 3, "create, status, cancel");
+    let b = sent[0].body.as_ref().unwrap();
+    assert_eq!(b["quantity"], 1);
+    assert_eq!(b["price"]["value"], "0.0100");
+    assert_eq!(b["participateDontInitiate"], true);
+    assert_eq!(sent[2].path, "/v1/order/pm-1/cancel");
+    assert_eq!(sent[2].body.as_ref().unwrap()["marketSlug"], SLUG);
+}
+
+/// A status call that errors must STILL cancel — same guarantee as Kalshi,
+/// where getting this wrong left a live order resting.
+#[test]
+fn a_status_error_still_cancels_the_order() {
+    let g = gw(vec![(200, CREATED), (500, "boom"), (200, "{}")]);
+    assert!(g.rehearse(SLUG).is_err());
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[2].path, "/v1/order/pm-1/cancel", "must cancel anyway");
+}
+
+/// A rehearsal order that actually FILLED is a failure, not a pass.
+#[test]
+fn a_filled_rehearsal_order_is_a_failure() {
+    let filled = r#"{"id":"pm-1","cumQuantity":1,"avgPx":{"value":"0.0100"}}"#;
+    let g = gw(vec![(200, CREATED), (200, filled), (200, "{}")]);
+    match g.rehearse(SLUG) {
+        Err(VenueError::Status { body, .. }) => assert!(body.contains("FILLED"), "{body}"),
+        other => panic!("expected a filled-order failure, got {other:?}"),
+    }
+}
+
+/// A cancel that fails is escalated loudly — this is the only outcome that
+/// really leaves something on the venue.
+#[test]
+fn a_cancel_that_fails_says_check_the_venue() {
+    let g = gw(vec![(200, CREATED), (200, OPEN_ORDER), (500, "nope")]);
+    match g.rehearse(SLUG) {
+        Err(VenueError::Status { body, .. }) => {
+            assert!(body.contains("COULD NOT BE CANCELLED"), "{body}");
+            assert!(body.contains("CHECK THE VENUE"), "{body}");
+        }
+        other => panic!("expected a loud escalation, got {other:?}"),
+    }
+}
+
+/// The inert default still cannot reach a venue.
+#[test]
+fn the_default_pmus_gateway_is_not_wired() {
+    let g = PmusGateway::new(signer(), RateLimiter::from_per_minute(60.0, 60.0, 0));
+    assert_eq!(g.place(&place_req()).unwrap_err(), VenueError::NotWired);
+    assert_eq!(
+        g.cancel(&CancelRequest { order_id: "pm-1".into(), market_slug: Some(SLUG.into()) })
+            .unwrap_err(),
+        VenueError::NotWired
+    );
+    assert_eq!(g.rehearse(SLUG).unwrap_err(), VenueError::NotWired);
+}
+
+/// The EXACT /v1/account/balances body PM-US returned on 2026-07-27. Every
+/// money field is a JSON NUMBER, not a string — the first PM-US preflight
+/// failed on exactly this. Pinned verbatim.
+#[test]
+fn the_real_pmus_balances_response_parses() {
+    const LIVE: &str = r#"{"balances":[{"currentBalance":653.15805,"currency":"USD","lastUpdated":null,"buyingPower":329.29805,"assetNotional":0,"assetAvailable":0,"pendingCredit":0,"openOrders":0,"unsettledFunds":0,"pendingWithdrawals":[],"marginRequirement":323.86}]}"#;
+    let g = gw(vec![(200, LIVE)]);
+    let b = g.balances().expect("the live balances shape must parse");
+    assert_eq!(b.balances[0].buying_power, "329.29805", "digits preserved exactly");
+}
+
+/// ...and a string still parses, so the venue may send either.
+#[test]
+fn a_string_money_field_still_parses() {
+    let g = gw(vec![(200, r#"{"balances":[{"buyingPower":"329.29805"}]}"#)]);
+    assert_eq!(g.balances().unwrap().balances[0].buying_power, "329.29805");
+}
+
+/// Order PRICES are strings and must stay strings — a float never crosses this
+/// boundary, whichever way the venue sends it.
+#[test]
+fn a_numeric_price_is_kept_as_an_exact_string() {
+    let g = gw(vec![(200, r#"{"id":"pm-1","cumQuantity":2,"avgPx":{"value":0.4225}}"#)]);
+    let o = g.order_status("pm-1").unwrap();
+    assert_eq!(
+        o.fill_state(),
+        arb_venue::resp::PmFillState::Filled { cum_quantity: 2, avg_px: "0.4225".into() }
+    );
+}
