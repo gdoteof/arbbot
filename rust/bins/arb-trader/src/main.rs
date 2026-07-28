@@ -26,6 +26,7 @@ mod engine;
 mod exec;
 mod feed;
 mod hist;
+mod ledger;
 mod risk;
 mod sink;
 mod wal;
@@ -57,6 +58,8 @@ struct Args {
     enable_orders: bool,
     /// Credential suffixes for the order path (`--cred-suffix pmus=rs_trader`).
     cred_suffix: Vec<(String, String)>,
+    /// Append-only trade ledger; open baskets seed the risk view's exposure.
+    ledger: String,
     /// Capital config for the risk gate.
     exec_yaml: String,
     topics_yaml: String,
@@ -88,6 +91,7 @@ fn parse_args() -> Args {
         health: "data/health.jsonl".into(),
         enable_orders: false,
         cred_suffix: Vec::new(),
+        ledger: "data/exec/trades.jsonl".into(),
         exec_yaml: "config/exec.yaml".into(),
         topics_yaml: "config/topics.yaml".into(),
         balances: Vec::new(),
@@ -115,6 +119,7 @@ fn parse_args() -> Args {
                 let (v, sfx) = kv.split_once('=').expect("--cred-suffix wants venue=suffix");
                 a.cred_suffix.push((v.to_string(), sfx.to_string()));
             }
+            "--ledger" => a.ledger = it.next().expect("--ledger value"),
             "--exec-config" => a.exec_yaml = it.next().expect("--exec-config value"),
             "--topics" => a.topics_yaml = it.next().expect("--topics value"),
             "--balance" => {
@@ -156,7 +161,7 @@ fn load_quoters(
     registry: &str,
     tradable: &str,
     rel_prefixes: &[String],
-) -> (Vec<Quoter>, HashMap<(Venue, String), Vec<usize>>, HashMap<String, String>) {
+) -> (Vec<Quoter>, HashMap<(Venue, String), Vec<usize>>, HashMap<String, (String, String)>) {
     let reg = arb_registry::Registry::load(registry).expect("read registry");
     // THE GATE (card c9ac7d1d, exec/main.py:131-146): a relationship is
     // tradable only if it is HUMAN-vetted in the registry or explicitly
@@ -167,13 +172,19 @@ fn load_quoters(
     let total = reg.relationships.len();
     let mut n_gated = 0usize;
 
-    // oracle_risk scales the per-relationship cap and is not carried on `Rel`,
-    // so keep it beside the quoters for the risk view to look up by id.
-    let mut oracle_risk: HashMap<String, String> = HashMap::new();
+    // Metadata for the risk view, keyed by id: oracle_risk scales the per-rel
+    // cap and the type is the class-exposure key, and neither is carried on
+    // `Rel`. Built from the FULL registry, not the quoting subset — a basket we
+    // no longer quote still consumes capital.
+    let mut rel_meta: HashMap<String, (String, String)> = HashMap::new();
     for r in &reg.relationships {
-        if let Some(o) = &r.oracle_risk {
-            oracle_risk.insert(r.id.clone(), o.clone());
-        }
+        rel_meta.insert(
+            r.id.clone(),
+            (
+                r.oracle_risk.clone().unwrap_or_else(|| "high".into()),
+                r.kind.clone().unwrap_or_else(|| "unknown".into()),
+            ),
+        );
     }
 
     let quoters: Vec<Quoter> = reg
@@ -222,7 +233,7 @@ fn load_quoters(
             by_market.entry((leg.venue, leg.market_id.clone())).or_default().push(qi);
         }
     }
-    (quoters, by_market, oracle_risk)
+    (quoters, by_market, rel_meta)
 }
 
 /// Everything that must hold before this process may touch a venue.
@@ -250,13 +261,11 @@ fn order_preconditions(
     if args.health.is_empty() {
         missing.push("--health disabled: quoting on an unwatched feed".into());
     }
-    // The engine measures caps from its own run's fills only, so a restart
-    // believes the whole book is free. Until exposure is seeded from open
-    // positions, live caps are not enforceable across a restart.
-    missing.push(
-        "exposure is not seeded from open positions (risk caps reset on every          restart) — see RiskView::record_open"
-            .into(),
-    );
+    // Exposure IS seeded from the ledger at startup — but only if it is
+    // readable. An engine that cannot see the open book must not size into it.
+    if let Err(e) = ledger::read(&args.ledger) {
+        missing.push(format!("trade ledger unreadable, so exposure is unknown: {e}"));
+    }
     // Fills arrive as events but nothing produces them live yet, so a filled
     // order would never be hedged or booked.
     missing.push(
@@ -348,7 +357,7 @@ async fn main() {
         8.0
     };
 
-    let (mut quoters, by_market, oracle_risk) =
+    let (mut quoters, by_market, rel_meta) =
         load_quoters(&args.registry, &args.tradable, &args.rel_prefixes);
 
     // Risk is OFF in bench/replay: those pin a decision digest, and a capital
@@ -358,7 +367,7 @@ async fn main() {
             &args.exec_yaml,
             &args.topics_yaml,
             args.balances.clone(),
-            oracle_risk,
+            rel_meta.iter().map(|(k, (o, _))| (k.clone(), o.clone())).collect(),
         ));
         eprintln!("[risk] {}", rv.describe());
         if args.balances.is_empty() {
@@ -367,14 +376,56 @@ async fn main() {
                  will refuse every order. Pass --balance kalshi=<usd> etc."
             );
         }
-        // The Python runner seeded exposure from its open baskets at startup
-        // (exec/main.py:264). This engine does not yet, so it begins every run
-        // believing the whole book is free. Harmless while it cannot place an
-        // order; a hard blocker before it can (see --enable-orders).
-        eprintln!(
-            "[risk] exposure starts EMPTY — not seeded from open positions. \
-             Caps are measured from this run's own fills only."
-        );
+        // Seed exposure from the open baskets in the trade ledger
+        // (exec/main.py:264). Without this the caps reset on every restart and
+        // the engine believes the whole book is free.
+        match ledger::read(&args.ledger) {
+            Ok(recs) => {
+                let open = ledger::open_exposure(recs);
+                let mut total = 0.0;
+                let mut unknown = 0usize;
+                let mut seeded: Vec<(String, f64)> = Vec::new();
+                for (rel_id, qty) in open {
+                    // An id missing from the registry cannot be classified, so
+                    // it is booked under `unknown`: it still counts toward the
+                    // GLOBAL cap (which sums per-relationship exposure) without
+                    // inflating a class cap it may not belong to. Python
+                    // skipped these entirely, which understated the book.
+                    let class = match rel_meta.get(&rel_id) {
+                        Some((_, k)) => k.as_str(),
+                        None => {
+                            unknown += 1;
+                            "unknown"
+                        }
+                    };
+                    rv.record_open(&rel_id, class, qty);
+                    total += qty;
+                    seeded.push((rel_id, qty));
+                }
+                seeded.sort_by(|a, b| b.1.total_cmp(&a.1));
+                eprintln!(
+                    "[risk] seeded {:.0} open contracts across {} relationships from {}{}",
+                    total,
+                    seeded.len(),
+                    args.ledger,
+                    if unknown > 0 {
+                        format!(" ({unknown} not in the registry, booked as `unknown`)")
+                    } else {
+                        String::new()
+                    }
+                );
+                for (id, q) in seeded.iter().take(5) {
+                    eprintln!("[risk]   {q:>7.0}  {id}");
+                }
+            }
+            Err(e) => {
+                // Fail LOUD: an unreadable ledger means unknown exposure, and
+                // an engine that silently assumes zero would size up into a
+                // book it cannot see.
+                eprintln!("[risk] CANNOT READ THE TRADE LEDGER: {e}");
+                eprintln!("[risk] exposure is UNKNOWN — caps cannot be trusted this run");
+            }
+        }
         for q in quoters.iter_mut() {
             q.set_risk(Some(rv.clone() as std::sync::Arc<dyn arb_core::quoter::RiskGate>));
         }
