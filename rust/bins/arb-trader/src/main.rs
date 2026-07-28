@@ -57,6 +57,9 @@ struct Args {
     /// precondition in `order_preconditions` holds — this engine has never
     /// placed an order, and the flag is the only thing that can change that.
     enable_orders: bool,
+    /// Run the startup sweep against the live venues and EXIT, without ever
+    /// quoting. The safe way to exercise the reconciliation path.
+    sweep_only: bool,
     /// Credential suffixes for the order path (`--cred-suffix pmus=rs_trader`).
     cred_suffix: Vec<(String, String)>,
     /// Append-only trade ledger; open baskets seed the risk view's exposure.
@@ -91,6 +94,7 @@ fn parse_args() -> Args {
         tradable: "config/tradable.yaml".into(),
         health: "data/health.jsonl".into(),
         enable_orders: false,
+        sweep_only: false,
         cred_suffix: Vec::new(),
         ledger: "data/exec/trades.jsonl".into(),
         exec_yaml: "config/exec.yaml".into(),
@@ -115,6 +119,10 @@ fn parse_args() -> Args {
             "--tradable" => a.tradable = it.next().expect("--tradable value"),
             "--health" => a.health = it.next().expect("--health value"),
             "--enable-orders" => a.enable_orders = true,
+            "--sweep-only" => {
+                a.enable_orders = true;
+                a.sweep_only = true;
+            }
             "--cred-suffix" => {
                 let kv = it.next().expect("--cred-suffix venue=suffix");
                 let (v, sfx) = kv.split_once('=').expect("--cred-suffix wants venue=suffix");
@@ -271,18 +279,10 @@ fn order_preconditions(
     // Credentials are checked below when the sinks are built; a fill feed that
     // cannot authenticate is the same failure as an order path that cannot.
     //
-    // What is NOT solved: the engine starts with no idea what is already
-    // RESTING at the venue. Arming without reconciling would quote on top of
-    // orders a previous run left behind — double exposure on the same market,
-    // and the older order is one this process cannot cancel because it never
-    // learned its id. `VenueGateway::resting_order_ids` is the primitive; the
-    // decision (adopt them, or sweep them at startup) is Geoff's, because
-    // either answer touches live orders.
-    missing.push(
-        "startup reconciliation: the engine does not know what is already resting \
-         at the venue (see VenueGateway::resting_order_ids)"
-            .into(),
-    );
+    // Startup reconciliation is handled by `startup_sweep`, not by a
+    // precondition: the engine starts from a clean book by CANCELLING whatever
+    // is resting (Geoff's call, 2026-07-28). Arming aborts if that sweep cannot
+    // be proven to have worked.
 
     if !missing.is_empty() {
         return Err(missing);
@@ -305,6 +305,58 @@ fn order_preconditions(
         Err(e) => missing.push(format!("polymarket_us: {e}")),
     }
     if missing.is_empty() { Ok(sinks) } else { Err(missing) }
+}
+
+/// Cancel every resting order on every armed venue, then PROVE the book is
+/// empty before the engine is allowed to quote.
+///
+/// This destroys real orders, including any a previous run or another tool left
+/// behind — which is the point, and why it only ever runs behind
+/// `--enable-orders`. A 2xx from cancel-all is not proof; the resting list is,
+/// and both venues' lists lag a write, so it polls.
+async fn startup_sweep(
+    sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
+) -> Result<(), String> {
+    for (venue, sink) in sinks {
+        let s = sink.clone();
+        let before = tokio::task::spawn_blocking(move || s.resting_order_ids())
+            .await
+            .map_err(|e| format!("{venue:?}: sweep task panicked: {e}"))?
+            .map_err(|e| format!("{venue:?}: cannot list resting orders: {e}"))?;
+        if before.is_empty() {
+            eprintln!("[exec] {venue:?}: nothing resting");
+            continue;
+        }
+        eprintln!("[exec] {venue:?}: CANCELLING {} resting order(s): {}", before.len(),
+                  before.join(" "));
+        let s = sink.clone();
+        tokio::task::spawn_blocking(move || s.cancel_all_open())
+            .await
+            .map_err(|e| format!("{venue:?}: sweep task panicked: {e}"))?
+            .map_err(|e| format!("{venue:?}: cancel_all_open: {e}"))?;
+
+        let mut left = before.clone();
+        for _ in 0..10 {
+            let s = sink.clone();
+            left = tokio::task::spawn_blocking(move || s.resting_order_ids())
+                .await
+                .map_err(|e| format!("{venue:?}: sweep task panicked: {e}"))?
+                .map_err(|e| format!("{venue:?}: cannot list resting orders: {e}"))?;
+            if left.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        if !left.is_empty() {
+            return Err(format!(
+                "{venue:?}: {} order(s) SURVIVED the sweep: {}",
+                left.len(),
+                left.join(" ")
+            ));
+        }
+        eprintln!("[exec] {venue:?}: book is clean");
+    }
+    Ok(())
 }
 
 fn credential(name: &str) -> Result<String, String> {
@@ -468,7 +520,11 @@ async fn main() {
     let sinks = if args.enable_orders {
         match order_preconditions(&args, bench) {
             Ok(s) => {
-                eprintln!("[exec] ORDERS ARMED — this process can place real orders");
+                if args.sweep_only {
+                    eprintln!("[exec] sweep-only: reconciling the book, then exiting");
+                } else {
+                    eprintln!("[exec] ORDERS ARMED — this process can place real orders");
+                }
                 s
             }
             Err(missing) => {
@@ -482,6 +538,20 @@ async fn main() {
     } else {
         HashMap::new()
     };
+    // Reconcile BEFORE anything can quote: the engine has no memory of orders a
+    // previous run left resting, and it cannot cancel what it never had an id
+    // for. Start from a book we know is empty.
+    if !sinks.is_empty() {
+        if let Err(e) = startup_sweep(&sinks).await {
+            eprintln!("[exec] STARTUP SWEEP FAILED: {e}");
+            eprintln!("[exec] refusing to arm: the book could not be proven clean");
+            std::process::exit(10);
+        }
+        if args.sweep_only {
+            eprintln!("[exec] --sweep-only: book reconciled, exiting without quoting");
+            return;
+        }
+    }
     // The fill feed runs whenever the order path does: a live order with no
     // fill feed is an unhedged position waiting to happen.
     if !sinks.is_empty() {
@@ -632,5 +702,76 @@ relationships:
         // asking for an agent-only rel by prefix still does NOT quote it
         let got = ids(reg.to_str().unwrap(), allow.to_str().unwrap(), &["agent".to_string()]);
         assert!(got.is_empty(), "prefix must not bypass the gate, got {got:?}");
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use arb_venue::gateway::{CancelRequest, PlaceRequest};
+    use arb_venue::VenueError;
+    use std::sync::Mutex;
+
+    /// Reports `resting` until cancel_all_open is called, then reports
+    /// `after_cancel` — so a sink that never clears models a failed sweep.
+    struct MockSink {
+        resting: Mutex<Vec<String>>,
+        after_cancel: Vec<String>,
+        cancelled: Mutex<bool>,
+    }
+    impl sink::OrderSink for MockSink {
+        fn place(&self, _r: &PlaceRequest) -> Result<String, VenueError> {
+            unreachable!("the sweep never places")
+        }
+        fn cancel(&self, _r: &CancelRequest) -> Result<(), VenueError> {
+            unreachable!("the sweep uses cancel_all_open")
+        }
+        fn cancel_all_open(&self) -> Result<(), VenueError> {
+            *self.cancelled.lock().unwrap() = true;
+            *self.resting.lock().unwrap() = self.after_cancel.clone();
+            Ok(())
+        }
+        fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+            Ok(self.resting.lock().unwrap().clone())
+        }
+    }
+
+    fn sinks(
+        resting: &[&str],
+        after: &[&str],
+    ) -> (HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>, std::sync::Arc<MockSink>) {
+        let m = std::sync::Arc::new(MockSink {
+            resting: Mutex::new(resting.iter().map(|s| s.to_string()).collect()),
+            after_cancel: after.iter().map(|s| s.to_string()).collect(),
+            cancelled: Mutex::new(false),
+        });
+        let mut h: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> = HashMap::new();
+        h.insert(Venue::Kalshi, m.clone());
+        (h, m)
+    }
+
+    #[tokio::test]
+    async fn a_clean_book_needs_no_cancel() {
+        let (h, m) = sinks(&[], &[]);
+        startup_sweep(&h).await.unwrap();
+        assert!(!*m.cancelled.lock().unwrap(), "nothing resting => no cancel sent");
+    }
+
+    #[tokio::test]
+    async fn resting_orders_are_cancelled_and_the_book_verified_empty() {
+        let (h, m) = sinks(&["a", "b"], &[]);
+        startup_sweep(&h).await.unwrap();
+        assert!(*m.cancelled.lock().unwrap());
+    }
+
+    /// The property that makes this safe to arm behind: if the sweep cannot be
+    /// PROVEN to have worked, arming must not proceed. A 2xx from cancel-all is
+    /// not proof — the resting list is.
+    #[tokio::test]
+    async fn a_sweep_that_leaves_orders_resting_is_an_error() {
+        let (h, _m) = sinks(&["a", "b"], &["b"]);
+        let err = startup_sweep(&h).await.unwrap_err();
+        assert!(err.contains("SURVIVED"), "{err}");
+        assert!(err.contains('b'), "names what is left: {err}");
     }
 }

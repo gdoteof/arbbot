@@ -19,11 +19,23 @@ pub trait OrderSink: Send + Sync {
     /// Returns the venue's order id.
     fn place(&self, req: &PlaceRequest) -> Result<String, VenueError>;
     fn cancel(&self, req: &CancelRequest) -> Result<(), VenueError>;
+    /// Cancel every resting order on the account (the startup sweep and the
+    /// kill-switch sweep are the same operation).
+    fn cancel_all_open(&self) -> Result<(), VenueError>;
+    /// Ids still resting. A 200 from `cancel_all_open` only says the venue
+    /// accepted the request; this is the evidence that it worked.
+    fn resting_order_ids(&self) -> Result<Vec<String>, VenueError>;
 }
 
 // Generic over the transport, not pinned to HTTP: a gateway carrying the
 // NotWired transport is still a valid (inert) sink, and tests drive a mock.
 impl<T: Transport + Send + Sync> OrderSink for KalshiGateway<T> {
+    fn cancel_all_open(&self) -> Result<(), VenueError> {
+        VenueGateway::cancel_all_open(self)
+    }
+    fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+        VenueGateway::resting_order_ids(self)
+    }
     fn place(&self, req: &PlaceRequest) -> Result<String, VenueError> {
         VenueGateway::place(self, req).map(|o| o.order_id)
     }
@@ -33,6 +45,12 @@ impl<T: Transport + Send + Sync> OrderSink for KalshiGateway<T> {
 }
 
 impl<T: Transport + Send + Sync> OrderSink for PmusGateway<T> {
+    fn cancel_all_open(&self) -> Result<(), VenueError> {
+        VenueGateway::cancel_all_open(self)
+    }
+    fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+        VenueGateway::resting_order_ids(self)
+    }
     fn place(&self, req: &PlaceRequest) -> Result<String, VenueError> {
         VenueGateway::place(self, req).map(|o| o.id)
     }
