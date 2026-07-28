@@ -9,4 +9,5 @@ pub mod scan;
 pub mod dec;
 pub mod model;
 pub mod quoter;
+pub mod resolve;
 pub mod risk;

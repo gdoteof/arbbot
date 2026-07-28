@@ -899,6 +899,7 @@ const VIEWS = [
   {path:'/pairs',         label:'Pairs'},
   {path:'/current',       label:'Current'},
   {path:'/intents',       label:'Intents'},
+  {path:'/trades',        label:'Trades'},
 ];
 
 const json = (u) => fetch(u).then(r=>r.json());
@@ -959,6 +960,7 @@ const NEEDS = {
   '/pairs':         () => ({pairs:    '/api/pairs'}),
   '/current':       () => ({current:  '/api/current' + location.search}),
   '/intents':       () => ({intents:  '/api/intents', top:'/api/top-series?n=4'}),
+  '/trades':        () => ({trades:   '/api/trades'}),
   '/pair':          () => {
     const q = new URLSearchParams(location.search);
     q.set('rel', relOf());
@@ -971,6 +973,7 @@ const NEEDS = {
 const TOPIC = {
   '/':'books', '/recording':'recording', '/opportunities':'opportunities',
   '/pairs':'pairs', '/current':'rollup', '/intents':'intents', '/pair':'rollup',
+  '/trades':'intents',
 };
 
 /* Each draw is PURE: reads S, appends to a fragment, returns the header text.
@@ -1005,6 +1008,17 @@ const DRAW = {
     f.append(currentPanel(d));
     return d.error ? 'no rollup'
       : `${d.scenario} &middot; clip ${d.clip} &middot; ${d.profitable}/${d.priced_pairs} profitable`;
+  },
+  '/trades': (f) => {
+    const d = S.data.trades;
+    if(!d) return loading(f, 'trades');
+    if(d.error) return fail(f, d.error);
+    f.append(tradeTotals(d));
+    f.append(venueRolePanel(d));
+    f.append(tradeRows(d));
+    const t = d.totals || {};
+    return `${t.open_trades||0} open &middot; locked <b class="${sign(t.open_net_usd)}">$${money(t.open_net_usd||0)}</b>` +
+           ` &middot; ${pctf(t.blended_apr_pct)}/yr to hold`;
   },
   '/intents': (f) => {
     const d = S.data.intents;
@@ -1050,6 +1064,108 @@ function rollupHost(day){
   host.dataset.day = day || '';
   host.append(rollupPanel(S.stream.rollup_status || {}, host.dataset.day));
   return host;
+}
+
+/* --------------------------------------------------------------------------
+   TRADES — what this system actually did, and what it was worth.
+
+   Every number is derived server-side from the append-only ledger. Nothing is
+   stored twice, so this view cannot drift from what the engine booked.
+   -------------------------------------------------------------------------- */
+const pctf = (v) => (v===null||v===undefined||!isFinite(v)) ? '&mdash;'
+  : (Number(v)>=0?'':'') + Number(v).toFixed(1) + '%';
+
+function tradeTotals(d){
+  const t = d.totals || {};
+  const kv = (label, val, cls) =>
+    `<div class="kv"><span>${label}</span><b class="${cls||''}">${val}</b></div>`;
+  return $(`<section>
+    <h2>Book &middot; ${t.open_trades||0} open, ${t.realized_trades||0} closed</h2>
+    ${kv('Open contracts', Number(t.open_contracts||0).toLocaleString())}
+    ${kv('Capital committed', '$'+money(t.open_cost_usd||0))}
+    ${kv('Locked, still open', '$'+money(t.open_net_usd||0), sign(t.open_net_usd))}
+    ${kv('APR to hold', pctf(t.blended_apr_pct), sign(t.blended_apr_pct))}
+    ${kv('Realized', '$'+money(t.realized_net_usd||0), sign(t.realized_net_usd))}
+    ${kv('Fees &mdash; settled', '$'+money(t.fees_settled_usd||0), 'warn')}
+    ${kv('Fees &mdash; modelled', '$'+money(t.fees_modelled_usd||0), 'warn')}
+    <div class="sub" style="margin-top:8px">
+      A hedged basket pays exactly <b>$1.00/contract</b> at resolution whatever
+      the event does, so profit is payoff minus cost &mdash; locked, not
+      forecast. Open and realized are kept apart: realized money is back in the
+      account and is not earning this APR. APR is capital-weighted and measured
+      from today to resolution.
+    </div>
+  </section>`);
+}
+
+function venueRolePanel(d){
+  const rows = (d.by_venue_role||[]).map(r=>`<tr>
+      <td>${esc(r.venue)}</td>
+      <td><span class="badge ${r.role==='maker'?'ok':''}">${esc(r.role)}</span></td>
+      <td class="num">${Number(r.legs).toLocaleString()}</td>
+      <td class="num">${Number(r.contracts).toLocaleString()}</td>
+      <td class="num">$${money(r.fees_usd)}</td>
+    </tr>`).join('');
+  const strat = (d.by_strategy||[]).map(s=>`<tr>
+      <td>${esc(s.strategy)}</td>
+      <td class="num">${Number(s.trades).toLocaleString()}</td>
+      <td class="num">${Number(s.contracts).toLocaleString()}</td>
+      <td class="num ${sign(s.net_usd)}">$${money(s.net_usd)}</td>
+    </tr>`).join('');
+  return $(`<section class="wide">
+    <h2>Make vs take &middot; by venue</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>venue</th><th>role</th><th class="num">legs</th>
+        <th class="num">contracts</th><th class="num">fees</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="5">no legs yet</td></tr>'}</tbody></table></div>
+    <h2 style="margin-top:14px">By strategy</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>strategy</th><th class="num">trades</th>
+        <th class="num">contracts</th><th class="num">net</th></tr></thead>
+      <tbody>${strat || '<tr><td colspan="4">none</td></tr>'}</tbody></table></div>
+    <div class="sub" style="margin-top:8px">${esc(d.fee_note||'')}</div>
+  </section>`);
+}
+
+function tradeRows(d){
+  const rows = (d.rows||[]).map(r=>{
+    const legs = (r.legs||[]).map(l =>
+      `${esc(l.venue)} ${esc(l.side)} ${Number(l.qty)} @ ${Number(l.price).toFixed(4)}` +
+      ` <span class="badge ${l.role==='maker'?'ok':''}">${esc(l.role)}</span>`).join('<br>');
+    const est = r.resolves_estimated ? ' <span class="sub">est</span>' : '';
+    const feeMark = r.fees_settled ? '' : ' <span class="sub">~</span>';
+    return `<tr>
+      <td>${esc(new Date((r.ts||0)*1000).toISOString().slice(0,16).replace('T',' '))}</td>
+      <td>${esc(r.relationship_id)}<div class="sub">${legs}</div></td>
+      <td>${esc(r.strategy)}<div class="sub">${esc(r.source)}</div></td>
+      <td><span class="badge ${r.status==='open'?'ok':''}">${esc(r.status)}</span></td>
+      <td class="num">${Number(r.qty).toLocaleString()}</td>
+      <td class="num">$${money(r.cost_usd||0)}</td>
+      <td class="num">$${money(r.payoff_usd||0)}</td>
+      <td class="num warn">$${money(r.fees_usd||0)}${feeMark}</td>
+      <td class="num ${sign(r.net_usd)}">$${money(r.net_usd||0)}</td>
+      <td>${esc(r.resolves_by||'—')}${est}</td>
+      <td class="num ${sign(r.apr_pct)}">${pctf(r.apr_pct)}</td>
+    </tr>`;
+  }).join('');
+  return $(`<section class="wide">
+    <h2>Trades &middot; newest first</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>when (UTC)</th><th>relationship / legs</th><th>strategy</th>
+        <th>status</th><th class="num">qty</th><th class="num">cost</th>
+        <th class="num">payoff</th><th class="num">fees</th><th class="num">net</th>
+        <th>resolves</th><th class="num">APR</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="11">no trades booked yet</td></tr>'}</tbody>
+    </table></div>
+    <div class="sub" style="margin-top:8px">
+      <b>~</b> on a fee means MODELLED, not settled &mdash; the engine books
+      <code>fees_pending</code> because it does not read fill reports. Cost is
+      all-in where the ledger reported it, and derived ex-fees where it did not.
+      APR is blank for closed rows: that capital is no longer committed.
+      ${d.corrections ? `<br>${d.corrections} correction record(s) excluded &mdash; compensating appends, not positions.` : ''}
+      ${d.unparsed_lines ? `<br><b class="warn">${d.unparsed_lines}</b> unparsed line(s) &mdash; normal mid-append.` : ''}
+    </div>
+  </section>`);
 }
 
 /* --------------------------------------------------------------------------

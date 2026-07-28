@@ -26,88 +26,16 @@ use arb_core::scan::{Cx, Rel, D};
 /// Conservative both-leg taker fee per contract. Port of `FEE_CT`.
 const FEE_CT: &str = "0.02";
 
-/// (relationship-id prefix, approximate resolve date, estimated?).
-/// Port of `src/arbbot/exec/resolve_dates.py` `_RULES`, longest match NOT
-/// applied — Python takes the FIRST prefix hit, so order is significant.
-const RESOLVE_RULES: &[(&str, &str, bool)] = &[
-    ("xvus-time-poty-26", "2026-12-09", true),
-    ("xvus-france-pres-27", "2027-04-25", true),
-    ("xvus-brazil-pres-26", "2026-10-25", true),
-    ("xvus-nobel-peace-26", "2026-10-09", true),
-    ("xvus-fedcut-26", "2026-12-31", false),
-    ("xvus-btcmax-26-31", "2026-12-31", false),
-];
-
-/// `-> (YYYY-MM-DD, estimated)`. `None` when the family is unknown, which is
-/// a HARD skip: no resolve date means no APR, and no APR cannot clear a bar.
-pub fn resolve_date(rel_id: &str) -> Option<(&'static str, bool)> {
-    RESOLVE_RULES
-        .iter()
-        .find(|(prefix, _, _)| rel_id.starts_with(prefix))
-        .map(|(_, date, est)| (*date, *est))
-}
-
-/// Days since 1970-01-01 for a proleptic Gregorian date (Hinnant's
-/// days_from_civil). Written out rather than pulling a date crate in for
-/// fifteen lines.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-/// Inverse of `days_from_civil`. Needed because the engine knows the clock
-/// only as epoch nanos, and every bar comparison is against a CIVIL date.
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-/// `YYYY-MM-DD` in UTC for an epoch-seconds instant.
-pub fn today_iso(epoch_s: f64) -> String {
-    let (y, m, d) = civil_from_days((epoch_s / 86400.0).floor() as i64);
-    format!("{y:04}-{m:02}-{d:02}")
-}
+// The resolve-date table lives in arb_core::resolve, not here: the dashboard
+// reports the APR of a trade this engine decided to make, and two copies of
+// the table would let them disagree about what the same trade was worth.
+pub use arb_core::resolve::{today_iso, years_to};
+use arb_core::resolve::parse_iso;
 
 /// Bar used when marks give us no blended APR. Port of Python's
 /// `bar = args.min_apr if ... else (bapr or 12.0)` — a MISSING bar must not
 /// collapse to zero, or every crossing that merely clears fees would fire.
 pub const DEFAULT_BAR_APR: f64 = 12.0;
-
-fn parse_iso(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
-        return None;
-    }
-    let y: i64 = s.get(0..4)?.parse().ok()?;
-    let m: i64 = s.get(5..7)?.parse().ok()?;
-    let d: i64 = s.get(8..10)?.parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return None;
-    }
-    Some(days_from_civil(y, m, d))
-}
-
-/// Years until the family's resolve date. Python floors the day count at 1
-/// before dividing, so a same-day or past resolve still yields a finite APR
-/// rather than dividing by zero.
-pub fn years_to(rel_id: &str, today_iso: &str) -> Option<f64> {
-    let (rd, _) = resolve_date(rel_id)?;
-    let days = parse_iso(rd)? - parse_iso(today_iso)?;
-    Some(days.max(1) as f64 / 365.25)
-}
 
 /// Current blended portfolio APR from `data/exec/marks.json` — the bar itself.
 /// Port of `blended_apr()`: locked profit over cost, annualised by the
@@ -348,55 +276,8 @@ mod tests {
         b
     }
 
-    #[test]
-    fn resolve_rules_match_python() {
-        assert_eq!(resolve_date("xvus-nobel-peace-26-elonmusk"), Some(("2026-10-09", true)));
-        assert_eq!(resolve_date("xvus-fedcut-26-usfed-2026-cut"), Some(("2026-12-31", false)));
-        assert_eq!(resolve_date("xvus-unknown-family-99"), None);
-    }
-
-    /// The guard that stops a standing crossing becoming an order storm.
-    #[test]
-    fn gate_blocks_refire_until_the_cooldown_expires() {
-        let mut g = Gate::default();
-        assert!(g.take("rel-a", 100.0, 60.0), "first sight must act");
-        // the same crossing, ten more book events in the same second
-        for i in 1..=10 {
-            assert!(!g.take("rel-a", 100.0 + i as f64 * 0.01, 60.0), "re-fire {i} must be gated");
-        }
-        // a DIFFERENT relationship is unaffected — the gate is per-rel
-        assert!(g.take("rel-b", 100.05, 60.0));
-        // still gated just before expiry, free exactly at it
-        assert!(!g.take("rel-a", 159.9, 60.0));
-        assert!(g.take("rel-a", 160.0, 60.0));
-    }
-
-    #[test]
-    fn today_iso_round_trips() {
-        // 2026-07-28T00:00:00Z
-        let d = parse_iso("2026-07-28").unwrap() as f64 * 86400.0;
-        assert_eq!(today_iso(d), "2026-07-28");
-        assert_eq!(today_iso(d + 86399.0), "2026-07-28");
-        assert_eq!(today_iso(d + 86400.0), "2026-07-29");
-        assert_eq!(today_iso(0.0), "1970-01-01");
-    }
-
-    #[test]
-    fn civil_days_are_exact() {
-        assert_eq!(parse_iso("1970-01-01"), Some(0));
-        assert_eq!(parse_iso("2026-07-28").unwrap() - parse_iso("2026-07-27").unwrap(), 1);
-        // across a leap day
-        assert_eq!(parse_iso("2028-03-01").unwrap() - parse_iso("2028-02-28").unwrap(), 2);
-        assert_eq!(parse_iso("garbage"), None);
-    }
-
-    #[test]
-    fn years_to_floors_at_one_day() {
-        let y = years_to("xvus-nobel-peace-26-elonmusk", "2026-10-09").unwrap();
-        assert!((y - 1.0 / 365.25).abs() < 1e-9, "same-day resolves floor to 1 day, got {y}");
-        // a past date must not go negative
-        assert!(years_to("xvus-nobel-peace-26-elonmusk", "2027-01-01").unwrap() > 0.0);
-    }
+    // resolve-date, civil-day and years_to coverage lives with the table in
+    // arb_core::resolve — duplicating it here is the drift the move prevents.
 
     /// The bar itself: cost-weighted average horizon, not a plain mean.
     #[test]

@@ -26,6 +26,7 @@
 //!            [--data-dir data] [--port 4749] [--kalshi-balance <usd>]
 
 mod integrity;
+mod trades;
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -74,6 +75,10 @@ struct Args {
     parquet_dir: String,
     rollup_dir: String,
     intents_path: String,
+    /// Append-only trade ledger. The Trades view derives every number from
+    /// this file and stores nothing, so it cannot disagree with what the
+    /// engine booked.
+    ledger_path: String,
     registry: String,
     tradable: String,
     port: u16,
@@ -418,6 +423,29 @@ fn opps_json(a: &Args, query: &str) -> String {
 ///
 /// The take leg is priced off the venue quote from the ToB rollup, so its age
 /// is reported per row: a stale quote makes the edge a guess, not a number.
+/// Trades this system made, priced. Everything is derived from the ledger on
+/// each request — no cache, so the tab cannot show a number the ledger does
+/// not support.
+fn trades_json(a: &Args) -> String {
+    let text = match std::fs::read_to_string(&a.ledger_path) {
+        Ok(t) => t,
+        // A missing ledger is the NORMAL state before the engine has ever been
+        // armed, so it must read as an empty book rather than an error.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return serde_json::json!({
+                "error": format!("read {}: {e}", a.ledger_path),
+            })
+            .to_string()
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    trades::build(&text, FEE_CATEGORY, now).to_string()
+}
+
 fn intents_json(a: &Args) -> String {
     let text = match std::fs::read_to_string(&a.intents_path) {
         Ok(t) => t,
@@ -1182,7 +1210,8 @@ fn handle(s: TcpStream, a: &Args, sh: &Shared) {
         // router picks the view from the path and fetches ONLY that view's
         // endpoints, which is the point — a single page would fan out to
         // every endpoint on every load as views are added.
-        "/" | "/recording" | "/opportunities" | "/pairs" | "/current" | "/intents" => {
+        "/" | "/recording" | "/opportunities" | "/pairs" | "/current" | "/intents"
+        | "/trades" => {
             respond(s, "200 OK", "text/html; charset=utf-8", PAGE)
         }
         // Long-lived: this call returns only when the client goes away.
@@ -1196,6 +1225,7 @@ fn handle(s: TcpStream, a: &Args, sh: &Shared) {
         "/api/opportunities" => respond(s, "200 OK", "application/json", &opps_json(a, &query)),
         "/api/pairs" => respond(s, "200 OK", "application/json", &pairs_json(a)),
         "/api/intents" => respond(s, "200 OK", "application/json", &intents_json(a)),
+        "/api/trades" => respond(s, "200 OK", "application/json", &trades_json(a)),
         "/api/top-series" => respond(s, "200 OK", "application/json", &top_series_json(a, &query)),
         "/api/intent-series" => {
             respond(s, "200 OK", "application/json", &intent_series_json(a, &query))
@@ -1227,6 +1257,7 @@ fn main() {
         parquet_dir: "data/parquet".into(),
         rollup_dir: "data/rollup".into(),
         intents_path: "data/trader-rs/intents.jsonl".into(),
+        ledger_path: "data/exec/trades.jsonl".into(),
         registry: "config/registry.yaml".into(),
         tradable: "config/tradable.yaml".into(),
         port: 4749,
@@ -1247,6 +1278,7 @@ fn main() {
             "--parquet-dir" => a.parquet_dir = v,
             "--rollup-dir" => a.rollup_dir = v,
             "--intents" => a.intents_path = v,
+            "--ledger" => a.ledger_path = v,
             "--registry" => a.registry = v,
             "--tradable" => a.tradable = v,
             "--port" => a.port = v.parse().unwrap_or(4749),
