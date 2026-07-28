@@ -1,0 +1,11 @@
+[Unit]
+Description=arbbot naked-leg hedge check every 5 min
+[Timer]
+# Wall-clock, not activation-chained. OnBootSec+OnUnitActiveSec only re-arms
+# from the service's LAST activation, so enabling this timer mid-boot-session
+# left it "active (elapsed)" with Trigger: n/a — silently never firing, which
+# is the worst possible failure for the thing that catches naked legs.
+OnCalendar=*:0/5
+Persistent=true
+[Install]
+WantedBy=timers.target
