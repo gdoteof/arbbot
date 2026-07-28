@@ -114,15 +114,15 @@ fn book_basket(path: &str, maker: &MakerOrder, hedge: &HedgeOrder, qty: i64, ts:
     let rec = json!({
         "ts": ts,
         "relationship_id": maker.rel_id,
-        "title": format!("{} (rust maker-hedge)", maker.rel_id),
+        "title": format!("{} (rust {})", maker.rel_id, maker.strategy),
         "qty": qty,
-        "strategy": "maker-hedge",
+        "strategy": maker.strategy,
         "status": "open",
         "source": "arb-trader",
         "fees_pending": true,
         "legs": [
             {"venue": maker.venue, "market_id": maker.market_id, "side": maker.side,
-             "role": "maker", "qty": qty, "yes_price": maker.price,
+             "role": maker.role(), "qty": qty, "yes_price": maker.price,
              "order_id": hedge.maker_order_id},
             {"venue": hedge.venue, "market_id": hedge.market_id, "side": hedge.side,
              "role": "taker", "qty": qty, "yes_price": hedge.price},
@@ -201,6 +201,26 @@ struct MakerOrder {
     market_id: String,
     side: String,
     price: String,
+    /// Which strategy opened this leg — `maker-hedge` or `take-take`.
+    ///
+    /// Take-take reuses the maker fill -> hedge pipeline, which is the right
+    /// call mechanically but made the ACCOUNTING lie: every take-take basket
+    /// booked as `strategy: maker-hedge` with its leg 1 tagged `role: maker`,
+    /// when leg 1 was a marketable IOC. P&L could not be attributed between
+    /// the two strategies, and Python's auto_take_take.py writes `take-take`,
+    /// so the same trade had two names depending on which stack made it.
+    strategy: &'static str,
+}
+
+impl MakerOrder {
+    /// Leg 1's true role. Take-take crosses the book; the maker path rests.
+    fn role(&self) -> &'static str {
+        if self.strategy == "take-take" {
+            "taker"
+        } else {
+            "maker"
+        }
+    }
 }
 
 /// May a retry take `touch`, given the anchor the basket was priced against?
@@ -333,7 +353,21 @@ pub async fn run(
     let mut n_tt_gated: u64 = 0;
     let mut n_tt_fired: u64 = 0;
     let mut tt_gate = crate::taketake::Gate::default();
-    let mut next_tt_oid: u64 = 0;
+    // Order-id counters (m = maker, t = take-take, h = hedge). They must not
+    // restart at 0 on a LIVE run: the id is sent as the venue's
+    // client_order_id, and Kalshi rejects one it has seen before with
+    // `409 order_already_exists`. Observed 2026-07-28 right after a restart —
+    // 4 places rejected. The rejection is the small half: the engine registers
+    // an order at INTENT time, before the place result, so it believed those
+    // quotes were resting when the venue had never accepted them. Those
+    // markets then go quietly dark, because the engine sees no reason to
+    // re-quote something it thinks is already working.
+    //
+    // Seeding from the wall clock keeps ids monotonic across restarts without
+    // changing the id FORMAT, which the golden digest tests pin. bench/replay
+    // still start at 0, so those digests stay byte-exact.
+    let id_base: u64 = if cfg.bench { 0 } else { wall_now() as u64 * 1000 };
+    let mut next_tt_oid: u64 = id_base;
     // The bar is re-derived from marks on the stats tick: it moves as the book
     // turns over, and a stale bar is a wrong bar in both directions.
     let mut tt_bar: f64 = crate::taketake::DEFAULT_BAR_APR;
@@ -350,7 +384,7 @@ pub async fn run(
             tt.max_clip
         );
     }
-    let mut next_oid: u64 = 0;
+    let mut next_oid: u64 = id_base;
     let mut intents: Vec<String> = Vec::new();
     let mut killed = false;
     // Feed-health pull (card 0a7e5478). Holds the REASON, not just a flag, so
@@ -371,7 +405,7 @@ pub async fn run(
     // Hedge orders we placed, by OUR id. Deliberately separate from the
     // FillLedger: a hedge in the ledger would hedge its own fill.
     let mut hedge_orders: HashMap<String, HedgeOrder> = HashMap::new();
-    let mut next_hedge_oid: u64 = 0;
+    let mut next_hedge_oid: u64 = id_base;
     // Outstanding hedges, keyed by OUR hedge order id.
     let mut pending_hedges: HashMap<String, PendingHedge> = HashMap::new();
     // Contracts actually hedged per maker order. A retry asks only for what is
@@ -447,6 +481,13 @@ pub async fn run(
                                     side: side.to_string(),
                                     price: v.get("price").and_then(|x| x.as_str())
                                         .unwrap_or("").to_string(),
+                                    // The intent already carries who emitted
+                                    // it; the ledger just has to stop
+                                    // discarding that.
+                                    strategy: match v.get("tag").and_then(|x| x.as_str()) {
+                                        Some("take-take") => "take-take",
+                                        _ => "maker-hedge",
+                                    },
                                 },
                             );
                         }
@@ -1234,6 +1275,7 @@ mod ledger_write_tests {
             market_id: "KXDEMO".into(),
             side: "bid".into(),
             price: "0.31".into(),
+            strategy: "maker-hedge",
         };
         let hedge = HedgeOrder {
             maker_order_id: "m1".into(),
@@ -1263,10 +1305,57 @@ mod ledger_write_tests {
         assert_eq!(first["legs"][0]["role"], "maker");
         assert_eq!(first["legs"][1]["venue"], "polymarket_us");
         assert_eq!(first["legs"][1]["role"], "taker");
+        assert_eq!(first["strategy"], "maker-hedge");
         assert_eq!(
             first["fees_pending"], true,
             "the engine does not know venue fees; the record must not pretend otherwise"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A take-take basket must NOT book as maker-hedge. It reuses the same
+    /// fill -> hedge pipeline, so before this was fixed every crossing landed
+    /// in the ledger as `strategy: maker-hedge` with leg 1 tagged `maker`,
+    /// which is two lies in the accounting record: P&L could not be attributed
+    /// between the strategies, and the same trade had a different name
+    /// depending on whether Python or Rust made it (auto_take_take.py writes
+    /// `take-take`).
+    #[test]
+    fn a_take_take_basket_books_as_take_take_with_a_taker_leg() {
+        let dir = std::env::temp_dir().join(format!("arb-book-tt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trades.jsonl");
+        let p = path.to_str().unwrap();
+
+        let maker = MakerOrder {
+            rel_id: "xvus-nobel-peace-26-donaldtrump".into(),
+            class: "cross-venue-equivalent",
+            venue: "polymarket_us".into(),
+            market_id: "tac-nobel-peace-2026-10-09-dontru".into(),
+            side: "ask".into(),
+            price: "0.0800".into(),
+            strategy: "take-take",
+        };
+        let hedge = HedgeOrder {
+            maker_order_id: "t1".into(),
+            market_id: "KXNOBELPEACE-26-DJT".into(),
+            venue: "kalshi",
+            side: "bid",
+            price: "0.0400".into(),
+            qty: 5,
+        };
+        book_basket(p, &maker, &hedge, 5, 1_700_000_000.0);
+
+        let rec: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(p).unwrap().lines().next().unwrap())
+                .unwrap();
+        assert_eq!(rec["strategy"], "take-take");
+        assert_eq!(rec["title"], "xvus-nobel-peace-26-donaldtrump (rust take-take)");
+        assert_eq!(rec["legs"][0]["role"], "taker", "leg 1 crossed the book, it did not rest");
+        assert_eq!(rec["legs"][1]["role"], "taker", "leg 2 is the crossing hedge");
+        // and it must still seed exposure like any other basket
+        let open = crate::ledger::open_exposure(crate::ledger::read(p).unwrap());
+        assert_eq!(open.get("xvus-nobel-peace-26-donaldtrump"), Some(&5.0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
