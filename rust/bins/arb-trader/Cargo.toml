@@ -6,6 +6,10 @@ edition = "2021"
 [dependencies]
 arb-core = { path = "../../crates/arb-core" }
 arb-registry = { path = "../../crates/arb-registry" }
+# TYPES ONLY at this step: PlaceRequest/CancelRequest so the executor seam can
+# carry an order. Linking this crate does NOT make the binary able to trade —
+# a gateway needs a Transport, and the default is NotWired.
+arb-venue = { path = "../../crates/arb-venue" }
 serde_json = { workspace = true }
 serde = { workspace = true }
 serde_yaml = "0.9"

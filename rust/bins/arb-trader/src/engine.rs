@@ -6,6 +6,7 @@
 //! and stats — never on per-event syscalls.
 
 use crate::exec::{Action, ExecCmd, ExecStats};
+use arb_venue::gateway::{CancelRequest, PlaceRequest, Side as VenueSide, Tif};
 use crate::feed::FeedMsg;
 use crate::hist::Hist;
 use crate::wal::Wal;
@@ -249,10 +250,42 @@ pub async fn run(
                     {
                         fills.observe_cancel(oid);
                     }
-                    let action = if v.get("place").is_some() {
-                        Some(Action::Place)
-                    } else if v.get("cancel").is_some() {
-                        Some(Action::Cancel)
+                    // Build the REAL request from the intent. The quoter only
+                    // ever rests post-only GTC makers, so tif/post_only are
+                    // fixed here; a taker hedge will carry its own.
+                    // `client_order_id` is our own order id, which is what makes
+                    // a retried place idempotent at the venue.
+                    let action = if let (Some(market), Some(oid)) = (
+                        v.get("place").and_then(|x| x.as_str()),
+                        v.get("order_id").and_then(|x| x.as_str()),
+                    ) {
+                        Some(Action::Place(PlaceRequest {
+                            market: market.to_string(),
+                            side: match v.get("side").and_then(|x| x.as_str()) {
+                                Some("ask") => VenueSide::Ask,
+                                _ => VenueSide::Bid,
+                            },
+                            price: v
+                                .get("price")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("0")
+                                .to_string(),
+                            qty: v.get("count").and_then(|x| x.as_i64()).unwrap_or(0),
+                            tif: Tif::Gtc,
+                            post_only: true,
+                            client_order_id: oid.to_string(),
+                        }))
+                    } else if let (Some(market), Some(oid)) = (
+                        v.get("cancel").and_then(|x| x.as_str()),
+                        v.get("order_id").and_then(|x| x.as_str()),
+                    ) {
+                        // PM-US REQUIRES the market slug in the cancel body and
+                        // we refuse to self-resolve it; the cancel intent
+                        // carries it, so it rides along here. Kalshi ignores it.
+                        Some(Action::Cancel(CancelRequest {
+                            order_id: oid.to_string(),
+                            market_slug: Some(market.to_string()),
+                        }))
                     } else {
                         None
                     };
@@ -294,6 +327,8 @@ pub async fn run(
                 "would_place": exec_stats.placed.load(std::sync::atomic::Ordering::Relaxed),
                 "would_cancel": exec_stats.cancelled.load(std::sync::atomic::Ordering::Relaxed),
                 "exec_dropped": exec_stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
+                "exec_sent": exec_stats.sent.load(std::sync::atomic::Ordering::Relaxed),
+                "exec_failed": exec_stats.failed.load(std::sync::atomic::Ordering::Relaxed),
                 "chan_high_water": chan_hw,
                 "decision_latency": decision.summary(),
                 "exec_hop_latency": exec_stats.hop.summary(),

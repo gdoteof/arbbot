@@ -27,6 +27,7 @@ mod exec;
 mod feed;
 mod hist;
 mod risk;
+mod sink;
 mod wal;
 
 use arb_core::model::Venue;
@@ -50,6 +51,12 @@ struct Args {
     /// cross-venue prices are hedge-priced against the other venue's book, so
     /// one stale feed invalidates BOTH sides. Empty string disables the check.
     health: String,
+    /// Arm the venue order path. OFF by default and refused unless every
+    /// precondition in `order_preconditions` holds — this engine has never
+    /// placed an order, and the flag is the only thing that can change that.
+    enable_orders: bool,
+    /// Credential suffixes for the order path (`--cred-suffix pmus=rs_trader`).
+    cred_suffix: Vec<(String, String)>,
     /// Capital config for the risk gate.
     exec_yaml: String,
     topics_yaml: String,
@@ -79,6 +86,8 @@ fn parse_args() -> Args {
         registry: "config/registry.yaml".into(),
         tradable: "config/tradable.yaml".into(),
         health: "data/health.jsonl".into(),
+        enable_orders: false,
+        cred_suffix: Vec::new(),
         exec_yaml: "config/exec.yaml".into(),
         topics_yaml: "config/topics.yaml".into(),
         balances: Vec::new(),
@@ -100,6 +109,12 @@ fn parse_args() -> Args {
             "--registry" => a.registry = it.next().expect("--registry value"),
             "--tradable" => a.tradable = it.next().expect("--tradable value"),
             "--health" => a.health = it.next().expect("--health value"),
+            "--enable-orders" => a.enable_orders = true,
+            "--cred-suffix" => {
+                let kv = it.next().expect("--cred-suffix venue=suffix");
+                let (v, sfx) = kv.split_once('=').expect("--cred-suffix wants venue=suffix");
+                a.cred_suffix.push((v.to_string(), sfx.to_string()));
+            }
             "--exec-config" => a.exec_yaml = it.next().expect("--exec-config value"),
             "--topics" => a.topics_yaml = it.next().expect("--topics value"),
             "--balance" => {
@@ -210,6 +225,114 @@ fn load_quoters(
     (quoters, by_market, oracle_risk)
 }
 
+/// Everything that must hold before this process may touch a venue.
+///
+/// Encoded here rather than in a runbook: a checklist that only exists in prose
+/// is one nobody runs. Returns the sinks on success, or the list of what is
+/// missing — never a partially-armed engine.
+fn order_preconditions(
+    args: &Args,
+    bench: bool,
+) -> Result<HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>, Vec<String>> {
+    let mut missing: Vec<String> = Vec::new();
+
+    if bench {
+        missing.push("bench/replay mode can never place orders".into());
+    }
+    if args.socket.is_none() {
+        missing.push("no --socket: orders require the live feed".into());
+    }
+    if args.balances.is_empty() {
+        missing.push(
+            "no --balance: the risk gate would see $0 cash and refuse everything anyway".into(),
+        );
+    }
+    if args.health.is_empty() {
+        missing.push("--health disabled: quoting on an unwatched feed".into());
+    }
+    // The engine measures caps from its own run's fills only, so a restart
+    // believes the whole book is free. Until exposure is seeded from open
+    // positions, live caps are not enforceable across a restart.
+    missing.push(
+        "exposure is not seeded from open positions (risk caps reset on every          restart) — see RiskView::record_open"
+            .into(),
+    );
+    // Fills arrive as events but nothing produces them live yet, so a filled
+    // order would never be hedged or booked.
+    missing.push(
+        "no live fill feed (private WS): a fill would go unhedged and unbooked".into(),
+    );
+
+    if !missing.is_empty() {
+        return Err(missing);
+    }
+
+    let mut sinks: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> = HashMap::new();
+    let suffix = |v: &str| {
+        args.cred_suffix.iter().find(|(k, _)| k == v).map(|(_, s)| s.clone())
+    };
+    match build_kalshi_sink(suffix("kalshi").as_deref()) {
+        Ok(s) => {
+            sinks.insert(Venue::Kalshi, s);
+        }
+        Err(e) => missing.push(format!("kalshi: {e}")),
+    }
+    match build_pmus_sink(suffix("pmus").or_else(|| suffix("polymarket_us")).as_deref()) {
+        Ok(s) => {
+            sinks.insert(Venue::PolymarketUs, s);
+        }
+        Err(e) => missing.push(format!("polymarket_us: {e}")),
+    }
+    if missing.is_empty() { Ok(sinks) } else { Err(missing) }
+}
+
+fn credential(name: &str) -> Result<String, String> {
+    let dir = std::env::var_os("CREDENTIALS_DIRECTORY")
+        .or_else(|| std::env::var_os("ARBBOT_CREDENTIALS_DIR"))
+        .ok_or("no credentials dir (set ARBBOT_CREDENTIALS_DIR)")?;
+    let p = std::path::PathBuf::from(dir).join(name);
+    std::fs::read(&p)
+        .map_err(|e| format!("missing credential {name}: {e}"))
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+}
+
+fn build_kalshi_sink(
+    suffix: Option<&str>,
+) -> Result<std::sync::Arc<dyn sink::OrderSink>, String> {
+    let (id, pem) = match suffix {
+        Some(s) => (format!("kalshi_{s}_api_key_id"), format!("kalshi_{s}_private_key.pem")),
+        None => ("kalshi_api_key_id".into(), "kalshi_private_key.pem".into()),
+    };
+    let signer = arb_venue::KalshiSigner::from_pkcs8_pem(credential(&id)?, &credential(&pem)?)
+        .map_err(|e| e.to_string())?;
+    let transport =
+        arb_venue::transport::HttpTransport::new("https://api.elections.kalshi.com/trade-api/v2", 15)
+            .map_err(|e| e.to_string())?;
+    Ok(std::sync::Arc::new(arb_venue::gateway::KalshiGateway::with_transport(
+        signer,
+        arb_venue::ratelimit::RateLimiter::from_per_minute(60.0, 60.0, 0),
+        transport,
+    )))
+}
+
+fn build_pmus_sink(
+    suffix: Option<&str>,
+) -> Result<std::sync::Arc<dyn sink::OrderSink>, String> {
+    let infix = suffix.map(|s| format!("_{s}")).unwrap_or_default();
+    let signer = arb_venue::PmusSigner::from_secret_b64(
+        credential(&format!("polymarket_usa{infix}_key_id"))?,
+        &credential(&format!("polymarket_usa{infix}_private_key"))?,
+    )
+    .map_err(|e| e.to_string())?;
+    let transport = arb_venue::transport::HttpTransport::new("https://api.polymarket.us", 15)
+        .map_err(|e| e.to_string())?;
+    Ok(std::sync::Arc::new(arb_venue::gateway::PmusGateway::with_transport(
+        signer,
+        arb_venue::ratelimit::RateLimiter::from_per_minute(60.0, 60.0, 0),
+        transport,
+    )))
+}
+
 #[tokio::main]
 async fn main() {
     let args = parse_args();
@@ -275,7 +398,24 @@ async fn main() {
         tokio::spawn(feed::socket_feed(sock, tx));
     }
 
-    let (exec_txs, exec_stats) = exec::spawn_executors(rate);
+    let sinks = if args.enable_orders {
+        match order_preconditions(&args, bench) {
+            Ok(s) => {
+                eprintln!("[exec] ORDERS ARMED — this process can place real orders");
+                s
+            }
+            Err(missing) => {
+                eprintln!("[exec] --enable-orders REFUSED. Unmet preconditions:");
+                for m in &missing {
+                    eprintln!("[exec]   - {m}");
+                }
+                std::process::exit(9);
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+    let (exec_txs, exec_stats) = exec::spawn_executors(rate, sinks);
     let cfg = engine::RunCfg {
         out_path: args.out,
         kill_file: args.kill_file,

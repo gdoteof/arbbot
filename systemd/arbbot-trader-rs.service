@@ -4,9 +4,19 @@
 # intents to data/trader-rs/intents.jsonl, which the dashboard's /intents view
 # reconstructs into "orders that would be resting right now".
 #
-# SAFETY: this binary contains NO venue order code path and loads NO
-# credentials. It cannot place, cancel or move an order. It honors data/KILL
-# exactly like the Python trader (kill => cancel-all intents + quoting pause).
+# SAFETY: the order path is OFF. The binary now LINKS the venue gateways
+# (arb-venue) so its executor seam carries real orders, but an executor with no
+# sink counts its command and drops it, and a sink is only ever built by
+# --enable-orders, which is absent here. --enable-orders additionally REFUSES
+# to start while its preconditions are unmet (unseeded exposure, no live fill
+# feed), so arming it is not a one-flag mistake.
+#
+# It honors data/KILL exactly like the Python trader (kill => cancel-all intents
+# + quoting pause), pulls ALL quotes when a critical feed goes stale, and
+# hard-gates quoting on the tradable registry.
+#
+# --balance is what the risk gate spends: a venue omitted here reads as $0 cash
+# and every order on it is refused. Update when the real balances move.
 #
 # It subscribes to the PYTHON recorder's socket (data/arbbot.sock) — the Rust
 # shadow recorder is not running, and both speak the same line-JSON protocol,
@@ -27,6 +37,10 @@ WorkingDirectory=%h/claude/arbbot
 ExecStart=%h/claude/arbbot/rust/target/release/arb-trader \
     --socket data/arbbot.sock \
     --registry config/registry.yaml \
+    --tradable config/tradable.yaml \
+    --health data/health.jsonl \
+    --balance kalshi=340.09 \
+    --balance polymarket_us=329.30 \
     --out data/trader-rs/intents.jsonl \
     --stats-every 300
 Restart=always
