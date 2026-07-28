@@ -1,0 +1,56 @@
+# M3 — the first Rust engine allowed to trade money, on ONE relationship.
+#
+# This is deliberately NOT arbbot-trader-rs.service. That unit stays as the
+# wide 40-relationship shadow feeding /intents and the daily decision gate;
+# narrowing it would blind that gate. This unit is the vertical slice, and
+# keeping it separate is also what makes per-relationship ownership legible:
+# exactly one process may write orders for xvus-nobel-peace-26-elonmusk.
+#
+# WHY THIS REL (M3 says the rel choice is the trading agent's call):
+#   - vetted_by=human, oracle_risk=low, cross-venue-equivalent
+#   - nobel-peace-26 has topic-budget headroom ($80) and no util gate, while
+#     time-poty-26 (154+5 > 150) and france-pres-27 (160+5 > 60) are BOTH over
+#     budget and would place nothing at all
+#   - it resolves 2026-10-09 — the fastest capital turn in the vetted set
+#   - it is the single most active quoter in the shadow tape, so a supervised
+#     session actually exercises fill -> hedge -> ledger instead of idling
+#   - it is not BTC: the btcmax rungs quote just as often, but a stale maker
+#     quote on a fast underlying is exactly the adverse selection a first live
+#     session should not be learning on
+#
+# ARMING IS NOT AUTOMATIC. As written this unit carries --enable-orders WITHOUT
+# --yes-trade-live, so starting it only PRINTS its preconditions and exits 0.
+# Arming means adding --yes-trade-live by hand, which is the whole point of the
+# two-flag design (see main.rs:62 — the 2026-07-28 incident).
+#
+# Restart=no on purpose: this is the supervised session. If it dies, a human
+# should read why before it starts cancelling and re-quoting again.
+
+[Unit]
+Description=arbbot Rust M3 slice (ONE relationship, order path behind two flags)
+After=arbbot-recorder.service
+Wants=arbbot-recorder.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude/arbbot
+Environment=ARBBOT_CREDENTIALS_DIR=%h/.arbbot-credentials
+ExecStart=%h/claude/arbbot/rust/target/release/arb-trader \
+    --socket data/arbbot.sock \
+    --registry config/registry.yaml \
+    --tradable config/tradable.yaml \
+    --health data/health.jsonl \
+    --rel-prefix xvus-nobel-peace-26-elonmusk \
+    --wal data/trader-rs/m3-wal.jsonl \
+    --out data/trader-rs/m3-intents.jsonl \
+    --cred-suffix pmus=rs_trader \
+    --balance kalshi=340.09 \
+    --balance polymarket_us=329.30 \
+    --stats-every 60 \
+    --enable-orders
+Restart=no
+Nice=10
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target
