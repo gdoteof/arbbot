@@ -402,48 +402,9 @@ fn spawn_shutdown_sweep(sinks: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink
         }
         eprintln!("[exec] shutdown: cancelling resting orders before exit");
         for (venue, s) in sinks {
-            let sk = s.clone();
-            let cancelled = tokio::task::spawn_blocking(move || sk.cancel_all_open()).await;
-            match cancelled {
-                Ok(Ok(())) => {
-                    // A 2xx is not proof, exactly as at startup: ask what is
-                    // still resting. And POLL for it — both venues' resting
-                    // lists lag a write, so a single immediate read reports
-                    // orders that are already gone. Observed 2026-07-28: a
-                    // one-shot read cried "STILL RESTING" for an order the
-                    // very next sweep found cancelled. A false orphan alarm is
-                    // not harmless; it is how a real one gets ignored.
-                    let mut left: Vec<String> = Vec::new();
-                    for i in 0..10 {
-                        if i > 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        }
-                        let sk = s.clone();
-                        match tokio::task::spawn_blocking(move || sk.resting_order_ids()).await {
-                            Ok(Ok(ids)) => {
-                                left = ids;
-                                if left.is_empty() {
-                                    break;
-                                }
-                            }
-                            _ => {
-                                eprintln!("[exec] {venue:?}: could not verify book at exit");
-                                left.clear();
-                                break;
-                            }
-                        }
-                    }
-                    if left.is_empty() {
-                        eprintln!("[exec] {venue:?}: book clean at exit");
-                    } else {
-                        eprintln!(
-                            "[exec] {venue:?}: STILL RESTING at exit: {}",
-                            left.join(",")
-                        );
-                    }
-                }
-                Ok(Err(e)) => eprintln!("[exec] {venue:?}: cancel-all on exit FAILED: {e}"),
-                Err(e) => eprintln!("[exec] {venue:?}: cancel-all on exit panicked: {e}"),
+            match sink::cancel_all_and_verify(s).await {
+                Ok(()) => eprintln!("[exec] {venue:?}: book clean at exit"),
+                Err(e) => eprintln!("[exec] {venue:?}: NOT CLEAN at exit — {e}"),
             }
         }
         std::process::exit(0);
@@ -472,31 +433,9 @@ async fn startup_sweep(
         }
         eprintln!("[exec] {venue:?}: CANCELLING {} resting order(s): {}", before.len(),
                   before.join(" "));
-        let s = sink.clone();
-        tokio::task::spawn_blocking(move || s.cancel_all_open())
+        sink::cancel_all_and_verify(sink.clone())
             .await
-            .map_err(|e| format!("{venue:?}: sweep task panicked: {e}"))?
-            .map_err(|e| format!("{venue:?}: cancel_all_open: {e}"))?;
-
-        let mut left = before.clone();
-        for _ in 0..10 {
-            let s = sink.clone();
-            left = tokio::task::spawn_blocking(move || s.resting_order_ids())
-                .await
-                .map_err(|e| format!("{venue:?}: sweep task panicked: {e}"))?
-                .map_err(|e| format!("{venue:?}: cannot list resting orders: {e}"))?;
-            if left.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-        if !left.is_empty() {
-            return Err(format!(
-                "{venue:?}: {} order(s) SURVIVED the sweep: {}",
-                left.len(),
-                left.join(" ")
-            ));
-        }
+            .map_err(|e| format!("{venue:?}: {e}"))?;
         eprintln!("[exec] {venue:?}: book is clean");
     }
     Ok(())

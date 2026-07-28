@@ -13,6 +13,45 @@ use arb_venue::gateway::{CancelRequest, KalshiGateway, PlaceRequest, PmusGateway
 use arb_venue::transport::Transport;
 use arb_venue::VenueError;
 
+/// Cancel everything resting on a venue and PROVE it is gone.
+///
+/// The ONE implementation behind every sweep — startup, shutdown, and the kill
+/// switch. They were three separate code paths and all three bugs on
+/// 2026-07-28 came from the differences between them:
+///
+///   * startup polled, and was correct;
+///   * shutdown read the resting list once and reported an order as surviving
+///     that the next sweep found already cancelled — both venues' lists lag a
+///     write, so a single immediate read cries wolf;
+///   * the kill switch cancelled by order id and never checked at all, logging
+///     "cancelled" for an order that was still resting 35 minutes later.
+///
+/// A response code is not proof. The resting list is, and it has to be polled.
+pub async fn cancel_all_and_verify(
+    sink: std::sync::Arc<dyn OrderSink>,
+) -> Result<(), String> {
+    let s = sink.clone();
+    tokio::task::spawn_blocking(move || s.cancel_all_open())
+        .await
+        .map_err(|e| format!("sweep task panicked: {e}"))?
+        .map_err(|e| format!("cancel_all_open: {e}"))?;
+    let mut left: Vec<String> = Vec::new();
+    for i in 0..10 {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        let s = sink.clone();
+        left = tokio::task::spawn_blocking(move || s.resting_order_ids())
+            .await
+            .map_err(|e| format!("sweep task panicked: {e}"))?
+            .map_err(|e| format!("cannot list resting orders: {e}"))?;
+        if left.is_empty() {
+            return Ok(());
+        }
+    }
+    Err(format!("{} order(s) SURVIVED the sweep: {}", left.len(), left.join(" ")))
+}
+
 /// What an executor may do to a venue. Deliberately only two verbs: the engine
 /// amends by cancel+place, and nothing here can read the account.
 pub trait OrderSink: Send + Sync {

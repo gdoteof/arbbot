@@ -35,6 +35,13 @@ fn now_ns() -> i64 {
 pub enum Action {
     Place(PlaceRequest),
     Cancel(CancelRequest),
+    /// Cancel EVERYTHING resting on this venue and verify it is gone.
+    ///
+    /// The kill switch's per-quote cancels only reach orders the engine still
+    /// has ids for; this reaches the rest, and unlike a cancel it proves the
+    /// outcome. Halting is the one moment where "probably cancelled" is not
+    /// good enough.
+    SweepAndVerify,
 }
 
 pub struct ExecCmd {
@@ -98,9 +105,23 @@ pub fn spawn_executors(
                 }
                 match &cmd.action {
                     Action::Place(_) => st.placed.fetch_add(1, Ordering::Relaxed),
-                    Action::Cancel(_) => st.cancelled.fetch_add(1, Ordering::Relaxed),
+                    Action::Cancel(_) | Action::SweepAndVerify => {
+                        st.cancelled.fetch_add(1, Ordering::Relaxed)
+                    }
                 };
                 let Some(sink) = sink.clone() else { continue }; // dry-run: counted, dropped
+                // Not a per-order verb: it owns its own blocking + polling, so
+                // it is handled before the place/cancel dispatch below.
+                if matches!(cmd.action, Action::SweepAndVerify) {
+                    match crate::sink::cancel_all_and_verify(sink).await {
+                        Ok(()) => eprintln!("[exec] {venue:?}: kill sweep verified clean"),
+                        Err(e) => {
+                            st.failed.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("[exec] {venue:?}: KILL SWEEP FAILED — {e}");
+                        }
+                    }
+                    continue;
+                }
                 // The gateways block; running one on this worker would stall
                 // every other task on it.
                 let st2 = st.clone();
@@ -108,11 +129,13 @@ pub fn spawn_executors(
                 // VENUE's id, and this is the only place both are in hand.
                 let ours = match &cmd.action {
                     Action::Place(p) => Some((p.client_order_id.clone(), p.market.clone())),
-                    Action::Cancel(_) => None,
+                    Action::Cancel(_) | Action::SweepAndVerify => None,
                 };
                 let res = tokio::task::spawn_blocking(move || match &cmd.action {
                     Action::Place(p) => sink.place(p).map(Some),
                     Action::Cancel(c) => sink.cancel(c).map(|_| None),
+                    // handled above, before this dispatch
+                    Action::SweepAndVerify => Ok(None),
                 })
                 .await;
                 match res {

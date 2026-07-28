@@ -869,6 +869,29 @@ pub async fn run(
                         q.cancel_all(&mut cx, last_now, &mut intents);
                         drain_intents!(Some(&q.rel));
                     }
+                    // Those cancels reach only orders we still hold ids for,
+                    // and NONE of them is verified. On 2026-07-28 that path
+                    // logged "cancelled" for a PM-US order that was still
+                    // resting 35 minutes later, which is how the engine can
+                    // report itself halted while it is still exposed.
+                    //
+                    // Follow with a real venue sweep that proves the book is
+                    // empty. Halting is the one moment where "probably
+                    // cancelled" is not good enough.
+                    for (venue, tx) in exec_txs.iter() {
+                        if tx
+                            .try_send(ExecCmd {
+                                t_read: std::time::Instant::now(),
+                                action: Action::SweepAndVerify,
+                            })
+                            .is_err()
+                        {
+                            eprintln!(
+                                "[engine] KILL: could not queue sweep for {venue:?} — \
+                                 executor backlogged; book NOT proven clean"
+                            );
+                        }
+                    }
                 } else if !kill_now && killed {
                     killed = false;
                     eprintln!("[engine] KILL switch cleared — quoting resumes");
