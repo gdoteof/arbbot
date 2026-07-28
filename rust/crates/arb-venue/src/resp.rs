@@ -28,7 +28,14 @@ fn parse<'a, T: Deserialize<'a>>(endpoint: &'static str, body: &'a str) -> Resul
 #[derive(Debug, Clone, Deserialize)]
 pub struct KalshiOrder {
     pub order_id: String,
-    pub status: String,
+    /// ABSENT on a create response — `POST /portfolio/events/orders` answers
+    /// with `{client_order_id, fill_count, order_id, remaining_count, ts_ms}`
+    /// and no status at all (observed live 2026-07-27). Requiring it here is
+    /// what made the first two live smokes fail after the order was already
+    /// resting. A create tells you an order EXISTS; only a GET tells you what
+    /// it is doing.
+    #[serde(default)]
+    pub status: Option<String>,
     #[serde(default)]
     pub ticker: Option<String>,
     #[serde(default)]
@@ -37,14 +44,30 @@ pub struct KalshiOrder {
     pub action: Option<String>,
     #[serde(default)]
     pub fill_count_fp: Option<String>,
+    /// The create response's spelling of the same thing.
+    #[serde(default)]
+    pub fill_count: Option<String>,
+    #[serde(default)]
+    pub remaining_count: Option<String>,
+    /// Our own idempotency tag. It is the ONLY way to find an order we created
+    /// but whose create response we failed to read.
+    #[serde(default)]
+    pub client_order_id: Option<String>,
 }
 
 impl KalshiOrder {
+    /// A create response has no status, so this is false for one — deliberately.
+    /// "It exists" and "it is resting" are different claims.
+    pub fn is_resting(&self) -> bool {
+        self.status.as_deref() == Some("resting")
+    }
+
     /// Cumulative filled contracts, replicating Python
     /// `int(float(o.get("fill_count_fp") or 0))` exactly (0 when absent).
     pub fn filled_qty(&self) -> i64 {
         self.fill_count_fp
             .as_deref()
+            .or(self.fill_count.as_deref())
             .and_then(|s| s.parse::<f64>().ok())
             .map(|f| f as i64)
             .unwrap_or(0)
@@ -95,6 +118,36 @@ pub struct KalshiMarketPosition {
 
 pub fn kalshi_order_envelope(body: &str) -> Result<KalshiOrderEnvelope, VenueError> {
     parse("kalshi:order", body)
+}
+
+/// The CREATE response, which does NOT have one fixed shape.
+///
+/// `POST /portfolio/events/orders` (the current create path) does not answer
+/// with the `{"order": ...}` envelope a single-order GET uses. Python tolerates
+/// this by reaching for `resp["order"]["order_id"]` and falling back to
+/// `resp["order_id"]`; a strict envelope parse instead fails with "missing
+/// required field `order`" AFTER the order is already resting on the venue —
+/// which is exactly how the first live smoke left an order behind
+/// (2026-07-27).
+///
+/// So accept every shape the venue has been seen to return, and if none match,
+/// put the RAW body in the error: a create response we cannot read is a fact we
+/// need in the log, not a guess to make twice.
+pub fn kalshi_created_order(body: &str) -> Result<KalshiOrder, VenueError> {
+    if let Ok(env) = serde_json::from_str::<KalshiOrderEnvelope>(body) {
+        return Ok(env.order);
+    }
+    if let Ok(o) = serde_json::from_str::<KalshiOrder>(body) {
+        return Ok(o);
+    }
+    if let Ok(page) = serde_json::from_str::<KalshiOrdersPage>(body) {
+        if let Some(o) = page.orders.into_iter().next() {
+            return Ok(o);
+        }
+    }
+    let mut detail = String::from("unrecognized create response: ");
+    detail.push_str(&body.chars().take(600).collect::<String>());
+    Err(VenueError::Parse { endpoint: "kalshi:create", detail })
 }
 pub fn kalshi_orders_page(body: &str) -> Result<KalshiOrdersPage, VenueError> {
     parse("kalshi:orders", body)

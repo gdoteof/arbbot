@@ -84,6 +84,7 @@ fn gw(replies: Vec<(u16, &str)>) -> KalshiGateway<MockTransport> {
         RateLimiter::from_per_minute(600.0, 600.0, 0),
         MockTransport::new(replies),
     )
+    .with_settle(std::time::Duration::ZERO, 1)
 }
 
 const ORDER_RESTING: &str = r#"{"order":{"order_id":"o-1","status":"resting","ticker":"KXTEST","side":"yes","action":"buy"}}"#;
@@ -263,4 +264,183 @@ fn an_exhausted_local_rate_budget_refuses_without_sending() {
     );
     assert!(matches!(g.place(&place_req()), Err(VenueError::RateLimited { .. })));
     assert!(g.transport.sent().is_empty(), "nothing may reach the wire");
+}
+
+// ------------------------------------------- create-response shapes (live) ---
+
+/// The create path does NOT answer with the single-order GET envelope. The
+/// first live smoke (2026-07-27) failed with "missing required field `order`"
+/// AFTER the order was already resting. Accept every shape Python tolerates.
+#[test]
+fn a_create_response_is_read_in_any_of_its_shapes() {
+    for (label, body) in [
+        ("enveloped", r#"{"order":{"order_id":"o-1","status":"resting"}}"#),
+        ("bare", r#"{"order_id":"o-1","status":"resting"}"#),
+        ("plural", r#"{"orders":[{"order_id":"o-1","status":"resting"}]}"#),
+    ] {
+        let g = gw(vec![(201, body)]);
+        let o = g.place(&place_req()).unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(o.order_id, "o-1", "{label}");
+    }
+}
+
+/// An unreadable create must carry the RAW body, so the shape is in the log
+/// rather than guessed at a second time.
+#[test]
+fn an_unreadable_create_reports_the_raw_body() {
+    let g = gw(vec![(201, r#"{"weird":"shape"}"#), (200, r#"{"orders":[],"cursor":null}"#)]);
+    match g.place(&place_req()) {
+        Err(VenueError::Parse { endpoint: "kalshi:create", detail }) => {
+            assert!(detail.contains(r#"{"weird":"shape"}"#), "{detail}");
+        }
+        other => panic!("expected a Parse error carrying the body, got {other:?}"),
+    }
+}
+
+// ------------------------------------------------ leave nothing behind ---
+
+/// The rehearsal's whole promise. If the status check fails, the order must
+/// STILL be cancelled — the first live run left one resting because the error
+/// path returned early.
+#[test]
+fn a_failed_status_check_still_cancels_the_order() {
+    let executed = r#"{"order":{"order_id":"o-1","status":"executed"}}"#;
+    let g = gw(vec![(201, ORDER_RESTING), (200, executed), (200, "{}")]);
+    assert!(g.rehearse("KXTEST").is_err());
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 3, "place, status, cancel");
+    assert_eq!(sent[2].method, "DELETE", "the order MUST be cancelled anyway");
+    assert_eq!(sent[2].path, "/trade-api/v2/portfolio/events/orders/o-1");
+}
+
+/// Same promise when the status call itself errors out.
+#[test]
+fn a_status_call_that_errors_still_cancels_the_order() {
+    let g = gw(vec![(201, ORDER_RESTING), (500, "boom"), (200, "{}")]);
+    assert!(g.rehearse("KXTEST").is_err());
+    let sent = g.transport.sent();
+    assert_eq!(sent[2].method, "DELETE", "a 500 on status must not orphan the order");
+}
+
+/// A cancel that fails is escalated in the loudest terms — this is the only
+/// outcome where something really is left on the venue.
+#[test]
+fn a_cancel_that_fails_says_check_the_venue() {
+    let g = gw(vec![(201, ORDER_RESTING), (200, ORDER_RESTING), (500, "nope")]);
+    match g.rehearse("KXTEST") {
+        Err(VenueError::Status { body, .. }) => {
+            assert!(body.contains("COULD NOT BE CANCELLED"), "{body}");
+            assert!(body.contains("CHECK THE VENUE"), "{body}");
+        }
+        other => panic!("expected a loud escalation, got {other:?}"),
+    }
+}
+
+/// The nastiest case: the POST reached the venue but we could not read the
+/// reply, so we never learned the order id. The client_order_id is the only
+/// handle on it — sweep, cancel, and report the recovery.
+#[test]
+fn an_unreadable_create_recovers_the_orphan_by_client_order_id() {
+    // create (unreadable) -> all_orders page -> DELETE the match
+    let page = r#"{"orders":[
+        {"order_id":"other","status":"resting","client_order_id":"someone-else"},
+        {"order_id":"orphan","status":"resting","client_order_id":"THE-COID"}
+    ],"cursor":null}"#;
+    let g = gw(vec![(201, r#"{"unreadable":true}"#), (200, page), (200, "{}")]);
+
+    // rehearse mints its own coid, so drive the recovery path directly.
+    match g.place(&place_req()) {
+        Err(VenueError::Parse { .. }) => {}
+        other => panic!("expected an unreadable create, got {other:?}"),
+    }
+    let recovered = g.cancel_by_client_order_id("THE-COID").unwrap();
+    assert_eq!(recovered.as_deref(), Some("orphan"));
+    let sent = g.transport.sent();
+    assert_eq!(sent[2].method, "DELETE");
+    assert_eq!(
+        sent[2].path, "/trade-api/v2/portfolio/events/orders/orphan",
+        "only the order carrying OUR client_order_id"
+    );
+}
+
+/// Nothing of ours resting => nothing to clean up, and nothing cancelled.
+#[test]
+fn the_orphan_sweep_cancels_nothing_when_no_order_is_ours() {
+    let page = r#"{"orders":[{"order_id":"other","status":"resting","client_order_id":"not-ours"}],"cursor":null}"#;
+    let g = gw(vec![(200, page)]);
+    assert_eq!(g.cancel_by_client_order_id("THE-COID").unwrap(), None);
+    assert_eq!(g.transport.sent().len(), 1, "no DELETE may be sent");
+}
+
+/// The EXACT create body Kalshi returned on 2026-07-27. No `status`, no
+/// `ticker`, and `fill_count` rather than `fill_count_fp`. Pinned verbatim so
+/// the shape that broke two live smokes can never break a third.
+#[test]
+fn the_real_kalshi_create_response_parses() {
+    const LIVE: &str = r#"{"client_order_id":"rehearse-1785197117443","fill_count":"0.00","order_id":"e68b62c0-b2f7-4c2c-b7f0-9d0d86965cfc","remaining_count":"1.00","ts_ms":1785197117488}"#;
+    let g = gw(vec![(201, LIVE)]);
+    let o = g.place(&place_req()).expect("the live create shape must parse");
+    assert_eq!(o.order_id, "e68b62c0-b2f7-4c2c-b7f0-9d0d86965cfc");
+    assert_eq!(o.client_order_id.as_deref(), Some("rehearse-1785197117443"));
+    assert_eq!(o.filled_qty(), 0, "fill_count is read like fill_count_fp");
+    assert!(o.status.is_none(), "a create carries NO status");
+    assert!(!o.is_resting(), "'exists' must never be mistaken for 'resting'");
+}
+
+/// Following the create with the GET is therefore mandatory, not belt-and-
+/// braces: the create alone cannot tell us the order rested.
+#[test]
+fn rehearse_passes_on_the_real_create_shape_via_the_status_get() {
+    const LIVE: &str = r#"{"client_order_id":"c","fill_count":"0.00","order_id":"o-1","remaining_count":"1.00","ts_ms":1}"#;
+    let g = gw(vec![(201, LIVE), (200, ORDER_RESTING), (200, "{}")]);
+    assert_eq!(g.rehearse("KXTEST").unwrap(), "o-1");
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[1].path, "/trade-api/v2/portfolio/orders/o-1", "status comes from the GET");
+    assert_eq!(sent[2].method, "DELETE");
+}
+
+/// Kalshi is not read-your-writes: a GET on a just-placed order 404s for a
+/// beat. That 404 means "not yet", not "no such order" — the create already
+/// proved it exists. The third live smoke (2026-07-27) failed exactly here.
+#[test]
+fn a_404_on_a_freshly_created_order_is_retried_not_believed() {
+    let g = KalshiGateway::with_transport(
+        signer(),
+        RateLimiter::from_per_minute(600.0, 600.0, 0),
+        MockTransport::new(vec![
+            (201, ORDER_RESTING),
+            (404, r#"{"error":{"code":"not_found"}}"#), // query service lagging
+            (404, r#"{"error":{"code":"not_found"}}"#),
+            (200, ORDER_RESTING),                        // ...now visible
+            (200, "{}"),                                 // cancel
+        ]),
+    )
+    .with_settle(std::time::Duration::ZERO, 8);
+
+    assert_eq!(g.rehearse("KXTEST").unwrap(), "o-1", "the lag must not fail the run");
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 5, "place, 3 status polls, cancel");
+    assert_eq!(sent[4].method, "DELETE");
+}
+
+/// But a 404 that never clears still fails — and still cancels.
+#[test]
+fn an_order_that_never_becomes_visible_fails_and_is_still_cancelled() {
+    let g = KalshiGateway::with_transport(
+        signer(),
+        RateLimiter::from_per_minute(600.0, 600.0, 0),
+        MockTransport::new(vec![
+            (201, ORDER_RESTING),
+            (404, "{}"),
+            (404, "{}"),
+            (200, "{}"), // cancel still fires
+        ]),
+    )
+    .with_settle(std::time::Duration::ZERO, 2);
+
+    assert!(g.rehearse("KXTEST").is_err());
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 4);
+    assert_eq!(sent[3].method, "DELETE", "never leave it resting");
 }

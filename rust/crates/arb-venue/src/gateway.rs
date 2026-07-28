@@ -104,19 +104,62 @@ pub struct KalshiGateway<T: Transport = NotWired> {
     pub signer: KalshiSigner,
     pub limiter: Mutex<RateLimiter>,
     pub transport: T,
+    /// Kalshi's create and query services are NOT read-your-writes: a GET on a
+    /// just-placed order 404s for a beat (observed live 2026-07-27), and the
+    /// order LIST lags further still. Python papered over this with a flat
+    /// `time.sleep(1.0)`; poll instead, so a fast venue costs nothing and a
+    /// slow one still succeeds. Zero delay in tests.
+    settle_delay: std::time::Duration,
+    settle_attempts: u32,
 }
 
 impl KalshiGateway<NotWired> {
     /// The inert gateway: holds the signer + rate limiter it WILL use, with
     /// no transport behind it.
     pub fn new(signer: KalshiSigner, limiter: RateLimiter) -> Self {
-        Self { signer, limiter: Mutex::new(limiter), transport: NotWired }
+        Self::with_transport(signer, limiter, NotWired)
     }
 }
 
 impl<T: Transport> KalshiGateway<T> {
     pub fn with_transport(signer: KalshiSigner, limiter: RateLimiter, transport: T) -> Self {
-        Self { signer, limiter: Mutex::new(limiter), transport }
+        Self {
+            signer,
+            limiter: Mutex::new(limiter),
+            transport,
+            settle_delay: std::time::Duration::from_millis(500),
+            settle_attempts: 8,
+        }
+    }
+
+    /// Override the create-visibility poll (tests use a zero delay).
+    pub fn with_settle(mut self, delay: std::time::Duration, attempts: u32) -> Self {
+        self.settle_delay = delay;
+        self.settle_attempts = attempts;
+        self
+    }
+
+    /// `order_status`, tolerating the window where a just-created order is not
+    /// yet visible to the query service. A 404 here means "not yet", NOT "no
+    /// such order" — the create already told us it exists.
+    fn order_status_settled(&self, order_id: &str) -> Result<resp::KalshiOrder, VenueError> {
+        let mut last = None;
+        for attempt in 0..self.settle_attempts.max(1) {
+            match self.order_status(order_id) {
+                Err(VenueError::Status { status: 404, endpoint, body }) => {
+                    last = Some(VenueError::Status { status: 404, endpoint, body });
+                    if attempt + 1 < self.settle_attempts.max(1) && !self.settle_delay.is_zero() {
+                        std::thread::sleep(self.settle_delay);
+                    }
+                }
+                other => return other,
+            }
+        }
+        Err(last.unwrap_or(VenueError::Status {
+            endpoint: "kalshi order_status",
+            status: 404,
+            body: format!("order {order_id} never became visible"),
+        }))
     }
 
     /// Sign `path` (never the query — quirk K2) and send. Spends one token of
@@ -178,6 +221,24 @@ impl<T: Transport> KalshiGateway<T> {
         }
         Ok(out)
     }
+
+    /// Find a RESTING order by our own `client_order_id` and cancel it.
+    /// `Ok(None)` means there was nothing to clean up. This is the recovery
+    /// path for a create whose response we could not read: the order may exist
+    /// under an id we never learned, and the client_order_id is the only handle
+    /// we have on it.
+    pub fn cancel_by_client_order_id(&self, coid: &str) -> Result<Option<String>, VenueError> {
+        let found = self.all_orders()?.into_iter().find(|o| {
+            o.is_resting() && o.client_order_id.as_deref() == Some(coid)
+        });
+        match found {
+            Some(o) => {
+                self.cancel(&CancelRequest { order_id: o.order_id.clone(), market_slug: None })?;
+                Ok(Some(o.order_id))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 impl<T: Transport> VenueGateway for KalshiGateway<T> {
@@ -205,7 +266,7 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
                 body: r.body,
             });
         }
-        Ok(resp::kalshi_order_envelope(&r.body)?.order)
+        resp::kalshi_created_order(&r.body)
     }
 
     fn cancel(&self, req: &CancelRequest) -> Result<(), VenueError> {
@@ -236,7 +297,7 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
     /// executed too), so filter to `resting` — never try to cancel a dead order.
     fn cancel_all_open(&self) -> Result<(), VenueError> {
         for o in self.all_orders()? {
-            if o.status == "resting" {
+            if o.is_resting() {
                 self.cancel(&CancelRequest { order_id: o.order_id, market_slug: None })?;
             }
         }
@@ -256,22 +317,71 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
             qty: 1,
             tif: Tif::Gtc,
             post_only: true,
-            client_order_id: coid,
-        })?;
-        let oid = placed.order_id;
-        // Confirm it is actually RESTING before cancelling — a place that
-        // returns an id but never rests is the failure this rehearsal exists
-        // to catch.
-        let seen = self.order_status(&oid)?;
-        if seen.status != "resting" {
-            return Err(VenueError::Status {
+            client_order_id: coid.clone(),
+        });
+
+        let oid = match placed {
+            Ok(o) => o.order_id,
+            // A place that FAILED TO PARSE may still have reached the venue —
+            // the POST was accepted, we just could not read the answer. That is
+            // how the first live smoke left an order resting (2026-07-27). The
+            // client_order_id is our only handle on it, so sweep for it.
+            Err(e @ VenueError::Parse { .. }) | Err(e @ VenueError::MissingField { .. }) => {
+                match self.cancel_by_client_order_id(&coid) {
+                    Ok(Some(id)) => {
+                        return Err(VenueError::Status {
+                            endpoint: "kalshi rehearse",
+                            status: 0,
+                            body: format!(
+                                "unreadable create response ({e}); \
+                                 recovered and CANCELLED orphan order {id}"
+                            ),
+                        })
+                    }
+                    Ok(None) => return Err(e),
+                    Err(sweep) => {
+                        return Err(VenueError::Status {
+                            endpoint: "kalshi rehearse",
+                            status: 0,
+                            body: format!(
+                                "unreadable create response ({e}); \
+                                 orphan sweep ALSO failed ({sweep}) — \
+                                 CHECK THE VENUE BY HAND"
+                            ),
+                        })
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
+
+        // From here the order EXISTS. Every exit path below must cancel it, or
+        // the rehearsal leaves behind exactly what it exists to prove we never
+        // leave behind.
+        let rested = match self.order_status_settled(&oid) {
+            Ok(seen) if seen.is_resting() => Ok(()),
+            Ok(seen) => Err(VenueError::Status {
                 endpoint: "kalshi rehearse",
                 status: 0,
-                body: format!("order {oid} did not rest (status={})", seen.status),
-            });
+                body: format!(
+                    "order {oid} did not rest (status={:?})",
+                    seen.status.as_deref().unwrap_or("<absent>")
+                ),
+            }),
+            Err(e) => Err(e),
+        };
+
+        let cancelled = self.cancel(&CancelRequest { order_id: oid.clone(), market_slug: None });
+
+        match (rested, cancelled) {
+            (Ok(()), Ok(())) => Ok(oid),
+            (Err(e), Ok(())) => Err(e), // check failed, but nothing left resting
+            (Ok(()), Err(c)) | (Err(_), Err(c)) => Err(VenueError::Status {
+                endpoint: "kalshi rehearse",
+                status: 0,
+                body: format!("order {oid} COULD NOT BE CANCELLED ({c}) — CHECK THE VENUE"),
+            }),
         }
-        self.cancel(&CancelRequest { order_id: oid.clone(), market_slug: None })?;
-        Ok(oid)
     }
 
     fn balances(&self) -> Result<Self::Balances, VenueError> {
