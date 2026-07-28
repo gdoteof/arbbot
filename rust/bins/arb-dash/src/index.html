@@ -148,6 +148,15 @@ const money = (s) => {
 };
 const sign = (s) => Number(s) < 0 ? 'bad' : 'ok';
 const esc = (s) => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+/* A dollar cell that refuses to invent a number. money(null) renders "0.00",
+   and a 0.00 in a column of dollars reads as "nothing happened" rather than "we
+   could not establish this" — that ambiguity is how 35 unpriceable ledger
+   records were reported as $56 of profit (2026-07-28 audit). A value the server
+   sent as null MUST look absent, and must carry the server's reason. */
+const usd = (v, why) => (v===null||v===undefined||!isFinite(Number(v)))
+  ? `<span class="warn" title="${esc(why||'not computable from the ledger')}">unknown</span>`
+  : '$'+money(v);
+const usdSign = (v) => (v===null||v===undefined||!isFinite(Number(v))) ? '' : sign(v);
 
 function statement(st, accounts){
   const net = Number(st.net_vs_capital);
@@ -174,6 +183,14 @@ function statement(st, accounts){
       <b class="${sign(st.trading_realized)}">$${money(st.trading_realized)}</b></div>
     ${breakdown}
     <div class="kv"><span>fees</span><b class="bad">−$${money(st.fees)}</b></div>
+    <div class="sub" style="margin-top:8px">
+      <b>Not comparable to the Trades tab.</b> This is cost basis over venue
+      snapshots; Trades is derived from the append-only ledger, includes
+      unrealized profit on open baskets, and charges a different fee population.
+      The PM-US half of realized is dominated by the <b>unitemized plug</b>, which
+      is a single residual — it cannot tell one record's P&amp;L from another's, so
+      a close match between the two figures is not evidence either is right.
+    </div>
   </section>`);
 }
 
@@ -183,12 +200,25 @@ function integrityPanel(iv){
       <td class="num">${(f.bytes/1e9).toFixed(2)} GB</td>
       <td class="num ${f.stale?'bad':'ok'}">${f.age_seconds}s</td>
     </tr>`).join('');
+  /* Files another systemd unit is supposed to keep fresh. A dead timer is
+     otherwise invisible here: on 2026-07-28 arbbot-marks.service had been
+     exiting non-zero every 2 minutes for hours while the engine kept deriving
+     its take-take APR bar from the frozen marks.json and reporting it as
+     current. Nothing on this page said a word. */
+  const derived = (iv.derived||[]).map(f=>`<tr>
+      <td>${esc(f.what)}</td>
+      <td class="num ${f.stale?'bad':'ok'}">${f.age_seconds===null?'missing':dur(f.age_seconds)}</td>
+      <td class="num dim">${dur(f.max_age_seconds)}</td>
+    </tr>`).join('');
   const warns = (iv.warnings||[]).map(w=>`<div class="warn">▲ ${esc(w)}</div>`).join('')
     || '<div class="ok">✓ no warnings</div>';
   return $(`<section>
     <h2>Recording integrity &middot; ${esc(iv.today)}</h2>
     <table><thead><tr><th>feed</th><th class="num">today</th><th class="num">age</th></tr></thead>
     <tbody>${feeds}</tbody></table>
+    ${derived ? `<h2 style="margin-top:14px">Derived files &middot; is their writer alive</h2>
+      <table><thead><tr><th>what</th><th class="num">age</th><th class="num">limit</th></tr></thead>
+      <tbody>${derived}</tbody></table>` : ''}
     <div class="rule"></div>
     ${warns}
   </section>`);
@@ -197,30 +227,49 @@ function integrityPanel(iv){
 /* "vs venue truth" was a promise the page could not keep: the Kalshi side is a
    number passed on the command line, so it cannot drift and the row read EXACT
    forever. Every input now carries where it came from and how old it is. */
-function reconPanel(rs, sources){
+/* A row that cannot fail is not a check and must not be painted like one. Both
+   rows here read a green EXACT for every possible input: cash:pmus is forced
+   equal to buyingPower by the import's plug entry, and cash:kalshi is compared
+   against a number typed on the command line (2026-07-28 audit). They are kept
+   because the figures are worth seeing, but they now say NOT A CHECK, and the
+   server computes rows beside them that genuinely can fail. */
+function reconPanel(b){
+  const rs = b.reconciliations, sources = b.sources;
   if(!rs || !rs.length) return $(`<section><h2>Reconciliation</h2>
     <div class="dim">no venue balances supplied</div></section>`);
+  const verdict = (r) => r.falsifiable === false
+    ? `<span class="warn" title="${esc(r.why||'')}">NOT A CHECK</span>`
+    : (r.exact ? '<span class="ok">EXACT</span>'
+               : `<span class="bad">${money(r.diff)}</span>`);
   const rows = rs.map(r=>`<tr>
-      <td>${esc(r.account)}</td>
+      <td>${esc(r.account)}<div class="sub">${esc(r.why||'')}</div></td>
       <td class="num">$${money(r.books)}</td>
       <td class="num">$${money(r.venue)}</td>
-      <td class="num ${r.exact?'ok':'bad'}">${r.exact?'EXACT':money(r.diff)}</td>
+      <td class="num">${verdict(r)}</td>
     </tr>`).join('');
   const src = (sources||[]).map(s=>`<tr>
       <td>${esc(s.what)}</td>
       <td class="dim" style="font-size:11px">${esc(String(s.from).replace(/^.*\//,''))}</td>
-      <td class="num ${s.frozen?'warn':(s.age_s>3600?'warn':'dim')}">${dur(s.age_s)}${s.frozen?' fixed':''}</td>
+      <td class="num ${s.frozen||s.stale?'warn':'dim'}">${dur(s.age_s)}${s.frozen?' fixed':(s.stale?' stale':'')}</td>
     </tr>`).join('');
   const anyFrozen = (sources||[]).some(s=>s.frozen);
+  const nCheck = Number(b.checks_falsifiable||0), nFail = Number(b.checks_failed||0);
   return $(`<section>
     <h2>Reconciliation vs the last venue snapshot</h2>
-    <table><thead><tr><th>account</th><th class="num">books</th>
-      <th class="num">snapshot</th><th class="num">diff</th></tr></thead>
+    <div class="${nFail?'bad':(nCheck?'ok':'warn')}" style="margin-bottom:6px">
+      ${nCheck ? `${nCheck} falsifiable check(s) &middot; <b>${nFail} failing</b>`
+               : 'no falsifiable check on this page'}
+    </div>
+    <table><thead><tr><th>claim</th><th class="num">books</th>
+      <th class="num">snapshot</th><th class="num">verdict</th></tr></thead>
     <tbody>${rows}</tbody></table>
     <div class="rule"></div>
     <h2>Where those numbers came from</h2>
     <table><thead><tr><th>input</th><th>source</th><th class="num">age</th></tr></thead>
       <tbody>${src}</tbody></table>
+    ${b.snapshot_stale ? `<div class="bad" style="margin-top:8px">▲ The venue snapshot is
+      <b>${dur(b.snapshot_age_s)}</b> old. Every verdict above is a statement about that
+      snapshot, not about the account now — FROZEN, not passing.</div>` : ''}
     ${anyFrozen ? `<div class="warn" style="margin-top:8px">▲ Rows marked <b>fixed</b> were
       set on the command line when this process started. They cannot move, so matching
       them is not evidence the venue agrees — re-pull the snapshot and restart to
@@ -986,7 +1035,7 @@ const DRAW = {
     if(!b) return loading(f, 'books');
     if(b.error) return fail(f, b.error);
     f.append(statement(b.statement, b.accounts||[]));
-    f.append(reconPanel(b.reconciliations, b.sources));
+    f.append(reconPanel(b));
     f.append(positionsPanel(b.positions||[]));
     f.append(accountsPanel(b.accounts||[]));
     return `${b.entries} entries &middot; trial balance ` +
@@ -1024,7 +1073,8 @@ const DRAW = {
     f.append(tradeRows(d));
     const t = d.totals || {};
     return `${t.open_trades||0} open &middot; locked <b class="${sign(t.open_net_usd)}">$${money(t.open_net_usd||0)}</b>` +
-           ` &middot; ${pctf(t.blended_apr_pct)}/yr to hold`;
+           ` &middot; ${pctf(t.blended_apr_pct)}/yr to hold` +
+           (t.unpriced_rows ? ` &middot; <b class="warn">${t.unpriced_rows} unpriced</b>` : '');
   },
   '/intents': (f) => {
     const d = S.data.intents;
@@ -1094,12 +1144,30 @@ function tradeTotals(d){
     ${kv('Realized', '$'+money(t.realized_net_usd||0), sign(t.realized_net_usd))}
     ${kv('Fees &mdash; settled', '$'+money(t.fees_settled_usd||0), 'warn')}
     ${kv('Fees &mdash; modelled', '$'+money(t.fees_modelled_usd||0), 'warn')}
+    ${t.open_unpriced_trades ? kv('Naked, NOT in locked',
+        `${t.open_unpriced_trades} pos &middot; ${Number(t.open_unpriced_contracts||0).toLocaleString()} ct
+         &middot; $${money(t.open_unpriced_cost_usd||0)} at risk`, 'warn') : ''}
+    ${t.realized_unpriced_trades ? kv('Closed but unpriceable',
+        `${t.realized_unpriced_trades} record(s)`, 'warn') : ''}
+    ${t.closed_by_unwind ? kv('Folded out as closed',
+        `${t.closed_by_unwind} basket(s)`, 'dim') : ''}
     <div class="sub" style="margin-top:8px">
-      A hedged basket pays exactly <b>$1.00/contract</b> at resolution whatever
-      the event does, so profit is payoff minus cost &mdash; locked, not
-      forecast. Open and realized are kept apart: realized money is back in the
-      account and is not earning this APR. APR is capital-weighted and measured
-      from today to resolution.
+      A <b>hedged</b> basket &mdash; both sides held, each covering the whole
+      contract count &mdash; pays exactly <b>$1.00/contract</b> at resolution
+      whatever the event does, so profit is payoff minus cost: locked, not
+      forecast. <b>Nothing else is.</b> A single-leg or same-side position is a
+      directional bet that pays $0.00 or $1.00, so it is shown as
+      <b class="warn">unknown</b> and is excluded from Locked and from the APR
+      &mdash; its contracts and its capital are still counted above, because
+      those are facts. Closed rows use the ledger's own realized P&amp;L, never a
+      re-derived payoff. Open and realized are kept apart: realized money is
+      back in the account and is not earning this APR. APR is capital-weighted
+      and measured from today to resolution.
+      <br><br>Every figure here comes from the ledger alone. It is <b>not</b>
+      reconciled against venue position snapshots, and it is <b>not</b> comparable
+      to the Books statement — different populations, and the PM-US side of that
+      statement is plug-dominated. Do not read agreement between the two as a
+      check on either.
     </div>
   </section>`);
 }
@@ -1117,6 +1185,8 @@ function venueRolePanel(d){
       <td class="num">${Number(s.trades).toLocaleString()}</td>
       <td class="num">${Number(s.contracts).toLocaleString()}</td>
       <td class="num ${sign(s.net_usd)}">$${money(s.net_usd)}</td>
+      <td class="num ${s.unpriced?'warn':'dim'}">${Number(s.unpriced||0)}</td>
+      <td class="num dim">${Number(s.closed_by_unwind||0)}</td>
     </tr>`).join('');
   return $(`<section class="wide">
     <h2>Make vs take &middot; by venue</h2>
@@ -1127,9 +1197,16 @@ function venueRolePanel(d){
     <h2 style="margin-top:14px">By strategy</h2>
     <div class="scroll"><table>
       <thead><tr><th>strategy</th><th class="num">trades</th>
-        <th class="num">contracts</th><th class="num">net</th></tr></thead>
-      <tbody>${strat || '<tr><td colspan="4">none</td></tr>'}</tbody></table></div>
-    <div class="sub" style="margin-top:8px">${esc(d.fee_note||'')}</div>
+        <th class="num">contracts</th><th class="num">net</th>
+        <th class="num">unpriced</th><th class="num">closed</th></tr></thead>
+      <tbody>${strat || '<tr><td colspan="6">none</td></tr>'}</tbody></table></div>
+    <div class="sub" style="margin-top:8px">
+      <b>net</b> sums exactly to Locked + Realized above. A trade whose P&amp;L is
+      not knowable (<b>unpriced</b>) or is already booked on its unwind row
+      (<b>closed</b>) contributes 0 rather than a guess, so a strategy can show
+      real activity and no net.
+      <br>${esc(d.fee_note||'')}
+    </div>
   </section>`);
 }
 
@@ -1140,18 +1217,26 @@ function tradeRows(d){
       ` <span class="badge ${l.role==='maker'?'ok':''}">${esc(l.role)}</span>`).join('<br>');
     const est = r.resolves_estimated ? ' <span class="sub">est</span>' : '';
     const feeMark = r.fees_settled ? '' : ' <span class="sub">~</span>';
+    /* NAKED is not a decoration: it is the difference between a hedged basket
+       whose profit is arithmetic and a directional bet whose outcome nobody
+       knows. `closed` means a later unwind record already retired this line —
+       the ledger is append-only and never rewrites the original's status. */
+    const naked = (r.status==='open' && r.hedged===false)
+      ? ' <span class="badge bad" title="single leg or same-side legs — not hedged">NAKED</span>' : '';
+    const qtyNote = (Number(r.qty_booked) !== Number(r.qty))
+      ? `<div class="sub">of ${Number(r.qty_booked).toLocaleString()} booked</div>` : '';
     return `<tr>
       <td>${esc(new Date((r.ts||0)*1000).toISOString().slice(0,16).replace('T',' '))}</td>
       <td>${esc(r.relationship_id)}<div class="sub">${legs}</div></td>
       <td>${esc(r.strategy)}<div class="sub">${esc(r.source)}</div></td>
-      <td><span class="badge ${r.status==='open'?'ok':''}">${esc(r.status)}</span></td>
-      <td class="num">${Number(r.qty).toLocaleString()}</td>
-      <td class="num">$${money(r.cost_usd||0)}</td>
-      <td class="num">$${money(r.payoff_usd||0)}</td>
+      <td><span class="badge ${r.status==='open'?'ok':''}">${esc(r.status)}</span>${naked}</td>
+      <td class="num">${Number(r.qty).toLocaleString()}${qtyNote}</td>
+      <td class="num">${usd(r.cost_usd, r.unpriced_reason)}</td>
+      <td class="num">${usd(r.payoff_usd, r.unpriced_reason)}</td>
       <td class="num warn">$${money(r.fees_usd||0)}${feeMark}</td>
-      <td class="num ${sign(r.net_usd)}">$${money(r.net_usd||0)}</td>
+      <td class="num ${usdSign(r.net_usd)}">${usd(r.net_usd, r.unpriced_reason)}</td>
       <td>${esc(r.resolves_by||'—')}${est}</td>
-      <td class="num ${sign(r.apr_pct)}">${pctf(r.apr_pct)}</td>
+      <td class="num ${usdSign(r.apr_pct)}">${pctf(r.apr_pct)}</td>
     </tr>`;
   }).join('');
   return $(`<section class="wide">
@@ -1168,7 +1253,13 @@ function tradeRows(d){
       <code>fees_pending</code> because it does not read fill reports. Cost is
       all-in where the ledger reported it, and derived ex-fees where it did not.
       APR is blank for closed rows: that capital is no longer committed.
-      ${d.corrections ? `<br>${d.corrections} correction record(s) excluded &mdash; compensating appends, not positions.` : ''}
+      A cell reading <b class="warn">unknown</b> is a number this tab refuses to
+      guess &mdash; hover it for the reason.
+      ${d.corrections ? `<br>${d.corrections} correction record(s) folded into their targets (${d.corrections_applied||0} record(s) amended) &mdash; a correction amends, it is not a position. Several corrections on one record coalesce, last wins.` : ''}
+      ${d.corrections_unmatched ? `<br><b class="bad">▲ ${d.corrections_unmatched} correction(s) reached no record.</b> Each one is a value the ledger RETRACTED that is still being displayed. Check <code>corrects_ts</code> against the file.` : ''}
+      ${d.superseded ? `<br><b class="warn">${d.superseded}</b> record(s) marked <code>superseded</code> by a correction and removed from the book.` : ''}
+      ${d.orphan_unwinds ? `<br><b class="warn">${d.orphan_unwinds}</b> unwind record(s) name no open basket (missing, unknown, or already-closed <code>closes_ts</code>) &mdash; they close nothing, so something is still reported as on.` : ''}
+      ${d.unusable_unwinds ? `<br><b class="bad">▲ ${d.unusable_unwinds} basket(s) named by an unwind that recorded no usable qty</b> &mdash; the remainder cannot be established, so they are unpriced rather than reported as fully open.` : ''}
       ${d.unparsed_lines ? `<br><b class="warn">${d.unparsed_lines}</b> unparsed line(s) &mdash; normal mid-append.` : ''}
     </div>
   </section>`);

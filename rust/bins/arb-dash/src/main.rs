@@ -39,7 +39,7 @@ use arb_core::fees::FeeSchedule;
 use arb_core::model::Venue;
 use arb_core::scan::Cx;
 use arb_ledger::kalshi::{Deposit, Fill, KalshiImport, Settlement};
-use arb_ledger::pmus::{Balances, PmusImport, Position};
+use arb_ledger::pmus::{self, Balances, PmusImport, Position};
 use arb_ledger::{accounts, report, Journal};
 use arb_query::{intents, opps, sources_for_range};
 use arb_registry::{Allowlist, Registry};
@@ -439,6 +439,49 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// A venue snapshot older than this is not evidence of anything current. The
+/// 2026-07-28 audit found both reconciliation rows reading EXACT over snapshots
+/// 20.2 hours old, which is a third state — frozen — not a pass.
+const SNAPSHOT_STALE_S: u64 = 3600;
+
+/// One row of the reconciliation table, with an explicit claim about whether it
+/// is a check at all.
+///
+/// `arb-ledger`'s `report.rs` says of `reconcile()`: *"This is the only claim
+/// the dashboard makes that a venue can contradict, so it is explicit."* Two of
+/// the rows this dashboard asked it for could not be contradicted by anything
+/// (2026-07-28 audit): `cash:kalshi` is compared against `--kalshi-balance`, a
+/// constant typed at startup, and `cash:pmus` against the very `buyingPower`
+/// that `PmusImport::apply`'s plug entry forces it to equal. Both read EXACT
+/// for every possible input — the tautology `arb-ledger`'s own crate header
+/// says the crate exists to kill.
+///
+/// They are kept, because the books figure beside the venue figure is worth
+/// seeing, but they now carry `falsifiable: false` and render as NOT A CHECK,
+/// and rows that genuinely can fail are computed next to them.
+fn recon_row(
+    cx: &mut Cx,
+    account: &str,
+    books: &str,
+    venue: &str,
+    falsifiable: bool,
+    why: &str,
+) -> serde_json::Value {
+    let b = cx.parse_exact(books);
+    let v = cx.parse_exact(venue);
+    let d = cx.sub(b, v);
+    let exact = arb_ledger::is_zero(cx, d);
+    serde_json::json!({
+        "account": account,
+        "books": b.to_string(),
+        "venue": v.to_string(),
+        "diff": d.to_string(),
+        "exact": exact,
+        "falsifiable": falsifiable,
+        "why": why,
+    })
+}
+
 /// Rebuild the books from venue snapshots on every request. The whole import is
 /// ~250 entries and takes microseconds; holding no state means the page can
 /// never show a number the files no longer support.
@@ -468,7 +511,10 @@ fn books_json(a: &Args) -> String {
         serde_json::json!({ "what": "kalshi deposits", "from": kd, "age_s": age_secs(&kd) }),
     ];
 
-    let mut pmus_buying_power: Option<String> = None;
+    // Held as strings so the reconciliation can be built after the import has
+    // consumed the snapshot. `short_contracts` must be computed BEFORE the
+    // positions move into PmusImport.
+    let mut pmus: Option<(String, String, String, String)> = None;
     if !a.pmus_dir.is_empty() {
         let pb = format!("{}/pmus_balances.json", a.pmus_dir);
         let pp = format!("{}/pmus_positions.json", a.pmus_dir);
@@ -483,7 +529,13 @@ fn books_json(a: &Args) -> String {
                                    e.replace('"', "'"))
                 }
             };
-        pmus_buying_power = Some(balances.buying_power_str());
+        let shorts = pmus::short_contracts(&mut cx, &positions).to_string();
+        pmus = Some((
+            balances.buying_power_str(),
+            balances.current_balance_str(),
+            balances.margin_requirement_str(),
+            shorts,
+        ));
         sources.push(serde_json::json!({ "what": "pm-us balances", "from": pb,
                                          "age_s": age_secs(&pb) }));
         sources.push(serde_json::json!({ "what": "pm-us positions", "from": pp,
@@ -496,12 +548,20 @@ fn books_json(a: &Args) -> String {
         }
     }
 
-    let mut rep = report::build(&mut cx, &j);
+    let rep = report::build(&mut cx, &j);
+    let mut checks: Vec<serde_json::Value> = Vec::new();
     if let Some(kb) = &a.kalshi_balance {
-        rep.reconciliations
-            .push(report::reconcile(&mut cx, &j, accounts::CASH_KALSHI, kb));
-        // NOT a venue read. A number typed on the command line cannot drift,
-        // so this row reads EXACT forever whatever the account does.
+        let books = j.balance(&mut cx, accounts::CASH_KALSHI).to_string();
+        checks.push(recon_row(
+            &mut cx,
+            accounts::CASH_KALSHI,
+            &books,
+            kb,
+            false,
+            "compared against --kalshi-balance, a constant typed at startup. A number that \
+             cannot move cannot disagree, so this is a display of the books figure, not a \
+             check. Re-pull the venue balance and restart to actually check it.",
+        ));
         sources.push(serde_json::json!({
             "what": "kalshi cash balance",
             "from": "--kalshi-balance (fixed at startup)",
@@ -509,9 +569,63 @@ fn books_json(a: &Args) -> String {
             "frozen": true,
         }));
     }
-    if let Some(bp) = &pmus_buying_power {
-        rep.reconciliations
-            .push(report::reconcile(&mut cx, &j, accounts::CASH_PMUS, bp));
+    if let Some((bp, cb, mr, shorts)) = &pmus {
+        let books = j.balance(&mut cx, accounts::CASH_PMUS).to_string();
+        checks.push(recon_row(
+            &mut cx,
+            accounts::CASH_PMUS,
+            &books,
+            bp,
+            false,
+            "PmusImport::apply posts pmus:opening:unitemized-pnl for exactly the gap between \
+             the books and buyingPower (PM-US publishes no trade history), so cash:pmus is \
+             forced equal to buyingPower for every possible input. Making this a real check \
+             means removing that plug, which lives in arb-ledger.",
+        ));
+        // NOT A CHECK, though it looks like one. I first shipped this as
+        // falsifiable because the three fields are reported separately — but
+        // docs/venue-quirks.md:273 documents and verifies
+        // `buyingPower = currentBalance - marginRequirement` as a PM-US
+        // IDENTITY, and the books side is plug-forced to buyingPower. So this
+        // compares buyingPower to buyingPower through a venue identity and
+        // cannot fail on any error in our books. Worse, it cries wolf: the
+        // identity has only ever been observed with openOrders, unsettledFunds
+        // and pendingCredit all zero, and with resting quotes up PM-US reports
+        // `buyingPower = currentBalance - marginRequirement - openOrders`, which
+        // would report a failure and blame the snapshot for the ordinary state
+        // of a market maker. Accounting for those three fields means teaching
+        // `arb_ledger::pmus::Balances` to deserialize them.
+        let derived = {
+            let c = cx.parse_exact(cb);
+            let m = cx.parse_exact(mr);
+            cx.sub(c, m).to_string()
+        };
+        checks.push(recon_row(
+            &mut cx,
+            "cash:pmus vs currentBalance − marginRequirement",
+            &books,
+            &derived,
+            false,
+            "a PM-US identity (documented in docs/venue-quirks.md), and the books side is the \
+             plug-forced buyingPower, so this compares buyingPower to itself and cannot fail on \
+             an error in our books. It also ignores openOrders, unsettledFunds and pendingCredit, \
+             which PM-US subtracts from buyingPower — shown for provenance only.",
+        ));
+        // FALSIFIABLE. PM-US withholds $1.00 of collateral per short contract,
+        // so |short contracts| must equal marginRequirement exactly. This is
+        // the one accounting cross-check in the codebase that can genuinely
+        // fail; it existed only in the hand-run arb-books CLI, which has no
+        // unit, so nothing was watching it.
+        checks.push(recon_row(
+            &mut cx,
+            "pmus short contracts vs marginRequirement",
+            shorts,
+            mr,
+            true,
+            "PM-US withholds $1.00 per short contract, so these must match exactly. A gap \
+             means the positions snapshot is incomplete — some short is missing from the \
+             books but is still costing collateral.",
+        ));
     }
     sources.push(serde_json::json!({
         "what": "pm-us capital in",
@@ -520,7 +634,30 @@ fn books_json(a: &Args) -> String {
         "frozen": true,
     }));
 
+    // Stale is a third state, not a pass: a green EXACT over a 20-hour-old
+    // snapshot says nothing about the account now.
+    let mut snapshot_age: Option<u64> = None;
+    for s in sources.iter_mut() {
+        if s.get("frozen").is_some() {
+            continue;
+        }
+        let age = s.get("age_s").and_then(|v| v.as_u64());
+        s["stale"] = serde_json::json!(age.map(|x| x > SNAPSHOT_STALE_S));
+        if let Some(x) = age {
+            snapshot_age = Some(snapshot_age.map_or(x, |m: u64| m.max(x)));
+        }
+    }
+
+    let falsifiable = checks.iter().filter(|c| c["falsifiable"] == true).count();
+    let failed =
+        checks.iter().filter(|c| c["falsifiable"] == true && c["exact"] == false).count();
+
     let mut v = serde_json::to_value(&rep).unwrap_or_else(|_| serde_json::json!({}));
+    v["reconciliations"] = serde_json::Value::Array(checks);
+    v["checks_falsifiable"] = serde_json::json!(falsifiable);
+    v["checks_failed"] = serde_json::json!(failed);
+    v["snapshot_age_s"] = serde_json::json!(snapshot_age);
+    v["snapshot_stale"] = serde_json::json!(snapshot_age.map(|x| x > SNAPSHOT_STALE_S));
     v["sources"] = serde_json::Value::Array(sources);
     v.to_string()
 }
@@ -1290,13 +1427,21 @@ fn day_range(from: &str, to: &str) -> Vec<String> {
         Some((s[0..4].parse().ok()?, s[5..7].parse().ok()?, s[8..10].parse().ok()?))
     };
     let (Some(f), Some(t)) = (parse(from), parse(to)) else { return vec![] };
+    // Days from an arbitrary epoch (Hinnant's short form) — only ever used for
+    // the difference between two dates, so the epoch does not matter. `parse`
+    // accepts a leading '-' in the year field ("-123-01-01" is 10 chars with
+    // dashes in the right places), and `/` on a negative i64 truncates toward
+    // zero where this formula needs floor. The effect is small and bounded: a
+    // miscount of at most one day per negative-year division, so a range
+    // spanning year 0 could slip one day past the 400-day cap — not a broken
+    // calculation. `div_euclid` floors and removes it. Verified identical to the
+    // old expression for every date 0001-01-01 through 3000-12-31.
     let to_days = |(y, m, d): (i32, u32, u32)| -> i64 {
         let (y, m) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
-        let era = y.div_euclid(100) as i64;
-        365 * y as i64 + y as i64 / 4 - y as i64 / 100 + y as i64 / 400
+        let y = y as i64;
+        365 * y + y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400)
             + (153 * (m as i64 - 3) + 2) / 5
             + d as i64
-            - era * 0
     };
     let (a0, b0) = (to_days(f), to_days(t));
     if b0 < a0 || b0 - a0 > 400 {

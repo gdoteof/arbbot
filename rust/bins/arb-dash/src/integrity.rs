@@ -32,15 +32,43 @@ pub struct FeedRow {
     pub stale: bool,
 }
 
+/// A file some other unit is supposed to keep fresh. Its age is the only
+/// evidence the dash has that that unit is still alive.
+#[derive(Debug, Serialize)]
+pub struct DerivedRow {
+    pub what: String,
+    pub path: String,
+    pub age_seconds: Option<u64>,
+    pub max_age_seconds: u64,
+    pub stale: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Integrity {
     pub today: String,
     pub live_feeds: Vec<FeedRow>,
+    pub derived: Vec<DerivedRow>,
     pub coverage: Vec<DayRow>,
     pub unarchived_days: usize,
     pub unarchived_bytes: u64,
     pub warnings: Vec<String>,
 }
+
+/// Files written by a timer, and how old each may be before the timer that
+/// writes it must be assumed dead.
+///
+/// `marks.json` is here because on 2026-07-28 `arbbot-marks.service` had been
+/// exiting non-zero every 2 minutes for over three hours
+/// (`mark_positions.py:111`, `KeyError: 'cost_usd'` on the engine's
+/// `fees_pending` record shape) while the engine kept re-deriving its take-take
+/// APR bar from the frozen file and reporting the result with no age. Nothing
+/// on this dashboard or in the engine said a word. The engine-side staleness
+/// guard belongs in the engine; this row is so an operator can SEE it.
+const DERIVED: [(&str, &str, u64); 1] = [(
+    "position marks (arbbot-marks.timer)",
+    "exec/marks.json",
+    600,
+)];
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -156,5 +184,31 @@ pub fn build(data_dir: &str) -> Integrity {
         ));
     }
 
-    Integrity { today, live_feeds, coverage, unarchived_days, unarchived_bytes, warnings }
+    let mut derived = Vec::new();
+    for (what, rel, max_age) in DERIVED {
+        let path = format!("{data_dir}/{rel}");
+        let age = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| now.saturating_sub(d.as_secs()));
+        // An absent file is stale too — a writer that has never run is not
+        // better news than one that stopped.
+        let stale = age.map(|a| a > max_age).unwrap_or(true);
+        if stale {
+            warnings.push(match age {
+                Some(a) => format!("{what} is {a}s old (limit {max_age}s) — its writer has died"),
+                None => format!("{what}: {path} does not exist"),
+            });
+        }
+        derived.push(DerivedRow {
+            what: what.into(),
+            path,
+            age_seconds: age,
+            max_age_seconds: max_age,
+            stale,
+        });
+    }
+
+    Integrity { today, live_feeds, derived, coverage, unarchived_days, unarchived_bytes, warnings }
 }
