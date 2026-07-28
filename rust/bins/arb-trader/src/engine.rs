@@ -45,6 +45,12 @@ pub struct RunCfg {
     pub hedge_retry: Option<HedgeRetry>,
     /// Take-take policy. `None` = the detector never runs.
     pub take_take: Option<TakeTake>,
+    /// Whether the venue order path is live. Reported in the stats `mode`.
+    ///
+    /// This existed only as an inference before (`ledger_path.is_some()`), so
+    /// every armed run still reported `mode: "shadow"` — the dashboard and any
+    /// log-based monitor would say NOT TRADING while it placed real orders.
+    pub armed: bool,
 }
 
 /// Immediately-executable crossings, tested on the book event that creates
@@ -519,7 +525,7 @@ pub async fn run(
         () => {{
             let elapsed = t_start.elapsed().as_secs_f64();
             serde_json::json!({
-                "mode": if cfg.bench { "bench" } else { "shadow" },
+                "mode": if cfg.bench { "bench" } else if cfg.armed { "live" } else { "shadow" },
                 "events": n_ev, "book_events": n_book, "intents": n_int,
                 "take_take_found": n_tt, "take_take_bar_apr": tt_bar,
                 "take_take_gated": n_tt_gated, "take_take_fired": n_tt_fired,

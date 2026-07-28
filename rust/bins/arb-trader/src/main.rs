@@ -368,6 +368,66 @@ fn order_preconditions(
     if missing.is_empty() { Ok(sinks) } else { Err(missing) }
 }
 
+/// Cancel resting orders on the way OUT, on SIGTERM or Ctrl-C.
+///
+/// The engine had no signal handler and did not cancel on exit, so stopping an
+/// armed process left its quotes resting on the venue with nothing owning
+/// them. That is exactly how the 2026-07-28 orphans happened: an armed run
+/// exited and left 13 live Kalshi orders that no process would ever cancel,
+/// re-quote, or hedge if they filled. `systemctl stop` was enough to cause it.
+///
+/// The startup sweep already covered the NEXT run; this covers the gap in
+/// between, which is the window where a fill goes unhedged.
+///
+/// Best-effort by design: a venue that will not answer must not stop the
+/// process from dying, so each cancel is bounded and failures are reported
+/// rather than retried forever. The startup sweep remains the backstop.
+fn spawn_shutdown_sweep(sinks: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>) {
+    tokio::spawn(async move {
+        let mut term = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[exec] WARNING: no SIGTERM handler ({e}) — exit will NOT cancel");
+                return;
+            }
+        };
+        tokio::select! {
+            _ = term.recv() => eprintln!("[exec] SIGTERM"),
+            r = tokio::signal::ctrl_c() => {
+                if r.is_err() { return; }
+                eprintln!("[exec] interrupt");
+            }
+        }
+        eprintln!("[exec] shutdown: cancelling resting orders before exit");
+        for (venue, s) in sinks {
+            let sk = s.clone();
+            let cancelled = tokio::task::spawn_blocking(move || sk.cancel_all_open()).await;
+            match cancelled {
+                Ok(Ok(())) => {
+                    // A 2xx is not proof, exactly as at startup: ask what is
+                    // still resting and say so plainly if anything is.
+                    let sk = s.clone();
+                    match tokio::task::spawn_blocking(move || sk.resting_order_ids()).await {
+                        Ok(Ok(ids)) if ids.is_empty() => {
+                            eprintln!("[exec] {venue:?}: book clean at exit")
+                        }
+                        Ok(Ok(ids)) => eprintln!(
+                            "[exec] {venue:?}: STILL RESTING at exit: {}",
+                            ids.join(",")
+                        ),
+                        _ => eprintln!("[exec] {venue:?}: could not verify book at exit"),
+                    }
+                }
+                Ok(Err(e)) => eprintln!("[exec] {venue:?}: cancel-all on exit FAILED: {e}"),
+                Err(e) => eprintln!("[exec] {venue:?}: cancel-all on exit panicked: {e}"),
+            }
+        }
+        std::process::exit(0);
+    });
+}
+
 /// Cancel every resting order on every armed venue, then PROVE the book is
 /// empty before the engine is allowed to quote.
 ///
@@ -629,6 +689,7 @@ async fn main() {
             eprintln!("[exec] --sweep-only: book reconciled, exiting without quoting");
             return;
         }
+        spawn_shutdown_sweep(sinks.clone());
     }
     // The fill feed runs whenever the order path does: a live order with no
     // fill feed is an unhedged position waiting to happen.
@@ -713,6 +774,7 @@ async fn main() {
             // the log readable.
             cooldown_s: if args.tt_detect_only || !armed { 5.0 } else { args.hedge_alarm_s },
         }),
+        armed,
     };
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;
     println!("{summary}");

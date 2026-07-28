@@ -186,6 +186,15 @@ pub struct Candidate {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Skip {
     NoBook,
+    /// A venue's own book is crossed (best ask <= best bid). That state is
+    /// impossible on a live venue and always means OUR book is corrupt — a
+    /// level added and never removed, or a missed resync. Observed
+    /// 2026-07-28: KXRATECUT-26DEC31 carried a phantom ask at 0.073 under a
+    /// 0.176 bid, which the detector read as a 9.7c crossing worth 20%/yr
+    /// against a PM-US book that in truth agreed with Kalshi at ~17c.
+    /// Trading it would have sold PM at 0.17 and then been unable to buy
+    /// Kalshi anywhere near 0.073, leaving a naked short.
+    CrossedBook { venue: &'static str },
     NoResolveDate,
     EdgeUnderFees,
     ReverseDirection,
@@ -235,6 +244,15 @@ pub fn detect(
 
     let (ka, pb) = (cx.parse_exact(k_ask), cx.parse_exact(p_bid));
     let (kb_px, pa) = (cx.parse_exact(k_bid), cx.parse_exact(p_ask));
+    // Sanity BEFORE arithmetic: a venue cannot be offering below its own bid.
+    // If it appears to be, our book is wrong, and every edge derived from it
+    // is fiction. Refuse rather than trade against our own corruption.
+    if cx.cmp(ka, kb_px) != std::cmp::Ordering::Greater {
+        return Err(Skip::CrossedBook { venue: "kalshi" });
+    }
+    if cx.cmp(pa, pb) != std::cmp::Ordering::Greater {
+        return Err(Skip::CrossedBook { venue: "polymarket_us" });
+    }
     // K->PM: buy Kalshi YES at its ask, sell PM YES at its bid.
     let edge_kpm = cx.sub(pb, ka);
     // The reverse leg-pairing, detected only so we can refuse it.
@@ -425,11 +443,36 @@ mod tests {
     fn refuses_when_edge_does_not_cover_fees() {
         let mut cx = Cx::default();
         let r = rel("xvus-nobel-peace-26-elonmusk");
-        // 2c edge == the 2c fee -> net zero, not tradable
-        let b = books("0.10", "0.10", "20", "0.12", "20", "0.20");
+        // 2c edge == the 2c fee -> net zero, not tradable. Kalshi bid/ask must
+        // be a SANE book (ask strictly above bid) or the crossed-book guard
+        // fires first and we would not be testing the fee floor at all.
+        let b = books("0.09", "0.10", "20", "0.12", "20", "0.20");
         assert_eq!(
             detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20),
             Err(Skip::EdgeUnderFees)
+        );
+    }
+
+    /// The 2026-07-28 fedcut false positive, reconstructed from the tape.
+    /// Kalshi's real book was bid 0.1760 / ask 0.1820 and PM-US agreed at
+    /// 0.1700 — no crossing existed. A phantom ask at 0.0730 that was added
+    /// and never removed made it read as +9.7c / 20%/yr.
+    #[test]
+    fn refuses_a_crossed_book_rather_than_trading_the_phantom() {
+        let mut cx = Cx::default();
+        let r = rel("xvus-fedcut-26-usfed-2026-cut");
+        // ask 0.0730 sits UNDER the 0.1760 bid — impossible on a live venue
+        let b = books("0.1760", "0.0730", "26", "0.1700", "330", "0.1800");
+        assert_eq!(
+            detect(&mut cx, &r, &b, "2026-07-28", 10.0, 50, 0, 5),
+            Err(Skip::CrossedBook { venue: "kalshi" })
+        );
+        // and with the REAL ask there is simply no trade, as it should be
+        let good = books("0.1760", "0.1820", "305", "0.1700", "330", "0.1800");
+        assert_eq!(
+            detect(&mut cx, &r, &good, "2026-07-28", 10.0, 50, 0, 5).is_err(),
+            true,
+            "true book offers no crossing"
         );
     }
 
