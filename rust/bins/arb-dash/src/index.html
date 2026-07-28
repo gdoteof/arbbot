@@ -900,6 +900,7 @@ const VIEWS = [
   {path:'/current',       label:'Current'},
   {path:'/intents',       label:'Intents'},
   {path:'/trades',        label:'Trades'},
+  {path:'/live',          label:'Live'},
 ];
 
 const json = (u) => fetch(u).then(r=>r.json());
@@ -961,6 +962,7 @@ const NEEDS = {
   '/current':       () => ({current:  '/api/current' + location.search}),
   '/intents':       () => ({intents:  '/api/intents', top:'/api/top-series?n=4'}),
   '/trades':        () => ({trades:   '/api/trades'}),
+  '/live':          () => ({}),
   '/pair':          () => {
     const q = new URLSearchParams(location.search);
     q.set('rel', relOf());
@@ -973,7 +975,7 @@ const NEEDS = {
 const TOPIC = {
   '/':'books', '/recording':'recording', '/opportunities':'opportunities',
   '/pairs':'pairs', '/current':'rollup', '/intents':'intents', '/pair':'rollup',
-  '/trades':'intents',
+  '/trades':'intents', '/live':'intents',
 };
 
 /* Each draw is PURE: reads S, appends to a fragment, returns the header text.
@@ -1008,6 +1010,10 @@ const DRAW = {
     f.append(currentPanel(d));
     return d.error ? 'no rollup'
       : `${d.scenario} &middot; clip ${d.clip} &middot; ${d.profitable}/${d.priced_pairs} profitable`;
+  },
+  '/live': (f) => {
+    f.append(livePanel());
+    return 'event tape &middot; pushed per line, no rollup';
   },
   '/trades': (f) => {
     const d = S.data.trades;
@@ -1169,6 +1175,100 @@ function tradeRows(d){
 }
 
 /* --------------------------------------------------------------------------
+   LIVE TAPE
+
+   The one view that does NOT go through refresh()/render(). Everything else
+   redraws a whole panel when a file signature changes, which costs seconds and
+   can only show what a panel already renders. Watching an engine work needs
+   the events themselves, in order, the moment they exist — so this owns a
+   dedicated EventSource and appends rows directly.
+   -------------------------------------------------------------------------- */
+const TAPE = {es:null, paused:false, rows:0, seen:{}, show:{skip:false}};
+const TAPE_MAX = 400;   /* DOM stays bounded; a tape is not a database */
+
+function tapeLine(fr){
+  const e = fr.ev || {}, k = fr.kind || 'other';
+  const t = e.ts ? new Date(e.ts*1000).toISOString().slice(11,23) : '';
+  let body;
+  if(k === 'skip')       body = (e.skip||[]).join('; ');
+  else if(k === 'basket')body = `${e.relationship_id} x${e.qty} ${e.strategy||''}`;
+  else if(k === 'hedge') body = `hedge ${e.hedge_needed} x${e.qty} @ ${e.anchor_price}`;
+  else if(k === 'cancel')body = `${e.cancel} ${e.side||''} @ ${e.price||''} (${e.order_id||''})`;
+  else if(e.place)       body = `${e.place} ${e.side||''} ${e.count||''} @ ${e.price||''}` +
+                                (e.replaces?` <span class="sub">replaces ${e.replaces}</span>`:'');
+  else                   body = JSON.stringify(e).slice(0,160);
+  const cls = k==='skip' ? 'sub' : (k==='basket'||k==='take-take') ? 'ok' : (k==='cancel'?'warn':'');
+  return `<tr data-k="${esc(k)}"><td class="sub">${esc(t)}</td>`+
+         `<td><span class="badge ${cls}">${esc(k)}</span></td>`+
+         `<td class="sub">${esc(fr.src||'')}</td>`+
+         `<td class="${cls}">${body}</td></tr>`;
+}
+
+function livePanel(){
+  return $(`<section class="wide">
+    <h2>Live tape</h2>
+    <nav style="padding:0;border:0;margin-bottom:8px">
+      <a href="#" id="tape-pause">pause</a>
+      <a href="#" id="tape-skips">show skips</a>
+      <a href="#" id="tape-clear">clear</a>
+      <span class="sub" id="tape-stat" style="margin-left:10px"></span>
+    </nav>
+    <div class="scroll" style="max-height:70vh">
+      <table><thead><tr><th style="width:90px">time</th><th style="width:80px">kind</th>
+        <th style="width:110px">source</th><th>event</th></tr></thead>
+      <tbody id="tape-body"></tbody></table>
+    </div>
+    <div class="sub" style="margin-top:8px">
+      Pushed per line as the engine appends, not on a refresh timer &mdash; no
+      rollup involved. Skips are hidden by default: the engine rejects far more
+      than it places, and unfiltered they are all you would see. Newest at the
+      top, ${TAPE_MAX} rows kept.
+    </div>
+  </section>`);
+}
+
+function tapeConnect(){
+  if(TAPE.es) return;
+  const es = new EventSource('/api/tape');
+  TAPE.es = es;
+  es.onmessage = (m) => {
+    if(TAPE.paused) return;
+    let fr; try{ fr = JSON.parse(m.data); }catch{ return; }
+    const body = document.getElementById('tape-body');
+    if(!body){ tapeClose(); return; }          /* navigated away */
+    TAPE.seen[fr.kind] = (TAPE.seen[fr.kind]||0) + 1;
+    if(fr.kind === 'skip' && !TAPE.show.skip) { tapeStat(); return; }
+    body.insertAdjacentHTML('afterbegin', tapeLine(fr));
+    TAPE.rows++;
+    while(TAPE.rows > TAPE_MAX && body.lastElementChild){
+      body.removeChild(body.lastElementChild); TAPE.rows--;
+    }
+    tapeStat();
+  };
+  es.onerror = () => { const s=document.getElementById('tape-stat');
+    if(s) s.textContent = 'reconnecting…'; };
+}
+function tapeClose(){ if(TAPE.es){ TAPE.es.close(); TAPE.es = null; } }
+function tapeStat(){
+  const s = document.getElementById('tape-stat');
+  if(!s) return;
+  const parts = Object.entries(TAPE.seen).map(([k,v])=>`${k} ${v}`).join(' · ');
+  s.textContent = (TAPE.paused ? 'PAUSED · ' : '') + parts;
+}
+function tapeWire(){
+  const on = (id, fn) => { const el = document.getElementById(id);
+    if(el) el.onclick = (e)=>{ e.preventDefault(); fn(); }; };
+  on('tape-pause', ()=>{ TAPE.paused = !TAPE.paused;
+    document.getElementById('tape-pause').textContent = TAPE.paused?'resume':'pause';
+    tapeStat(); });
+  on('tape-skips', ()=>{ TAPE.show.skip = !TAPE.show.skip;
+    document.getElementById('tape-skips').textContent =
+      TAPE.show.skip?'hide skips':'show skips'; });
+  on('tape-clear', ()=>{ const b=document.getElementById('tape-body');
+    if(b) b.innerHTML=''; TAPE.rows=0; TAPE.seen={}; tapeStat(); });
+}
+
+/* --------------------------------------------------------------------------
    RENDER — the only function permitted to touch the document
    -------------------------------------------------------------------------- */
 function renderNav(active){
@@ -1195,6 +1295,11 @@ function render(){
   }
   document.getElementById('meta').innerHTML = meta;
   apply(document.getElementById('root'), frag);
+
+  // The live tape owns a dedicated connection, so it has to be opened and
+  // closed as the view comes and goes — leaving it open would keep an SSE
+  // connection (and its 150ms file polling) alive on every other page.
+  if(p === '/live'){ tapeWire(); tapeConnect(); } else { tapeClose(); }
 
   // The one post-render effect, and it is explicit, one-shot, and only ever
   // armed by a click — never by a background refresh.
