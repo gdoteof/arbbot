@@ -42,11 +42,38 @@ pub struct PlaceRequest {
     pub client_order_id: String,
 }
 
+/// Which id namespace a cancel is addressed in.
+///
+/// This was a bare `order_id: String`, and every per-order cancel the trader
+/// ever sent put OUR client_order_id in it (audit 2026-07-28): the venue had
+/// never heard of that id, Kalshi answered 404 — which quirk K4 maps to success
+/// — and PM-US answered <300 for an order it had never issued. Both venues
+/// reported cancelling something that went on resting, so `exec_failed` stayed
+/// 0 while stale quotes accumulated. Naming the namespace in the TYPE is what
+/// stops a caller expressing that mistake again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelBy {
+    /// The venue's own order id, as learned from the place response. The only
+    /// handle either venue's cancel endpoint accepts directly.
+    VenueId(String),
+    /// OUR client_order_id, for an order whose venue id we never learned (a
+    /// place whose response was lost, or one whose ack never came back).
+    /// Kalshi can resolve it against its own order list; PM-US has no
+    /// client-order-id field on the wire at all ([`wire::pmus_order_body`]), so
+    /// it refuses rather than address a phantom.
+    ClientId(String),
+}
+
+// No accessor returns the bare id: an `id() -> &str` erases exactly the
+// namespace this enum exists to keep, and a caller that only wants to NAME the
+// target (a log line, a test record) should print the variant — `{:?}` gives
+// `VenueId("BH9…")` / `ClientId("m1")`, which says which id space it was in.
+
 /// A cancel request. PM-US requires the `market_slug` in the body; Kalshi
 /// cancels by id alone (`market_slug` ignored there).
 #[derive(Debug, Clone)]
 pub struct CancelRequest {
-    pub order_id: String,
+    pub by: CancelBy,
     pub market_slug: Option<String>,
 }
 
@@ -230,23 +257,54 @@ impl<T: Transport> KalshiGateway<T> {
         Ok(out)
     }
 
+    /// Where an order carrying OUR `client_order_id` stands on this account.
+    /// The three cases are deliberately distinct: "resting", "on the account
+    /// but finished" and "not here at all" call for three different answers
+    /// from a cancel, and collapsing them is how a cancel reports success for
+    /// an order it never touched.
+    fn find_ours(&self, coid: &str) -> Result<Ours, VenueError> {
+        let mut seen = false;
+        for o in self.all_orders()? {
+            if o.client_order_id.as_deref() != Some(coid) {
+                continue;
+            }
+            if o.is_resting() {
+                return Ok(Ours::Resting(o.order_id));
+            }
+            seen = true;
+        }
+        Ok(if seen { Ours::Gone } else { Ours::Absent })
+    }
+
     /// Find a RESTING order by our own `client_order_id` and cancel it.
     /// `Ok(None)` means there was nothing to clean up. This is the recovery
     /// path for a create whose response we could not read: the order may exist
     /// under an id we never learned, and the client_order_id is the only handle
     /// we have on it.
     pub fn cancel_by_client_order_id(&self, coid: &str) -> Result<Option<String>, VenueError> {
-        let found = self.all_orders()?.into_iter().find(|o| {
-            o.is_resting() && o.client_order_id.as_deref() == Some(coid)
-        });
-        match found {
-            Some(o) => {
-                self.cancel(&CancelRequest { order_id: o.order_id.clone(), market_slug: None })?;
-                Ok(Some(o.order_id))
+        match self.find_ours(coid)? {
+            Ours::Resting(id) => {
+                self.cancel(&CancelRequest {
+                    by: CancelBy::VenueId(id.clone()),
+                    market_slug: None,
+                })?;
+                Ok(Some(id))
             }
-            None => Ok(None),
+            Ours::Gone | Ours::Absent => Ok(None),
         }
     }
+}
+
+/// The state of an order we tagged with a `client_order_id`, as the venue's own
+/// order list reports it.
+enum Ours {
+    /// Still resting, under the venue's own id.
+    Resting(String),
+    /// On the account but finished (canceled or executed) — a cancel has
+    /// nothing left to do.
+    Gone,
+    /// Not on the account at all.
+    Absent,
 }
 
 impl<T: Transport> VenueGateway for KalshiGateway<T> {
@@ -281,11 +339,58 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
         order.order_id.clone()
     }
 
+    /// DELETE /portfolio/events/orders/{venue order id}.
+    ///
+    /// A [`CancelBy::ClientId`] target is resolved against the venue's own order
+    /// list first — that is the recovery handle for an order whose id we never
+    /// learned. "Not on the account" is an ERROR there, never success: the order
+    /// list also LAGS a write (see [`Self::order_status_settled`]), so absence
+    /// can mean "not visible yet" just as easily as "never accepted", and
+    /// claiming a cancel we did not make is the failure mode this whole path
+    /// exists to end.
     fn cancel(&self, req: &CancelRequest) -> Result<(), VenueError> {
-        let path = format!("{K_PLACE}/{}", req.order_id);
+        let oid = match &req.by {
+            CancelBy::VenueId(id) => id.clone(),
+            CancelBy::ClientId(coid) => match self.find_ours(coid)? {
+                Ours::Resting(id) => id,
+                // Genuinely already gone. This is the ONE case where "we
+                // cancelled nothing" is the right answer.
+                Ours::Gone => return Ok(()),
+                // Not on the account. Still an error rather than a success —
+                // nothing was cancelled and the order list LAGS a write, so this
+                // cannot be read as proof the order is gone. Stated plainly, not
+                // shouted: the commonest cause is a place the venue rejected, in
+                // which case there was never anything here to cancel.
+                Ours::Absent => {
+                    return Err(VenueError::Status {
+                        endpoint: "kalshi cancel",
+                        status: 0,
+                        body: format!(
+                            "no order carries client_order_id `{coid}`; nothing cancelled \
+                             (the place may have been rejected, or the order list has not \
+                             caught up)"
+                        ),
+                    })
+                }
+            },
+        };
+        if oid.is_empty() {
+            // An empty id would DELETE the collection path, which is not a
+            // cancel of anything and may not be a no-op either.
+            return Err(VenueError::MissingField {
+                endpoint: "kalshi cancel",
+                field: "order_id".into(),
+            });
+        }
+        let path = format!("{K_PLACE}/{oid}");
         let r = self.call(Priority::Critical, "DELETE", &path, None, None)?;
         // 404 == already gone == successfully cancelled (quirk K4). Treating
         // it as an error would orphan a resting order on a retry path.
+        //
+        // That reading is only sound because `oid` is the VENUE's own id: a 404
+        // on an id the venue never issued means "wrong id", not "already gone",
+        // and mapping THAT to success is what hid every phantom cancel until
+        // 2026-07-28. `CancelBy` makes an unresolved id impossible to send here.
         if r.status == 404 || r.status < 300 {
             return Ok(());
         }
@@ -314,7 +419,10 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
     fn cancel_all_open(&self) -> Result<(), VenueError> {
         for o in self.all_orders()? {
             if o.is_resting() {
-                self.cancel(&CancelRequest { order_id: o.order_id, market_slug: None })?;
+                self.cancel(&CancelRequest {
+                    by: CancelBy::VenueId(o.order_id),
+                    market_slug: None,
+                })?;
             }
         }
         Ok(())
@@ -387,7 +495,8 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
             Err(e) => Err(e),
         };
 
-        let cancelled = self.cancel(&CancelRequest { order_id: oid.clone(), market_slug: None });
+        let cancelled =
+            self.cancel(&CancelRequest { by: CancelBy::VenueId(oid.clone()), market_slug: None });
 
         match (rested, cancelled) {
             (Ok(()), Ok(())) => Ok(oid),
@@ -589,27 +698,46 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
         resp::pmus_order(&r.body)
     }
 
+    fn order_id(order: &Self::Order) -> String {
+        order.id.clone()
+    }
+
     /// POST /v1/order/{id}/cancel, with the marketSlug in the BODY.
     ///
-    /// Two things differ from Kalshi and both are deliberate:
+    /// Three things differ from Kalshi and all three are deliberate:
     ///   * `market_slug` is REQUIRED. We do NOT self-resolve it via
     ///     open_orders — doing that on every reprice hammered the API into
     ///     429s.
     ///   * a non-2xx is an ERROR, never success. Kalshi's 404-means-already-
     ///     gone does NOT transfer: treating a failed PM cancel as success is
     ///     what caused stray-order accumulation.
-    fn order_id(order: &Self::Order) -> String {
-        order.id.clone()
-    }
-
+    ///   * a [`CancelBy::ClientId`] target is REFUSED, locally. PM-US has no
+    ///     client-order-id field on the wire ([`wire::pmus_order_body`] — and
+    ///     the retired Python `_order_body` had none either), so there is
+    ///     nothing on the venue to resolve our id against. Sending it anyway
+    ///     would POST `/v1/order/m1/cancel`, which PM-US answers with <300 for
+    ///     an id it has never issued — 11 such "successes" were logged on
+    ///     2026-07-28 while every quote kept resting.
     fn cancel(&self, req: &CancelRequest) -> Result<(), VenueError> {
+        let CancelBy::VenueId(oid) = &req.by else {
+            return Err(VenueError::MissingField {
+                endpoint: "pmus cancel",
+                field: "venue order id (PM-US cannot resolve a client_order_id)".into(),
+            });
+        };
+        if oid.is_empty() {
+            return Err(VenueError::MissingField {
+                endpoint: "pmus cancel",
+                field: "venue order id".into(),
+            });
+        }
         let Some(slug) = req.market_slug.as_deref() else {
             return Err(VenueError::MissingField {
                 endpoint: "pmus cancel",
                 field: "market_slug".into(),
             });
         };
-        let path = format!("/v1/order/{}/cancel", req.order_id);
+        let path = format!("/v1/order/{oid}/cancel");
         let body = wire::pmus_cancel_body(slug);
         let r = self.call(Priority::Critical, "POST", &path, Some(&body))?;
         if r.status >= 300 {
@@ -686,7 +814,7 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
         };
 
         let cancelled = self.cancel(&CancelRequest {
-            order_id: oid.clone(),
+            by: CancelBy::VenueId(oid.clone()),
             market_slug: Some(market.to_string()),
         });
 

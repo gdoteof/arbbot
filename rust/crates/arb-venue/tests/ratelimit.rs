@@ -1,6 +1,8 @@
 //! RateLimiter is a pure type with injected `now_ns` — deterministic, no clock.
 
-use arb_venue::gateway::{CancelRequest, KalshiGateway, PlaceRequest, Side, Tif, VenueGateway};
+use arb_venue::gateway::{
+    CancelBy, CancelRequest, KalshiGateway, PlaceRequest, Side, Tif, VenueGateway,
+};
 use arb_venue::ratelimit::{Priority, RateLimiter, TokenBucket};
 use arb_venue::sign::PmusSigner;
 use arb_venue::{KalshiSigner, PmusGateway, VenueError};
@@ -73,7 +75,8 @@ fn gateways_are_not_wired() {
     };
     assert_eq!(g.place(&place).unwrap_err(), VenueError::NotWired);
     assert_eq!(
-        g.cancel(&CancelRequest { order_id: "o1".into(), market_slug: None }).unwrap_err(),
+        g.cancel(&CancelRequest { by: CancelBy::VenueId("o1".into()), market_slug: None })
+            .unwrap_err(),
         VenueError::NotWired
     );
     assert_eq!(g.order_status("o1").unwrap_err(), VenueError::NotWired);

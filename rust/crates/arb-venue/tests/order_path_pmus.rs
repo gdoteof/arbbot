@@ -9,7 +9,9 @@
 //!   * cancel-all is one call, not a paginated sweep
 //!   * the create response carries no fill data at all
 
-use arb_venue::gateway::{CancelRequest, PlaceRequest, PmusGateway, Side, Tif, VenueGateway};
+use arb_venue::gateway::{
+    CancelBy, CancelRequest, PlaceRequest, PmusGateway, Side, Tif, VenueGateway,
+};
 use arb_venue::ratelimit::RateLimiter;
 use arb_venue::transport::{Response, Transport};
 use arb_venue::{PmusSigner, VenueError};
@@ -156,7 +158,7 @@ fn an_ask_opens_a_short_on_the_yes_axis() {
 fn cancel_carries_the_market_slug_in_the_body() {
     let g = gw(vec![(200, "{}")]);
     g.cancel(&CancelRequest {
-        order_id: "pm-1".into(),
+        by: CancelBy::VenueId("pm-1".into()),
         market_slug: Some(SLUG.into()),
     })
     .unwrap();
@@ -172,11 +174,45 @@ fn cancel_carries_the_market_slug_in_the_body() {
 #[test]
 fn a_cancel_without_a_slug_fails_before_reaching_the_wire() {
     let g = gw(vec![]);
-    match g.cancel(&CancelRequest { order_id: "pm-1".into(), market_slug: None }) {
+    match g.cancel(&CancelRequest { by: CancelBy::VenueId("pm-1".into()), market_slug: None }) {
         Err(VenueError::MissingField { field, .. }) => assert_eq!(field, "market_slug"),
         other => panic!("expected a local MissingField, got {other:?}"),
     }
     assert!(g.transport.sent().is_empty(), "nothing may reach the wire");
+}
+
+/// PM-US has NO client-order-id field on the wire — `pmus_order_body` never
+/// sends one, so the venue has never seen an `m…` id and has nothing to resolve
+/// one against. A cancel we cannot address must be REFUSED, not sent: on
+/// 2026-07-28 eleven `POST /v1/order/m…/cancel` calls answered <300 and were
+/// logged as `[exec] PolymarketUs cancelled` while every quote kept resting.
+#[test]
+fn a_client_id_cancel_is_refused_before_the_wire() {
+    let g = gw(vec![]);
+    match g.cancel(&CancelRequest {
+        by: CancelBy::ClientId("m1785257819026".into()),
+        market_slug: Some(SLUG.into()),
+    }) {
+        Err(VenueError::MissingField { endpoint: "pmus cancel", field }) => {
+            assert!(field.contains("venue order id"), "{field}");
+        }
+        other => panic!("PM-US cannot resolve our id; expected a refusal, got {other:?}"),
+    }
+    assert!(g.transport.sent().is_empty(), "nothing may reach the wire");
+}
+
+/// ...and an empty venue id must not POST to `/v1/order//cancel` either.
+#[test]
+fn an_empty_venue_id_is_refused_before_the_wire() {
+    let g = gw(vec![]);
+    assert!(matches!(
+        g.cancel(&CancelRequest {
+            by: CancelBy::VenueId(String::new()),
+            market_slug: Some(SLUG.into()),
+        }),
+        Err(VenueError::MissingField { endpoint: "pmus cancel", .. })
+    ));
+    assert!(g.transport.sent().is_empty());
 }
 
 /// Kalshi's "404 on cancel means already gone" does NOT transfer. On PM-US a
@@ -187,7 +223,7 @@ fn a_failed_pmus_cancel_is_an_error_unlike_kalshi() {
     for status in [404u16, 400, 500] {
         let g = gw(vec![(status, r#"{"message":"nope"}"#)]);
         match g.cancel(&CancelRequest {
-            order_id: "pm-1".into(),
+            by: CancelBy::VenueId("pm-1".into()),
             market_slug: Some(SLUG.into()),
         }) {
             Err(VenueError::Status { status: s, .. }) => assert_eq!(s, status),
@@ -349,8 +385,11 @@ fn the_default_pmus_gateway_is_not_wired() {
     let g = PmusGateway::new(signer(), RateLimiter::from_per_minute(60.0, 60.0, 0));
     assert_eq!(g.place(&place_req()).unwrap_err(), VenueError::NotWired);
     assert_eq!(
-        g.cancel(&CancelRequest { order_id: "pm-1".into(), market_slug: Some(SLUG.into()) })
-            .unwrap_err(),
+        g.cancel(&CancelRequest {
+            by: CancelBy::VenueId("pm-1".into()),
+            market_slug: Some(SLUG.into())
+        })
+        .unwrap_err(),
         VenueError::NotWired
     );
     assert_eq!(g.rehearse(SLUG).unwrap_err(), VenueError::NotWired);

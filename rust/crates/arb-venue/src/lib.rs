@@ -16,7 +16,7 @@ pub mod wire;
 
 pub use error::VenueError;
 pub use gateway::{
-    CancelRequest, KalshiGateway, PlaceRequest, PmusGateway, Side, Tif, VenueGateway,
+    CancelBy, CancelRequest, KalshiGateway, PlaceRequest, PmusGateway, Side, Tif, VenueGateway,
 };
 pub use ratelimit::{Priority, RateLimiter, TokenBucket};
 pub use sign::{KalshiSigner, KalshiVerifier, PmusSigner};

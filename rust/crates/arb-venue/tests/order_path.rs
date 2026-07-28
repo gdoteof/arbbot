@@ -7,7 +7,9 @@
 //! the live venue (tests/test_venue_contracts.py, now retired with the Python
 //! trader).
 
-use arb_venue::gateway::{CancelRequest, KalshiGateway, PlaceRequest, Side, Tif, VenueGateway};
+use arb_venue::gateway::{
+    CancelBy, CancelRequest, KalshiGateway, PlaceRequest, Side, Tif, VenueGateway,
+};
 use arb_venue::ratelimit::RateLimiter;
 use arb_venue::transport::{Response, Transport};
 use arb_venue::{KalshiSigner, VenueError};
@@ -167,10 +169,11 @@ fn a_crossing_post_only_400_is_surfaced_not_swallowed() {
 
 /// K4: 404 on cancel means the order is already gone, which is exactly what
 /// cancel wanted. Treating it as an error orphans resting orders on retry.
+/// Sound ONLY for a venue id — see `a_client_id_absent_from_the_account_is_not_a_cancel`.
 #[test]
 fn cancel_treats_404_as_success() {
     let g = gw(vec![(404, r#"{"error":"order not found"}"#)]);
-    g.cancel(&CancelRequest { order_id: "o-1".into(), market_slug: None })
+    g.cancel(&CancelRequest { by: CancelBy::VenueId("o-1".into()), market_slug: None })
         .expect("404 on cancel is success");
     let s = &g.transport.sent()[0];
     assert_eq!(s.method, "DELETE");
@@ -182,9 +185,108 @@ fn cancel_treats_404_as_success() {
 fn cancel_still_fails_on_a_server_error() {
     let g = gw(vec![(500, "boom")]);
     assert!(matches!(
-        g.cancel(&CancelRequest { order_id: "o-1".into(), market_slug: None }),
+        g.cancel(&CancelRequest { by: CancelBy::VenueId("o-1".into()), market_slug: None }),
         Err(VenueError::Status { status: 500, .. })
     ));
+}
+
+// ------------------------------------------- cancelling the RIGHT order ---
+//
+// Until 2026-07-28 every per-order cancel this stack sent carried OUR
+// client_order_id (`m1785257819045`) in the path. Kalshi answered 404, K4 above
+// mapped that to success, and the order kept resting. `CancelBy` makes the two
+// id namespaces distinct so a caller has to say which one it has.
+
+/// A client-id cancel resolves through the venue's OWN order list and then
+/// deletes the venue's id — never our own.
+#[test]
+fn a_client_id_cancel_is_resolved_to_the_venues_own_order_id() {
+    let page = r#"{"orders":[
+        {"order_id":"someone-else","status":"resting","client_order_id":"m999"},
+        {"order_id":"66e1c799-507b","status":"resting","client_order_id":"m1785257819045"}
+    ],"cursor":null}"#;
+    let g = gw(vec![(200, page), (200, "{}")]);
+    g.cancel(&CancelRequest {
+        by: CancelBy::ClientId("m1785257819045".into()),
+        market_slug: None,
+    })
+    .expect("a resolvable client id must cancel");
+
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 2, "one list read, one DELETE");
+    assert_eq!(sent[1].method, "DELETE");
+    assert_eq!(
+        sent[1].path, "/trade-api/v2/portfolio/events/orders/66e1c799-507b",
+        "the VENUE's id — addressing our own m… id is the 2026-07-28 phantom cancel"
+    );
+}
+
+/// THE finding, in one assertion: our order id must never appear in a cancel
+/// path. A `VenueId` is the only thing that ever reaches the URL.
+#[test]
+fn our_own_order_id_never_appears_in_a_cancel_url() {
+    let page = r#"{"orders":[{"order_id":"venue-abc","status":"resting","client_order_id":"m1"}],"cursor":null}"#;
+    let g = gw(vec![(200, page), (200, "{}")]);
+    g.cancel(&CancelRequest { by: CancelBy::ClientId("m1".into()), market_slug: None }).unwrap();
+    for s in g.transport.sent() {
+        assert!(
+            !s.path.ends_with("/m1"),
+            "a cancel addressed with our client_order_id reached the wire: {}",
+            s.path
+        );
+    }
+}
+
+/// An order the account has never seen must NOT read as a successful cancel.
+/// The order list lags a write (see `a_404_on_a_freshly_created_order_...`), so
+/// "absent" can mean "not visible yet" just as easily as "never accepted" — and
+/// either way nothing was cancelled. This is the case K4's 404 rule used to
+/// swallow.
+///
+/// The message is deliberately plain rather than an alarm: the commonest cause
+/// is a place the venue REJECTED, where there was never anything here to cancel.
+#[test]
+fn a_client_id_absent_from_the_account_is_not_a_cancel() {
+    let g = gw(vec![(200, r#"{"orders":[],"cursor":null}"#)]);
+    match g.cancel(&CancelRequest { by: CancelBy::ClientId("m1".into()), market_slug: None }) {
+        Err(VenueError::Status { endpoint: "kalshi cancel", body, .. }) => {
+            assert!(body.contains("nothing cancelled"), "{body}");
+            assert!(body.contains("m1"), "the id must be in the error: {body}");
+            assert!(
+                body.to_uppercase() != body,
+                "a routine, expected outcome must not be shouted: {body}"
+            );
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(g.transport.sent().len(), 1, "no DELETE may be sent");
+}
+
+/// ...but an order that IS on the account and already finished is a real
+/// "already gone", which is the outcome cancel wanted. Distinguishing this from
+/// the case above is the whole point.
+#[test]
+fn a_client_id_whose_order_is_already_finished_is_success() {
+    for status in ["canceled", "executed"] {
+        let page = format!(
+            r#"{{"orders":[{{"order_id":"v-1","status":"{status}","client_order_id":"m1"}}],"cursor":null}}"#
+        );
+        let g = gw(vec![(200, &page)]);
+        g.cancel(&CancelRequest { by: CancelBy::ClientId("m1".into()), market_slug: None })
+            .unwrap_or_else(|e| panic!("{status} is already gone, not an error: {e}"));
+        assert_eq!(g.transport.sent().len(), 1, "nothing to DELETE");
+    }
+}
+
+/// An empty id would DELETE the collection path. Refuse locally.
+#[test]
+fn an_empty_order_id_never_reaches_the_wire() {
+    let g = gw(vec![]);
+    assert!(matches!(
+        g.cancel(&CancelRequest { by: CancelBy::VenueId(String::new()), market_slug: None }),
+        Err(VenueError::MissingField { endpoint: "kalshi cancel", .. })
+    ));
+    assert!(g.transport.sent().is_empty());
 }
 
 /// K1: /portfolio/orders is paginated and `?status=resting` returns nothing,
