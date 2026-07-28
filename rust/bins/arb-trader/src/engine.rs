@@ -40,6 +40,33 @@ pub struct RunCfg {
     /// the order path is armed — a dry run must never write into the accounting
     /// ledger, or it would invent exposure that the next startup seeds from.
     pub ledger_path: Option<String>,
+    /// Hedge-retry policy. `None` disables the deadline entirely (bench/replay,
+    /// which must stay byte-deterministic).
+    pub hedge_retry: Option<HedgeRetry>,
+}
+
+#[derive(Clone)]
+pub struct HedgeRetry {
+    /// Seconds before an unfilled hedge is retried. Comfortably longer than a
+    /// fill report takes, so a retry is not racing an outcome we already have.
+    pub interval_s: f64,
+    /// How far WORSE than the anchor the touch may be and still be taken. The
+    /// anchor is the price at which the basket was known profitable, so this is
+    /// the profit we are willing to give up to stop being naked.
+    pub max_slip: String,
+    /// Seconds naked before it stops being a retry and becomes an alarm.
+    pub alarm_after_s: f64,
+}
+
+/// A hedge that has been placed but not (fully) filled.
+struct PendingHedge {
+    hedge: HedgeOrder,
+    /// Event time the FIRST attempt for this maker fill went out — the age that
+    /// matters is how long we have been naked, not how long since the last try.
+    first_ts: f64,
+    last_try_ts: f64,
+    tries: u32,
+    alarmed: bool,
 }
 
 /// Book a completed basket: the maker leg filled and its hedge filled, so the
@@ -143,7 +170,37 @@ struct MakerOrder {
     price: String,
 }
 
+/// May a retry take `touch`, given the anchor the basket was priced against?
+///
+/// The anchor is the price at which the basket was known profitable, so
+/// `max_slip` is exactly how much of that edge we will surrender to stop being
+/// naked. Beyond it the answer is WAIT, never chase — Geoff 2026-07-22, "hedge
+/// only if profitable; otherwise find a profitable hedge in the future". The
+/// naked alarm is what keeps waiting from being silent.
+///
+/// `book_side` is the side of the hedge leg's book we take: "bid" means we are
+/// SELLING into it (worse = lower), "ask" means BUYING from it (worse = higher).
+fn hedge_price_acceptable(
+    cx: &mut Cx,
+    book_side: &str,
+    touch: &str,
+    anchor: &str,
+    max_slip: &str,
+) -> bool {
+    let a = cx.parse_exact(anchor);
+    let slip = cx.parse_exact(max_slip);
+    let t = cx.parse_exact(touch);
+    if book_side == "bid" {
+        let floor = cx.sub(a, slip);
+        cx.cmp(t, floor) != std::cmp::Ordering::Less
+    } else {
+        let ceil = cx.add(a, slip);
+        cx.cmp(t, ceil) != std::cmp::Ordering::Greater
+    }
+}
+
 /// A hedge we placed, kept so its fill can be recognised and booked.
+#[derive(Clone)]
 struct HedgeOrder {
     /// The maker order whose fill created this hedge.
     maker_order_id: String,
@@ -256,6 +313,12 @@ pub async fn run(
     // FillLedger: a hedge in the ledger would hedge its own fill.
     let mut hedge_orders: HashMap<String, HedgeOrder> = HashMap::new();
     let mut next_hedge_oid: u64 = 0;
+    // Outstanding hedges, keyed by OUR hedge order id.
+    let mut pending_hedges: HashMap<String, PendingHedge> = HashMap::new();
+    // Contracts actually hedged per maker order. A retry asks only for what is
+    // still missing, so a late fill arriving after a retry cannot over-hedge.
+    let mut hedged_by_maker: HashMap<String, i64> = HashMap::new();
+    let (mut n_retry, mut n_naked) = (0u64, 0u64);
     let (mut n_ack, mut n_fill, mut n_hedge) = (0u64, 0u64, 0u64);
     let t_start = std::time::Instant::now();
     let mut wal = cfg.wal_path.as_deref().map(Wal::spawn);
@@ -276,6 +339,8 @@ pub async fn run(
     stats_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut feed_iv = tokio::time::interval(std::time::Duration::from_secs(5));
     feed_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut hedge_iv = tokio::time::interval(std::time::Duration::from_secs(1));
+    hedge_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // $rel: the relationship whose quoter emitted these intents (for the
     // hedge-anchor lookup at place time), or None for intents that rest
@@ -407,6 +472,9 @@ pub async fn run(
                 "feed_pulled": feed_reason.is_some(),
                 "risk_allowed": cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
                 "risk_rejected": cfg.risk.as_ref().map(|r| r.stats().1).unwrap_or(0),
+                "hedges_pending": pending_hedges.len(),
+                "hedges_retried": n_retry,
+                "hedges_naked": n_naked,
                 "order_acks": n_ack, "fills": n_fill, "hedge_obligations": n_hedge,
                 // programming-bug alarm: an obligation that was minted and
                 // never hedged (arb_core::fill) — must stay 0.
@@ -520,6 +588,11 @@ pub async fn run(
                         // are recognised here and booked exactly once.
                         if let Some(h) = hedge_orders.remove(oid) {
                             let filled = cum.min(h.qty);
+                            // Credit the MAKER order, not the hedge: a retry
+                            // asks for what is still missing, so a late fill
+                            // cannot cause a second hedge for the same size.
+                            *hedged_by_maker.entry(h.maker_order_id.clone()).or_insert(0) += filled;
+                            pending_hedges.remove(oid);
                             if let Some(mo) = order_rel.get(&h.maker_order_id) {
                                 if let Some(lp) = cfg.ledger_path.as_deref() {
                                     book_basket(lp, mo, &h, filled, ts_local_ns as f64 / 1e9);
@@ -588,17 +661,27 @@ pub async fn run(
                                 // fill from a maker fill. Hedges are NOT in the
                                 // FillLedger: registering one would let its own
                                 // fill mint another hedge, forever.
-                                hedge_orders.insert(
-                                    hoid.clone(),
-                                    HedgeOrder {
-                                        maker_order_id: f_oid,
-                                        market_id: a.market_id.clone(),
-                                        venue: a.venue,
-                                        side: order_side,
-                                        price: px.clone(),
-                                        qty,
-                                    },
-                                );
+                                let ho = HedgeOrder {
+                                    maker_order_id: f_oid,
+                                    market_id: a.market_id.clone(),
+                                    venue: a.venue,
+                                    side: order_side,
+                                    price: px.clone(),
+                                    qty,
+                                };
+                                if cfg.hedge_retry.is_some() {
+                                    pending_hedges.insert(
+                                        hoid.clone(),
+                                        PendingHedge {
+                                            hedge: HedgeOrder { ..ho.clone() },
+                                            first_ts: now,
+                                            last_try_ts: now,
+                                            tries: 1,
+                                            alarmed: false,
+                                        },
+                                    );
+                                }
+                                hedge_orders.insert(hoid.clone(), ho);
                                 intents.push(
                                     json!({"ts": now, "place": a.market_id, "venue": a.venue,
                                            "side": order_side, "price": px, "count": qty,
@@ -638,6 +721,96 @@ pub async fn run(
                 } else if !kill_now && killed {
                     killed = false;
                     eprintln!("[engine] KILL switch cleared — quoting resumes");
+                }
+            }
+            _ = hedge_iv.tick(), if cfg.hedge_retry.is_some() && !cfg.bench => {
+                let pol = cfg.hedge_retry.as_ref().expect("guarded above");
+                let mut retries: Vec<(String, PendingHedge)> = Vec::new();
+                for (hoid, p) in pending_hedges.iter_mut() {
+                    if last_now - p.last_try_ts < pol.interval_s {
+                        continue;
+                    }
+                    // How much of this maker fill is still unhedged. A hedge
+                    // that filled late is already credited here, so a retry
+                    // never re-buys what we already have.
+                    let done = hedged_by_maker.get(&p.hedge.maker_order_id).copied().unwrap_or(0);
+                    let missing = p.hedge.qty - done;
+                    if missing <= 0 {
+                        retries.push((hoid.clone(), PendingHedge { tries: 0, ..PendingHedge {
+                            hedge: p.hedge.clone(), first_ts: p.first_ts,
+                            last_try_ts: p.last_try_ts, tries: 0, alarmed: p.alarmed } }));
+                        continue; // fully hedged after all — retire below
+                    }
+                    let naked_for = last_now - p.first_ts;
+                    if naked_for >= pol.alarm_after_s && !p.alarmed {
+                        p.alarmed = true;
+                        n_naked += 1;
+                        eprintln!(
+                            "[hedge] NAKED {}x {} on {} for {naked_for:.0}s after {} tries — \
+                             the book has not offered a price that keeps the basket profitable",
+                            missing, p.hedge.market_id, p.hedge.venue, p.tries
+                        );
+                    }
+                    // Retry at the CURRENT touch, but never worse than the
+                    // anchor by more than max_slip. Geoff 2026-07-22: "hedge
+                    // only if profitable; otherwise find a profitable hedge in
+                    // the future" — so an unprofitable book is a WAIT, never a
+                    // chase. The naked alarm above is what stops waiting from
+                    // being silent.
+                    let book_side = if p.hedge.side == "ask" { "bid" } else { "ask" };
+                    let touch = parse_venue(p.hedge.venue)
+                        .and_then(|v| books.get(v, &p.hedge.market_id))
+                        .and_then(|b| {
+                            if book_side == "bid" { b.bids.first() } else { b.asks.first() }
+                        })
+                        .map(|l| l.price.clone());
+                    let Some(touch) = touch else { continue };
+                    if !hedge_price_acceptable(
+                        &mut cx, book_side, &touch, &p.hedge.price, &pol.max_slip,
+                    ) {
+                        p.last_try_ts = last_now;
+                        continue; // wait for a better book
+                    }
+                    let mut h = p.hedge.clone();
+                    h.qty = missing;
+                    h.price = touch;
+                    retries.push((
+                        hoid.clone(),
+                        PendingHedge {
+                            hedge: h,
+                            first_ts: p.first_ts,
+                            last_try_ts: last_now,
+                            tries: p.tries + 1,
+                            alarmed: p.alarmed,
+                        },
+                    ));
+                }
+                for (old_hoid, mut p) in retries {
+                    pending_hedges.remove(&old_hoid);
+                    if p.tries == 0 {
+                        continue; // fully hedged; nothing to re-place
+                    }
+                    next_hedge_oid += 1;
+                    let hoid = format!("h{next_hedge_oid}");
+                    n_retry += 1;
+                    eprintln!(
+                        "[hedge] retry {} {}x {} @ {} (try {})",
+                        hoid, p.hedge.qty, p.hedge.market_id, p.hedge.price, p.tries
+                    );
+                    intents.push(
+                        json!({"ts": last_now, "place": p.hedge.market_id,
+                               "venue": p.hedge.venue, "side": p.hedge.side,
+                               "price": p.hedge.price, "count": p.hedge.qty,
+                               "order_id": hoid, "tag": "hedge", "taker": true,
+                               "retry": p.tries})
+                        .to_string(),
+                    );
+                    // The OLD hedge id stays in hedge_orders so a late fill on
+                    // it still books; only the pending entry moves.
+                    p.last_try_ts = last_now;
+                    hedge_orders.insert(hoid.clone(), p.hedge.clone());
+                    pending_hedges.insert(hoid, p);
+                    drain_intents!(Option::<&Rel>::None);
                 }
             }
             _ = feed_iv.tick(), if cfg.health_file.is_some() => {
@@ -857,5 +1030,54 @@ mod ledger_write_tests {
             "the engine does not know venue fees; the record must not pretend otherwise"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod hedge_retry_tests {
+    use super::*;
+
+    fn ok(book_side: &str, touch: &str, anchor: &str, slip: &str) -> bool {
+        let mut cx = Cx::default();
+        hedge_price_acceptable(&mut cx, book_side, touch, anchor, slip)
+    }
+
+    /// Selling into a bid: a HIGHER bid is better than we expected, always fine.
+    #[test]
+    fn selling_takes_any_price_at_or_above_the_anchor() {
+        assert!(ok("bid", "0.40", "0.40", "0.00"), "exactly the anchor");
+        assert!(ok("bid", "0.45", "0.40", "0.00"), "better than the anchor");
+    }
+
+    /// ...and gives up at most max_slip of the edge below it.
+    #[test]
+    fn selling_gives_up_at_most_max_slip() {
+        assert!(ok("bid", "0.39", "0.40", "0.01"), "exactly at the tolerance");
+        assert!(!ok("bid", "0.38", "0.40", "0.01"), "past it => WAIT, never chase");
+    }
+
+    /// Buying from an ask: worse means paying MORE.
+    #[test]
+    fn buying_gives_up_at_most_max_slip() {
+        assert!(ok("ask", "0.40", "0.40", "0.00"));
+        assert!(ok("ask", "0.35", "0.40", "0.00"), "cheaper than expected is fine");
+        assert!(ok("ask", "0.41", "0.40", "0.01"));
+        assert!(!ok("ask", "0.42", "0.40", "0.01"));
+    }
+
+    /// Zero tolerance means the anchor is a hard floor/ceiling — the setting
+    /// that never gives up a cent of the basket's edge.
+    #[test]
+    fn zero_slip_refuses_any_worse_price() {
+        assert!(!ok("bid", "0.3999", "0.40", "0"));
+        assert!(!ok("ask", "0.4001", "0.40", "0"));
+    }
+
+    /// The direction must not be symmetric — swapping the side must flip which
+    /// way is "worse", or a retry would chase in one direction.
+    #[test]
+    fn the_two_sides_are_not_symmetric() {
+        assert!(ok("bid", "0.50", "0.40", "0.00"), "selling higher is better");
+        assert!(!ok("ask", "0.50", "0.40", "0.00"), "buying higher is worse");
     }
 }

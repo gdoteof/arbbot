@@ -57,6 +57,14 @@ struct Args {
     /// precondition in `order_preconditions` holds — this engine has never
     /// placed an order, and the flag is the only thing that can change that.
     enable_orders: bool,
+    /// Second, unmissable confirmation. `--enable-orders` ALONE is inert.
+    ///
+    /// This exists because of a real incident (2026-07-28): `--enable-orders`
+    /// had been a safe way to PRINT unmet preconditions, and the moment the
+    /// last one was cleared that same command armed the engine and rested 31
+    /// live orders. A flag whose meaning silently changes from "explain" to
+    /// "trade" is a trap; two flags cannot be typed by muscle memory.
+    confirm_live: bool,
     /// Run the startup sweep against the live venues and EXIT, without ever
     /// quoting. The safe way to exercise the reconciliation path.
     sweep_only: bool,
@@ -64,6 +72,14 @@ struct Args {
     cred_suffix: Vec<(String, String)>,
     /// Append-only trade ledger; open baskets seed the risk view's exposure.
     ledger: String,
+    /// Seconds before an unfilled hedge is retried.
+    hedge_retry_s: f64,
+    /// How far worse than the anchor a retry may price. The anchor is where the
+    /// basket was known profitable, so this is the edge we will give up to stop
+    /// being naked; 0 means never give any up.
+    hedge_max_slip: String,
+    /// Seconds naked before it stops being a retry and becomes an alarm.
+    hedge_alarm_s: f64,
     /// Capital config for the risk gate.
     exec_yaml: String,
     topics_yaml: String,
@@ -94,9 +110,13 @@ fn parse_args() -> Args {
         tradable: "config/tradable.yaml".into(),
         health: "data/health.jsonl".into(),
         enable_orders: false,
+        confirm_live: false,
         sweep_only: false,
         cred_suffix: Vec::new(),
         ledger: "data/exec/trades.jsonl".into(),
+        hedge_retry_s: 5.0,
+        hedge_max_slip: "0.01".into(),
+        hedge_alarm_s: 60.0,
         exec_yaml: "config/exec.yaml".into(),
         topics_yaml: "config/topics.yaml".into(),
         balances: Vec::new(),
@@ -119,6 +139,7 @@ fn parse_args() -> Args {
             "--tradable" => a.tradable = it.next().expect("--tradable value"),
             "--health" => a.health = it.next().expect("--health value"),
             "--enable-orders" => a.enable_orders = true,
+            "--yes-trade-live" => a.confirm_live = true,
             "--sweep-only" => {
                 a.enable_orders = true;
                 a.sweep_only = true;
@@ -129,6 +150,15 @@ fn parse_args() -> Args {
                 a.cred_suffix.push((v.to_string(), sfx.to_string()));
             }
             "--ledger" => a.ledger = it.next().expect("--ledger value"),
+            "--hedge-retry-s" => {
+                a.hedge_retry_s = it.next().expect("s").parse().expect("float")
+            }
+            "--hedge-max-slip" => {
+                a.hedge_max_slip = it.next().expect("--hedge-max-slip value")
+            }
+            "--hedge-alarm-s" => {
+                a.hedge_alarm_s = it.next().expect("s").parse().expect("float")
+            }
             "--exec-config" => a.exec_yaml = it.next().expect("--exec-config value"),
             "--topics" => a.topics_yaml = it.next().expect("--topics value"),
             "--balance" => {
@@ -517,6 +547,23 @@ async fn main() {
         tokio::spawn(feed::socket_feed(sock, tx));
     }
 
+    // --enable-orders alone only REPORTS. Arming needs the second flag, so
+    // checking the preconditions can never place an order by accident.
+    if args.enable_orders && !args.sweep_only && !args.confirm_live {
+        match order_preconditions(&args, bench) {
+            Ok(_) => {
+                eprintln!("[exec] preconditions OK — arming would place REAL orders.");
+                eprintln!("[exec] add --yes-trade-live to actually arm. Nothing was sent.");
+            }
+            Err(missing) => {
+                eprintln!("[exec] --enable-orders blocked. Unmet preconditions:");
+                for m in &missing {
+                    eprintln!("[exec]   - {m}");
+                }
+            }
+        }
+        return;
+    }
     let sinks = if args.enable_orders {
         match order_preconditions(&args, bench) {
             Ok(s) => {
@@ -612,6 +659,14 @@ async fn main() {
         // Only an ARMED engine books baskets. A dry run writing here would
         // invent exposure that the next startup would seed from as if real.
         ledger_path: (!exec_txs.is_empty() && armed).then(|| args.ledger.clone()),
+        // Off in bench/replay (byte-determinism) and pointless unarmed, but
+        // kept ON in the dry-run shadow so the retry policy is exercised
+        // against the live book long before it is trusted with money.
+        hedge_retry: (!bench).then(|| engine::HedgeRetry {
+            interval_s: args.hedge_retry_s,
+            max_slip: args.hedge_max_slip.clone(),
+            alarm_after_s: args.hedge_alarm_s,
+        }),
     };
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;
     println!("{summary}");
