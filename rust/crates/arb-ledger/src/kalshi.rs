@@ -287,8 +287,6 @@ mod tests {
         .apply(&mut cx, &mut j)
         .expect("applies");
 
-        let tb = j.trial_balance(&mut cx);
-        assert!(crate::is_zero(&mut cx, tb), "trial balance {tb}");
         let v = j.balance(&mut cx, accounts::CASH_KALSHI); assert_amount(&mut cx, v, "0.90");
         let v = j.balance(&mut cx, accounts::PNL_REALIZED); assert_amount(&mut cx, v, "-1.00");
         let v = j.balance(&mut cx, accounts::FEES_KALSHI_TAKER); assert_amount(&mut cx, v, "0.10");
@@ -307,8 +305,6 @@ mod tests {
             .apply(&mut cx, &mut j)
             .expect("applies");
 
-        let tb = j.trial_balance(&mut cx);
-        assert!(crate::is_zero(&mut cx, tb), "trial balance {tb}");
         let v = j.qty(&mut cx, &accounts::position("kalshi", "KXB")); assert_amount(&mut cx, v, "-5");
         let v = j.balance(&mut cx, &accounts::position("kalshi", "KXB")); assert_amount(&mut cx, v, "4.00");
         let v = j.balance(&mut cx, accounts::CASH_KALSHI); assert_amount(&mut cx, v, "-4.00");
@@ -333,8 +329,6 @@ mod tests {
         .apply(&mut cx, &mut j)
         .expect("applies");
 
-        let tb = j.trial_balance(&mut cx);
-        assert!(crate::is_zero(&mut cx, tb), "trial balance {tb}");
         let v = j.qty(&mut cx, &accounts::position("kalshi", "KXD")); assert_amount(&mut cx, v, "0");
         let v = j.balance(&mut cx, &accounts::position("kalshi", "KXD")); assert_amount(&mut cx, v, "0");
         let v = j.balance(&mut cx, accounts::PNL_REALIZED); assert_amount(&mut cx, v, "-0.50");
@@ -359,8 +353,6 @@ mod tests {
         .apply(&mut cx, &mut j)
         .expect("applies");
 
-        let tb = j.trial_balance(&mut cx);
-        assert!(crate::is_zero(&mut cx, tb), "trial balance {tb}");
         let v = j.balance(&mut cx, accounts::CASH_KALSHI); assert_amount(&mut cx, v, "6.00");
         let v = j.balance(&mut cx, accounts::PNL_REALIZED); assert_amount(&mut cx, v, "-6.00");
         let v = j.qty(&mut cx, &accounts::position("kalshi", "KXC")); assert_amount(&mut cx, v, "0");

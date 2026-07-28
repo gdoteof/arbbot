@@ -231,9 +231,6 @@ mod tests {
         .apply(&mut cx, &mut j)
         .expect("applies");
 
-        let tb = j.trial_balance(&mut cx);
-        assert!(is_zero(&mut cx, tb), "trial balance {tb}");
-
         // cash lands exactly on the venue's spendable figure
         let cash = j.balance(&mut cx, accounts::CASH_PMUS);
         let want = cx.parse_exact("329.29805");

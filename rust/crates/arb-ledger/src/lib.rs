@@ -89,6 +89,9 @@ pub enum LedgerError {
     Unbalanced { id: String, residual: String },
     Empty { id: String },
     Duplicate { id: String },
+    /// A line of the journal file will not parse. Carries the 1-based line and
+    /// its length, which is what tells a torn tail from a fused pair.
+    Unreadable { line: usize, bytes: usize, why: String },
 }
 
 impl std::fmt::Display for LedgerError {
@@ -99,6 +102,11 @@ impl std::fmt::Display for LedgerError {
             }
             LedgerError::Empty { id } => write!(f, "entry {id} has no postings"),
             LedgerError::Duplicate { id } => write!(f, "entry {id} already posted"),
+            LedgerError::Unreadable { line, bytes, why } => write!(
+                f,
+                "journal line {line} ({bytes} bytes) is unreadable, so the books are \
+                 incomplete: {why}"
+            ),
         }
     }
 }
@@ -243,16 +251,29 @@ impl Journal {
         s
     }
 
+    /// Read back what `to_jsonl` wrote.
+    ///
+    /// A line that will not parse is REFUSED, not skipped. Skipping it — which
+    /// is what this used to do — drops an entry silently and hands back a
+    /// journal whose trial balance is still zero (every surviving entry sums to
+    /// zero on its own), so the loss is invisible in exactly the check meant to
+    /// catch it. An entry is money; a missing one is money we cannot see.
     pub fn from_jsonl(cx: &mut Cx, text: &str) -> Result<Journal, LedgerError> {
         let mut j = Journal::new();
-        for line in text.lines() {
+        for (i, line) in text.lines().enumerate() {
             let t = line.trim();
             if t.is_empty() {
                 continue;
             }
             let e: Entry = match serde_json::from_str(t) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(err) => {
+                    return Err(LedgerError::Unreadable {
+                        line: i + 1,
+                        bytes: line.len(),
+                        why: err.to_string(),
+                    })
+                }
             };
             j.post(cx, e)?;
         }
@@ -299,9 +320,78 @@ mod tests {
             ],
         );
         assert!(j.post(&mut cx, entry).is_ok());
-        let tb = j.trial_balance(&mut cx);
-        assert!(is_zero(&mut cx, tb));
         assert_eq!(j.balance(&mut cx, accounts::CASH_KALSHI).to_string(), "439.78");
+        assert_eq!(
+            j.balance(&mut cx, accounts::EQUITY_CAPITAL).to_string(),
+            "-439.78"
+        );
+    }
+
+    /// `trial_balance() == 0` is NOT a check — it is a restatement.
+    ///
+    /// `post` refuses any entry whose postings do not sum to zero, and
+    /// `trial_balance` recomputes that identical sum over the entries that
+    /// survived, so for any journal reachable through this API it is zero by
+    /// construction. Eight assertions across this crate asserted it anyway and
+    /// read as coverage while being incapable of failing — the same
+    /// `fold()`-identity flaw this crate exists to replace.
+    ///
+    /// What CAN fail is the enforcement point, so that is what is tested: the
+    /// only door into `entries` rejects an imbalance, and rejecting leaves the
+    /// journal untouched. Break `post` and this test goes red; the old
+    /// assertions would not have.
+    #[test]
+    fn the_trial_balance_is_enforced_at_post_not_observed_afterwards() {
+        let mut cx = Cx::default();
+        let mut j = Journal::new();
+        let a = cx.parse_exact("10.00");
+        let b = cx.parse_exact("-9.99");
+        let bad = e(
+            "resid",
+            vec![
+                Posting::new(accounts::CASH_KALSHI, a),
+                Posting::new(accounts::EQUITY_CAPITAL, b),
+            ],
+        );
+        assert!(matches!(j.post(&mut cx, bad), Err(LedgerError::Unbalanced { .. })));
+        assert!(j.is_empty(), "a refused entry must not reach the journal");
+        assert_eq!(
+            j.balance(&mut cx, accounts::CASH_KALSHI).to_string(),
+            "0",
+            "nor leave half of itself behind"
+        );
+    }
+
+    /// A journal file line that will not parse must FAIL the read. Skipping it
+    /// returns a journal that is short one entry and still trial-balances,
+    /// which is silent lost money.
+    #[test]
+    fn an_unreadable_line_fails_the_read_instead_of_vanishing() {
+        let mut cx = Cx::default();
+        let mut j = Journal::new();
+        let d = cx.parse_exact("100.00");
+        let c = neg(&mut cx, d);
+        j.post(
+            &mut cx,
+            e(
+                "dep-1",
+                vec![
+                    Posting::new(accounts::CASH_KALSHI, d),
+                    Posting::new(accounts::EQUITY_CAPITAL, c),
+                ],
+            ),
+        )
+        .expect("posts");
+        // Two entries on the wire, the second torn by an interrupted write.
+        let text = format!("{}{}", j.to_jsonl(), "{\"id\":\"dep-2\",\"ts\":0,\"sour");
+        match Journal::from_jsonl(&mut cx, &text) {
+            Err(LedgerError::Unreadable { line, bytes, .. }) => {
+                assert_eq!(line, 2);
+                assert_eq!(bytes, 26);
+            }
+            Ok(read) => panic!("a lost entry must not read as success ({} kept)", read.len()),
+            Err(other) => panic!("wrong error: {other:?}"),
+        }
     }
 
     #[test]
@@ -403,8 +493,6 @@ mod tests {
         let text = j.to_jsonl();
         let j2 = Journal::from_jsonl(&mut cx, &text).expect("reparses");
         assert_eq!(j2.len(), j.len());
-        let tb = j2.trial_balance(&mut cx);
-        assert!(is_zero(&mut cx, tb));
         assert_eq!(
             j2.qty(&mut cx, "pos:kalshi:KXPRESNOMD-28-GN").to_string(),
             "-5"

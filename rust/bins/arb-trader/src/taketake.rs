@@ -15,16 +15,70 @@
 //! NO by selling PM YES at its bid). The persistent basis makes that the
 //! profitable side; the reverse is detected and reported, never traded.
 //!
-//! Fees use the same conservative flat `FEE_CT` the Python bar used rather
-//! than the engine's exact per-venue fee model. That is deliberate: this is a
-//! port of a POLICY, and changing the fee basis would silently move the bar.
+//! Fees were originally the flat `FEE_CT` the Python bar used, on the grounds
+//! that this is a port of a POLICY and changing the fee basis would silently
+//! move the bar. That was wrong, and the 2026-07-28 audit caught it: both
+//! venues charge `k*P*(1-P)`, which summed over the two TAKER legs is
+//! ~0.13*P*(1-P) and so EXCEEDS 0.02 for P in (0.19, 0.81) — the band that
+//! near-dated at-the-money markets actually trade in. Six of the sixteen
+//! take-take baskets ever booked (the xvus-time-poty-26 names, crossed at
+//! 0.19/0.36) really paid 2.5-3.2c per contract against a 2c charge. Worse,
+//! a 3c crossing on a 16-day fedcut computed to 23.5%/yr, cleared the live
+//! 10.0%/yr bar, and would have LOST 0.25c/contract.
+//!
+//! So the fee now comes from `arb_core::fees` — the same per-venue curves the
+//! quoter, the scanner and the dashboard use — and `FEE_CT` survives only as
+//! the policy floor beneath it.
 
 use arb_core::book::BookBuilder;
+use arb_core::fees::{FeeSchedule, Role};
 use arb_core::model::Venue;
-use arb_core::scan::{Cx, Rel};
+use arb_core::scan::{Cx, Rel, D};
 
-/// Conservative both-leg taker fee per contract. Port of `FEE_CT`.
+/// Policy FLOOR on the both-leg taker fee per contract — no longer the fee
+/// itself. Python's `FEE_CT` was the whole model; `arb_core::fees` is now, and
+/// it comes out BELOW this at the tails (0.0064/ct on the 0.028/0.080
+/// france-pres crossings this engine actually took).
+///
+/// Kept as a floor deliberately. Correcting an UNDERSTATED fee is this fix's
+/// mandate; loosening what fires at the tails is not, and `max(real, floor)`
+/// is the only shape that can never charge less than reality. It also stands
+/// in for two costs `detect` genuinely cannot see: PM-US's per-market
+/// `feeCoefficient` (the schedule's 0.06 is documented as the observed
+/// FALLBACK, and `taker_coef_override` is never populated in this workspace),
+/// and a clip that walks past the touch it was sized against.
 const FEE_CT: &str = "0.02";
+
+/// The fee curves, built once. A `FeeSchedule` is a constant coefficient
+/// table, so one process-wide instance and the engine's own
+/// `FeeSchedule::new` are the same object by construction — and `detect` runs
+/// on the book-event path, where re-parsing thirteen decimals per
+/// relationship per event would be pure waste.
+fn schedule() -> &'static FeeSchedule {
+    static S: std::sync::OnceLock<FeeSchedule> = std::sync::OnceLock::new();
+    S.get_or_init(|| FeeSchedule::new(&mut Cx::default()))
+}
+
+/// Both-leg taker fee per contract for a K->PM crossing of `size` contracts:
+/// buy Kalshi YES at `k_ask`, sell PM-US YES at `p_bid`. Floored at `FEE_CT`.
+///
+/// SIZE IS AN INPUT, not a scale factor. Kalshi ceils its fee to the cent per
+/// ORDER (`fees.rs`, `quantize_ceil`), so at 0.47 a 5-lot pays 0.0180/ct of
+/// Kalshi fee and a 50-lot pays 0.0176 — and it is not even monotone, because
+/// what matters is where the ceiling lands. There is no per-contract figure to
+/// multiply, which is why this is computed after the clip is known.
+fn both_leg_taker_fee(cx: &mut Cx, k_ask: D, p_bid: D, size: i64) -> D {
+    let sched = schedule();
+    let n = cx.from_i64(size);
+    // `category` is read only by Polymarket INTL's curve; Kalshi's and PM-US's
+    // ignore it entirely (fees.rs), and take-take only ever touches those two.
+    let k = sched.fee(cx, Venue::Kalshi, Role::Taker, k_ask, n, "default");
+    let p = sched.fee(cx, Venue::PolymarketUs, Role::Taker, p_bid, n, "default");
+    let both = cx.add(k, p);
+    let per_ct = cx.div(both, n);
+    let floor = cx.parse_exact(FEE_CT);
+    if cx.cmp(per_ct, floor) == std::cmp::Ordering::Less { floor } else { per_ct }
+}
 
 // The resolve-date table lives in arb_core::resolve, not here: the dashboard
 // reports the APR of a trade this engine decided to make, and two copies of
@@ -41,32 +95,154 @@ pub const DEFAULT_BAR_APR: f64 = 12.0;
 /// Port of `blended_apr()`: locked profit over cost, annualised by the
 /// COST-WEIGHTED average time to resolution. `None` when marks are missing or
 /// carry no priceable position, and a `None` bar must not be read as "no bar".
+///
+/// Every accumulator runs over the SAME set of positions. Python's version (and
+/// this port until 2026-07-28) summed profit and cost over ALL positions but
+/// weighted the horizon over only the DATED ones, so an undated position — or
+/// one with zero cost — put money in the yield without putting time in the
+/// denominator. A position carrying cost and no locked profit dragged the bar
+/// DOWN, which is the fail-open direction: a low bar fires unprofitable
+/// crossings. Inert on the 2026-07-28 marks file (all 27 positions dated,
+/// none zero-cost, so both denominators give 10.0088%/yr), latent otherwise.
 pub fn blended_apr(marks_json: &str, today_iso: &str) -> Option<f64> {
     let doc: serde_json::Value = serde_json::from_str(marks_json).ok()?;
     let today = parse_iso(today_iso)?;
-    let (mut num, mut den, mut cost, mut prof) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let (mut num, mut den, mut prof) = (0.0f64, 0.0f64, 0.0f64);
     for p in doc.get("positions")?.as_array()? {
         let c = p.get("cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let pr = p.get("locked_profit_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        cost += c;
-        prof += pr;
         let Some(rb) = p.get("resolves_by").and_then(|v| v.as_str()) else { continue };
         if c == 0.0 {
             continue;
         }
         let Some(days) = parse_iso(rb).map(|d| d - today) else { continue };
         let yrs = days.max(1) as f64 / 365.25;
+        prof += pr;
         num += c * yrs;
         den += c;
     }
-    if den == 0.0 || cost == 0.0 {
+    if den == 0.0 {
         return None;
     }
     let wavg = num / den;
     if wavg == 0.0 {
         return None;
     }
-    Some(prof / cost / wavg * 100.0)
+    Some(prof / den / wavg * 100.0)
+}
+
+/// How far behind `marks.json` may be before its bar stops being usable.
+///
+/// `arbbot-marks.timer` rewrites the file every 2 minutes, so 15 minutes is
+/// seven missed runs: a slow run or one transient failure survives, a wedged
+/// service does not.
+pub const MAX_MARKS_AGE_S: f64 = 900.0;
+
+/// The take-take bar, and whether it may be traded against at all.
+///
+/// Deliberately NOT an `Option<f64>`. On 2026-07-28 the engine read the bar as
+/// `read_to_string(..).ok().and_then(blended_apr).unwrap_or(DEFAULT_BAR_APR)`,
+/// `marks.json` stopped being written at 12:46:12 — the engine's own first
+/// ledger record landed 8 s later carrying no `cost_usd`, and
+/// `scripts/mark_positions.py:111` has raised `KeyError` every 2 minutes since
+/// — and the armed session then spent four hours firing against a frozen
+/// 10.0088%/yr bar without one line of output saying so. The engine broke the
+/// input to its own risk decision and could not tell.
+///
+/// A stale bar is not a missing bar. Collapsing the two is the bug, so the
+/// type refuses to let a caller do it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Bar {
+    /// Marks are recent and priceable. `age_s` is how far behind they were.
+    Fresh { apr: f64, age_s: f64 },
+    /// Marks exist but their bar cannot be trusted: older than
+    /// `MAX_MARKS_AGE_S`, clock-skewed into the future, undated, or corrupt.
+    /// Take-take must not fire while this holds — the marks service being
+    /// broken is itself a reason not to trade, and the frozen value is wrong
+    /// in BOTH directions, so no substitute is defensible.
+    Untrusted { why: String },
+    /// There is no portfolio to average yet: no marks file, or none of its
+    /// positions is priceable. A cold start, not a fault — `DEFAULT_BAR_APR`
+    /// is the right answer, and it sits ABOVE every blended value observed so
+    /// far, so it declines rather than over-fires.
+    NoPortfolio { why: String },
+}
+
+impl Bar {
+    /// The bar to test crossings against. `None` is a REFUSAL to run take-take
+    /// at all, not a missing value: there is no default to substitute, because
+    /// substituting one is exactly what went wrong.
+    #[must_use]
+    pub fn tradable(&self) -> Option<f64> {
+        match self {
+            Bar::Fresh { apr, .. } => Some(*apr),
+            Bar::NoPortfolio { .. } => Some(DEFAULT_BAR_APR),
+            Bar::Untrusted { .. } => None,
+        }
+    }
+
+    /// One line for the operator. A refused bar must be loud: the failure it
+    /// reports is silent everywhere else.
+    pub fn describe(&self) -> String {
+        match self {
+            Bar::Fresh { apr, age_s } => format!("bar {apr:.4}%/yr (marks {age_s:.0}s old)"),
+            Bar::NoPortfolio { why } => {
+                format!("bar {DEFAULT_BAR_APR:.1}%/yr (default — {why})")
+            }
+            Bar::Untrusted { why } => format!("NO BAR — take-take REFUSED: {why}"),
+        }
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` -> epoch seconds. The one shape
+/// `scripts/mark_positions.py` writes (`time.strftime(..., time.gmtime())`),
+/// pinned strictly so a format change reads as untrusted rather than as a
+/// guess. Local to the staleness guard: `arb_core::resolve` is deliberately
+/// date-only, and only this needs sub-day resolution.
+fn parse_iso8601_z(s: &str) -> Option<f64> {
+    let b = s.as_bytes();
+    if b.len() != 20 || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
+        return None;
+    }
+    let day = parse_iso(s)?;
+    let h: i64 = s.get(11..13)?.parse().ok()?;
+    let m: i64 = s.get(14..16)?.parse().ok()?;
+    let sec: i64 = s.get(17..19)?.parse().ok()?;
+    if h > 23 || m > 59 || sec > 60 {
+        return None;
+    }
+    Some((day * 86400 + h * 3600 + m * 60 + sec) as f64)
+}
+
+/// The bar, aged against the marks file's OWN `generated_at` rather than its
+/// mtime — mtime can be freshened by a touch or a copy, `generated_at` is what
+/// the writer asserts about the data. Pure, so the staleness rule is
+/// replayable: the caller supplies the file's text and the clock.
+///
+/// An empty `marks_json` means "no file" (the caller's read failed), which is
+/// a cold start. Text that is present but unparseable means something WROTE
+/// garbage, which is a fault — those two must not share an answer.
+pub fn bar_from_marks(marks_json: &str, now: f64) -> Bar {
+    if marks_json.trim().is_empty() {
+        return Bar::NoPortfolio { why: "no marks file".into() };
+    }
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(marks_json) else {
+        return Bar::Untrusted { why: "marks.json present but not parseable".into() };
+    };
+    let Some(gen) = doc.get("generated_at").and_then(|v| v.as_str()).and_then(parse_iso8601_z)
+    else {
+        return Bar::Untrusted { why: "marks.json carries no usable generated_at".into() };
+    };
+    let age_s = now - gen;
+    if age_s.abs() > MAX_MARKS_AGE_S {
+        return Bar::Untrusted {
+            why: format!("marks.json is {age_s:.0}s off (limit {MAX_MARKS_AGE_S:.0}s)"),
+        };
+    }
+    match blended_apr(marks_json, &today_iso(now)) {
+        Some(apr) => Bar::Fresh { apr, age_s },
+        None => Bar::NoPortfolio { why: "no priceable position in marks.json".into() },
+    }
 }
 
 /// Per-relationship re-fire gate.
@@ -105,6 +281,10 @@ pub struct Candidate {
     pub kalshi_ask: String,
     pub size: i64,
     pub edge: String,
+    /// Both-leg taker fee per contract charged against `edge` — the real
+    /// per-venue curves at THIS `size`, floored at `FEE_CT`. Reported because
+    /// it is no longer a constant a reader can assume.
+    pub fee: String,
     pub net: String,
     pub apr: f64,
 }
@@ -189,9 +369,9 @@ pub fn detect(
         return Err(Skip::ReverseDirection);
     }
 
-    let fee = cx.parse_exact(FEE_CT);
-    let net = cx.sub(edge_kpm, fee);
-    if !cx.is_pos(net) {
+    // No fee can rescue a non-positive gross edge, so bail before doing the
+    // work of sizing it.
+    if !cx.is_pos(edge_kpm) {
         return Err(Skip::EdgeUnderFees);
     }
     let cost_ct = cx.one_minus(edge_kpm);
@@ -202,6 +382,28 @@ pub fn detect(
     let Some(yrs) = years_to(&rel.id, today_iso) else {
         return Err(Skip::NoResolveDate);
     };
+
+    // SIZE BEFORE FEE. Kalshi ceils its fee to the cent per ORDER, so the
+    // per-contract cost is a function of the clip and simply does not exist
+    // until the clip does. Sizing is bounded by remaining per-rel headroom,
+    // the depth on the two levels we would actually cross, and the clip.
+    let headroom = (max_ct_per_rel - open_ct).max(0);
+    if headroom < 1 {
+        return Err(Skip::AtCap { open: open_ct });
+    }
+    let depth_k: i64 = k_ask_sz.parse::<f64>().map(|f| f as i64).unwrap_or(0);
+    let depth_p: i64 = p_bid_sz.parse::<f64>().map(|f| f as i64).unwrap_or(0);
+    let size = headroom.min(depth_k.min(depth_p)).min(max_clip);
+    if size < 1 {
+        return Err(Skip::NoDepth);
+    }
+
+    let fee = both_leg_taker_fee(cx, ka, pb, size);
+    let net = cx.sub(edge_kpm, fee);
+    if !cx.is_pos(net) {
+        return Err(Skip::EdgeUnderFees);
+    }
+
     // APR leaves exact arithmetic here, matching Python, which also floats at
     // this line. The comparison is a policy threshold, not money.
     let net_f: f64 = cx.emit_6dp(net).parse().unwrap_or(0.0);
@@ -214,18 +416,6 @@ pub fn detect(
         return Err(Skip::BelowBar { apr, bar: bar_apr });
     }
 
-    let headroom = (max_ct_per_rel - open_ct).max(0);
-    if headroom < 1 {
-        return Err(Skip::AtCap { open: open_ct });
-    }
-    // Size is bounded by the depth on the levels we would actually cross.
-    let depth_k: i64 = k_ask_sz.parse::<f64>().map(|f| f as i64).unwrap_or(0);
-    let depth_p: i64 = p_bid_sz.parse::<f64>().map(|f| f as i64).unwrap_or(0);
-    let size = headroom.min(depth_k.min(depth_p)).min(max_clip);
-    if size < 1 {
-        return Err(Skip::NoDepth);
-    }
-
     Ok(Candidate {
         rel_id: rel.id.clone(),
         pmus_market: ps.to_string(),
@@ -234,6 +424,7 @@ pub fn detect(
         kalshi_ask: k_ask.to_string(),
         size,
         edge: cx.emit_6dp(edge_kpm),
+        fee: cx.emit_6dp(fee),
         net: cx.emit_6dp(net),
         apr,
     })
@@ -291,19 +482,120 @@ mod tests {
         assert_eq!(blended_apr(r#"{"positions":[]}"#, "2026-07-28"), None);
     }
 
-    /// Reproduces the Python dry-run line for melenchon captured 2026-07-28:
-    ///   edge=+7c net=+5c apr=7%
-    /// france-pres-27 resolves 2027-04-25, so ~0.74yr from 2026-07-28.
+    /// F6: profit, cost and horizon must come from one set of positions.
+    ///
+    /// The undated position below carries cost and NO locked profit. Weighting
+    /// the horizon over the dated position only, while dividing profit by both
+    /// costs, halved the yield and reported 2.5%/yr for a book returning 5% —
+    /// and a bar that is too LOW fires crossings that lose money.
     #[test]
-    fn matches_python_melenchon_line() {
+    fn an_undated_position_cannot_dilute_the_bar() {
+        let marks = r#"{"positions":[
+            {"cost_usd":100.0,"locked_profit_usd":5.0,"resolves_by":"2027-07-28"},
+            {"cost_usd":100.0,"locked_profit_usd":0.0}]}"#;
+        let apr = blended_apr(marks, "2026-07-28").unwrap();
+        assert!((apr - 5.0).abs() < 0.05, "expected the dated book's 5%/yr, got {apr}");
+
+        // and a zero-cost position is excluded from both sides the same way:
+        // it has no capital to weight and no yield to average.
+        let with_zero = r#"{"positions":[
+            {"cost_usd":100.0,"locked_profit_usd":5.0,"resolves_by":"2027-07-28"},
+            {"cost_usd":0.0,"locked_profit_usd":9.0,"resolves_by":"2027-07-28"}]}"#;
+        let apr = blended_apr(with_zero, "2026-07-28").unwrap();
+        assert!((apr - 5.0).abs() < 0.05, "expected 5%/yr, got {apr}");
+    }
+
+    /// The exact numbers from the 2026-07-28 armed session: `marks.json` was
+    /// last written 12:46:12 local (16:46:12Z) and the engine was still trading
+    /// against its 10.0088%/yr bar over four hours later.
+    #[test]
+    fn a_stale_marks_file_yields_no_tradable_bar() {
+        // 2026-07-28T16:46:12Z
+        let generated = 1785257172.0;
+        let marks = r#"{"generated_at":"2026-07-28T16:46:12Z","positions":[
+                {"cost_usd":100.0,"locked_profit_usd":5.0,"resolves_by":"2027-07-28"}]}"#;
+
+        // fresh: two minutes old, one marks-timer period
+        match bar_from_marks(marks, generated + 120.0) {
+            Bar::Fresh { apr, age_s } => {
+                assert!((apr - 5.0).abs() < 0.05, "got {apr}");
+                assert!((age_s - 120.0).abs() < 0.001);
+            }
+            other => panic!("two minutes old is fresh, got {other:?}"),
+        }
+
+        // the real failure: 15210s behind, which is what the armed engine read
+        let stale = bar_from_marks(marks, generated + 15210.0);
+        assert!(matches!(stale, Bar::Untrusted { .. }), "got {stale:?}");
+        assert_eq!(stale.tradable(), None, "a stale bar must refuse, not default");
+        assert!(stale.describe().contains("REFUSED"), "{}", stale.describe());
+
+        // the boundary, and one second past it
+        assert!(bar_from_marks(marks, generated + MAX_MARKS_AGE_S).tradable().is_some());
+        assert!(bar_from_marks(marks, generated + MAX_MARKS_AGE_S + 1.0).tradable().is_none());
+
+        // a clock skewed far into the FUTURE is just as unusable
+        assert!(bar_from_marks(marks, generated - MAX_MARKS_AGE_S - 1.0).tradable().is_none());
+    }
+
+    /// The three ways there is no bar are not one thing. A missing file is a
+    /// cold start and gets the default; a file that exists but cannot be aged
+    /// or parsed is a FAULT and gets a refusal.
+    #[test]
+    fn a_cold_start_defaults_but_a_broken_marks_file_refuses() {
+        let now = 1785257172.0;
+        assert_eq!(bar_from_marks("", now).tradable(), Some(DEFAULT_BAR_APR));
+        assert_eq!(bar_from_marks("   \n", now).tradable(), Some(DEFAULT_BAR_APR));
+
+        // present, timestamped, but nothing priceable yet
+        let empty = r#"{"generated_at":"2026-07-28T16:46:12Z","positions":[]}"#;
+        assert_eq!(bar_from_marks(empty, now).tradable(), Some(DEFAULT_BAR_APR));
+
+        // torn or half-written
+        assert_eq!(bar_from_marks(r#"{"generated_at":"2026-07-2"#, now).tradable(), None);
+        // no timestamp at all: unageable, so untrustable
+        let undated = r#"{"positions":[
+            {"cost_usd":100.0,"locked_profit_usd":5.0,"resolves_by":"2027-07-28"}]}"#;
+        assert_eq!(bar_from_marks(undated, now).tradable(), None);
+        // a timestamp we do not recognise must not be guessed at
+        for bad in ["2026-07-28 16:46:12", "2026-07-28T16:46:12", "2026-07-28T99:46:12Z", ""] {
+            let doc = format!(r#"{{"generated_at":"{bad}","positions":[]}}"#);
+            assert_eq!(bar_from_marks(&doc, now).tradable(), None, "{bad} must not parse");
+        }
+    }
+
+    /// `generated_at` is the writer's own statement about the data, and this is
+    /// the epoch it maps to — pinned because the whole staleness guard hangs
+    /// off it. Value taken from the live file, whose mtime is the same second.
+    #[test]
+    fn generated_at_parses_to_the_epoch_the_file_was_written() {
+        assert_eq!(parse_iso8601_z("2026-07-28T16:46:12Z"), Some(1785257172.0));
+        assert_eq!(parse_iso8601_z("1970-01-01T00:00:00Z"), Some(0.0));
+        assert_eq!(parse_iso8601_z("2026-07-28T16:46:12"), None, "no Z");
+        assert_eq!(parse_iso8601_z("2026-13-28T16:46:12Z"), None, "month 13");
+        assert_eq!(parse_iso8601_z("2026-07-28T16:60:12Z"), None, "minute 60");
+    }
+
+    /// The melenchon crossing the Python dry-run printed on 2026-07-28 as
+    ///   edge=+7c net=+5c apr=7%
+    /// — and what it is really worth. Python's flat 2c fee was under half the
+    /// truth: at Kalshi ask 0.43 the taker fee is
+    /// `ceil_cents(0.07 * 20 * 0.43 * 0.57) = 0.35` (0.0175/ct) and at PM-US
+    /// bid 0.50 it is `0.06 * 0.50 * 0.50 * 20 = 0.30` (0.015/ct), so
+    /// **0.0325/ct**, not 0.02. Net is 3.75c not 5c, and the APR 5.43%/yr not
+    /// 7% — 38% lower, exactly as the audit computed.
+    /// france-pres-27 resolves 2027-04-25, so ~0.742yr from 2026-07-28.
+    #[test]
+    fn melenchon_pays_the_real_both_leg_fee_not_the_flat_two_cents() {
         let mut cx = Cx::default();
         let r = rel("xvus-france-pres-27-jeanlucmelenchon");
-        // PM bid 0.50, Kalshi ask 0.43 -> edge 7c, net 5c, cost 0.93
+        // PM bid 0.50, Kalshi ask 0.43 -> edge 7c, cost 0.93
         let b = books("0.40", "0.43", "20", "0.50", "20", "0.55");
         let got = detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20).expect("clears a zero bar");
         assert_eq!(got.edge, "0.070000");
-        assert_eq!(got.net, "0.050000");
-        assert!((got.apr - 7.0).abs() < 0.5, "expected ~7%/yr like Python, got {}", got.apr);
+        assert_eq!(got.fee, "0.032500", "0.0175 kalshi + 0.015 pmus, per contract");
+        assert_eq!(got.net, "0.037500");
+        assert!((got.apr - 5.4346).abs() < 0.01, "expected ~5.43%/yr, got {}", got.apr);
     }
 
     #[test]
@@ -311,13 +603,100 @@ mod tests {
         let mut cx = Cx::default();
         let r = rel("xvus-france-pres-27-jeanlucmelenchon");
         let b = books("0.40", "0.43", "20", "0.50", "20", "0.55");
-        // same crossing, 10%/yr bar -> the 7%/yr APR must not fire
+        // same crossing, 10%/yr bar -> the 5.43%/yr APR must not fire
         match detect(&mut cx, &r, &b, "2026-07-28", 10.0, 50, 0, 20) {
             Err(Skip::BelowBar { apr, bar }) => {
                 assert!(apr < bar, "{apr} should be under {bar}");
             }
             other => panic!("expected BelowBar, got {other:?}"),
         }
+    }
+
+    /// C9, the concrete loss the audit priced. A 3c crossing on an at-the-money
+    /// fedcut market 16 days from resolution: under the flat 2c fee net reads
+    /// +1c and the APR 23.5%/yr, which clears the live 10.0088%/yr bar and
+    /// FIRES. The real both-leg fee at 0.49/0.52 is 0.032476/ct, so the trade
+    /// is worth -0.25c/contract and must never be sent.
+    ///
+    /// This family is why it matters: the armed drop-in passed
+    /// `--rel-prefix xvus-fedcut-26` AND `--take-take`, and fedcut is
+    /// near-dated and at-the-money — the worst corner of the curve.
+    #[test]
+    fn refuses_the_three_cent_fedcut_crossing_that_loses_money() {
+        let mut cx = Cx::default();
+        let r = rel("xvus-fedcut-26-usfed-2026-cut");
+        // resolves 2026-12-31; from 2026-12-15 that is 16 days
+        let b = books("0.48", "0.49", "20", "0.52", "20", "0.53");
+        // the live bar the armed session was using
+        assert_eq!(
+            detect(&mut cx, &r, &b, "2026-12-15", 10.0088, 50, 0, 20),
+            Err(Skip::EdgeUnderFees)
+        );
+        // and it is the FEE that refuses it, not the bar: a zero bar cannot
+        // rescue a crossing whose net is negative
+        assert_eq!(
+            detect(&mut cx, &r, &b, "2026-12-15", 0.0, 50, 0, 20),
+            Err(Skip::EdgeUnderFees)
+        );
+    }
+
+    /// The other half of C9: this must not become a switch that turns take-take
+    /// off. The band the engine actually traded is the tails, where the real
+    /// curves come out BELOW the 2c policy floor — 0.0064/ct on the
+    /// 0.028/0.080 france-pres crossings, 0.0069/ct here — so the floor binds
+    /// and behaviour there is unchanged.
+    ///
+    /// Ten of the sixteen take-take baskets ever booked sit in this
+    /// floor-bound region.
+    #[test]
+    fn a_tail_crossing_still_fires() {
+        let mut cx = Cx::default();
+        let r = rel("xvus-nobel-peace-26-elonmusk");
+        // Kalshi ask 0.03 / PM bid 0.08 -> 5c edge, 73 days to 2026-10-09
+        let b = books("0.02", "0.03", "20", "0.08", "20", "0.09");
+        let got = detect(&mut cx, &r, &b, "2026-07-28", 10.0088, 50, 0, 20)
+            .expect("a 5c tail crossing must still clear the live bar");
+        assert_eq!(got.fee, "0.020000", "real fee is 0.006916/ct — the floor binds");
+        assert_eq!(got.net, "0.030000");
+        assert!((got.apr - 15.799).abs() < 0.01, "got {}", got.apr);
+        assert_eq!(got.size, 20);
+
+        // Where the band ENDS at this horizon: 4c clears the 10%/yr bar, 3c
+        // does not. Nothing here is switched off, it is priced.
+        let four = books("0.02", "0.03", "20", "0.07", "20", "0.09");
+        assert!(detect(&mut cx, &r, &four, "2026-07-28", 10.0088, 50, 0, 20).is_ok());
+        let three = books("0.02", "0.03", "20", "0.06", "20", "0.09");
+        assert!(matches!(
+            detect(&mut cx, &r, &three, "2026-07-28", 10.0088, 50, 0, 20),
+            Err(Skip::BelowBar { .. })
+        ));
+    }
+
+    /// Kalshi ceils its fee to the cent PER ORDER, so the per-contract fee is
+    /// not linear in the clip and is not even monotone in it — what matters is
+    /// where the ceiling lands. At Kalshi ask 0.47:
+    ///   clip  5: ceil(0.07*5*0.47*0.53)  = 0.09 -> 0.0180/ct
+    ///   clip 20: ceil(0.07*20*0.47*0.53) = 0.35 -> 0.0175/ct
+    ///   clip 50: ceil(0.07*50*0.47*0.53) = 0.88 -> 0.0176/ct  <- worse than 20
+    /// PM-US does not ceil, so its 0.014946/ct is the same at every clip.
+    ///
+    /// A per-contract figure assumed linear would have charged all three the
+    /// same, which is why the fee is computed after the clip is known.
+    #[test]
+    fn the_kalshi_ceiling_prices_each_clip_separately() {
+        let mut cx = Cx::default();
+        let r = rel("xvus-fedcut-26-usfed-2026-cut");
+        // 6c edge so every clip clears and a Candidate exists to inspect
+        let b = books("0.46", "0.47", "500", "0.53", "500", "0.54");
+        let f = |cx: &mut Cx, clip: i64| {
+            let got = detect(cx, &r, &b, "2026-12-15", 10.0, 50, 0, clip)
+                .unwrap_or_else(|e| panic!("clip {clip} should fire, got {e:?}"));
+            assert_eq!(got.size, clip);
+            got.fee
+        };
+        assert_eq!(f(&mut cx, 5), "0.032946", "0.0180 + 0.014946");
+        assert_eq!(f(&mut cx, 20), "0.032446", "0.0175 + 0.014946");
+        assert_eq!(f(&mut cx, 50), "0.032546", "0.0176 + 0.014946 — dearer than clip 20");
     }
 
     #[test]
