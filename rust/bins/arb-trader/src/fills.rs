@@ -196,3 +196,190 @@ mod tests {
         }
     }
 }
+
+// ------------------------------------------------------------------ Kalshi ---
+
+const KALSHI_WS: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
+const KALSHI_WS_PATH: &str = "/trade-api/ws/v2";
+
+/// Kalshi's `fill` channel differs from PM-US's in two ways that matter:
+///
+///  1. `count_fp` is a per-fill DELTA, not a cumulative total. The engine's
+///     contract is CUMULATIVE, so this accumulates.
+///  2. The payload carries no `client_order_id`, only Kalshi's own `order_id` —
+///     so the engine's venue-id mapping is load-bearing here, not optional.
+///
+/// Accumulating is only safe if it is idempotent, which is what `trade_id` is
+/// for: a reconnect that replays fills, or a duplicate frame, must not hedge
+/// the same fill twice. Dedupe first, then accumulate.
+#[derive(Default)]
+pub struct KalshiFills {
+    seen: std::collections::HashSet<String>,
+    cum: std::collections::HashMap<String, i64>,
+}
+
+impl KalshiFills {
+    pub fn line(&mut self, raw: &str) -> Option<String> {
+        let v: Value = serde_json::from_str(raw).ok()?;
+        if v.get("type").and_then(|t| t.as_str())? != "fill" {
+            return None;
+        }
+        let msg = v.get("msg")?;
+        let order_id = msg.get("order_id").and_then(|x| x.as_str())?;
+        let trade_id = msg.get("trade_id").and_then(|x| x.as_str())?;
+        if !self.seen.insert(trade_id.to_string()) {
+            return None; // already counted — never hedge a fill twice
+        }
+        // count_fp is a fixed-point STRING ("2.00" == 2 contracts).
+        let n = msg
+            .get("count_fp")
+            .and_then(|x| x.as_str())
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|f| f as i64)
+            .unwrap_or(0);
+        if n <= 0 {
+            return None;
+        }
+        let entry = self.cum.entry(order_id.to_string()).or_insert(0);
+        *entry += n;
+        let cum = *entry;
+        let market = msg.get("market_ticker").and_then(|x| x.as_str()).unwrap_or_default();
+        Some(
+            serde_json::json!({
+                "kind": "fill",
+                "venue": "kalshi",
+                "market_id": market,
+                "order_id": order_id,
+                "cum": cum,
+                "ts_local_ns": now_ns(),
+            })
+            .to_string(),
+        )
+    }
+}
+
+pub async fn kalshi_fill_feed(key_id: String, pem: String, tx: Sender<FeedMsg>) {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message;
+
+    // State lives ACROSS reconnects: a reconnect replays fills, and the dedupe
+    // is what stops that becoming a double hedge.
+    let mut state = KalshiFills::default();
+
+    loop {
+        let attempt = async {
+            let signer = arb_venue::KalshiSigner::from_pkcs8_pem(key_id.clone(), &pem)
+                .map_err(|e| format!("signer: {e}"))?;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis().to_string())
+                .unwrap_or_default();
+            let mut req = KALSHI_WS.into_client_request().map_err(|e| e.to_string())?;
+            for (k, v) in signer.headers(&ts, "GET", KALSHI_WS_PATH) {
+                req.headers_mut()
+                    .insert(k, v.parse().map_err(|_| format!("bad header {k}"))?);
+            }
+            let (mut ws, _) = tokio_tungstenite::connect_async(req)
+                .await
+                .map_err(|e| format!("connect: {e}"))?;
+            // No market filter: we want every fill on this account, including
+            // one on an order this process did not place.
+            ws.send(Message::Text(
+                serde_json::json!({"id": 1, "cmd": "subscribe",
+                                   "params": {"channels": ["fill"]}})
+                .to_string()
+                .into(),
+            ))
+            .await
+            .map_err(|e| format!("subscribe: {e}"))?;
+            eprintln!("[fills] kalshi fill channel connected");
+
+            while let Some(frame) = ws.next().await {
+                let msg = frame.map_err(|e| format!("read: {e}"))?;
+                let Message::Text(raw) = msg else { continue };
+                if let Some(line) = state.line(&raw) {
+                    eprintln!("[fills] {line}");
+                    if tx.send(FeedMsg { line, t_read: Instant::now() }).await.is_err() {
+                        return Ok::<(), String>(());
+                    }
+                }
+            }
+            Err("stream ended".to_string())
+        };
+
+        match attempt.await {
+            Ok(()) => return,
+            Err(e) => eprintln!("[fills] kalshi dropped ({e}); reconnecting in 2s"),
+        }
+        if tx.is_closed() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+#[cfg(test)]
+mod kalshi_tests {
+    use super::*;
+
+    fn frame(trade: &str, order: &str, count: &str) -> String {
+        format!(
+            r#"{{"type":"fill","sid":1,"msg":{{"trade_id":"{trade}","order_id":"{order}",
+               "market_ticker":"KXTEST","is_taker":false,"side":"yes","action":"buy",
+               "count_fp":"{count}","yes_price_dollars":"0.42"}}}}"#
+        )
+    }
+
+    /// Kalshi sends DELTAS; the engine's contract is cumulative.
+    #[test]
+    fn deltas_accumulate_into_a_cumulative_count() {
+        let mut s = KalshiFills::default();
+        let a: Value = serde_json::from_str(&s.line(&frame("t1", "o1", "2.00")).unwrap()).unwrap();
+        let b: Value = serde_json::from_str(&s.line(&frame("t2", "o1", "3.00")).unwrap()).unwrap();
+        assert_eq!(a["cum"], 2, "first fill");
+        assert_eq!(b["cum"], 5, "2 + 3, not 3");
+        assert_eq!(b["venue"], "kalshi");
+        assert_eq!(b["order_id"], "o1", "Kalshi's id — no client_order_id in this payload");
+        assert_eq!(b["market_id"], "KXTEST");
+    }
+
+    /// THE reason accumulation is safe: a reconnect replays fills, and hedging
+    /// the same trade twice would open a naked leg.
+    #[test]
+    fn a_replayed_trade_id_is_ignored() {
+        let mut s = KalshiFills::default();
+        assert!(s.line(&frame("t1", "o1", "2.00")).is_some());
+        assert!(s.line(&frame("t1", "o1", "2.00")).is_none(), "same trade_id twice");
+        let c: Value = serde_json::from_str(&s.line(&frame("t2", "o1", "1.00")).unwrap()).unwrap();
+        assert_eq!(c["cum"], 3, "the duplicate must not have counted");
+    }
+
+    /// Orders accumulate independently.
+    #[test]
+    fn each_order_has_its_own_running_total() {
+        let mut s = KalshiFills::default();
+        s.line(&frame("t1", "o1", "4.00"));
+        let b: Value = serde_json::from_str(&s.line(&frame("t2", "o2", "1.00")).unwrap()).unwrap();
+        assert_eq!(b["cum"], 1, "o2 starts at its own zero");
+    }
+
+    #[test]
+    fn non_fill_frames_are_ignored() {
+        let mut s = KalshiFills::default();
+        for raw in [
+            r#"{"type":"subscribed","sid":1}"#,
+            r#"{"type":"orderbook_delta","msg":{}}"#,
+            r#"{"type":"error","msg":{"code":6}}"#,
+            "{}",
+            "not json",
+        ] {
+            assert!(s.line(raw).is_none(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_zero_count_is_not_a_fill() {
+        let mut s = KalshiFills::default();
+        assert!(s.line(&frame("t1", "o1", "0.00")).is_none());
+    }
+}

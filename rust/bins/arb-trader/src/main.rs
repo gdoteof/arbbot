@@ -267,11 +267,20 @@ fn order_preconditions(
     if let Err(e) = ledger::read(&args.ledger) {
         missing.push(format!("trade ledger unreadable, so exposure is unknown: {e}"));
     }
-    // PM-US pushes fills over its private WS. Kalshi has no such feed here yet
-    // (Python polled REST for it), so a Kalshi maker fill would not be seen and
-    // its hedge would never fire.
+    // Both venues now push fills over their private WS channels (src/fills.rs).
+    // Credentials are checked below when the sinks are built; a fill feed that
+    // cannot authenticate is the same failure as an order path that cannot.
+    //
+    // What is NOT solved: the engine starts with no idea what is already
+    // RESTING at the venue. Arming without reconciling would quote on top of
+    // orders a previous run left behind — double exposure on the same market,
+    // and the older order is one this process cannot cancel because it never
+    // learned its id. `VenueGateway::resting_order_ids` is the primitive; the
+    // decision (adopt them, or sweep them at startup) is Geoff's, because
+    // either answer touches live orders.
     missing.push(
-        "no Kalshi fill feed: a Kalshi maker fill would go unhedged (PM-US has one)"
+        "startup reconciliation: the engine does not know what is already resting \
+         at the venue (see VenueGateway::resting_order_ids)"
             .into(),
     );
 
@@ -494,6 +503,25 @@ async fn main() {
             (a, b) => {
                 eprintln!(
                     "[fills] cannot start polymarket_us fill feed: {}",
+                    a.err().or(b.err()).unwrap_or_default()
+                );
+            }
+        }
+
+        let ksfx = args.cred_suffix.iter().find(|(k, _)| k == "kalshi").map(|(_, v)| v.clone());
+        let (kid_n, pem_n) = match &ksfx {
+            Some(x) => (format!("kalshi_{x}_api_key_id"), format!("kalshi_{x}_private_key.pem")),
+            None => ("kalshi_api_key_id".into(), "kalshi_private_key.pem".into()),
+        };
+        match (credential(&kid_n), credential(&pem_n)) {
+            (Ok(kid), Ok(pem)) => {
+                if let Some(t) = tx_acks.clone() {
+                    tokio::spawn(fills::kalshi_fill_feed(kid, pem, t));
+                }
+            }
+            (a, b) => {
+                eprintln!(
+                    "[fills] cannot start kalshi fill feed: {}",
                     a.err().or(b.err()).unwrap_or_default()
                 );
             }
