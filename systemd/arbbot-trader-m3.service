@@ -45,7 +45,7 @@ ExecStart=%h/claude/arbbot/rust/target/release/arb-trader \
     --out data/trader-rs/m3-intents.jsonl \
     --cred-suffix pmus=rs_trader \
     --balance kalshi=340.09 \
-    --balance polymarket_us=329.30 \
+    --balance polymarket_us=349.42 \
     --stats-every 60 \
     --enable-orders
 Restart=no

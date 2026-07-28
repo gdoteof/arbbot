@@ -18,6 +18,13 @@
 # --balance is what the risk gate spends: a venue omitted here reads as $0 cash
 # and every order on it is refused. Update when the real balances move.
 #
+# These are HAND-ENTERED and go stale silently — on 2026-07-28 the PM-US figure
+# was $20.12 low, so the gate had been under-sizing that venue. Both venues DO
+# expose live cash (`arb-order --venue <v> --preflight-only` is a signed read:
+# Kalshi balance_dollars, PM-US buying_power), so an armed run should read them
+# at startup instead of trusting this line. The shadow can't — it holds no
+# credentials, which is why the flag exists at all.
+#
 # It subscribes to the PYTHON recorder's socket (data/arbbot.sock) — the Rust
 # shadow recorder is not running, and both speak the same line-JSON protocol,
 # which is what the P1 parity work established. Point --socket at
@@ -40,7 +47,7 @@ ExecStart=%h/claude/arbbot/rust/target/release/arb-trader \
     --tradable config/tradable.yaml \
     --health data/health.jsonl \
     --balance kalshi=340.09 \
-    --balance polymarket_us=329.30 \
+    --balance polymarket_us=349.42 \
     --out data/trader-rs/intents.jsonl \
     --stats-every 300
 Restart=always
