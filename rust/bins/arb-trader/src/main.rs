@@ -407,17 +407,39 @@ fn spawn_shutdown_sweep(sinks: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink
             match cancelled {
                 Ok(Ok(())) => {
                     // A 2xx is not proof, exactly as at startup: ask what is
-                    // still resting and say so plainly if anything is.
-                    let sk = s.clone();
-                    match tokio::task::spawn_blocking(move || sk.resting_order_ids()).await {
-                        Ok(Ok(ids)) if ids.is_empty() => {
-                            eprintln!("[exec] {venue:?}: book clean at exit")
+                    // still resting. And POLL for it — both venues' resting
+                    // lists lag a write, so a single immediate read reports
+                    // orders that are already gone. Observed 2026-07-28: a
+                    // one-shot read cried "STILL RESTING" for an order the
+                    // very next sweep found cancelled. A false orphan alarm is
+                    // not harmless; it is how a real one gets ignored.
+                    let mut left: Vec<String> = Vec::new();
+                    for i in 0..10 {
+                        if i > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
-                        Ok(Ok(ids)) => eprintln!(
+                        let sk = s.clone();
+                        match tokio::task::spawn_blocking(move || sk.resting_order_ids()).await {
+                            Ok(Ok(ids)) => {
+                                left = ids;
+                                if left.is_empty() {
+                                    break;
+                                }
+                            }
+                            _ => {
+                                eprintln!("[exec] {venue:?}: could not verify book at exit");
+                                left.clear();
+                                break;
+                            }
+                        }
+                    }
+                    if left.is_empty() {
+                        eprintln!("[exec] {venue:?}: book clean at exit");
+                    } else {
+                        eprintln!(
                             "[exec] {venue:?}: STILL RESTING at exit: {}",
-                            ids.join(",")
-                        ),
-                        _ => eprintln!("[exec] {venue:?}: could not verify book at exit"),
+                            left.join(",")
+                        );
                     }
                 }
                 Ok(Err(e)) => eprintln!("[exec] {venue:?}: cancel-all on exit FAILED: {e}"),
