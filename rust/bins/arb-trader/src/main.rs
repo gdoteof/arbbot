@@ -707,6 +707,11 @@ async fn main() {
             // Detection is free and unarmed; FIRING additionally requires the
             // order path, so take-take can never place from a dry run.
             detect_only: args.tt_detect_only || !armed,
+            // Armed, the gate must outlast place -> fill -> hedge -> book, or
+            // the same crossing re-fires before exposure catches up; the hedge
+            // alarm threshold is exactly that horizon. Unarmed it only keeps
+            // the log readable.
+            cooldown_s: if args.tt_detect_only || !armed { 5.0 } else { args.hedge_alarm_s },
         }),
     };
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;

@@ -141,6 +141,30 @@ pub fn blended_apr(marks_json: &str, today_iso: &str) -> Option<f64> {
     Some(prof / cost / wavg * 100.0)
 }
 
+/// Per-relationship re-fire gate.
+///
+/// A crossing is present on EVERY book event until someone takes it, and the
+/// concentration cap reads exposure that does not move until a fill books. So
+/// between placing leg 1 and booking it, an ungated detector would re-place
+/// the same crossing on every tick. This is the thing standing between "acts
+/// in milliseconds" and "sends a hundred orders in a second".
+#[derive(Default)]
+pub struct Gate {
+    until: std::collections::HashMap<String, f64>,
+}
+
+impl Gate {
+    /// `true` if this relationship may act now, which ALSO starts its
+    /// cooldown — callers must not ask unless they intend to act.
+    pub fn take(&mut self, rel_id: &str, now: f64, cooldown_s: f64) -> bool {
+        if now < self.until.get(rel_id).copied().unwrap_or(f64::MIN) {
+            return false;
+        }
+        self.until.insert(rel_id.to_string(), now + cooldown_s);
+        true
+    }
+}
+
 /// A crossing that clears the bar, sized and ready to fire.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
@@ -311,6 +335,22 @@ mod tests {
         assert_eq!(resolve_date("xvus-nobel-peace-26-elonmusk"), Some(("2026-10-09", true)));
         assert_eq!(resolve_date("xvus-fedcut-26-usfed-2026-cut"), Some(("2026-12-31", false)));
         assert_eq!(resolve_date("xvus-unknown-family-99"), None);
+    }
+
+    /// The guard that stops a standing crossing becoming an order storm.
+    #[test]
+    fn gate_blocks_refire_until_the_cooldown_expires() {
+        let mut g = Gate::default();
+        assert!(g.take("rel-a", 100.0, 60.0), "first sight must act");
+        // the same crossing, ten more book events in the same second
+        for i in 1..=10 {
+            assert!(!g.take("rel-a", 100.0 + i as f64 * 0.01, 60.0), "re-fire {i} must be gated");
+        }
+        // a DIFFERENT relationship is unaffected — the gate is per-rel
+        assert!(g.take("rel-b", 100.05, 60.0));
+        // still gated just before expiry, free exactly at it
+        assert!(!g.take("rel-a", 159.9, 60.0));
+        assert!(g.take("rel-a", 160.0, 60.0));
     }
 
     #[test]

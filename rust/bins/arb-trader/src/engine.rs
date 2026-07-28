@@ -14,7 +14,7 @@ use arb_core::book::{ApplyError, BookBuilder};
 use arb_core::fees::FeeSchedule;
 use arb_core::fill::{dropped_unconsumed, FillLedger, HedgeAnchor};
 use arb_core::model::{BookSide, Level, Venue};
-use arb_core::quoter::Quoter;
+use arb_core::quoter::{Quoter, RiskGate};
 use arb_core::scan::{Cx, Rel};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -22,16 +22,6 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-
-/// Wall clock as epoch seconds. Only ever called on the take-take path, which
-/// is off in bench/replay — those must stay byte-deterministic, and a clock
-/// read is exactly the kind of thing that would break that.
-fn wall_now_s() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
 
 pub struct RunCfg {
     pub out_path: Option<String>,
@@ -70,6 +60,16 @@ pub struct TakeTake {
     pub marks_path: String,
     /// Detect and log, place nothing. The shadow step before arming.
     pub detect_only: bool,
+    /// Seconds a relationship is barred from re-firing after it acts.
+    ///
+    /// This is NOT cosmetic. A crossing persists across every book event until
+    /// someone takes it, and `open_ct` — which the concentration cap reads —
+    /// does not move until the fill is BOOKED. Without this gate an armed
+    /// detector re-fires the same crossing on every tick in the window between
+    /// placing leg 1 and booking it, i.e. hundreds of times in a second. The
+    /// detect-only run on 2026-07-28 logged one fedcut crossing ~10x in
+    /// seconds, which is exactly that failure with the orders removed.
+    pub cooldown_s: f64,
 }
 
 #[derive(Clone)]
@@ -322,13 +322,19 @@ pub async fn run(
     // opportunities we DECLINED to take, which is the number worth watching
     // before arming the taker path.
     let mut n_tt: u64 = 0;
+    // Crossings the gate below refused to re-fire. A large number here is
+    // normal and healthy — it is the same standing crossing seen again.
+    let mut n_tt_gated: u64 = 0;
+    let mut n_tt_fired: u64 = 0;
+    let mut tt_gate = crate::taketake::Gate::default();
+    let mut next_tt_oid: u64 = 0;
     // The bar is re-derived from marks on the stats tick: it moves as the book
     // turns over, and a stale bar is a wrong bar in both directions.
     let mut tt_bar: f64 = crate::taketake::DEFAULT_BAR_APR;
     if let Some(tt) = cfg.take_take.as_ref() {
         tt_bar = std::fs::read_to_string(&tt.marks_path)
             .ok()
-            .and_then(|s| crate::taketake::blended_apr(&s, &crate::taketake::today_iso(wall_now_s())))
+            .and_then(|s| crate::taketake::blended_apr(&s, &crate::taketake::today_iso(wall_now())))
             .unwrap_or(crate::taketake::DEFAULT_BAR_APR);
         eprintln!(
             "[take-take] {} — bar {:.1}%/yr, cap {}ct/rel, clip {}",
@@ -516,6 +522,7 @@ pub async fn run(
                 "mode": if cfg.bench { "bench" } else { "shadow" },
                 "events": n_ev, "book_events": n_book, "intents": n_int,
                 "take_take_found": n_tt, "take_take_bar_apr": tt_bar,
+                "take_take_gated": n_tt_gated, "take_take_fired": n_tt_fired,
                 "killed": killed,
                 "feed_pulled": feed_reason.is_some(),
                 "risk_allowed": cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
@@ -759,40 +766,88 @@ pub async fn run(
                         if let Some(tt) = cfg.take_take.as_ref() {
                             let today = crate::taketake::today_iso(now);
                             for &qi in idxs {
-                                let rel = &quoters[qi].rel;
                                 let open = cfg
                                     .risk
                                     .as_ref()
-                                    .map(|r| r.open_ct(&rel.id))
+                                    .map(|r| r.open_ct(&quoters[qi].rel.id))
                                     .unwrap_or(0.0) as i64;
-                                if let Ok(c) = crate::taketake::detect(
+                                let found = crate::taketake::detect(
                                     &mut cx,
-                                    rel,
+                                    &quoters[qi].rel,
                                     &books,
                                     &today,
                                     tt_bar,
                                     tt.max_ct_per_rel,
                                     open,
                                     tt.max_clip,
-                                ) {
-                                    n_tt += 1;
-                                    eprintln!(
-                                        "[take-take] {} {} x{} edge={} net={} apr={:.0}%/yr (bar {:.0}%) \
-                                         — buy {} @{} / sell {} @{}{}",
-                                        if tt.detect_only { "FOUND" } else { "FIRE" },
-                                        c.rel_id,
-                                        c.size,
-                                        c.edge,
-                                        c.net,
-                                        c.apr,
-                                        tt_bar,
-                                        c.kalshi_market,
-                                        c.kalshi_ask,
-                                        c.pmus_market,
-                                        c.pmus_bid,
-                                        if tt.detect_only { " [DETECT ONLY — nothing sent]" } else { "" },
-                                    );
+                                );
+                                let Ok(c) = found else { continue };
+                                n_tt += 1;
+                                // The SAME crossing is present on every event
+                                // until someone takes it, and exposure does not
+                                // move until a fill books. Without this the
+                                // armed path would re-place it every tick.
+                                if !tt_gate.take(&c.rel_id, now, tt.cooldown_s) {
+                                    n_tt_gated += 1;
+                                    continue;
                                 }
+                                if tt.detect_only {
+                                    eprintln!(
+                                        "[take-take] FOUND {} x{} edge={} net={} apr={:.0}%/yr \
+                                         (bar {:.0}%) — buy {} @{} / sell {} @{} \
+                                         [DETECT ONLY — nothing sent]",
+                                        c.rel_id, c.size, c.edge, c.net, c.apr, tt_bar,
+                                        c.kalshi_market, c.kalshi_ask, c.pmus_market, c.pmus_bid,
+                                    );
+                                    continue;
+                                }
+                                // Capital caps, balances and topic budgets are
+                                // the maker path's gate too — take-take is a
+                                // different reason to trade, not a licence to
+                                // ignore how much is already committed.
+                                //
+                                // The risk gate's `opportunity_apr` overflow
+                                // (risk.rs:208) is deliberately NOT supplied:
+                                // it would let a great crossing exceed normal
+                                // caps, and not taking that allowance is the
+                                // conservative direction.
+                                if let Some(rv) = cfg.risk.as_ref() {
+                                    let v = rv.check(
+                                        &quoters[qi].rel,
+                                        Venue::PolymarketUs,
+                                        c.size,
+                                    );
+                                    if !v.allowed {
+                                        eprintln!(
+                                            "[take-take] REFUSED {} x{} apr={:.0}%/yr — {}",
+                                            c.rel_id, c.size, c.apr, v.reasons.join("; ")
+                                        );
+                                        continue;
+                                    }
+                                }
+                                // Leg 1 ONLY. It is the constrained leg, and
+                                // its fill mints the Kalshi hedge through the
+                                // same anchor path a maker fill uses — so leg 2
+                                // inherits retry, escalation, the naked alarm
+                                // and ledger booking rather than duplicating
+                                // them. `taker` makes it a marketable IOC.
+                                next_tt_oid += 1;
+                                n_tt_fired += 1;
+                                eprintln!(
+                                    "[take-take] FIRE {} x{} edge={} net={} apr={:.0}%/yr \
+                                     (bar {:.0}%) — sell {} @{} then buy {} @{}",
+                                    c.rel_id, c.size, c.edge, c.net, c.apr, tt_bar,
+                                    c.pmus_market, c.pmus_bid, c.kalshi_market, c.kalshi_ask,
+                                );
+                                intents.push(
+                                    json!({"place": c.pmus_market,
+                                           "order_id": format!("t{next_tt_oid}"),
+                                           "count": c.size, "side": "ask",
+                                           "price": c.pmus_bid, "venue": "polymarket_us",
+                                           "tag": "take-take", "taker": true, "ts": now})
+                                    .to_string(),
+                                );
+                                drain_intents!(Some(&quoters[qi].rel));
                             }
                         }
                     }
@@ -938,7 +993,7 @@ pub async fn run(
                     tt_bar = std::fs::read_to_string(&tt.marks_path)
                         .ok()
                         .and_then(|s| crate::taketake::blended_apr(
-                            &s, &crate::taketake::today_iso(wall_now_s())))
+                            &s, &crate::taketake::today_iso(wall_now())))
                         .unwrap_or(crate::taketake::DEFAULT_BAR_APR);
                 }
             }
@@ -953,6 +1008,60 @@ pub async fn run(
         s["sha256"] = serde_json::json!(format!("{:x}", digest.finalize()));
     }
     s
+}
+
+#[cfg(test)]
+mod take_take_wiring_tests {
+    use super::*;
+    use arb_core::scan::{RelLeg, RelType};
+
+    /// The whole take-take execution design rests on ONE assumption: that a
+    /// leg-1 sell on PM-US derives a hedge anchor pointing at the Kalshi leg's
+    /// ASK — i.e. leg 2 BUYS Kalshi, completing the K->PM basket.
+    ///
+    /// `detect_only` is forced on whenever the order path is unarmed, so the
+    /// fire path cannot be exercised end-to-end without real money. This pins
+    /// the assumption directly instead.
+    #[test]
+    fn leg1_sell_on_pmus_anchors_a_kalshi_buy() {
+        let rel = Rel {
+            id: "xvus-nobel-peace-26-elonmusk".into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: "K".into() },
+                RelLeg { venue: Venue::PolymarketUs, market_id: "P".into() },
+            ],
+        };
+        let mut books = BookBuilder::new();
+        books.apply_snapshot(
+            Venue::Kalshi,
+            "K",
+            vec![Level { price: "0.03".into(), size: "50".into() }],
+            vec![Level { price: "0.04".into(), size: "50".into() }],
+            1,
+            0,
+            None,
+        );
+        books.apply_snapshot(
+            Venue::PolymarketUs,
+            "P",
+            vec![Level { price: "0.08".into(), size: "50".into() }],
+            vec![Level { price: "0.09".into(), size: "50".into() }],
+            1,
+            0,
+            None,
+        );
+        // leg 1 is an ASK-side order on the PM-US market (we sell PM YES)
+        let a = hedge_anchor(&rel, "P", "ask", &books, 1.0).expect("anchor on the other leg");
+        assert_eq!(a.venue, "kalshi", "hedge must be the OTHER leg");
+        assert_eq!(a.market_id, "K");
+        assert_eq!(a.side, "ask", "we take Kalshi's ask, i.e. we BUY");
+        assert_eq!(a.price, "0.04", "at the Kalshi ask the crossing was priced against");
+        // and the engine turns an 'ask' anchor into a bid-side (buy) order
+        let order_side = if a.side == "bid" { "ask" } else { "bid" };
+        assert_eq!(order_side, "bid", "leg 2 must BUY Kalshi");
+    }
 }
 
 #[cfg(test)]
