@@ -186,6 +186,8 @@ pub async fn run(
     // only, but exposure is booked per relationship, so the mapping is captured
     // at place time when the rel is in hand.
     let mut order_rel: HashMap<String, (String, &'static str)> = HashMap::new();
+    // venue's order id -> ours, learned from order_ack.
+    let mut venue_oid: HashMap<String, String> = HashMap::new();
     let (mut n_ack, mut n_fill, mut n_hedge) = (0u64, 0u64, 0u64);
     let t_start = std::time::Instant::now();
     let mut wal = cfg.wal_path.as_deref().map(Wal::spawn);
@@ -398,18 +400,36 @@ pub async fn run(
                     // intent). Unknown kinds keep being skipped.
                     "order_ack" => {
                         // The ledger already registered the order at place
-                        // time (ids are ours), so an ack is observation only:
-                        // no state change, no intent, digest-invisible.
+                        // time (ids are ours), so an ack changes no decision
+                        // state and emits no intent: digest-invisible.
+                        //
+                        // It carries ONE thing the engine cannot know
+                        // otherwise: the venue's id for our order. Fills arrive
+                        // under that id, so without this mapping a fill on a
+                        // live order would match nothing and the hedge would
+                        // never fire.
+                        if let (Some(ours), Some(theirs)) = (
+                            v.get("order_id").and_then(|x| x.as_str()),
+                            v.get("venue_order_id").and_then(|x| x.as_str()),
+                        ) {
+                            venue_oid.insert(theirs.to_string(), ours.to_string());
+                        }
                         n_ack += 1;
                         last_now = ts_local_ns as f64 / 1e9;
                         decision.record(m.t_read.elapsed().as_nanos() as u64);
                         continue;
                     }
                     "fill" => {
-                        let (Some(oid), Some(cum)) = (
+                        let (Some(reported), Some(cum)) = (
                             v.get("order_id").and_then(|x| x.as_str()),
                             v.get("cum").and_then(|x| x.as_i64()),
                         ) else { continue };
+                        // A venue reports its own id; the ledger knows ours.
+                        // Fall through to the reported id when it is already
+                        // ours (the dry-run/replay case, and the poll path
+                        // which looks orders up by our id).
+                        let oid: &str =
+                            venue_oid.get(reported).map(|s| s.as_str()).unwrap_or(reported);
                         n_fill += 1;
                         let now = ts_local_ns as f64 / 1e9;
                         last_now = now;

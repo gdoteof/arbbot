@@ -175,11 +175,13 @@ dependencies = [
  "arb-core",
  "arb-registry",
  "arb-venue",
+ "futures-util",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

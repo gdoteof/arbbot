@@ -19,6 +19,13 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
 /// The effect, carrying the ORDER — not just its shape.
 ///
 /// This used to be a bare `Place`/`Cancel` with no market, price, quantity or
@@ -47,9 +54,13 @@ pub struct ExecStats {
     pub failed: AtomicU64,
 }
 
+/// `acks` is the SAME channel the feed writes to. A venue reply is an event
+/// like any other: it enters the one ordered channel, so it lands in the WAL
+/// and replays with everything else.
 pub fn spawn_executors(
     rate_per_s: f64,
     mut sinks: HashMap<Venue, Arc<dyn OrderSink>>,
+    acks: Option<mpsc::Sender<crate::feed::FeedMsg>>,
 ) -> (HashMap<Venue, mpsc::Sender<ExecCmd>>, Arc<ExecStats>) {
     let stats = Arc::new(ExecStats {
         hop: Hist::new(),
@@ -62,6 +73,7 @@ pub fn spawn_executors(
     let mut txs = HashMap::new();
     for venue in [Venue::Kalshi, Venue::Polymarket, Venue::PolymarketUs] {
         let sink = sinks.remove(&venue);
+        let acks = acks.clone();
         let (tx, mut rx) = mpsc::channel::<ExecCmd>(1024);
         let st = stats.clone();
         tokio::spawn(async move {
@@ -92,17 +104,43 @@ pub fn spawn_executors(
                 // The gateways block; running one on this worker would stall
                 // every other task on it.
                 let st2 = st.clone();
+                // (our order id, market) for the ack: a fill arrives under the
+                // VENUE's id, and this is the only place both are in hand.
+                let ours = match &cmd.action {
+                    Action::Place(p) => Some((p.client_order_id.clone(), p.market.clone())),
+                    Action::Cancel(_) => None,
+                };
                 let res = tokio::task::spawn_blocking(move || match &cmd.action {
-                    Action::Place(p) => sink.place(p).map(|id| format!("placed {id}")),
-                    Action::Cancel(c) => {
-                        sink.cancel(c).map(|_| format!("cancelled {}", c.order_id))
-                    }
+                    Action::Place(p) => sink.place(p).map(Some),
+                    Action::Cancel(c) => sink.cancel(c).map(|_| None),
                 })
                 .await;
                 match res {
-                    Ok(Ok(what)) => {
+                    Ok(Ok(venue_oid)) => {
                         st2.sent.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("[exec] {venue:?} {what}");
+                        match (venue_oid, ours) {
+                            (Some(vid), Some((our_id, market))) => {
+                                eprintln!("[exec] {venue:?} placed {our_id} -> {vid}");
+                                if let Some(tx) = &acks {
+                                    let line = serde_json::json!({
+                                        "kind": "order_ack",
+                                        "venue": venue.as_str(),
+                                        "market_id": market,
+                                        "order_id": our_id,
+                                        "venue_order_id": vid,
+                                        "ts_local_ns": now_ns(),
+                                    })
+                                    .to_string();
+                                    let _ = tx
+                                        .send(crate::feed::FeedMsg {
+                                            line,
+                                            t_read: Instant::now(),
+                                        })
+                                        .await;
+                                }
+                            }
+                            _ => eprintln!("[exec] {venue:?} cancelled"),
+                        }
                     }
                     Ok(Err(e)) => {
                         st2.failed.fetch_add(1, Ordering::Relaxed);

@@ -25,6 +25,7 @@
 mod engine;
 mod exec;
 mod feed;
+mod fills;
 mod hist;
 mod ledger;
 mod risk;
@@ -266,10 +267,12 @@ fn order_preconditions(
     if let Err(e) = ledger::read(&args.ledger) {
         missing.push(format!("trade ledger unreadable, so exposure is unknown: {e}"));
     }
-    // Fills arrive as events but nothing produces them live yet, so a filled
-    // order would never be hedged or booked.
+    // PM-US pushes fills over its private WS. Kalshi has no such feed here yet
+    // (Python polled REST for it), so a Kalshi maker fill would not be seen and
+    // its hedge would never fire.
     missing.push(
-        "no live fill feed (private WS): a fill would go unhedged and unbooked".into(),
+        "no Kalshi fill feed: a Kalshi maker fill would go unhedged (PM-US has one)"
+            .into(),
     );
 
     if !missing.is_empty() {
@@ -439,6 +442,10 @@ async fn main() {
     );
 
     let (tx, rx) = tokio::sync::mpsc::channel::<feed::FeedMsg>(65536);
+    // An extra sender keeps the channel OPEN, so the engine would never see the
+    // feed's EOF — which in bench/replay means it never terminates. Only clone
+    // when there is genuinely something to send back (order acks and fills).
+    let tx_acks = args.enable_orders.then(|| tx.clone());
     if let Some(tape) = args.bench_tape.clone() {
         let (max, pace) = (args.max_events, args.pace_x);
         std::thread::spawn(move || feed::tape_feed(tape, max, pace, tx));
@@ -466,7 +473,34 @@ async fn main() {
     } else {
         HashMap::new()
     };
-    let (exec_txs, exec_stats) = exec::spawn_executors(rate, sinks);
+    // The fill feed runs whenever the order path does: a live order with no
+    // fill feed is an unhedged position waiting to happen.
+    if !sinks.is_empty() {
+        let sfx = args
+            .cred_suffix
+            .iter()
+            .find(|(k, _)| k == "pmus" || k == "polymarket_us")
+            .map(|(_, v)| v.clone());
+        let infix = sfx.map(|s| format!("_{s}")).unwrap_or_default();
+        match (
+            credential(&format!("polymarket_usa{infix}_key_id")),
+            credential(&format!("polymarket_usa{infix}_private_key")),
+        ) {
+            (Ok(kid), Ok(sec)) => {
+                if let Some(t) = tx_acks.clone() {
+                    tokio::spawn(fills::pmus_fill_feed(kid, sec, t));
+                }
+            }
+            (a, b) => {
+                eprintln!(
+                    "[fills] cannot start polymarket_us fill feed: {}",
+                    a.err().or(b.err()).unwrap_or_default()
+                );
+            }
+        }
+    }
+    let acks = if sinks.is_empty() { None } else { tx_acks.clone() };
+    let (exec_txs, exec_stats) = exec::spawn_executors(rate, sinks, acks);
     let cfg = engine::RunCfg {
         out_path: args.out,
         kill_file: args.kill_file,
