@@ -451,16 +451,6 @@ fn max_depth(cx: &mut Cx, ladder: &Ladder) -> D {
     total
 }
 
-fn is_crossed(cx: &mut Cx, book: &Book) -> bool {
-    match (book.bids.first(), book.asks.first()) {
-        (Some(b), Some(a)) => {
-            let (bp, ap) = (cx.parse_exact(&b.price), cx.parse_exact(&a.price));
-            cx.cmp(bp, ap) != Ordering::Less
-        }
-        _ => false,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn price_basket(
     cx: &mut Cx,
@@ -550,7 +540,7 @@ pub fn scan_relationship(
     let mut leg_books: Vec<&Book> = Vec::with_capacity(n);
     for leg in &rel.legs {
         match books.get(leg.venue, &leg.market_id) {
-            Some(b) if !is_crossed(cx, b) => leg_books.push(b),
+            Some(b) if !b.is_crossed() => leg_books.push(b),
             _ => return vec![], // unsynced or self-crossed: data quality
         }
     }
@@ -672,6 +662,54 @@ mod tests {
         assert_eq!(opps[0].canonical_line(&mut cx2), PY_LINE);
     }
 
+    fn fedcut_rel() -> Rel {
+        Rel {
+            id: "xvus-fedcut-26-usfed-2026-cut".into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: "KXRATECUT-26DEC31".into() },
+                RelLeg { venue: Venue::PolymarketUs, market_id: "cbpac-usfed-2026-cut".into() },
+            ],
+        }
+    }
+
+    /// audit C5: both maker pricing functions price entirely off the HEDGE
+    /// book, so a crossed hedge book makes the quote fiction. Same rule and
+    /// same position (before any arithmetic) as the take-take detector's guard
+    /// from 4542e5f.
+    ///
+    /// Numbers are the real KXRATECUT-26DEC31 book of 2026-07-28: a phantom ask
+    /// at 0.0730 under a 0.1770 bid. The control moves ONLY the bid, below the
+    /// same ask, so the single variable under test is the crossing itself.
+    #[test]
+    fn no_maker_quote_off_a_crossed_hedge_book() {
+        let rel = fedcut_rel();
+        let metas = |_l: &RelLeg| MarketMeta::default_for_golden(&mut Cx::default());
+        let quote = |bids: Vec<Level>, asks: Vec<Level>| {
+            let mut cx = Cx::default();
+            let fees = FeeSchedule::new(&mut cx);
+            let mut bb = BookBuilder::new();
+            bb.apply_snapshot(Venue::Kalshi, "KXRATECUT-26DEC31", bids, asks, 1, 1, None);
+            let clip = cx.from_i64(5);
+            // maker leg 1 (PM-US), hedge leg 0 (Kalshi)
+            let bid_q = maker_quote(&mut cx, &fees, &rel, 1, &bb, &metas, clip);
+            let ask_q = maker_ask_quote(&mut cx, &fees, &rel, 1, &bb, &metas, clip);
+            (bid_q.is_some(), ask_q.is_some())
+        };
+
+        let crossed = vec![lvl("0.1770", "305")];
+        let locked = vec![lvl("0.0730", "305")];
+        let sane = vec![lvl("0.0720", "305")];
+        let asks = vec![lvl("0.0730", "26")];
+
+        assert_eq!(quote(crossed, asks.clone()), (false, false), "crossed book priced a quote");
+        assert_eq!(quote(locked, asks.clone()), (false, false), "locked book priced a quote");
+        // the control: same ask, bid one tick BELOW it. Both sides must still
+        // price, or the guard has switched the maker off rather than gated it.
+        assert_eq!(quote(sane, asks), (true, true), "the guard silenced a sane book");
+    }
+
     #[test]
     fn feasible_states_match_python() {
         assert_eq!(feasible_states(RelType::CrossVenueEquivalent, 2),
@@ -712,6 +750,12 @@ pub fn maker_quote(
     let hedge_index = 1 - maker_leg_index;
     let (maker_leg, hedge_leg) = (&rel.legs[maker_leg_index], &rel.legs[hedge_index]);
     let hedge_book = books.get(hedge_leg.venue, &hedge_leg.market_id)?;
+    // Sanity BEFORE arithmetic, same rule and same place as the take-take
+    // detector (4542e5f): this whole quote is priced off the hedge book, so a
+    // crossed hedge book makes the quote fiction. `Book::crossing` says why.
+    if hedge_book.is_crossed() {
+        return None;
+    }
     let bids = parse_ladder(cx, &hedge_book.bids);
     let ladder = no_ask_ladder(cx, &bids);
     let hedge_cost = walk_cost(cx, &ladder, hedge_size)?;
@@ -769,6 +813,11 @@ pub fn maker_ask_quote(
     let hedge_index = 1 - maker_leg_index;
     let (maker_leg, hedge_leg) = (&rel.legs[maker_leg_index], &rel.legs[hedge_index]);
     let hedge_book = books.get(hedge_leg.venue, &hedge_leg.market_id)?;
+    // The C5 exposure verbatim: this walks the hedge ASK ladder, whose first
+    // level is the phantom on a crossed book. Refuse before any arithmetic.
+    if hedge_book.is_crossed() {
+        return None;
+    }
     let ladder = parse_ladder(cx, &hedge_book.asks);
     let hedge_cost = walk_cost(cx, &ladder, hedge_size)?;
     let hedge_vwap = cx.div(hedge_cost, hedge_size);

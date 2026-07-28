@@ -49,6 +49,28 @@ pub fn dropped_unconsumed() -> u64 {
     DROPPED_UNCONSUMED.load(Ordering::Relaxed)
 }
 
+/// The outcome of one fill report — the three cases a caller MUST tell apart.
+///
+/// This used to be `Option<HedgeObligation>`, which collapsed two of them:
+/// "already hedged, nothing to do" and "this fill belongs to no order we have
+/// ever heard of" were both `None`. The doc on `observe_cum_fill` promised the
+/// caller alarms on the second; it had no way to. The engine therefore counted
+/// a foreign fill and dropped it — real money moving in our account with no
+/// record, no hedge and no alarm (audit 2026-07-28), while the Kalshi fill
+/// channel subscribes account-wide *on purpose*, so foreign ids are expected
+/// rather than impossible.
+#[must_use = "an unattributed fill is money that moved in our account — handle every arm"]
+pub enum FillOutcome {
+    /// The cumulative count INCREASED: hedge this delta.
+    Minted(HedgeObligation),
+    /// A duplicate, stale or replayed report for an order we know. Idempotent
+    /// by construction — nothing to do.
+    Seen,
+    /// No order with this id was ever registered here. The caller has to decide
+    /// what it means; it must not decide nothing.
+    Unknown,
+}
+
 /// An unhedged fill. Cannot be cloned, cannot be constructed outside
 /// `FillLedger`, and must be consumed (`into_parts`) by exactly one hedger.
 #[must_use = "an unconsumed HedgeObligation is an exposed leg — hedge it or it alarms on drop"]
@@ -136,18 +158,22 @@ impl FillLedger {
     }
 
     /// The single funnel for both fill paths. Cumulative semantics:
-    /// duplicate or stale reports (cum <= seen) return None; an increase
-    /// mints exactly one obligation for the delta, clamped to resting size.
-    /// Unknown order ids return None (caller alarms — foreign fill).
-    pub fn observe_cum_fill(&mut self, order_id: &str, cum: i64) -> Option<HedgeObligation> {
-        let rec = self.orders.get_mut(order_id)?;
+    /// duplicate or stale reports (cum <= seen) are `Seen`; an increase mints
+    /// exactly one obligation for the delta, clamped to resting size. An id
+    /// this ledger never registered is `Unknown` — a distinct answer, so the
+    /// caller can alarm on a foreign fill instead of confusing it with one it
+    /// has already hedged.
+    pub fn observe_cum_fill(&mut self, order_id: &str, cum: i64) -> FillOutcome {
+        let Some(rec) = self.orders.get_mut(order_id) else {
+            return FillOutcome::Unknown;
+        };
         let cum = cum.min(rec.resting); // venue over-report clamps
         if cum <= rec.cum_filled {
-            return None; // duplicate / out-of-order — idempotent by construction
+            return FillOutcome::Seen; // duplicate / out-of-order — idempotent
         }
         let delta = cum - rec.cum_filled;
         rec.cum_filled = cum;
-        Some(HedgeObligation {
+        FillOutcome::Minted(HedgeObligation {
             order_id: order_id.to_owned(),
             market_id: rec.market_key.clone(),
             qty: delta,
@@ -168,6 +194,20 @@ impl FillLedger {
 mod tests {
     use super::*;
 
+    /// The obligation an increase minted. Panics on the other arms, which is
+    /// what a test asserting a mint wants.
+    fn mint(o: FillOutcome) -> HedgeObligation {
+        match o {
+            FillOutcome::Minted(ob) => ob,
+            FillOutcome::Seen => panic!("expected a mint, got Seen"),
+            FillOutcome::Unknown => panic!("expected a mint, got Unknown"),
+        }
+    }
+
+    fn is_seen(o: FillOutcome) -> bool {
+        matches!(o, FillOutcome::Seen)
+    }
+
     fn anchor() -> HedgeAnchor {
         HedgeAnchor {
             venue: "polymarket_us",
@@ -184,10 +224,10 @@ mod tests {
         // exactly one obligation, for 3.
         let mut fl = FillLedger::new();
         fl.register_order("k1", "mkt", 5, Some(anchor()));
-        let ob = fl.observe_cum_fill("k1", 3).expect("first report mints");
+        let ob = mint(fl.observe_cum_fill("k1", 3));
         assert_eq!(ob.qty(), 3);
         assert_eq!(ob.market_id(), "mkt");
-        assert!(fl.observe_cum_fill("k1", 3).is_none(), "duplicate is a no-op");
+        assert!(is_seen(fl.observe_cum_fill("k1", 3)), "duplicate is a no-op");
         let _ = ob.into_parts();
     }
 
@@ -195,18 +235,18 @@ mod tests {
     fn out_of_order_report_is_a_noop() {
         let mut fl = FillLedger::new();
         fl.register_order("k1", "mkt", 5, None);
-        fl.observe_cum_fill("k1", 4).expect("mint").into_parts();
-        assert!(fl.observe_cum_fill("k1", 2).is_none(), "stale cum ignored");
+        mint(fl.observe_cum_fill("k1", 4)).into_parts();
+        assert!(is_seen(fl.observe_cum_fill("k1", 2)), "stale cum ignored");
     }
 
     #[test]
     fn increasing_cum_mints_deltas() {
         let mut fl = FillLedger::new();
         fl.register_order("k1", "mkt", 10, Some(anchor()));
-        let a = fl.observe_cum_fill("k1", 2).expect("mint 2");
+        let a = mint(fl.observe_cum_fill("k1", 2));
         assert_eq!(a.qty(), 2);
         a.into_parts();
-        let b = fl.observe_cum_fill("k1", 7).expect("mint 5 more");
+        let b = mint(fl.observe_cum_fill("k1", 7));
         assert_eq!(b.qty(), 5);
         assert_eq!(b.anchor().expect("anchor carried").price, "0.41");
         b.into_parts();
@@ -216,16 +256,30 @@ mod tests {
     fn overfill_clamps_to_resting() {
         let mut fl = FillLedger::new();
         fl.register_order("k1", "mkt", 5, None);
-        let ob = fl.observe_cum_fill("k1", 9).expect("mint");
+        let ob = mint(fl.observe_cum_fill("k1", 9));
         assert_eq!(ob.qty(), 5, "venue over-report clamped to resting size");
         ob.into_parts();
-        assert!(fl.observe_cum_fill("k1", 9).is_none());
+        assert!(is_seen(fl.observe_cum_fill("k1", 9)));
     }
 
+    /// A fill for an id this ledger never registered is UNKNOWN, and that is a
+    /// different answer from "already hedged". Collapsing the two into `None`
+    /// is why a foreign fill — or our own order's fill after its `order_ack`
+    /// was lost — was counted and then silently dropped.
     #[test]
-    fn unknown_order_id_is_none() {
+    fn an_unknown_order_id_is_distinguishable_from_an_already_hedged_one() {
         let mut fl = FillLedger::new();
-        assert!(fl.observe_cum_fill("ghost", 1).is_none());
+        assert!(matches!(fl.observe_cum_fill("ghost", 1), FillOutcome::Unknown));
+        fl.register_order("k1", "mkt", 5, None);
+        mint(fl.observe_cum_fill("k1", 5)).into_parts();
+        assert!(
+            matches!(fl.observe_cum_fill("k1", 5), FillOutcome::Seen),
+            "a known order we have already hedged must NOT read as foreign"
+        );
+        assert!(
+            matches!(fl.observe_cum_fill("ghost", 1), FillOutcome::Unknown),
+            "and a foreign id must NOT read as already hedged"
+        );
     }
 
     #[test]
@@ -233,7 +287,7 @@ mod tests {
         let mut fl = FillLedger::new();
         fl.register_order("k1", "mkt", 5, Some(anchor()));
         fl.observe_cancel("k1");
-        let ob = fl.observe_cum_fill("k1", 2).expect("racing fill still hedges");
+        let ob = mint(fl.observe_cum_fill("k1", 2));
         assert_eq!(ob.qty(), 2);
         ob.into_parts();
     }
@@ -244,12 +298,16 @@ mod tests {
         fl.register_order("k1", "mkt", 5, None);
         fl.register_order("k2", "mkt", 5, None);
         let before = dropped_unconsumed();
-        let consumed = fl.observe_cum_fill("k1", 1).expect("mint");
+        let consumed = mint(fl.observe_cum_fill("k1", 1));
         consumed.into_parts(); // hedged — no alarm
         assert_eq!(dropped_unconsumed(), before);
-        let leaked = fl.observe_cum_fill("k2", 1).expect("mint");
-        drop(leaked); // NOT hedged — the counter must catch it
-        assert_eq!(dropped_unconsumed(), before + 1);
+        let leaked = fl.observe_cum_fill("k2", 1);
+        drop(leaked); // NOT hedged — the counter must catch it, enum and all
+        assert_eq!(
+            dropped_unconsumed(),
+            before + 1,
+            "wrapping the obligation in FillOutcome must not weaken the Drop alarm"
+        );
     }
 
     #[test]
@@ -258,11 +316,14 @@ mod tests {
         fl.register_order("live", "mkt", 5, None);
         fl.register_order("done", "mkt", 5, None);
         fl.register_order("gone", "mkt", 5, None);
-        fl.observe_cum_fill("done", 5).expect("full fill").into_parts();
+        mint(fl.observe_cum_fill("done", 5)).into_parts();
         fl.observe_cancel("gone");
         fl.prune_settled();
-        assert!(fl.observe_cum_fill("live", 1).is_some());
-        assert!(fl.observe_cum_fill("done", 5).is_none());
-        assert!(fl.observe_cum_fill("gone", 1).is_none());
+        mint(fl.observe_cum_fill("live", 1)).into_parts();
+        // A pruned order is genuinely no longer known here, so a late report
+        // for one reads as foreign. That is why the engine's own hedge/fill
+        // accounting, not this ledger, is what keeps a late frame quiet.
+        assert!(matches!(fl.observe_cum_fill("done", 5), FillOutcome::Unknown));
+        assert!(matches!(fl.observe_cum_fill("gone", 1), FillOutcome::Unknown));
     }
 }
