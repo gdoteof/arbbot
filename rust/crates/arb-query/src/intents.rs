@@ -27,7 +27,15 @@ struct Raw {
     place: Option<String>,
     #[serde(default)]
     cancel: Option<String>,
-    order_id: String,
+    /// OPTIONAL, and this matters more than it looks. A `skip` intent carries
+    /// no order id, so a required field here made every skip line fail to
+    /// deserialize — and the failure `continue`s BEFORE `last_ts` is updated.
+    /// The dashboard therefore reported "NOT RUNNING" for an engine writing
+    /// every second, purely because it had been skipping rather than placing
+    /// (2026-07-28: 28 minutes of topic-budget skips read as a dead engine,
+    /// and ~365k of 374k lines were silently counted as parse failures).
+    #[serde(default)]
+    order_id: Option<String>,
     #[serde(default)]
     replaces: Option<String>,
     #[serde(default)]
@@ -107,10 +115,16 @@ pub fn fold(text: &str) -> IntentState {
             } else {
                 st.opens += 1;
             }
+            // A place without an id cannot be tracked, cancelled or matched
+            // to a fill. Count it and move on rather than inventing a key.
+            let Some(oid) = r.order_id.clone() else {
+                st.parse_failures += 1;
+                continue;
+            };
             live.insert(
-                r.order_id.clone(),
+                oid.clone(),
                 LiveOrder {
-                    order_id: r.order_id,
+                    order_id: oid,
                     venue: r.venue.unwrap_or_default(),
                     market,
                     side: r.side.unwrap_or_default(),
@@ -122,7 +136,9 @@ pub fn fold(text: &str) -> IntentState {
             );
         } else if r.cancel.is_some() {
             st.cancels += 1;
-            live.remove(&r.order_id);
+            if let Some(oid) = r.order_id.as_ref() {
+                live.remove(oid);
+            }
         }
     }
 
@@ -169,6 +185,26 @@ mod tests {
         assert_eq!(st.reprices, 2);
         assert_eq!(st.cancels, 1);
         assert_eq!(st.total, 5);
+    }
+
+    /// A skip intent has no `order_id`, and it MUST still advance `last_ts`.
+    /// When it did not, the dashboard called a busy engine "NOT RUNNING":
+    /// every line for 28 minutes was a topic-budget skip, so the last
+    /// recognised timestamp was half an hour old while the file grew every
+    /// second. ~365k of 374k lines were also being counted as parse failures.
+    #[test]
+    fn skip_intents_are_liveness_too() {
+        let text = concat!(
+            r#"{"place":"M","order_id":"m1","venue":"kalshi","side":"bid","price":"0.10","count":5,"ts":10.0}"#,
+            "\n",
+            r#"{"skip":["topic budget [x]: 1+5 > 5"],"ts":99.0}"#,
+            "\n",
+        );
+        let st = fold(text);
+        assert_eq!(st.last_ts, 99.0, "a skip is the engine speaking, not silence");
+        assert_eq!(st.parse_failures, 0, "a skip is a valid intent, not a broken line");
+        assert_eq!(st.total, 2);
+        assert_eq!(st.live.len(), 1, "and it must not disturb the resting book");
     }
 
     /// A cancel record carries no market, so the history must remember where
@@ -231,7 +267,8 @@ pub fn history_for(text: &str, markets: &[(String, String)]) -> Vec<Event> {
         let Ok(r) = serde_json::from_str::<Raw>(t) else { continue };
         let venue = r.venue.clone().unwrap_or_default();
         if let Some(market) = &r.place {
-            where_of.insert(r.order_id.clone(), (venue.clone(), market.clone()));
+            let Some(oid) = r.order_id.clone() else { continue };
+            where_of.insert(oid, (venue.clone(), market.clone()));
             if !want(&venue, market) {
                 continue;
             }
@@ -245,7 +282,8 @@ pub fn history_for(text: &str, markets: &[(String, String)]) -> Vec<Event> {
                 from_price: r.old_price.clone(),
             });
         } else if r.cancel.is_some() {
-            let Some((v, m)) = where_of.get(&r.order_id).cloned() else { continue };
+            let Some(oid) = r.order_id.as_ref() else { continue };
+            let Some((v, m)) = where_of.get(oid).cloned() else { continue };
             if !want(&v, &m) {
                 continue;
             }
