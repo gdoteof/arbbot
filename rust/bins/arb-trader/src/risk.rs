@@ -42,6 +42,9 @@ pub struct RiskView {
     /// `topics.yaml` that EXISTS and is damaged; the budgets are then $0, which
     /// refuses every order rather than granting every family unlimited room.
     topics_corrupt: Option<String>,
+    /// Why the bankroll and class cap cannot be trusted, when they cannot. Both
+    /// are then $0 — see `Caps::corrupt`.
+    caps_corrupt: Option<String>,
     /// venue -> available cash. Empty means the per-venue cash check sees $0
     /// and refuses everything, so this is REQUIRED for the gate to pass — an
     /// unconfigured balance fails closed, which is the right direction. BOTH of
@@ -61,6 +64,25 @@ pub struct RiskView {
     /// Counts, for the stats line. Rejections are not errors — a gate that
     /// never fires is a gate nobody can see working.
     pub checked: Mutex<(u64, u64)>, // (allowed, rejected)
+}
+
+/// What BOTH cap loaders in this file accept as a number.
+///
+/// They used to disagree: the topic loader took `60` or `"60"`, the exec loader
+/// took only `60` and silently kept its compiled-in default for `"60"` — so the
+/// same quoting, in the same format, in the same directory, meant "that is the
+/// cap" in one file and "your edit did nothing" in the other. Quoting is an
+/// editing accident, not a semantic.
+///
+/// A string that is not a number is not a number, in either file: the value is
+/// carried to `arb_core::risk` as a decimal STRING and parsed there under an
+/// `expect`, so `"none"` would panic the gate mid-run rather than refuse.
+fn num(v: Option<&serde_yaml::Value>) -> Option<String> {
+    let v = v?;
+    v.as_str()
+        .filter(|s| s.trim().parse::<f64>().is_ok())
+        .map(|s| s.to_string())
+        .or_else(|| v.as_f64().map(|f| f.to_string()))
 }
 
 /// The per-topic caps, or the reason they cannot be trusted.
@@ -129,10 +151,6 @@ fn topics_from_yaml(path: &str) -> Topics {
         // old code read as "no budgets configured".
         return Topics::corrupt(format!("{path} is not a mapping (empty or truncated?)"));
     }
-    let num = |v: Option<&serde_yaml::Value>| -> Option<String> {
-        let v = v?;
-        v.as_str().map(|s| s.to_string()).or_else(|| v.as_f64().map(|f| f.to_string()))
-    };
     let mut out = Vec::new();
     if let Some(t) = doc.get("topics") {
         let Some(list) = t.as_sequence() else {
@@ -183,6 +201,84 @@ fn topics_from_yaml(path: &str) -> Topics {
     }
 }
 
+/// The bankroll and the class cap, or the reason they cannot be trusted.
+struct Caps {
+    bankroll: String,
+    per_class: String,
+    corrupt: Option<String>,
+}
+
+impl Caps {
+    /// FAIL CLOSED, the same rule and the same reasoning as `Topics::corrupt`.
+    /// The bankroll becomes $0, and the class cap and the global cap are both
+    /// fractions of it (`bankroll * per_class_cap`, `bankroll * 0.50`), so every
+    /// order of nonzero size is refused.
+    ///
+    /// The engine still STARTS, and here that matters MORE than it does for
+    /// topics: `arm_venues` exits with code 9 the moment a precondition is
+    /// unmet, and it does so BEFORE `startup_sweep` runs. A cap file that
+    /// refused to arm would therefore leave the previous run's quotes resting on
+    /// the venue with nothing owning them — the exact 2026-07-28 orphan. A
+    /// process that runs and refuses cancels the book it inherited, answers the
+    /// kill switch, and sweeps on the way out.
+    fn corrupt(why: String) -> Caps {
+        eprintln!("[risk] CAPITAL CAPS UNUSABLE: {why}");
+        eprintln!(
+            "[risk] bankroll and per_class_cap are forced to $0 — the class and global caps \
+             are both fractions of the bankroll, so no order of nonzero size will pass the \
+             gate until config/exec.yaml is repaired (it IS tracked: `git checkout` it)"
+        );
+        Caps { bankroll: "0".to_string(), per_class: "0".to_string(), corrupt: Some(why) }
+    }
+}
+
+/// `config/exec.yaml` -> the bankroll and the class cap.
+///
+/// This used to be four `if let`s with no `else`, each falling back to a
+/// compiled-in `980` / `0.35`, and it is the OUTERMOST cap: the bankroll scales
+/// both the class cap and the global cap, and nothing sits behind it. Four
+/// distinct failures all read as "980 is what the file says":
+///   * the file cannot be read (permissions, EIO, wrong working directory),
+///   * it does not parse (a 4-line file caught mid-write),
+///   * a key is absent (`per_class_cap` is the LAST line — a tail truncation
+///     drops it and leaves valid YAML behind, exactly as it does in topics.yaml),
+///   * the value is not a YAML float — and `bankroll_usd: "500"` is an ordinary
+///     edit, not damage. See `num`.
+///
+/// `describe()` then printed a contented `bankroll $980 per_class 0.35`,
+/// indistinguishable from a good load, because it was numerically identical to
+/// one: the live file happens to hold exactly those two values, which is what
+/// kept this latent.
+///
+/// ABSENCE is damage here, unlike in `topics_from_yaml`. The distinction is not
+/// arbitrary: `topics.yaml` is gitignored and optional, and its absence NARROWS
+/// the rule set (the per-rel, class, global and per-venue cash caps all still
+/// apply). `exec.yaml` is tracked, so a correct checkout always has one, and its
+/// absence removes the only ceiling there is — leaving a transcription of a
+/// Python default in place of the file this module's header calls the one source
+/// of truth. The likeliest way to lose it is not deleting it but starting the
+/// process somewhere else; both systemd units set WorkingDirectory, and this is
+/// what says so out loud if one stops.
+fn caps_from_yaml(path: &str) -> Caps {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => return Caps::corrupt(format!("cannot read {path}: {e}")),
+    };
+    let doc = match serde_yaml::from_str::<serde_yaml::Value>(&text) {
+        Ok(d) => d,
+        Err(e) => return Caps::corrupt(format!("{path} does not parse: {e}")),
+    };
+    // An empty or truncated-to-nothing file parses as YAML null, on which
+    // `get` is None — so it lands here rather than needing its own arm.
+    let Some(bankroll) = num(doc.get("bankroll_usd")) else {
+        return Caps::corrupt(format!("{path} has no usable `bankroll_usd`"));
+    };
+    let Some(per_class) = num(doc.get("per_class_cap")) else {
+        return Caps::corrupt(format!("{path} has no usable `per_class_cap`"));
+    };
+    Caps { bankroll, per_class, corrupt: None }
+}
+
 impl RiskView {
     /// `balances` are venue->cash pairs. The dry-run engine has no credentials,
     /// so they arrive on the command line; once the engine reads them from the
@@ -193,25 +289,16 @@ impl RiskView {
         balances: Vec<(String, String)>,
         oracle_risk: HashMap<String, String>,
     ) -> RiskView {
-        let (mut bankroll, mut per_class) = ("980".to_string(), "0.35".to_string());
-        if let Ok(text) = std::fs::read_to_string(exec_yaml) {
-            if let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text) {
-                if let Some(b) = doc.get("bankroll_usd").and_then(|v| v.as_f64()) {
-                    bankroll = b.to_string();
-                }
-                if let Some(c) = doc.get("per_class_cap").and_then(|v| v.as_f64()) {
-                    per_class = c.to_string();
-                }
-            }
-        }
+        let c = caps_from_yaml(exec_yaml);
         let t = topics_from_yaml(topics_yaml);
         RiskView {
-            bankroll,
-            per_class_cap: per_class,
+            bankroll: c.bankroll,
+            per_class_cap: c.per_class,
             topics: t.list,
             default_topic_budget: t.default_budget,
             default_only_below_util: t.default_gate,
             topics_corrupt: t.corrupt,
+            caps_corrupt: c.corrupt,
             balances,
             oracle_risk,
             exposure: Mutex::new(Exposure::default()),
@@ -221,9 +308,11 @@ impl RiskView {
 
     pub fn describe(&self) -> String {
         format!(
-            "bankroll ${} per_class {} topics {} balances [{}]",
-            self.bankroll,
-            self.per_class_cap,
+            "{} topics {} balances [{}]",
+            match &self.caps_corrupt {
+                Some(why) => format!("CAPITAL CAPS UNUSABLE (bankroll $0): {why},"),
+                None => format!("bankroll ${} per_class {}", self.bankroll, self.per_class_cap),
+            },
             match &self.topics_corrupt {
                 Some(why) => format!("UNUSABLE (all budgets $0): {why}"),
                 None => self.topics.len().to_string(),
@@ -418,24 +507,51 @@ mod tests {
     }
 
     fn view_with_topics(topics: &str, balances: Vec<(&str, &str)>, oracle: &str) -> RiskView {
+        view_with_configs(&valid_exec(), topics, balances, oracle)
+    }
+
+    fn view_with_configs(
+        exec: &str,
+        topics: &str,
+        balances: Vec<(&str, &str)>,
+        oracle: &str,
+    ) -> RiskView {
         let mut o = HashMap::new();
         o.insert("r1".to_string(), oracle.to_string());
         RiskView::load(
-            "/nonexistent/exec.yaml", // falls back to the pinned defaults
+            exec,
             topics,
             balances.into_iter().map(|(a, b)| (a.to_string(), b.to_string())).collect(),
             o,
         )
     }
 
-    fn write_topics(tag: &str, body: &str) -> std::path::PathBuf {
+    fn write_cfg(tag: &str, name: &str, body: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir()
             .join(format!("arb-risk-test-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        let p = d.join("topics.yaml");
+        let p = d.join(name);
         std::fs::write(&p, body).unwrap();
         p
+    }
+
+    fn write_topics(tag: &str, body: &str) -> std::path::PathBuf {
+        write_cfg(tag, "topics.yaml", body)
+    }
+
+    fn write_exec(tag: &str, body: &str) -> std::path::PathBuf {
+        write_cfg(tag, "exec.yaml", body)
+    }
+
+    /// A valid `exec.yaml` for the fixtures that are not ABOUT exec.yaml: an
+    /// absent one is damage now, so every view needs a real file. Holds what the
+    /// live `config/exec.yaml` holds, which is what the old fallback assumed.
+    fn valid_exec() -> String {
+        static P: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        P.get_or_init(|| write_exec("exec-ok", "bankroll_usd: 980\nper_class_cap: 0.35\n"))
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// FAIL-CLOSED: an unconfigured venue balance reads as $0 cash, so the
@@ -705,6 +821,112 @@ mod tests {
             "{:?}",
             d.reasons
         );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    // ---- config/exec.yaml must not widen a cap when it breaks either ----
+
+    /// Every way of losing the exec caps lands here: no order passes, and the
+    /// startup line does not read like a good load. Each of the four used to
+    /// leave the compiled-in `980` / `0.35` — numerically identical to the live
+    /// file, so nothing downstream could tell.
+    fn assert_caps_failed_closed(exec: &std::path::Path) {
+        let v = view_with_configs(
+            exec.to_str().unwrap(),
+            "/nonexistent/topics.yaml",
+            vec![("kalshi", "1000"), ("polymarket_us", "1000")],
+            "low",
+        );
+        let d = v.check(&rel("r1"), Venue::Kalshi, 5);
+        assert!(!d.allowed, "a cap that did not load must refuse: {:?}", d.reasons);
+        assert!(d.reasons.iter().any(|r| r.contains("class cap")), "{:?}", d.reasons);
+        let desc = v.describe();
+        assert!(desc.contains("CAPITAL CAPS UNUSABLE"), "and say so: {desc}");
+        assert!(!desc.contains("bankroll $980"), "the permissive default: {desc}");
+        assert!(!desc.contains("per_class 0.35"), "the permissive default: {desc}");
+    }
+
+    /// Mode 1: exists, cannot be read. A DIRECTORY at the path gives EISDIR for
+    /// any uid, where `chmod 000` is still readable as root.
+    #[test]
+    fn an_unreadable_exec_file_does_not_leave_the_permissive_default() {
+        let d = std::env::temp_dir()
+            .join(format!("arb-risk-test-{}-exec-unreadable", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        assert_caps_failed_closed(&d);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ...and the wrong working directory is the same failure with a friendlier
+    /// cause. `exec.yaml` is TRACKED, so a correct checkout always has one:
+    /// absent is damage here, unlike the gitignored topics.yaml.
+    #[test]
+    fn an_absent_exec_file_is_damage_not_a_default() {
+        assert_caps_failed_closed(std::path::Path::new("/nonexistent/exec.yaml"));
+    }
+
+    /// Mode 2: caught mid-write. The file is four lines long, so the window is
+    /// small but the whole file is inside it.
+    #[test]
+    fn an_unparseable_exec_file_does_not_leave_the_permissive_default() {
+        let p = write_exec("exec-unparseable", "bankroll_usd: 980\nper_class_cap: [0.35\n");
+        assert_caps_failed_closed(&p);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// Mode 3: the tail truncation, which still parses. `per_class_cap` is the
+    /// LAST line of the live file — exactly the shape that already defeated the
+    /// first version of the topics fix.
+    #[test]
+    fn an_exec_file_missing_per_class_cap_does_not_keep_the_old_one() {
+        let p = write_exec("exec-tail-cut", "bankroll_usd: 500\n");
+        assert_caps_failed_closed(&p);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// Mode 4, which needs no damage at all: `bankroll_usd: "500"` is an
+    /// ordinary edit. The topic loader has always taken it; the exec loader
+    /// dropped it on the floor and kept 980. Both spellings must now mean the
+    /// same cap — which is the point of the shared `num`.
+    #[test]
+    fn a_quoted_number_is_the_same_cap_as_an_unquoted_one() {
+        for (i, body) in [
+            "bankroll_usd: 500\nper_class_cap: 0.35\n",
+            "bankroll_usd: \"500\"\nper_class_cap: \"0.35\"\n",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let p = write_exec(&format!("exec-num-{i}"), body);
+            let v = view_with_configs(
+                p.to_str().unwrap(),
+                "/nonexistent/topics.yaml",
+                vec![("kalshi", "1000"), ("polymarket_us", "1000")],
+                "low",
+            );
+            assert!(v.describe().contains("bankroll $500 per_class 0.35"), "{}", v.describe());
+            // 500 * 0.35 = 175, so 170 open in the class leaves no room for 10.
+            // The silently-kept 980 default would have allowed it: 343.
+            v.record_open("other-rel", "cross-venue-equivalent", 170.0);
+            let d = v.check(&rel("r1"), Venue::Kalshi, 10);
+            assert!(!d.allowed, "the cap must be the file's: {:?}", d.reasons);
+            assert!(
+                d.reasons.iter().any(|r| r.contains("class cap") && r.contains("175")),
+                "{:?}",
+                d.reasons
+            );
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
+    }
+
+    /// A string that is not a number is not a number in EITHER loader: the value
+    /// reaches `arb_core::risk` as a decimal string and is parsed under an
+    /// `expect`, so accepting it would panic the gate mid-run instead.
+    #[test]
+    fn a_non_numeric_string_is_damage_not_a_cap() {
+        let p = write_exec("exec-notanumber", "bankroll_usd: none\nper_class_cap: 0.35\n");
+        assert_caps_failed_closed(&p);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }
