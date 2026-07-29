@@ -496,6 +496,11 @@ impl Engine {
                 // Only the park reads this clock, and only an armed engine
                 // parks, so a replay's determinism cannot depend on it.
                 let now = std::time::Instant::now();
+                // The order this intent's cancel is owed FOR, so the dispatch
+                // below can record the attempt against its park entry. The
+                // cancel is parked when it is decided and discharged only when
+                // the venue answers — see `cancel::resolve_cancel`.
+                let owed = cancel::cancel_target(&it).map(str::to_string);
                 for action in intent_actions(
                     &it,
                     self.cfg.armed,
@@ -503,7 +508,14 @@ impl Engine {
                     &mut self.parked_cancels,
                     now,
                 ) {
-                    if !self.dispatch(venue, action) {
+                    let is_cancel = matches!(action, Action::Cancel { .. });
+                    let queued = self.dispatch(venue, action);
+                    if is_cancel {
+                        if let Some(oid) = owed.as_deref() {
+                            cancel::mark_sent(&mut self.parked_cancels, oid, queued);
+                        }
+                    }
+                    if !queued {
                         // The commands of ONE intent are a sequence: an
                         // amend's place must never go out without the
                         // cancel that precedes it, or the amend doubles
@@ -565,9 +577,11 @@ impl Engine {
             "feed_pulled": self.feed_reason.is_some(),
             "risk_allowed": self.cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
             "risk_rejected": self.cfg.risk.as_ref().map(|r| r.stats().1).unwrap_or(0),
-            // Cancels the engine decided on but has not been able to queue a
-            // venue-addressed command for. Healthy is 0, or a transient 1
-            // while an ack is in flight.
+            // Cancels the engine has DECIDED and the venue has not yet
+            // confirmed: waiting on an ack to become addressable, on the wire,
+            // or refused and due for a retry. Healthy is 0, or a transient
+            // handful; a number that does not come back down is orders resting
+            // that this engine has already decided against.
             "cancels_unresolved": self.parked_cancels.len(),
             // ...of which these have already had their one client-id
             // escalation and are still unaddressable. This is the subset a
@@ -624,6 +638,10 @@ impl Engine {
             "exec_dropped": self.exec_stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
             "exec_sent": self.exec_stats.sent.load(std::sync::atomic::Ordering::Relaxed),
             "exec_failed": self.exec_stats.failed.load(std::sync::atomic::Ordering::Relaxed),
+            // Orders the venue took while we could not read the answer, found
+            // resting and adopted. Must stay 0; each one was live under an id
+            // this process had not learned.
+            "exec_recovered": self.exec_stats.recovered.load(std::sync::atomic::Ordering::Relaxed),
             "chan_high_water": self.chan_hw,
             "decision_latency": self.decision.summary(),
             "exec_hop_latency": self.exec_stats.hop.summary(),
@@ -737,6 +755,17 @@ impl Engine {
             // intent). Unknown kinds keep being skipped.
             "order_ack" => {
                 self.on_order_ack(&v, ts_local_ns, m.t_read);
+                return;
+            }
+            // ...and the venue's answer to a CANCEL:
+            //   {"kind":"cancel_result","venue":...,"market_id":str,
+            //    "venue_order_id"|"order_id":str,"ok":bool,"error":str|null,
+            //    "ts_local_ns":int}
+            // The id is reported in the space the cancel was addressed in. It
+            // is the only way the engine can learn that a cancel it owes has
+            // actually been carried out — or refused.
+            "cancel_result" => {
+                self.on_cancel_result(&v, m.t_read);
                 return;
             }
             "fill" => {
@@ -1236,6 +1265,7 @@ fn test_engine(cfg: RunCfg) -> Engine {
             dropped: AtomicU64::new(0),
             sent: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            recovered: AtomicU64::new(0),
         }),
         &HashMap::new(),
         // These tests drive the hedge and fill paths directly, never
@@ -1412,6 +1442,7 @@ mod feed_wiring_tests {
             dropped: AtomicU64::new(0),
             sent: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            recovered: AtomicU64::new(0),
         })
     }
 

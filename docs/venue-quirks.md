@@ -216,6 +216,20 @@ double-entry books. Together they make the Kalshi account reconcile to
 - **Current handling:** `src/arbbot/exec/polymarket_us_gateway.py:101-106` (create, bare), `:69-77` (preview, wrapped).
 - **Port requirement:** Encode the two body shapes separately; do not share a serializer between create and preview.
 
+### `pmus-cancel-unknown-id-succeeds`
+- **Venue:** polymarket_us
+- **What the API does:** `POST /v1/order/{id}/cancel` answers <300 for an `id` the venue has never issued. There is no "no such order" error to detect.
+- **Failure it caused:** every per-order cancel the trader sent carried OUR `m…` client id, and all of them were logged as `[exec] PolymarketUs cancelled` — 11 of them on 2026-07-28 — while every quote went on resting. `exec_failed` stayed 0 the whole time, so the one counter that would have shown it read healthy.
+- **Current handling:** `rust/crates/arb-venue/src/gateway/pmus.rs` (`cancel` REFUSES a `CancelBy::ClientId` target locally and never puts it on the wire); `rust/bins/arb-trader/src/engine/cancel.rs` (a cancel is parked until the venue's own id is known, rather than addressed with ours).
+- **Port requirement:** Never send our id to this endpoint. A 2xx from it is not evidence that anything was cancelled unless the id came from the venue; the resting-order list is the only proof.
+
+### `pmus-no-client-order-id`
+- **Venue:** polymarket_us
+- **What the API does:** The create body carries NO client-order-id field of any kind (`POST /v1/orders` takes marketSlug/type/price/quantity/tif/intent and nothing of ours), so the venue never learns a tag we could look ourselves up by. Kalshi's `client_order_id` has no counterpart here.
+- **Failure it caused:** a place whose RESPONSE is lost (the 15s HTTP timeout, or a body that will not parse) may still have REACHED the venue, and the order then rests under an id we never learned: no per-order cancel can address it, the client-id escalation is refused locally and forever, and a fill on it arrives under an id the engine cannot attribute (`fills_unattributed`, no hedge minted, the leg naked).
+- **Current handling:** `rust/crates/arb-venue/src/gateway/pmus.rs` (`recover_place`: one `GET /v1/orders/open`, matched on marketSlug + quantity, excluding ids this process has already claimed, and refusing outright when more than one candidate matches); `rust/bins/arb-trader/src/exec.rs` (the recovered order is adopted with a real `order_ack` and counted in `exec_recovered`). The Python this ports had no recovery at all.
+- **Port requirement:** Never send our id in a PM-US order body or cancel path (it will be answered <300 for an order the venue never issued). Recover a lost create ONLY from the open-orders row, scoped to orders this process owns and refused when ambiguous — the account is shared, and an adopted order gets cancelled later.
+
 ### `pmus-order-id-field-is-id`
 - **Venue:** polymarket_us
 - **What the API does:** The order id field is `id` (Kalshi uses `order_id`, sometimes nested under `order`).

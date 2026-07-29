@@ -11,7 +11,7 @@
 
 use crate::hist::Hist;
 use crate::sink::{OrderSink, SweepPolicy};
-use arb_venue::gateway::{CancelRequest, PlaceRequest};
+use arb_venue::gateway::{CancelBy, CancelRequest, PlaceRequest};
 use arb_core::clock::now_ns;
 use arb_core::model::Venue;
 use std::collections::{HashMap, HashSet};
@@ -28,7 +28,15 @@ use tokio::sync::mpsc;
 /// value the executor counts today is the value a gateway will send.
 pub enum Action {
     Place(PlaceRequest),
-    Cancel(CancelRequest),
+    /// A cancel, plus the engine's ATTEMPT NUMBER for the order it names.
+    ///
+    /// The number never reaches a wire — it is echoed back in `cancel_result` so
+    /// the engine can tell the answer to the attempt currently outstanding from
+    /// a LATE answer to a superseded one. Without it, an answer to attempt 1
+    /// arriving after attempt 2 had gone re-armed the retry and put attempt 3 on
+    /// the wire alongside 2. `0` means unnumbered: an escalation, or a dry run,
+    /// whose answer must never be matched to a numbered attempt.
+    Cancel { req: CancelRequest, attempt: u32 },
     /// Cancel EVERYTHING resting on this venue and verify it is gone.
     ///
     /// The kill switch's per-quote cancels only reach orders the engine still
@@ -53,6 +61,11 @@ pub struct ExecStats {
     /// Venue rejections/errors. Counted separately from `sent` so a venue that
     /// refuses everything cannot read as a working order path.
     pub failed: AtomicU64,
+    /// Places whose RESPONSE was lost and whose order was then FOUND resting at
+    /// the venue. Each one was live under an id this process had not learned:
+    /// unaddressable by any cancel, and a fill on it would have arrived under an
+    /// id nothing could attribute. Never routine; must never be silent.
+    pub recovered: AtomicU64,
 }
 
 // -------------------------------------------------------------- the halt ---
@@ -709,6 +722,88 @@ pub fn install_armed_panic_hook() {
     }));
 }
 
+/// Tell the engine what a venue call decided.
+///
+/// `acks` is the SAME channel the feed writes to, so a venue reply is an event
+/// like any other: it enters the one ordered channel, lands in the WAL and
+/// replays with everything else. `None` is dry-run, where nothing reached a
+/// venue and there is nothing to report.
+async fn tell_engine(acks: &Option<mpsc::Sender<crate::feed::FeedMsg>>, line: serde_json::Value) {
+    if let Some(tx) = acks {
+        let _ = tx
+            .send(crate::feed::FeedMsg { line: line.to_string(), t_read: Instant::now() })
+            .await;
+    }
+}
+
+/// The venue's ANSWER to one cancel, as an event.
+///
+/// A cancel is the one command whose outcome the engine cannot infer from
+/// anything else it sees: a place answers with an `order_ack`, a fill answers
+/// with a fill, and a cancel the venue REFUSED used to answer with nothing at
+/// all. The engine had already retired every record that the order existed, so
+/// nothing would ever try again and the quote went on resting beside its
+/// replacement, at a price the engine had decided was wrong.
+///
+/// The id is reported in the SPACE it was addressed in — that is the whole
+/// point of [`CancelBy`] — and the engine maps a venue id back through the ack
+/// that taught it the pair.
+pub(crate) fn cancel_result(
+    venue: Venue,
+    by: &CancelBy,
+    market: &str,
+    attempt: u32,
+    err: Option<&str>,
+) -> serde_json::Value {
+    let (field, id) = match by {
+        CancelBy::VenueId(v) => ("venue_order_id", v),
+        CancelBy::ClientId(c) => ("order_id", c),
+    };
+    let mut v = serde_json::json!({
+        "kind": "cancel_result",
+        "venue": venue.as_str(),
+        "market_id": market,
+        // Echoed, not interpreted: it is the engine's own attempt number, and it
+        // is what lets a late answer be told from the current one.
+        "attempt": attempt,
+        "ok": err.is_none(),
+        "error": err,
+        "ts_local_ns": now_ns(),
+    });
+    v[field] = serde_json::json!(id);
+    v
+}
+
+/// Whether a failed place left us UNABLE TO SAY if the venue took the order.
+///
+/// This is the entire scope of the lost-response recovery, and it is a much
+/// narrower question than "did the place fail". Both gateways return
+/// [`VenueError::Status`] for any `status >= 300`, so a post-only that would
+/// cross (400), a 403, a 422 are all DEFINITIVE: the venue did not take it,
+/// nothing of ours rests, and there is nothing to recover. Those are also
+/// routine — one 3.7-day shadow replay produced ~150 rejected places on PM-US
+/// alone — and PM-US's recovery can only match on market and size, so running it
+/// on a rejection would sooner or later adopt an order belonging to somebody
+/// else on this shared account, cancel it, and book its fills as ours.
+///
+/// What is left is exactly the errors that can only happen AFTER the request
+/// left this process:
+///   * [`VenueError::Transport`] — the 15s reqwest timeout, a reset, a closed
+///     connection. The venue may have processed it and we never saw the answer;
+///   * [`VenueError::Parse`] / [`VenueError::MissingField`] — a 2xx whose body we
+///     could not read. The order EXISTS; we just cannot name it. This is the
+///     pair `KalshiGateway::rehearse` already recovers from, and the 2026-07-27
+///     incident is the reason it does.
+///
+/// `NotWired`, `Sign` and `RateLimited` all fail before a byte is sent.
+fn place_answer_was_lost(e: &arb_venue::VenueError) -> bool {
+    use arb_venue::VenueError as E;
+    match e {
+        E::Transport(_) | E::Parse { .. } | E::MissingField { .. } => true,
+        E::Status { .. } | E::NotWired | E::Sign(_) | E::RateLimited { .. } => false,
+    }
+}
+
 /// `acks` is the SAME channel the feed writes to. A venue reply is an event
 /// like any other: it enters the one ordered channel, so it lands in the WAL
 /// and replays with everything else.
@@ -724,6 +819,7 @@ pub fn spawn_executors(
         dropped: AtomicU64::new(0),
         sent: AtomicU64::new(0),
         failed: AtomicU64::new(0),
+        recovered: AtomicU64::new(0),
     });
     let mut txs = HashMap::new();
     for venue in [Venue::Kalshi, Venue::Polymarket, Venue::PolymarketUs] {
@@ -752,6 +848,13 @@ async fn run_executor(
 ) {
     let mut tokens = rate_per_s.max(0.0);
     let mut last = Instant::now();
+    // Venue ids this executor has taken responsibility for. It is the scope of
+    // the lost-response recovery below: an id in here is an order we already
+    // know about, so it can never be handed back as a NEW one — which is what
+    // stops the recovery re-adopting our own order off a resting list that lags
+    // a write. Grows with places made, never pruned: forgetting an id we once
+    // claimed is the direction that adopts the wrong order.
+    let mut claimed: HashSet<String> = HashSet::new();
     while let Some(cmd) = rx.recv().await {
         st.hop.record(cmd.t_read.elapsed().as_nanos() as u64);
         // `placed`/`cancelled` are dequeue counters — `would_place` has always
@@ -761,7 +864,7 @@ async fn run_executor(
         // than after it; totals are identical either way.
         match &cmd.action {
             Action::Place(_) => st.placed.fetch_add(1, Ordering::Relaxed),
-            Action::Cancel(_) | Action::SweepAndVerify => {
+            Action::Cancel { .. } | Action::SweepAndVerify => {
                 st.cancelled.fetch_add(1, Ordering::Relaxed)
             }
         };
@@ -816,11 +919,22 @@ async fn run_executor(
         // The gateways block; running one on this worker would stall
         // every other task on it.
         let st2 = st.clone();
-        // (our order id, market) for the ack: a fill arrives under the
-        // VENUE's id, and this is the only place both are in hand.
-        let ours = match &cmd.action {
-            Action::Place(p) => Some((p.client_order_id.clone(), p.market.clone())),
-            Action::Cancel(_) | Action::SweepAndVerify => None,
+        let sink2 = sink.clone();
+        // The order this command carries, kept OUT of the blocking closure: the
+        // ack needs our id and its market (a fill arrives under the VENUE's id,
+        // and this is the only place both are in hand), and a place whose
+        // response is lost needs the whole request to find the order by.
+        let placing = match &cmd.action {
+            Action::Place(p) => Some(p.clone()),
+            Action::Cancel { .. } | Action::SweepAndVerify => None,
+        };
+        // ...and what a cancel was addressed to, and as which attempt, for the
+        // same reason: the engine cannot learn a cancel's outcome any other way.
+        let cancelling = match &cmd.action {
+            Action::Cancel { req, attempt } => {
+                Some((req.by.clone(), req.market_slug.clone().unwrap_or_default(), *attempt))
+            }
+            Action::Place(_) | Action::SweepAndVerify => None,
         };
         // The latch can flip between the check above and here. `enter` closes
         // that window and counts the discard; the guard rides INTO the blocking
@@ -828,7 +942,7 @@ async fn run_executor(
         // actually answered.
         let Some(guard) = halt.enter(match &cmd.action {
             Action::Place(p) => Some(p),
-            Action::Cancel(_) | Action::SweepAndVerify => None,
+            Action::Cancel { .. } | Action::SweepAndVerify => None,
         }) else {
             eprintln!("[exec] {venue:?}: HALTED mid-dispatch — place discarded, not sent");
             continue;
@@ -837,47 +951,110 @@ async fn run_executor(
             let _g = guard;
             match &cmd.action {
                 Action::Place(p) => sink.place(p).map(Some),
-                Action::Cancel(c) => sink.cancel(c).map(|_| None),
+                Action::Cancel { req, .. } => sink.cancel(req).map(|_| None),
                 // handled above, before this dispatch
                 Action::SweepAndVerify => Ok(None),
             }
         })
         .await;
-        match res {
+        // Whatever the venue did, the engine is TOLD. Both arms below report,
+        // and the failure arm is the one that used to end here.
+        //
+        // `unreadable` is the narrower question the recovery below turns on: did
+        // this failure leave us UNABLE TO SAY whether the venue took the order?
+        // Not the same as "it failed" — see `place_answer_was_lost`.
+        let mut unreadable = false;
+        let failure = match res {
             Ok(Ok(venue_oid)) => {
                 st2.sent.fetch_add(1, Ordering::Relaxed);
-                match (venue_oid, ours) {
-                    (Some(vid), Some((our_id, market))) => {
-                        eprintln!("[exec] {venue:?} placed {our_id} -> {vid}");
-                        if let Some(tx) = &acks {
-                            let line = serde_json::json!({
+                match (venue_oid, &placing) {
+                    (Some(vid), Some(p)) => {
+                        eprintln!("[exec] {venue:?} placed {} -> {vid}", p.client_order_id);
+                        claimed.insert(vid.clone());
+                        tell_engine(
+                            &acks,
+                            serde_json::json!({
                                 "kind": "order_ack",
                                 "venue": venue.as_str(),
-                                "market_id": market,
-                                "order_id": our_id,
+                                "market_id": p.market,
+                                "order_id": p.client_order_id,
                                 "venue_order_id": vid,
                                 "ts_local_ns": now_ns(),
-                            })
-                            .to_string();
-                            let _ = tx
-                                .send(crate::feed::FeedMsg {
-                                    line,
-                                    t_read: Instant::now(),
-                                })
-                                .await;
-                        }
+                            }),
+                        )
+                        .await;
                     }
                     _ => eprintln!("[exec] {venue:?} cancelled"),
                 }
+                None
             }
             Ok(Err(e)) => {
                 st2.failed.fetch_add(1, Ordering::Relaxed);
                 eprintln!("[exec] {venue:?} FAILED: {e}");
+                unreadable = place_answer_was_lost(&e);
+                Some(e.to_string())
             }
             Err(e) => {
                 st2.failed.fetch_add(1, Ordering::Relaxed);
                 eprintln!("[exec] {venue:?} task panicked: {e}");
+                // A panic is our bug, not a venue answer. It says nothing about
+                // whether the order landed, so it is not licence to go looking
+                // for one.
+                Some(format!("executor task panicked: {e}"))
             }
+        };
+        if let Some((by, market, attempt)) = &cancelling {
+            tell_engine(&acks, cancel_result(venue, by, market, *attempt, failure.as_deref()))
+                .await;
+        }
+        // A place whose answer was LOST may still have reached the venue. Kalshi
+        // has recovered from this since the first live smoke left an order
+        // resting (2026-07-27, `gateway/kalshi.rs`); PM-US could not, because it
+        // carries no client_order_id to look itself up by. `recover_place` is
+        // that lookup by the only other means the venue offers — and it is why
+        // the gate is `unreadable` and NOT "the place failed". A REJECTED place
+        // is routine (a replay of one 3.7-day shadow produced ~150 on PM-US
+        // alone) and definitive: nothing of ours rests, so a search that matches
+        // on market and size could only find somebody ELSE's order, on a shared
+        // account, and adopt it.
+        //
+        // Skipped while halting, for the reason the cancel escalation stands
+        // down while killed: the sweep is already cancelling EVERYTHING and
+        // proving it, which reaches this order without needing its id, and the
+        // read would compete with the only evidence the halt accepts.
+        let (Some(p), true, false) = (&placing, unreadable, halt.is_on()) else { continue };
+        let (req, mine) = (p.clone(), claimed.clone());
+        match tokio::task::spawn_blocking(move || sink2.recover_place(&req, &mine)).await {
+            Ok(Ok(Some(vid))) => {
+                st2.recovered.fetch_add(1, Ordering::Relaxed);
+                claimed.insert(vid.clone());
+                eprintln!(
+                    "[exec] {venue:?}: the place of {} ({} @{}) FAILED but order {vid} is \
+                     RESTING — the venue took it and we could not read the answer. Adopting \
+                     it, so it can be cancelled and its fills attributed.",
+                    p.client_order_id, p.market, p.price
+                );
+                tell_engine(
+                    &acks,
+                    serde_json::json!({
+                        "kind": "order_ack",
+                        "venue": venue.as_str(),
+                        "market_id": p.market,
+                        "order_id": p.client_order_id,
+                        "venue_order_id": vid,
+                        "ts_local_ns": now_ns(),
+                    }),
+                )
+                .await;
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => eprintln!(
+                "[exec] {venue:?}: {} FAILED and the recovery read could not settle whether \
+                 the venue took it ({e}) — if it did, this process cannot address that \
+                 order. CHECK THE VENUE.",
+                p.client_order_id
+            ),
+            Err(e) => eprintln!("[exec] {venue:?}: recovery task panicked: {e}"),
         }
     }
 }
@@ -906,11 +1083,36 @@ mod tests {
         wedged: bool,
         /// Blocking delay on every resting-list read.
         stall: Option<Duration>,
+        /// The venue REFUSES every cancel — a 502, a reset, a rate limit the
+        /// shaper did not catch.
+        refuse_cancels: bool,
+        /// Places refused from the Nth on, 1-based (0 = never), with this
+        /// error. The default is the lost-response shape (a reqwest timeout);
+        /// a `Status` is the venue REFUSING, which is a different thing
+        /// entirely. `recover` is what a resting-order read then finds.
+        refuse_places_from: usize,
+        place_err: Option<VenueError>,
+        recover: Option<String>,
+        /// Latched from INSIDE the place — SIGTERM arriving while this very
+        /// call is on the wire.
+        latch: Option<Arc<Halt>>,
     }
 
     impl OrderSink for Recorder {
         fn place(&self, r: &PlaceRequest) -> Result<String, VenueError> {
-            self.placed.lock().unwrap().push(r.client_order_id.clone());
+            let n = {
+                let mut p = self.placed.lock().unwrap();
+                p.push(r.client_order_id.clone());
+                p.len()
+            };
+            if self.refuse_places_from > 0 && n >= self.refuse_places_from {
+                if let Some(h) = &self.latch {
+                    h.begin();
+                }
+                return Err(self.place_err.clone().unwrap_or(VenueError::Transport(
+                    "connection closed before message completed".into(),
+                )));
+            }
             self.resting.lock().unwrap().push(r.client_order_id.clone());
             Ok(format!("venue-{}", r.client_order_id))
         }
@@ -922,7 +1124,24 @@ mod tests {
                 CancelBy::VenueId(s) | CancelBy::ClientId(s) => s.clone(),
             };
             self.cancelled.lock().unwrap().push(id);
+            if self.refuse_cancels {
+                return Err(VenueError::Status {
+                    endpoint: "test cancel",
+                    status: 502,
+                    body: "bad gateway".into(),
+                });
+            }
             Ok(())
+        }
+        /// Whatever the lost response left behind — unless this process has
+        /// already claimed it, which is the scope rule the real PM-US
+        /// implementation enforces (`PmusGateway::recover_place`).
+        fn recover_place(
+            &self,
+            _req: &PlaceRequest,
+            claimed: &HashSet<String>,
+        ) -> Result<Option<String>, VenueError> {
+            Ok(self.recover.clone().filter(|v| !claimed.contains(v)))
         }
         fn cancel_all_open(&self) -> Result<(), VenueError> {
             *self.sweeps.lock().unwrap() += 1;
@@ -1000,10 +1219,13 @@ mod tests {
     fn cancel(oid: &str) -> ExecCmd {
         ExecCmd {
             t_read: Instant::now(),
-            action: Action::Cancel(CancelRequest {
-                by: CancelBy::VenueId(oid.into()),
-                market_slug: Some("KXTEST".into()),
-            }),
+            action: Action::Cancel {
+                req: CancelRequest {
+                    by: CancelBy::VenueId(oid.into()),
+                    market_slug: Some("KXTEST".into()),
+                },
+                attempt: 1,
+            },
         }
     }
 
@@ -1015,6 +1237,7 @@ mod tests {
             dropped: AtomicU64::new(0),
             sent: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            recovered: AtomicU64::new(0),
         })
     }
 
@@ -1029,6 +1252,33 @@ mod tests {
         let st = stats();
         run_executor(Venue::Kalshi, 0.0, Some(sink), rx, st.clone(), halt, None).await;
         st
+    }
+
+    /// Drain commands and collect everything the executor told the ENGINE.
+    ///
+    /// That channel is the fix: until 2026-07-29 the executor's only
+    /// engine-bound output was an `order_ack` on a SUCCESSFUL place, so every
+    /// other outcome — a refused cancel, a place whose answer was lost — was
+    /// counted, logged and dropped.
+    async fn drain_reporting(
+        venue: Venue,
+        sink: Arc<Recorder>,
+        cmds: Vec<ExecCmd>,
+    ) -> (Arc<ExecStats>, Vec<serde_json::Value>) {
+        let (tx, rx) = mpsc::channel::<ExecCmd>(1024);
+        for c in cmds {
+            tx.try_send(c).expect("test queue fits");
+        }
+        drop(tx);
+        let (atx, mut arx) = mpsc::channel::<crate::feed::FeedMsg>(64);
+        let st = stats();
+        run_executor(venue, 0.0, Some(sink), rx, st.clone(), Arc::new(Halt::default()), Some(atx))
+            .await;
+        let mut told = Vec::new();
+        while let Ok(m) = arx.try_recv() {
+            told.push(serde_json::from_str(&m.line).expect("the engine parses these"));
+        }
+        (st, told)
     }
 
     /// FINDING #0, first half. At 15:40:13 the sweep began; at 15:40:14 an
@@ -1457,6 +1707,242 @@ mod tests {
             "{HALT_LOSER_WAIT:?} must be < TimeoutStopUSec"
         );
         assert!(QUIESCE_BUDGET + SWEEP_BUDGET < Duration::from_secs(90));
+    }
+
+    /// **DEFECT 1, at the boundary.** A cancel the venue refuses must reach the
+    /// engine as a refusal.
+    ///
+    /// `Ok(Err(e))` was one counter and one log line — the executor's only
+    /// engine-bound output was an `order_ack` on a SUCCESSFUL place — so a
+    /// refused cancel and a completed one were indistinguishable to everything
+    /// upstream. The engine retired the obligation on `try_send`, which had
+    /// already returned true.
+    #[tokio::test]
+    async fn a_cancel_the_venue_refuses_is_reported_to_the_engine_as_refused() {
+        let refuses = Arc::new(Recorder { refuse_cancels: true, ..Default::default() });
+        let (st, told) =
+            drain_reporting(Venue::PolymarketUs, refuses.clone(), vec![cancel("v1")]).await;
+
+        assert_eq!(*refuses.cancelled.lock().unwrap(), vec!["v1"], "it did reach the venue");
+        assert_eq!(st.failed.load(Ordering::Relaxed), 1);
+        assert_eq!(told.len(), 1, "and the engine is TOLD, which is the whole fix");
+        assert_eq!(told[0]["kind"], "cancel_result");
+        assert_eq!(told[0]["ok"], false, "the venue did NOT cancel it");
+        assert_eq!(
+            told[0]["venue_order_id"], "v1",
+            "reported in the id space it was addressed in, so the engine can name the order"
+        );
+        assert_eq!(told[0]["venue"], "polymarket_us");
+        assert_eq!(told[0]["market_id"], "KXTEST", "PM-US needs the slug to try again");
+        assert!(
+            told[0]["error"].as_str().unwrap_or_default().contains("502"),
+            "carrying the venue's own reason: {}",
+            told[0]
+        );
+    }
+
+    /// The control, and the other half of the contract: a cancel the venue
+    /// ACCEPTS is reported too. Without this the engine could never retire an
+    /// obligation at all and every cancel would be retried until it ran out of
+    /// tries.
+    #[tokio::test]
+    async fn a_cancel_the_venue_accepts_is_reported_as_done() {
+        let sink = Arc::new(Recorder::default());
+        let (st, told) = drain_reporting(Venue::Kalshi, sink, vec![cancel("v1")]).await;
+        assert_eq!(st.failed.load(Ordering::Relaxed), 0);
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0]["kind"], "cancel_result");
+        assert_eq!(told[0]["ok"], true);
+        assert_eq!(told[0]["venue_order_id"], "v1");
+        assert!(told[0]["error"].is_null());
+    }
+
+    /// **DEFECT 2.** A place whose RESPONSE was lost leaves an order this engine
+    /// can address.
+    ///
+    /// The transport maps a reqwest timeout to `Transport` after 15s, so a place
+    /// can fail with the order RESTING. No ack was emitted, so `oid_venue` never
+    /// learned the venue's id: the cancel could not be addressed, the escalation
+    /// PM-US refuses locally (it has no client_order_id on the wire at all), and
+    /// a fill on it would have arrived under an id nothing could attribute —
+    /// `n_unattributed`, with no hedge obligation minted and the leg NAKED.
+    ///
+    /// The ack is the whole remedy: it is exactly what `on_order_ack` needs to
+    /// make the parked cancel addressable and to claim a held fill.
+    #[tokio::test]
+    async fn a_place_whose_response_was_lost_is_recovered_and_acked() {
+        let lost = Arc::new(Recorder {
+            refuse_places_from: 1,
+            recover: Some("BH8H83AY09NG".into()),
+            ..Default::default()
+        });
+        let (st, told) =
+            drain_reporting(Venue::PolymarketUs, lost.clone(), vec![place("m1")]).await;
+
+        assert_eq!(st.failed.load(Ordering::Relaxed), 1, "the CALL failed and still says so");
+        assert_eq!(st.sent.load(Ordering::Relaxed), 0);
+        assert_eq!(st.recovered.load(Ordering::Relaxed), 1, "and the order it left is found");
+        assert_eq!(told.len(), 1, "one ack, for an order the venue really holds");
+        assert_eq!(told[0]["kind"], "order_ack");
+        assert_eq!(told[0]["order_id"], "m1", "ours");
+        assert_eq!(told[0]["venue_order_id"], "BH8H83AY09NG", "and theirs — the cancel handle");
+        assert_eq!(told[0]["venue"], "polymarket_us");
+        assert_eq!(told[0]["market_id"], "KXTEST");
+    }
+
+    /// The control: a place that genuinely never landed adopts NOTHING. A
+    /// recovery that invents an order would be worse than the leak.
+    #[tokio::test]
+    async fn a_place_the_venue_really_refused_recovers_nothing() {
+        let refused = Arc::new(Recorder { refuse_places_from: 1, ..Default::default() });
+        let (st, told) = drain_reporting(Venue::PolymarketUs, refused, vec![place("m1")]).await;
+        assert_eq!(st.failed.load(Ordering::Relaxed), 1);
+        assert_eq!(st.recovered.load(Ordering::Relaxed), 0);
+        assert!(told.is_empty(), "nothing rests, so there is nothing to tell: {told:?}");
+    }
+
+    /// **BLOCKER 1 — a place the venue REJECTED must never start a search.**
+    /// This is the difference between "we could not read the answer" and "the
+    /// answer was no", and getting it wrong is a money path.
+    ///
+    /// Both gateways return `Status` for any `status >= 300`, so a post-only
+    /// that would cross is a 400 — routine (~150 in one 3.7-day shadow replay on
+    /// PM-US alone) and DEFINITIVE: nothing of ours rests. PM-US's recovery can
+    /// only match on market and size, so running it here would sooner or later
+    /// find a single unclaimed order in that market of that size belonging to
+    /// somebody else on this SHARED account and adopt it — after which the next
+    /// reprice cancels THEIR order, and a fill on it is booked as a maker fill
+    /// of ours and hedged with a real taker order against a position we do not
+    /// hold.
+    #[tokio::test]
+    async fn a_rejected_place_never_goes_looking_for_someone_elses_order() {
+        for e in [
+            VenueError::Status {
+                endpoint: "pmus place",
+                status: 400,
+                body: r#"{"error":"post_only_would_cross"}"#.into(),
+            },
+            VenueError::NotWired,
+            VenueError::Sign("bad key".into()),
+            VenueError::RateLimited { priority: "critical" },
+        ] {
+            let sink = Arc::new(Recorder {
+                refuse_places_from: 1,
+                place_err: Some(e.clone()),
+                // The stranger's order, resting in the same market at the same
+                // size. It must not be touched.
+                recover: Some("SOMEBODY-ELSES-ORDER".into()),
+                ..Default::default()
+            });
+            let (st, told) = drain_reporting(Venue::PolymarketUs, sink, vec![place("m1")]).await;
+            assert_eq!(st.failed.load(Ordering::Relaxed), 1, "{e:?}");
+            assert_eq!(
+                st.recovered.load(Ordering::Relaxed),
+                0,
+                "{e:?} is not an unreadable answer, it is a definitive one"
+            );
+            assert!(told.is_empty(), "and NOTHING is adopted: {told:?}");
+        }
+    }
+
+    /// ...and the other side of the same line, so the gate is not simply "never
+    /// recover": every error that can only happen AFTER the request left this
+    /// process still recovers. `Parse`/`MissingField` mean a 2xx whose body we
+    /// could not read — the order EXISTS — which is the pair
+    /// `KalshiGateway::rehearse` has recovered from since 2026-07-27.
+    #[tokio::test]
+    async fn an_unreadable_answer_still_recovers_whichever_way_it_was_unreadable() {
+        for e in [
+            VenueError::Transport("operation timed out".into()),
+            VenueError::Parse { endpoint: "pmus:order", detail: "expected value".into() },
+            VenueError::MissingField { endpoint: "pmus:order", field: "id".into() },
+        ] {
+            let sink = Arc::new(Recorder {
+                refuse_places_from: 1,
+                place_err: Some(e.clone()),
+                recover: Some("pm-lost".into()),
+                ..Default::default()
+            });
+            let (st, told) = drain_reporting(Venue::PolymarketUs, sink, vec![place("m1")]).await;
+            assert_eq!(st.recovered.load(Ordering::Relaxed), 1, "{e:?} leaves it unknown");
+            assert_eq!(told[0]["venue_order_id"], "pm-lost");
+        }
+    }
+
+    /// The predicate itself, exhaustively — a new `VenueError` variant must be
+    /// classified deliberately, not default into "go looking for an order".
+    #[test]
+    fn only_the_errors_that_can_happen_after_the_request_left_are_recoverable() {
+        assert!(place_answer_was_lost(&VenueError::Transport("reset".into())));
+        assert!(place_answer_was_lost(&VenueError::Parse { endpoint: "e", detail: "d".into() }));
+        assert!(place_answer_was_lost(&VenueError::MissingField {
+            endpoint: "e",
+            field: "id".into()
+        }));
+        // ...and everything the venue or this process settled definitively.
+        assert!(!place_answer_was_lost(&VenueError::Status {
+            endpoint: "e",
+            status: 400,
+            body: String::new()
+        }));
+        assert!(!place_answer_was_lost(&VenueError::NotWired));
+        assert!(!place_answer_was_lost(&VenueError::Sign("x".into())));
+        assert!(!place_answer_was_lost(&VenueError::RateLimited { priority: "critical" }));
+    }
+
+    /// The scope rule, at the boundary that owns it: an order this process has
+    /// ALREADY claimed can never be handed back as a new one.
+    ///
+    /// Both venues' resting lists LAG a write, so the order we placed (and even
+    /// cancelled) a moment ago is still on them. Adopting it as the id of a
+    /// DIFFERENT order would point the next cancel at the wrong order — and on a
+    /// SHARED account (docs/venue-quirks.md §xv-graceful-shutdown-cancels-orders)
+    /// that is exactly the class of mistake worth more than the bug.
+    #[tokio::test]
+    async fn the_recovery_never_adopts_an_order_this_process_already_placed() {
+        let sink = Arc::new(Recorder {
+            refuse_places_from: 2,          // m1 lands; m2's answer is lost
+            recover: Some("venue-m1".into()), // ...and m1 is what is resting
+            ..Default::default()
+        });
+        let (st, told) =
+            drain_reporting(Venue::PolymarketUs, sink, vec![place("m1"), place("m2")]).await;
+
+        assert_eq!(st.recovered.load(Ordering::Relaxed), 0, "m1 is not m2");
+        assert_eq!(told.len(), 1, "only m1's real ack: {told:?}");
+        assert_eq!(told[0]["order_id"], "m1");
+        assert_eq!(told[0]["venue_order_id"], "venue-m1");
+    }
+
+    /// The one case the recovery stands down: SIGTERM arrived while this very
+    /// place was on the wire.
+    ///
+    /// The sweep is a strictly better remedy there — it reaches orders we hold
+    /// no id for at all and it PROVES the outcome — and a resting-order read
+    /// here would compete for the budget that proof depends on. Same rule as the
+    /// cancel escalation standing down while killed.
+    ///
+    /// The sink latches mid-call, which is the real shape of it: the place was
+    /// dispatched with the latch off and failed with it on.
+    #[tokio::test]
+    async fn the_recovery_stands_down_when_the_halt_beat_it() {
+        let halt = Arc::new(Halt::default());
+        let lost = Arc::new(Recorder {
+            refuse_places_from: 1,
+            recover: Some("BH8H83AY09NG".into()),
+            latch: Some(halt.clone()),
+            ..Default::default()
+        });
+        let (tx, rx) = mpsc::channel::<ExecCmd>(8);
+        tx.try_send(place("m1")).unwrap();
+        drop(tx);
+        let st = stats();
+        let (atx, mut arx) = mpsc::channel::<crate::feed::FeedMsg>(8);
+        run_executor(Venue::PolymarketUs, 0.0, Some(lost), rx, st.clone(), halt, Some(atx)).await;
+
+        assert_eq!(st.failed.load(Ordering::Relaxed), 1, "the place did go, and did fail");
+        assert_eq!(st.recovered.load(Ordering::Relaxed), 0, "but the sweep owns this now");
+        assert!(arx.try_recv().is_err(), "and nothing is adopted behind the sweep's back");
     }
 
     #[test]

@@ -470,17 +470,19 @@ impl Engine {
             // our id (a no-op both venues report as success), so
             // this is where it actually goes out.
             //
-            // The park entry is retired by `settle` only if the
-            // command was actually QUEUED — never before the
-            // dispatch. A full channel loses the command, and
-            // logging a send that never happened while the gauge
-            // dropped to 0 was how an unaddressable quote could
-            // rest with every number reading healthy.
+            // `settle` records the ATTEMPT only if the command was
+            // actually QUEUED — never before the dispatch. A full
+            // channel loses the command, and logging a send that
+            // never happened while the gauge dropped to 0 was how an
+            // unaddressable quote could rest with every number
+            // reading healthy. The entry itself is retired only by
+            // the venue's own answer.
             let w = self.parked_cancels.get(ours).map(|p| CancelWork::Send {
                 oid: ours.to_string(),
                 venue: p.venue,
                 market: p.market.clone(),
                 venue_order_id: theirs.to_string(),
+                attempt: p.sent + 1,
             });
             if let Some(w) = w {
                 let queued = self.dispatch(w.venue(), w.action());

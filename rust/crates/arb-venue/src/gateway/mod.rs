@@ -25,6 +25,7 @@ pub use pmus::PmusGateway;
 
 use crate::error::VenueError;
 use crate::ratelimit::{Priority, RateLimiter};
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 /// Raw venue side on the YES price axis. `Bid` buys YES; `Ask` sells YES
@@ -105,6 +106,29 @@ pub trait VenueGateway {
 
     fn place(&self, req: &PlaceRequest) -> Result<Self::Order, VenueError>;
     fn cancel(&self, req: &CancelRequest) -> Result<(), VenueError>;
+    /// The venue's own id for an order this process PLACED but could not read
+    /// the answer for — `Ok(None)` when nothing matching it is resting.
+    ///
+    /// A place that failed may still have REACHED the venue: the transport maps
+    /// a timeout to [`VenueError::Transport`] after 15s, and a body we cannot
+    /// parse is a 2xx we could not read. Without a way back to that order's id
+    /// it rests unaddressable, and a fill on it arrives under an id this process
+    /// never learned.
+    ///
+    /// The default is NO recovery, deliberately. A venue that can be searched
+    /// for our own order has to say HOW — Kalshi by `client_order_id`, PM-US by
+    /// the fields of the order itself — and guessing on a SHARED account means
+    /// cancelling somebody else's order (docs/venue-quirks.md
+    /// §xv-graceful-shutdown-cancels-orders). `claimed` is the venue-id set this
+    /// process has already taken responsibility for; an implementation must
+    /// never hand one of those back as a new order.
+    fn recover_place(
+        &self,
+        _req: &PlaceRequest,
+        _claimed: &HashSet<String>,
+    ) -> Result<Option<String>, VenueError> {
+        Ok(None)
+    }
     /// The venue's own id for an order. Kalshi spells it `order_id`, PM-US
     /// spells it `id`; callers that work across venues need one name.
     fn order_id(order: &Self::Order) -> String;
