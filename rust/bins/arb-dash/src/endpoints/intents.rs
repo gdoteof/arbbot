@@ -14,7 +14,10 @@ use arb_registry::{Allowlist, Leg, Registry, Relationship};
 use arb_scenario::price_at;
 use arb_tob::{series, TobSample};
 
-use crate::endpoints::{coverage_age_s, rollup_paths, Latest, MAX_COVERAGE_AGE_S};
+use crate::endpoints::{
+    coverage_by_venue, coverage_json, rollup_paths, stalest_age_s, venue_age_s, Latest,
+    MAX_COVERAGE_AGE_S,
+};
 use crate::{integrity, Args, FEE_CATEGORY};
 
 /// market -> relationship. A market can back more than one pair; the first
@@ -271,7 +274,8 @@ pub fn json(a: &Args) -> String {
 
     let day = integrity::build(&a.data_dir).today;
     let latest = series::latest_by_market(&rollup_paths(&a.rollup_dir, &day));
-    let coverage_age_s = coverage_age_s(&latest, (now * 1e9) as i64);
+    let cov = coverage_by_venue(&latest, (now * 1e9) as i64);
+    let coverage_age_s = stalest_age_s(&cov);
     let rollup_current = coverage_age_s <= MAX_COVERAGE_AGE_S;
 
     let mut cx = Cx::default();
@@ -279,17 +283,39 @@ pub fn json(a: &Args) -> String {
     let clip = cx.parse_exact("25");
 
     let mut rows: Vec<serde_json::Value> = Vec::new();
+    // The mirror of a stale venue, and the same defect: a pair the rollup has
+    // no book for prices no route at all and leaves the view WITHOUT a row.
+    // The engine is still resting on it. A silently shorter list of what we
+    // are working reads as "we are working less", so it is counted by venue.
+    let mut no_book: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut unevaluated = 0usize;
     for rel_id in rels {
         let Some(p) = Pair::join(&reg, &rel_id, &ours, &latest) else { continue };
         let (routes, best) = routes_for(&p, &mut cx, &sched, clip);
         if routes.is_empty() {
+            if p.qa.is_none() || p.qb.is_none() {
+                unevaluated += 1;
+                for (q, l) in [(p.qa, p.la), (p.qb, p.lb)] {
+                    if q.is_none() {
+                        *no_book.entry(l.venue.clone()).or_default() += 1;
+                    }
+                }
+            }
             continue;
         }
         let (best_edge, best_route) = best.unwrap_or((f64::MIN, "none"));
         let priced = routes.get(best_route).cloned();
         let f = feasible(&p, best_route);
-        let actionable =
-            f.fillable && f.deep_enough && f.have_books && rollup_current && best_edge > 0.0;
+        // Per VENUE, and the older of the two: this row is only as current as
+        // its stalest leg, and a live feed on one venue is not evidence about
+        // the other. A whole-rollup `rollup_current` here let a dead venue's
+        // rows ride on a live venue's newest sample.
+        let coverage_age_s = venue_age_s(&cov, &p.la.venue).max(venue_age_s(&cov, &p.lb.venue));
+        let actionable = f.fillable
+            && f.deep_enough
+            && f.have_books
+            && coverage_age_s <= MAX_COVERAGE_AGE_S
+            && best_edge > 0.0;
 
         rows.push(serde_json::json!({
             "relationship_id": rel_id,
@@ -327,6 +353,10 @@ pub fn json(a: &Args) -> String {
             // Time since this market's book last MOVED — information about how
             // quiet it is, deliberately not a staleness flag.
             "since_change_s": q_age(p.qa, now).unwrap_or(-1).max(q_age(p.qb, now).unwrap_or(-1)),
+            // Unlike `since_change_s` this IS the staleness flag: how far the
+            // rollup covers on the older of the row's two venues. It is what
+            // `actionable` is gated on, so the row has to show it.
+            "coverage_age_s": coverage_age_s,
             "actionable": actionable,
             "edge": priced.as_ref().and_then(|p| p["edge_per_contract"].as_str().map(String::from)),
             "last_ts": p.rest_a.map(|o| o.ts).into_iter()
@@ -339,10 +369,13 @@ pub fn json(a: &Args) -> String {
 
     serde_json::json!({
         "actionable": actionable,
+        "unevaluated_pairs": unevaluated,
+        "unevaluated_by_venue": no_book,
         "max_rest_spread": 0.05,
         "min_take_depth": 25,
         "rollup_current": rollup_current,
         "rollup_coverage_age_s": if coverage_age_s == i64::MAX { -1 } else { coverage_age_s },
+        "venues": coverage_json(&cov),
         "max_coverage_age_s": MAX_COVERAGE_AGE_S,
         "engine_live": (0.0..120.0).contains(&age),
         "last_intent_age_s": age.round() as i64,
