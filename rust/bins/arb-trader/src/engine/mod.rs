@@ -640,10 +640,27 @@ impl Engine {
     ///     1.0-2.5s, and ONE of 138 (Kalshi 53, PM-US 83) -> 5.8-10.5s. The
     ///     registry this engine quotes is what decides which of those it is.
     ///
-    /// All of it was spent on work the sweep redoes: as of 2026-07-29
-    /// `cancel_all_open` is account-wide on both venues (Kalshi pages its whole
-    /// order list and DELETEs every resting order; PM-US posts one
-    /// empty-bodied cancel-all), so every one of those cancels is subsumed.
+    /// Most of it was spent on work the sweep redoes: PM-US posts one
+    /// empty-bodied account-wide cancel-all, and Kalshi pages its order list
+    /// and DELETEs every resting order THIS STACK minted
+    /// (`arb_venue::gateway::is_ours`), which is every order this engine can
+    /// have placed. So every one of those cancels is subsumed.
+    ///
+    /// ONE STATE BREAKS THAT, and it is worth knowing because it only exists
+    /// with the head-of-queue ordering above. When Kalshi's order list stops
+    /// echoing `client_order_id`, `cancel_all_open` can attribute nothing and
+    /// cancels NOTHING (`KalshiGateway::cancel_all_open`, `Book::premise_broken`)
+    /// — while the 10-12 per-order cancels queued behind it use
+    /// `CancelBy::VenueId` and would have worked. A kill in that state leaves
+    /// quotes live for up to `SweepPolicy::budget` (20s) longer than it would
+    /// have before this reordering.
+    ///
+    /// Accepted rather than special-cased: skipping the head sweep on that
+    /// verdict means the engine carrying venue state it currently has no reason
+    /// to hold, to optimise a 20s window in a state that has never occurred and
+    /// that pages loudly the moment it does (the sweep refuses, and the halt
+    /// exits non-zero). Recorded here so the next person to see a slow kill has
+    /// the explanation rather than a mystery.
     ///
     /// THE COST, which is real: the sweep now blocks the HEAD of that queue
     /// rather than the tail. It is awaited inline and bounded by

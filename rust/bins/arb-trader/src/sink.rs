@@ -725,6 +725,49 @@ mod tests {
         assert!(err.msg.contains("missing required field `orders`"), "names the cause: {err}");
     }
 
+    /// THE SWEEP-LEVEL VERDICT on a truncated cursor walk — where the bug was.
+    ///
+    /// The gateway halves were each pinned separately and neither was wrong:
+    /// the proof refused, and the cancel went out. What nothing pinned was what
+    /// `cancel_all_and_verify_blocking` CONCLUDES from that pair. While
+    /// `cancel_all_open` returned `Ok(())` on a cut-short walk it set
+    /// `cancel_accepted`, every proof read then errored so `orders_seen` stayed
+    /// false, and the whole failure came out `is_only_unconfirmed()` — which
+    /// ARMS. An order resting on page 3 would have been cancelled by nothing,
+    /// observed by nothing, and armed on top of.
+    #[test]
+    fn a_truncated_cursor_walk_does_not_come_out_as_merely_unconfirmed() {
+        // page 1 parses and carries a tag (so the premise holds); page 2 is a
+        // 200 whose body cannot be read. Repeated for every round.
+        let p1 = r#"{"orders":[{"order_id":"o-1","status":"canceled","client_order_id":"m1"}],"cursor":"CUR"}"#;
+        let p2 = r#"{"cursor":""}"#;
+        let mut replies = Vec::new();
+        for _ in 0..40 {
+            replies.push((200, p1.to_string()));
+            replies.push((200, p2.to_string()));
+        }
+        let gw = KalshiGateway::with_transport(
+            signer(),
+            RateLimiter::from_per_minute(600.0, 0),
+            Mock { replies: Mutex::new(replies), sent: Mutex::new(Vec::new()) },
+        );
+        let pol = SweepPolicy {
+            poll_delay: std::time::Duration::ZERO,
+            ..SweepPolicy::default()
+        };
+        let e = cancel_all_and_verify_blocking(&gw, &pol)
+            .expect_err("a walk that never finished cannot prove a book clean");
+        assert!(
+            !e.cancel_accepted,
+            "a cancel over a list we could not finish reading is not an accepted cancel"
+        );
+        assert!(
+            !e.is_only_unconfirmed(),
+            "this must NOT arm: pages we never read could hold our resting orders"
+        );
+        assert!(e.msg.contains("cursor walk stopped"), "{}", e.msg);
+    }
+
     /// A venue rejection surfaces as an error rather than being counted as a
     /// successful place.
     #[test]

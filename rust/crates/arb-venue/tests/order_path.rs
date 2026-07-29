@@ -456,8 +456,15 @@ fn a_list_that_echoes_no_tags_at_all_is_a_named_refusal_not_a_silent_no_op() {
 /// instead of hard-failing the whole sweep on a shape nobody has captured.
 ///
 /// But a truncated walk must never read as a complete one: the page we did not
-/// see could hold a resting order of ours. So the cancel proceeds over what was
-/// read, and the PROOF refuses.
+/// see could hold a resting order of ours. So the cancel goes out over what WAS
+/// read — and then BOTH halves report the truncation.
+///
+/// The cancel reporting it is not cosmetic, and the first cut got it wrong.
+/// `Ok(())` here sets `cancel_accepted` in the sweep, and with every proof read
+/// erroring, `orders_seen` stays false and the whole failure comes out
+/// `is_only_unconfirmed()` — which ARMS. See
+/// `sink::tests::a_truncated_cursor_walk_does_not_come_out_as_merely_unconfirmed`
+/// for the sweep-level verdict this protects.
 #[test]
 fn a_continuation_page_that_cannot_be_read_ends_the_walk_without_proving_anything() {
     let p1 = format!(
@@ -467,12 +474,16 @@ fn a_continuation_page_that_cannot_be_read_ends_the_walk_without_proving_anythin
     // the trailing page, with `orders` omitted entirely
     let p2 = r#"{"cursor":""}"#;
 
-    // the cancel still happens for everything page 1 showed
+    // the cancel still happens for everything page 1 showed...
     let g = gw(vec![(200, &p1), (200, p2), (200, "{}")]);
-    g.cancel_all_open().expect("a truncated walk must not withhold the cancel");
+    let err = g.cancel_all_open().expect_err("a truncated walk must not report success");
+    assert!(format!("{err}").contains("cursor walk stopped"), "{err}");
     let sent = g.transport.sent();
     assert_eq!(sent.len(), 3, "two page reads and the cancel: {sent:?}");
-    assert_eq!(sent[2].path, "/trade-api/v2/portfolio/events/orders/ours");
+    assert_eq!(
+        sent[2].path, "/trade-api/v2/portfolio/events/orders/ours",
+        "...the rows we DID read are still cancelled before it reports"
+    );
 
     // ...but nothing is proven over a list that was cut short
     let g = gw(vec![(200, &p1), (200, p2)]);

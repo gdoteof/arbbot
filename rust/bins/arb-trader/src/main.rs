@@ -623,15 +623,26 @@ fn sweep_only_blast_radius(cred_suffix: &[(String, String)], unscoped: bool) -> 
 ///
 /// The pre-read survives only as a log line for the human, and is now
 /// best-effort: an unreadable list is a reason to sweep, not a reason to stop.
+/// `Ok(unconfirmed)` — the venues that swept without proving. Empty is the
+/// normal answer; anything in it means the caller armed over a book no venue
+/// could confirm, and every caller has to say so rather than print "clean".
 async fn startup_sweep(
     sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
     pol: &sink::SweepPolicy,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
+    let mut unconfirmed: Vec<String> = Vec::new();
     for (venue, sink) in sinks {
         let s = sink.clone();
         match tokio::task::spawn_blocking(move || s.resting_order_ids()).await {
             Ok(Ok(before)) if before.is_empty() => {
-                eprintln!("[exec] {venue:?}: nothing resting (unconfirmed) — sweeping anyway");
+                // NOT the word "unconfirmed": that is the verdict line below,
+                // and this one fires on every single start. A `grep -i
+                // unconfirmed` that matches the boring line twice a start is
+                // exactly how the grave one gets trained away.
+                eprintln!(
+                    "[exec] {venue:?}: pre-read shows nothing resting (one read, not \
+                     evidence) — sweeping anyway"
+                );
             }
             Ok(Ok(before)) => {
                 eprintln!("[exec] {venue:?}: CANCELLING {} resting order(s): {}", before.len(),
@@ -655,18 +666,24 @@ async fn startup_sweep(
             // its failure comes back through `cancel_all_open`, so it still
             // refuses below); it is not earned here.
             Err(e) if e.is_only_unconfirmed() => {
-                eprintln!("[exec] {venue:?}: ARMING ON AN UNCONFIRMED BOOK — {e}");
+                // `###`, the same mechanism `ShutdownOutcome::report` reserves
+                // for a non-zero exit. "Loud" in wording alone is not loud
+                // against a journal whose 60s cadence is a 2 KB JSON blob.
+                eprintln!("[exec] ###########################################################");
+                eprintln!("[exec] ### ARMING ON A BOOK NO VENUE COULD CONFIRM            ###");
+                eprintln!("[exec] ###########################################################");
+                eprintln!("[exec] ### {venue:?}: {e}");
                 eprintln!(
-                    "[exec] {venue:?}: cancel-all was accepted and nothing was seen resting, \
-                     but the resting list could not be READ. The body is in the line above: \
-                     it is the response shape this repo has never captured. Pin it and \
-                     tighten the check."
+                    "[exec] ###   cancel-all was ACCEPTED and nothing was seen resting, but \
+                     the resting list could not be READ. The body above is a response shape \
+                     this repo has never captured — PIN IT and tighten the check."
                 );
+                unconfirmed.push(format!("{venue:?}: {e}"));
             }
             Err(e) => return Err(format!("{venue:?}: {e}")),
         }
     }
-    Ok(())
+    Ok(unconfirmed)
 }
 
 fn credential(name: &str) -> Result<String, String> {
@@ -1432,14 +1449,34 @@ async fn main() {
         // SIGTERM did, and only after the engine was already quoting.
         exec::register_sinks(sinks.clone());
         exec::install_armed_panic_hook();
-        if let Err(e) = startup_sweep(&sinks, &sink::SweepPolicy::default()).await {
-            eprintln!("[exec] STARTUP SWEEP FAILED: {e}");
-            eprintln!("[exec] refusing to arm: the book could not be proven clean");
-            std::process::exit(10);
-        }
+        let unconfirmed = match startup_sweep(&sinks, &sink::SweepPolicy::default()).await {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("[exec] STARTUP SWEEP FAILED: {e}");
+                eprintln!("[exec] refusing to arm: the book could not be proven clean");
+                std::process::exit(10);
+            }
+        };
         if args.sweep_only {
-            eprintln!("[exec] --sweep-only: book reconciled, exiting without quoting");
-            return;
+            // The verdict, not just the fact that we finished. This is the tool
+            // the halt banner tells a human to reach for, so "reconciled" over
+            // a book no venue could confirm — and an exit 0 with it — is the
+            // one answer it must never give.
+            if unconfirmed.is_empty() {
+                eprintln!("[exec] --sweep-only: book reconciled, exiting without quoting");
+                return;
+            }
+            eprintln!(
+                "[exec] ### --sweep-only: the cancel went in, but {} venue(s) could NOT \
+                 CONFIRM the book: {}",
+                unconfirmed.len(),
+                unconfirmed.join("; ")
+            );
+            eprintln!(
+                "[exec] ### exiting {} — nothing was seen resting, and nothing is proven",
+                exec::EXIT_BOOK_UNCONFIRMED
+            );
+            std::process::exit(exec::EXIT_BOOK_UNCONFIRMED);
         }
         spawn_shutdown_sweep();
         spawn_fill_feeds(&args, tx_acks.as_ref());

@@ -70,6 +70,17 @@ impl<T: Transport> PmusGateway<T> {
     /// or `{"orders": [...]}` (Python: `j if isinstance(j, list) else
     /// j.get("orders", [])`).
     ///
+    /// PRE-EXISTING, NOT INTRODUCED HERE, and recorded because this function is
+    /// now the sweep's only evidence on this venue: it reads ONE page and
+    /// handles no cursor, while [`resp::PmPositions`] in the same crate models a
+    /// `next_cursor` for the positions endpoint. If `/v1/orders/open` paginates
+    /// the way positions does, a book wider than one page would report only its
+    /// first page and `resting_order_ids` could answer "empty" over a later one
+    /// — Kalshi's `listing` walks its cursor for exactly that reason. Nobody has
+    /// captured a paginated response here either way. Left alone rather than
+    /// guessed at: inventing a cursor parameter this endpoint may not accept is
+    /// its own failure mode, on the halt path.
+    ///
     /// The envelope's `orders` is REQUIRED — the same defect
     /// [`resp::KalshiOrdersPage`] carried, reached through the fallback instead
     /// of the struct. Python's `.get("orders", [])` really does default, and

@@ -81,6 +81,28 @@ pub struct ExecStats {
 /// cancelled by hand. A halt that cannot fail loudly is not a halt.
 pub const EXIT_ORDERS_LEFT_RESTING: i32 = 17;
 
+/// Exit code that means: **the cancel went in, nothing was seen resting, and
+/// the book could not be CONFIRMED.** Weaker than 17 and still not zero.
+///
+/// It is not zero because of how this unit is actually watched.
+/// `arbbot-trader-m3` is `Restart=no` with no `OnFailure=`, and
+/// `scripts/freshness_check.sh` pages on `systemctl is-failed` and nothing
+/// else — its own comment says "is-failed is therefore the only RUNTIME
+/// condition that means something is wrong". So a zero exit here would leave
+/// the unit `inactive/Result=success`, byte-identical to a deliberate disarm,
+/// with the evidence only in a journal nobody is instructed to read. The one
+/// automated alarm this system has would be silent for the one outcome nobody
+/// has ever observed.
+///
+/// The asymmetry with the ARMING path is deliberate and is the whole reason
+/// these are two different decisions. Refusing to start risks a real outage —
+/// an engine that can never come up over an unobserved response body — and a
+/// human is present to see it. On the way OUT the process exits either way:
+/// the code changes nothing about whether orders rest, only whether the alarm
+/// fires. Fail-closed here has zero outage risk. Noisy, never an outage — and
+/// that noise is precisely how the missing observation finally gets made.
+pub const EXIT_BOOK_UNCONFIRMED: i32 = 18;
+
 /// Wall-clock budget for in-flight PLACES to settle before we verify.
 ///
 /// Strictly LONGER than `HttpTransport`'s own 15s timeout, on purpose. A place
@@ -350,11 +372,16 @@ impl ShutdownOutcome {
         let provable = self.unclean.is_empty()
             && self.places_inflight_at_verify == 0
             && self.discarded_takers == 0;
-        if provable {
-            0
-        } else {
-            EXIT_ORDERS_LEFT_RESTING
+        if !provable {
+            return EXIT_ORDERS_LEFT_RESTING;
         }
+        // Nothing is known to be resting, but a venue could not confirm it.
+        // Distinct from 17 so a human never has to disambiguate the two, and
+        // non-zero so the one alarm this deployment has actually fires.
+        if !self.unconfirmed.is_empty() {
+            return EXIT_BOOK_UNCONFIRMED;
+        }
+        0
     }
 
     /// Unmissable in `systemctl status`, which shows the last log lines and the
@@ -383,17 +410,6 @@ impl ShutdownOutcome {
                 ));
             }
         }
-        for (v, e) in &self.unconfirmed {
-            out.push(format!(
-                "[exec] {v:?}: cancel-all ACCEPTED and nothing was ever seen resting, \
-                 but the book could NOT be confirmed — {e}"
-            ));
-            out.push(format!(
-                "[exec] {v:?}: ^ this is an UNREAD list, not a proven-empty one. If this \
-                 line is routine, the body above is the response shape this repo has \
-                 never captured — pin it and tighten the check"
-            ));
-        }
         let makers = self.discarded_places.saturating_sub(self.discarded_takers);
         if makers > 0 {
             out.push(format!(
@@ -403,11 +419,29 @@ impl ShutdownOutcome {
         if self.exit_code() == 0 {
             return out;
         }
+        let code = self.exit_code();
         out.push("[exec] ###########################################################".into());
-        out.push("[exec] ### ORDERS MAY STILL BE RESTING ON A VENUE — NOT CLEAN  ###".into());
+        if code == EXIT_BOOK_UNCONFIRMED {
+            // Weaker claim, deliberately: nothing was SEEN resting. Saying
+            // "orders may still be resting" here would cry wolf on every
+            // shutdown if this turns out to be what an empty PM-US book looks
+            // like, and an alarm that cries wolf is the one nobody reads.
+            out.push("[exec] ### BOOK NOT CONFIRMED — the cancel went in, nothing was ###".into());
+            out.push("[exec] ### seen resting, and no venue could PROVE it empty.    ###".into());
+        } else {
+            out.push("[exec] ### ORDERS MAY STILL BE RESTING ON A VENUE — NOT CLEAN  ###".into());
+        }
         out.push("[exec] ###########################################################".into());
         for (v, e) in &self.unclean {
             out.push(format!("[exec] ### {v:?}: {e}"));
+        }
+        for (v, e) in &self.unconfirmed {
+            out.push(format!("[exec] ### {v:?}: {e}"));
+            out.push(
+                "[exec] ###   ^ an UNREAD list, not a proven-empty one. The body above is \
+                 a response shape this repo has never captured — PIN IT and tighten the check"
+                    .into(),
+            );
         }
         if self.places_inflight_at_verify > 0 {
             out.push(format!(
@@ -447,8 +481,7 @@ impl ShutdownOutcome {
                 .into(),
         );
         out.push(format!(
-            "[exec] ### exiting {EXIT_ORDERS_LEFT_RESTING} so systemd records a FAILURE, \
-             not a clean stop"
+            "[exec] ### exiting {code} so systemd records a FAILURE, not a clean stop"
         ));
         out
     }
@@ -1544,6 +1577,77 @@ mod tests {
         assert_eq!(halt_exit_code(101, &clean), 101, "panic, book clean");
         assert_eq!(halt_exit_code(101, &dirty), EXIT_ORDERS_LEFT_RESTING);
         assert_ne!(EXIT_ORDERS_LEFT_RESTING, 0, "never a clean stop");
+    }
+
+    /// A book no venue could CONFIRM must not exit 0.
+    ///
+    /// This deployment gives exit code exactly one consequence: `Restart=no`,
+    /// no `OnFailure=`, and `scripts/freshness_check.sh` pages on
+    /// `systemctl is-failed` and nothing else — its own comment calls that
+    /// "the only RUNTIME condition that means something is wrong". A zero here
+    /// would leave the unit `inactive/Result=success`, byte-identical to a
+    /// deliberate disarm, with the evidence only in a journal nobody is told to
+    /// read. The one automated alarm in the system would be silent for the one
+    /// outcome nobody has ever observed.
+    #[test]
+    fn a_book_no_venue_could_confirm_still_fails_the_unit() {
+        let unconfirmed = ShutdownOutcome {
+            clean: vec![Venue::Kalshi],
+            unconfirmed: vec![(
+                Venue::PolymarketUs,
+                "book could NOT be proven clean (last venue error: cannot list resting \
+                 orders: pmus:open_orders: parse error: missing field `orders` — body \
+                 was: {})"
+                    .into(),
+            )],
+            ..Default::default()
+        };
+        assert_eq!(
+            unconfirmed.exit_code(),
+            EXIT_BOOK_UNCONFIRMED,
+            "an unconfirmed book must page, not read as a clean stop"
+        );
+        assert_ne!(EXIT_BOOK_UNCONFIRMED, 0);
+        assert_ne!(
+            EXIT_BOOK_UNCONFIRMED, EXIT_ORDERS_LEFT_RESTING,
+            "a human must never have to disambiguate 'unread' from 'leaked'"
+        );
+
+        // ...and a real leak still wins when both apply.
+        let both = ShutdownOutcome {
+            unclean: vec![(Venue::Kalshi, "1 order(s) SURVIVED".into())],
+            unconfirmed: vec![(Venue::PolymarketUs, "unreadable".into())],
+            ..Default::default()
+        };
+        assert_eq!(both.exit_code(), EXIT_ORDERS_LEFT_RESTING, "the graver verdict wins");
+        assert_eq!(halt_exit_code(70, &unconfirmed), EXIT_BOOK_UNCONFIRMED);
+    }
+
+    /// ...and it says so where a human will see it: `systemctl status` shows the
+    /// last log lines and the exit code, so the report has to carry the banner.
+    /// It must NOT claim orders may be resting — nothing was seen resting, and
+    /// an alarm that overstates on every shutdown is one nobody reads.
+    #[test]
+    fn an_unconfirmed_book_is_bannered_without_claiming_a_leak() {
+        let out = ShutdownOutcome {
+            clean: vec![Venue::Kalshi],
+            unconfirmed: vec![(Venue::PolymarketUs, "body was: {}".into())],
+            ..Default::default()
+        };
+        let r = out.report().join("\n");
+        assert!(r.contains("###"), "the loud mechanism, not just loud wording: {r}");
+        assert!(r.contains("BOOK NOT CONFIRMED"), "{r}");
+        assert!(!r.contains("ORDERS MAY STILL BE RESTING"), "must not overstate: {r}");
+        assert!(r.contains("PIN IT"), "tells the reader what the body is for: {r}");
+        assert!(r.contains("body was: {}"), "carries the raw body: {r}");
+        assert!(r.contains(&format!("exiting {EXIT_BOOK_UNCONFIRMED}")), "{r}");
+
+        // a real leak keeps the stronger banner
+        let leak = ShutdownOutcome {
+            unclean: vec![(Venue::Kalshi, "1 order(s) SURVIVED".into())],
+            ..Default::default()
+        };
+        assert!(leak.report().join("\n").contains("ORDERS MAY STILL BE RESTING"));
     }
 
     /// The report has to survive being read at 3am in `systemctl status`.

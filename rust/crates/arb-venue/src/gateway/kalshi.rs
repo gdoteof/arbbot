@@ -216,6 +216,16 @@ impl<T: Transport> KalshiGateway<T> {
     }
 }
 
+/// `Err` when the walk that produced this result was cut short. The cancels have
+/// already gone out by the time this is consulted — this decides only what the
+/// operation REPORTS, and reporting success is what would arm the engine.
+fn truncated(cut_short: Option<String>) -> Result<(), VenueError> {
+    match cut_short {
+        Some(why) => Err(VenueError::Parse { endpoint: "kalshi:orders", detail: why }),
+        None => Ok(()),
+    }
+}
+
 /// One cursor walk, and whether it reached the end.
 struct Listing {
     orders: Vec<resp::KalshiOrder>,
@@ -286,6 +296,32 @@ impl Book {
     /// exists to stop. So it is named, it carries the numbers, and it names the
     /// flag that overrides it — `--sweep-unscoped` restores the old
     /// account-wide behaviour for an operator who has decided to accept it.
+    /// Say out loud how many resting rows this sweep declined to attribute.
+    ///
+    /// `untagged` was computed and thrown away, which left the ONE residual in
+    /// this design with no signal at all: the premise check asks whether the tag
+    /// survives the round trip ANYWHERE in history, but the proof relies on it
+    /// being present on EVERY resting row of ours. A venue that echoed the tag
+    /// on finished rows but dropped it from resting ones would pass the premise,
+    /// land our own resting orders in `untagged`, and let `resting_order_ids`
+    /// answer `Ok(vec![])` — "PROVEN clean" over our own book.
+    ///
+    /// Tightening the check cannot fix that without wedging the web-UI order
+    /// this design deliberately tolerates, so the residual stays and this line
+    /// is how anyone would ever notice it. On a healthy account it is silent;
+    /// a count that tracks our own quote count is the tell.
+    fn report_untagged(&self) {
+        if self.untagged > 0 {
+            eprintln!(
+                "[venue] kalshi sweep: {} resting order(s) carry NO client_order_id — not \
+                 cancelled and not counted as ours. Expected for orders placed by hand in \
+                 the venue's own UI; if this tracks THIS engine's quote count, the list has \
+                 stopped echoing the tag on resting rows and the sweep is proving nothing.",
+                self.untagged
+            );
+        }
+    }
+
     fn premise_broken(&self) -> Option<VenueError> {
         (!self.echoes_tags && self.rows > 0).then(|| VenueError::Status {
             endpoint: "kalshi orders",
@@ -468,12 +504,22 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
     /// does — so [`Book`] checks that against the same read, and refuses rather
     /// than quietly cancelling nothing. See [`Book::echoes_tags`].
     fn cancel_all_open(&self) -> Result<(), VenueError> {
-        // Cancelling proceeds on a cut-short walk — every row we DID read is
-        // still worth cancelling, and withholding the cancel because the list
-        // was truncated would leave orders resting to protect a proof we were
-        // never going to be able to give. `resting_order_ids` is where the
-        // truncation refuses.
-        let orders = self.listing()?.orders;
+        // A cut-short walk cancels everything it DID read and then still
+        // REPORTS the truncation. Both halves matter and the first cut had only
+        // the first: withholding the cancel would leave read orders resting to
+        // protect a proof we could never give, but returning `Ok(())` sets
+        // `cancel_accepted` in the sweep, which makes the whole failure
+        // `is_only_unconfirmed()` — and the engine ARMS over pages 3..n it never
+        // read. That is defect A relocated one layer up, and it is likeliest
+        // exactly when page 1 holds no resting rows, which is the common case.
+        //
+        // Note the asymmetry it fixes: a continuation page with status != 200 is
+        // already fail-closed (`listing` returns Err), so only the
+        // 200-with-unreadable-body page could arm — the same hypothesised body
+        // class this whole change exists to refuse.
+        let listing = self.listing()?;
+        let cut_short = listing.cut_short;
+        let orders = listing.orders;
         if self.unscoped_sweep {
             for o in orders {
                 if o.is_resting() {
@@ -483,16 +529,17 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
                     })?;
                 }
             }
-            return Ok(());
+            return truncated(cut_short);
         }
         let book = Book::read(orders);
         if let Some(e) = book.premise_broken() {
             return Err(e);
         }
+        book.report_untagged();
         for oid in book.ours {
             self.cancel(&CancelRequest { by: CancelBy::VenueId(oid), market_slug: None })?;
         }
-        Ok(())
+        truncated(cut_short)
     }
 
     /// Live auth rehearsal (docs/migration-plan.md M2): place ONE contract at
