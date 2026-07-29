@@ -1434,6 +1434,11 @@ fn run_cfg(
         // a bench run has no utilization to size.
         unwind: (!bench && args.unwind_detect_only).then(|| engine::Unwind {
             marks_path: args.marks.clone(),
+            // The SAME scope `load_quoters` filters the registry by, so the
+            // scan can say which of its candidates this process could act on.
+            // The live answer is "none of them" and that is the finding —
+            // `crate::unwind` §1.
+            owned_prefixes: args.rel_prefixes.clone(),
         }),
         armed,
     }
@@ -2406,9 +2411,18 @@ relationships:
 
         let mut a = default_args();
         a.unwind_detect_only = true;
+        // ...and the SAME scope the registry was filtered by, so the scan can
+        // report which candidates this process holds a quoter for. The armed
+        // unit runs three of these and selects candidates in none of them.
+        a.rel_prefixes = vec!["xvus-nobel-peace-26".into()];
         let on = run_cfg(a, false, false, false, None, 0, no_policy());
         let u = on.unwind.expect("the flag must reach the engine");
         assert_eq!(u.marks_path, default_args().marks, "and it reads the marks file");
+        assert_eq!(
+            u.owned_prefixes,
+            ["xvus-nobel-peace-26"],
+            "the ownership scope must reach it too, or every candidate reads as actionable"
+        );
 
         let mut a = default_args();
         a.unwind_detect_only = true;
