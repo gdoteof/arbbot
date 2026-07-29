@@ -870,6 +870,25 @@ impl Engine {
             // digit while an order's pieces land. A number that sits high is
             // dust nothing will ever hedge — see `fills::kalshi_fill_dust_hundredths`.
             "kalshi_fill_dust_hundredths": crate::fills::kalshi_fill_dust_hundredths(),
+            // Fills the venue had that this process's WS never delivered,
+            // recovered by the reconciliation and hedged. This is the gauge
+            // that says the defect ACTUALLY happened — `kalshi_fill_gaps`
+            // above only says there was a window it could have happened in.
+            // Not an error: nonzero is the repair working.
+            "kalshi_fills_recovered": crate::fills::kalshi_fills_recovered(),
+            // ...and reconciliations that could not run at all: venue refused,
+            // background budget spent, unparseable response, or a history
+            // longer than the page cap. Must stay 0. While it rises the Kalshi
+            // fill totals are a local sum with nothing behind them — the
+            // posture the reconciliation exists to end.
+            "kalshi_reconcile_failures": crate::fills::kalshi_reconcile_failures(),
+            // ...and orders whose venue rows were REFUSED because merging them
+            // would have exceeded the venue's own total for the window. Must
+            // stay 0. A transient count is the REST list lagging the socket; a
+            // number that climbs with the fill rate means WS and REST
+            // trade_ids are different id spaces, which makes the whole
+            // reconciliation inert (see `fills::kalshi_reconcile_rejected`).
+            "kalshi_reconcile_rejected": crate::fills::kalshi_reconcile_rejected(),
             "would_place": self.exec_stats.placed.load(std::sync::atomic::Ordering::Relaxed),
             "would_cancel": self.exec_stats.cancelled.load(std::sync::atomic::Ordering::Relaxed),
             "exec_dropped": self.exec_stats.dropped.load(std::sync::atomic::Ordering::Relaxed),

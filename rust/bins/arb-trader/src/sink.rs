@@ -282,6 +282,17 @@ pub trait OrderSink: Send + Sync {
     ) -> Result<Option<String>, VenueError> {
         Ok(None)
     }
+    /// Venue truth for the private fill feed: every fill on this account at or
+    /// after `min_ts` (unix seconds), carrying the venue's own per-fill id.
+    ///
+    /// Reached through the SINK rather than a gateway the fill task builds for
+    /// itself, so it spends the same per-venue background budget as every other
+    /// read this process makes. A second gateway would be a second token
+    /// bucket, which is exactly the "one cross-process budget" that quirk
+    /// `xv-shared-api-budget` exists to keep.
+    fn fills_since(&self, _min_ts: i64) -> Result<Vec<arb_venue::resp::KalshiFillRow>, VenueError> {
+        Ok(Vec::new())
+    }
 }
 
 /// Every gateway is a sink. The adapter is the same four delegations for both
@@ -314,6 +325,9 @@ where
         claimed: &std::collections::HashSet<String>,
     ) -> Result<Option<String>, VenueError> {
         VenueGateway::recover_place(self, req, claimed)
+    }
+    fn fills_since(&self, min_ts: i64) -> Result<Vec<arb_venue::resp::KalshiFillRow>, VenueError> {
+        VenueGateway::fills_since(self, min_ts)
     }
 }
 

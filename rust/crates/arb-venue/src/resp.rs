@@ -110,6 +110,57 @@ pub struct KalshiOrdersPage {
     pub cursor: Option<String>,
 }
 
+/// One row of GET /portfolio/fills — the venue's own record of a single fill.
+///
+/// Shape pinned from the live dump in `data/venue/kalshi_fills.json` — the
+/// untracked snapshot `arb-books` reconciles the Kalshi account from. Every row carries BOTH `trade_id` and `order_id`, and that pair is
+/// what makes the fill feed reconcilable at all: the count alone would only let
+/// a caller overwrite a running total, while the id lets it MERGE — see
+/// `arb-trader`'s `KalshiFills::claim`.
+///
+/// `fill_id == trade_id` on every row of it. They are read as separate fields
+/// anyway, because the WS `fill` frame carries only `trade_id` and that is the
+/// one that has to match.
+///
+/// `count_fp` is a plain contract count (quirk `kalshi-fill-count-fp-plain-count`)
+/// and it is NOT always an integer: about a tenth of the rows are fractional,
+/// in pieces that sum to their order's whole size. It stays a STRING here under
+/// the module contract above; the caller does the fixed-point arithmetic.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KalshiFillRow {
+    /// The WS `fill` frame's dedupe key, and the whole point of this struct.
+    pub trade_id: String,
+    pub order_id: String,
+    pub count_fp: String,
+    #[serde(default)]
+    pub market_ticker: Option<String>,
+    #[serde(default)]
+    pub ticker: Option<String>,
+    /// Unix SECONDS. Rows come back newest-first in the dump, which is what lets
+    /// a caller stop paging instead of walking the account's whole history —
+    /// but see `KalshiGateway::fills_since` for why that is not ASSUMED.
+    #[serde(default)]
+    pub ts: i64,
+}
+
+impl KalshiFillRow {
+    /// The market this fill was on. `market_ticker` is the WS frame's spelling
+    /// and `ticker` the REST row's; both appear in the live dump and they are
+    /// equal on every row of it.
+    pub fn market(&self) -> &str {
+        self.market_ticker.as_deref().or(self.ticker.as_deref()).unwrap_or_default()
+    }
+}
+
+/// GET /portfolio/fills — paginated, `cursor` absent/empty on the last page.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KalshiFillsPage {
+    #[serde(default)]
+    pub fills: Vec<KalshiFillRow>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
 /// GET /portfolio/balance. `balance_dollars` is money → string.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KalshiBalance {
@@ -172,6 +223,34 @@ pub fn kalshi_created_order(body: &str) -> Result<KalshiOrder, VenueError> {
 }
 pub fn kalshi_orders_page(body: &str) -> Result<KalshiOrdersPage, VenueError> {
     parse("kalshi:orders", body)
+}
+/// The envelope is `{"fills": [...], "cursor": ...}` per `docs/venue-quirks.md`
+/// §`kalshi-fills-are-the-fee-authority`, but the only capture in this repo is
+/// the dump, which was already unwrapped to a bare array. So accept BOTH, the
+/// way `kalshi_created_order` accepts every create shape the venue has been
+/// seen to return — and for the same reason: an envelope we guessed wrong must
+/// fail loudly with the raw body, not silently reconcile zero fills.
+pub fn kalshi_fills_page(body: &str) -> Result<KalshiFillsPage, VenueError> {
+    // Dispatch on the SHAPE before deserializing. `#[serde(default)]` on
+    // `fills` — which `cursor` genuinely needs, since it is absent on the last
+    // page — would otherwise let any JSON object at all parse as a page of
+    // zero fills. "Nothing to reconcile" is precisely the wrong answer to give
+    // for a response we could not read: it leaves contracts unhedged and moves
+    // no counter. So the `fills` key must actually be there.
+    let v: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return Err(from_serde("kalshi:fills", &e)),
+    };
+    let has_fills = v.get("fills").map(|f| f.is_array()).unwrap_or(false);
+    if has_fills {
+        return parse("kalshi:fills", body);
+    }
+    if v.is_array() {
+        return Ok(KalshiFillsPage { fills: parse("kalshi:fills", body)?, cursor: None });
+    }
+    let mut detail = String::from("neither {\"fills\":[..]} nor a bare array; raw body: ");
+    detail.push_str(&body.chars().take(600).collect::<String>());
+    Err(VenueError::Parse { endpoint: "kalshi:fills", detail })
 }
 pub fn kalshi_balance(body: &str) -> Result<KalshiBalance, VenueError> {
     parse("kalshi:balance", body)

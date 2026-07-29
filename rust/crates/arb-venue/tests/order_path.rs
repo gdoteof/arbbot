@@ -1042,3 +1042,189 @@ fn an_order_that_never_becomes_visible_fails_and_is_still_cancelled() {
     assert_eq!(sent.len(), 4);
     assert_eq!(sent[3].method, "DELETE", "never leave it resting");
 }
+
+// ------------------------------------------------------- fill history (K6) ---
+
+/// The `GET /portfolio/fills` row SHAPE, field for field, as the live dump
+/// carries it — and, deliberately, none of its content: this repo is public, so
+/// the ids, ticker, prices and fees are synthetic. What is reproduced from the
+/// venue is the field SET (every key the dump has, including the ones this
+/// parser ignores) and the one property the reconciliation depends on: a single
+/// order filled in two FRACTIONAL pieces that sum to its whole size.
+const LIVE_FILLS: &str = r#"{"fills":[
+ {"action":"sell","book_side":"ask","count_fp":"2.13","created_time":"2026-01-01T00:00:00.000000Z",
+  "fee_cost":"0.010000","fill_id":"fill-a","is_taker":true,
+  "market_ticker":"KXSHAPE-TEST","no_price_dollars":"0.5000",
+  "order_id":"order-1","outcome_side":"no","side":"no",
+  "subaccount_number":0,"ticker":"KXSHAPE-TEST",
+  "trade_id":"fill-a","ts":1784878633,"yes_price_dollars":"0.5000"},
+ {"action":"sell","book_side":"ask","count_fp":"1.87","created_time":"2026-01-01T00:00:00.000000Z",
+  "fee_cost":"0.010000","fill_id":"fill-b","is_taker":true,
+  "market_ticker":"KXSHAPE-TEST","no_price_dollars":"0.5000",
+  "order_id":"order-1","outcome_side":"no","side":"no",
+  "subaccount_number":0,"ticker":"KXSHAPE-TEST",
+  "trade_id":"fill-b","ts":1784878633,"yes_price_dollars":"0.5000"}
+]}"#;
+
+/// K6: the row shape parses, and the two fields the reconciliation is FOR —
+/// `trade_id` and `order_id` — survive it. A count alone would only let a
+/// caller overwrite a running total; the id is what lets it MERGE.
+///
+/// `fill_id` and `trade_id` are equal on every row of the live dump. They are
+/// still read as separate fields, because the WS `fill` frame carries only
+/// `trade_id` and that is the one that has to match.
+#[test]
+fn the_kalshi_fills_row_shape_parses_with_its_trade_ids() {
+    let g = gw(vec![(200, LIVE_FILLS)]);
+    let rows = g.fills_since(0).expect("the fills row shape must parse");
+    assert_eq!(rows.len(), 2);
+    // Both rows share a timestamp, so assert membership rather than order.
+    let ids: Vec<&str> = rows.iter().map(|r| r.trade_id.as_str()).collect();
+    assert!(ids.contains(&"fill-a"), "{ids:?}");
+    assert!(ids.contains(&"fill-b"), "{ids:?}");
+    for r in &rows {
+        assert_eq!(r.order_id, "order-1", "two fills, ONE order — that is the whole point");
+        assert_eq!(r.market(), "KXSHAPE-TEST");
+    }
+    let sent = g.transport.sent();
+    assert_eq!(sent[0].method, "GET");
+    assert_eq!(sent[0].path, "/trade-api/v2/portfolio/fills");
+    assert_eq!(sent[0].query.as_deref(), Some("limit=100"), "paginated, like /portfolio/orders");
+}
+
+/// The dump this fixture came from is a BARE ARRAY — the envelope was stripped
+/// by whatever fetched it — while `docs/venue-quirks.md` describes a cursor
+/// page. Neither shape may be the one that silently reconciles zero fills.
+#[test]
+fn a_bare_array_of_fills_parses_like_the_enveloped_one() {
+    let bare = LIVE_FILLS.replacen(r#"{"fills":"#, "", 1);
+    let bare = bare.strip_suffix('}').expect("trailing brace");
+    let g = gw(vec![(200, bare)]);
+    assert_eq!(g.fills_since(0).expect("a bare array is a page too").len(), 2);
+}
+
+/// An envelope we guessed wrong must FAIL with the body in the error, never
+/// return an empty page — an empty page reads as "nothing to reconcile", which
+/// is the answer that leaves contracts unhedged.
+#[test]
+fn an_unrecognised_fills_envelope_is_an_error_carrying_the_body() {
+    let g = gw(vec![(200, r#"{"data":{"rows":[]}}"#)]);
+    match g.fills_since(0) {
+        Err(VenueError::Parse { endpoint, detail }) => {
+            assert_eq!(endpoint, "kalshi:fills");
+            assert!(detail.contains(r#"{"data":{"rows":[]}}"#), "raw body in the error: {detail}");
+        }
+        other => panic!("an unreadable page must not read as no fills: {other:?}"),
+    }
+}
+
+/// Rows come back NEWEST-first in the live dump, so the walk stops at the first
+/// row older than the window instead of paging the account's whole history. Without this, every reconnect costs a full history read that
+/// grows forever.
+#[test]
+fn paging_stops_at_the_first_row_older_than_the_window() {
+    let page1 = r#"{"fills":[
+      {"trade_id":"t3","order_id":"o1","count_fp":"1.00","ticker":"KX","ts":300},
+      {"trade_id":"t2","order_id":"o1","count_fp":"1.00","ticker":"KX","ts":200},
+      {"trade_id":"t1","order_id":"o1","count_fp":"1.00","ticker":"KX","ts":100}
+    ],"cursor":"more"}"#;
+    let g = gw(vec![(200, page1), (200, r#"{"fills":[]}"#)]);
+    let rows = g.fills_since(200).expect("page");
+    assert_eq!(rows.len(), 2, "t1 is before the window");
+    assert_eq!(
+        rows.iter().map(|r| r.trade_id.as_str()).collect::<Vec<_>>(),
+        vec!["t2", "t3"],
+        "returned OLDEST first, whatever order the venue used"
+    );
+    assert_eq!(g.transport.sent().len(), 1, "the cursor is not followed past the window");
+}
+
+/// ...but ONLY on a page it can see is descending. Nothing in this repo
+/// produces the dump the newest-first claim comes from, so an oldest-first
+/// venue is not ruled out — and against one, an unconditional early stop
+/// discards page 1 as entirely pre-window and answers `Ok(vec![])`. That is a
+/// permanently inert reconciliation reporting itself healthy: `recovered` 0,
+/// `failures` 0, every gauge green, contracts unhedged.
+#[test]
+fn an_ascending_page_is_not_early_stopped() {
+    let page1 = r#"{"fills":[
+      {"trade_id":"t1","order_id":"o1","count_fp":"1.00","ts":100},
+      {"trade_id":"t2","order_id":"o1","count_fp":"1.00","ts":150}
+    ],"cursor":"more"}"#;
+    let page2 = r#"{"fills":[
+      {"trade_id":"t3","order_id":"o1","count_fp":"1.00","ts":300},
+      {"trade_id":"t4","order_id":"o1","count_fp":"1.00","ts":400}
+    ]}"#;
+    let g = gw(vec![(200, page1), (200, page2)]);
+    let rows = g.fills_since(200).expect("page");
+    assert_eq!(g.transport.sent().len(), 2, "page 1 is ALL pre-window; it proves nothing");
+    assert_eq!(
+        rows.iter().map(|r| r.trade_id.as_str()).collect::<Vec<_>>(),
+        vec!["t3", "t4"],
+        "the in-window rows are on the LAST page when the venue sorts ascending"
+    );
+}
+
+/// A single-row page proves nothing about sort order either, so it must not
+/// end the walk on its own.
+#[test]
+fn a_one_row_page_does_not_prove_the_order() {
+    let page1 = r#"{"fills":[{"trade_id":"t1","order_id":"o1","count_fp":"1.00","ts":100}],
+                    "cursor":"more"}"#;
+    let page2 = r#"{"fills":[{"trade_id":"t2","order_id":"o1","count_fp":"1.00","ts":300}]}"#;
+    let g = gw(vec![(200, page1), (200, page2)]);
+    let rows = g.fills_since(200).expect("page");
+    assert_eq!(g.transport.sent().len(), 2);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].trade_id, "t2");
+}
+
+/// A history longer than the page cap is an ERROR, never a partial list. The
+/// caller cannot tell a truncated answer from a complete one, and it uses this
+/// to decide whether contracts are unhedged.
+#[test]
+fn running_out_of_pages_with_a_live_cursor_is_an_error() {
+    let page = r#"{"fills":[{"trade_id":"t","order_id":"o1","count_fp":"1.00","ts":300},
+                            {"trade_id":"u","order_id":"o1","count_fp":"1.00","ts":301}],
+                   "cursor":"never-ends"}"#;
+    let g = gw(vec![(200, page); 6]);
+    match g.fills_since(0) {
+        Err(VenueError::Status { endpoint: "kalshi fills", body, .. }) => {
+            assert!(body.contains("truncated"), "say what it refused and why: {body}");
+        }
+        other => panic!("a truncated history must not read as the whole history: {other:?}"),
+    }
+    assert_eq!(g.transport.sent().len(), 5, "and it stops at the cap rather than paging forever");
+}
+
+/// ...and while every row is inside the window the cursor IS followed.
+#[test]
+fn paging_follows_the_cursor_while_rows_are_inside_the_window() {
+    let page1 = r#"{"fills":[{"trade_id":"t2","order_id":"o1","count_fp":"1.00","ts":200}],
+                    "cursor":"c1"}"#;
+    let page2 = r#"{"fills":[{"trade_id":"t1","order_id":"o1","count_fp":"1.00","ts":150}]}"#;
+    let g = gw(vec![(200, page1), (200, page2)]);
+    assert_eq!(g.fills_since(100).expect("pages").len(), 2);
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].query.as_deref(), Some("limit=100&cursor=c1"));
+}
+
+/// A reconciliation READ is Background — unlike `all_orders`, which is Critical
+/// because the cancel path cannot complete without it. Nothing waits on this
+/// one, so a spent budget must refuse it rather than earn a venue-side 429
+/// (`xv-shared-api-budget`). Proven by draining the bucket, since priority is
+/// not otherwise observable from outside.
+#[test]
+fn the_fill_history_read_spends_the_background_budget() {
+    let g = KalshiGateway::with_transport(
+        signer(),
+        RateLimiter::from_per_minute(0.0, 0), // no background tokens, ever
+        MockTransport::new(vec![(200, LIVE_FILLS)]),
+    );
+    assert!(
+        matches!(g.fills_since(0), Err(VenueError::RateLimited { .. })),
+        "a spent background budget must refuse the read"
+    );
+    assert!(g.transport.sent().is_empty(), "and refuse it BEFORE the wire");
+}
