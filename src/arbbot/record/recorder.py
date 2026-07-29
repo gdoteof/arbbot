@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -125,9 +126,33 @@ class UnixBroadcaster:
             return
         line = (event.model_dump_json() + "\n").encode()
         for w in list(self._writers):
-            if w.transport.get_write_buffer_size() > self.MAX_BUFFER:
+            buffered = w.transport.get_write_buffer_size()
+            if buffered > self.MAX_BUFFER:
                 self._writers.discard(w)
                 w.close()
+                # SAY SO. This used to be a bare `discard` + `close`, and the
+                # subscriber it drops is the ARMED TRADER: it reads this socket,
+                # sees the close as `subscription ended (EOF)`, and pulls every
+                # resting quote plus a sweep of both venues before it can
+                # reconnect. From here that cost nothing and appeared nowhere —
+                # the only trace of it in the whole system was on the client.
+                #
+                # It fires most often on `rebroadcast_snapshots`, which is one
+                # burst of every tracked book: ~1.5 MB on 2026-07-28 (222 INTL
+                # markets at ~4.5 KB each is two thirds of it) against this
+                # 1 MB limit. So the heal-burst evicts the subscriber it is
+                # healing whenever that subscriber is a moment slow to drain,
+                # which makes the rate a function of machine load — five on
+                # 2026-07-28, tightening from 49 minutes apart to 7 as the box
+                # got busy.
+                print(
+                    f"[recorder] DROPPED a subscriber: write buffer reached "
+                    f"{buffered} bytes, over the {self.MAX_BUFFER} limit. It sees "
+                    f"an EOF and must reconnect; if that subscriber is the trader, "
+                    f"it has just pulled every quote it had resting.",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 continue
             with contextlib.suppress(Exception):
                 w.write(line)
