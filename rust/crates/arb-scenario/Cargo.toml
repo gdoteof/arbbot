@@ -3,6 +3,9 @@ name = "arb-scenario"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { workspace = true }
 arb-core = { path = "../arb-core" }

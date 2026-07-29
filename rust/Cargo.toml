@@ -6,7 +6,7 @@ members = ["crates/arb-core", "crates/arb-tape", "crates/arb-venue", "crates/arb
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Lint policy. Members opt in with `[lints] workspace = true`.
+# Lint policy. All 16 members opt in with `[lints] workspace = true`.
 #
 # Every lint below is at deny/forbid AND was measured at zero violations across
 # `cargo clippy --all-targets --workspace` on 2026-07-28. That is the selection
@@ -14,20 +14,43 @@ serde_json = "1"
 # member can opt in with no code change and the gate can never be "temporarily"
 # downgraded to get a build out.
 #
+# The rule is only worth as much as the opt-in. Eleven of the sixteen members
+# carried no `[lints]` section at all until 2026-07-28 — arb-core and arb-dash
+# among them — so `unsafe_code = "forbid"` and every deny below applied to five
+# crates and quietly to nothing else. A member added without that stanza is
+# exempt from this whole file and nothing says so. Check it when you add one.
+#
+# `clippy::all` and `unused` joined the table on 2026-07-28, after the campaign
+# that cleared their 27 outstanding warnings (4 too_many_arguments, 4 unused_mut,
+# 3 items_after_test_module, 2 each unnecessary_map_or / identity_op /
+# useless_conversion, and one each of unused_variables, unused_assignments,
+# should_implement_trait, non_canonical_partial_ord_impl, redundant_closure,
+# manual_clamp, manual_is_multiple_of, manual_range_contains, manual_contains,
+# type_complexity). Eleven `#[allow]`s survive that cleanup, every one at the
+# site with its reason on the line above. A silent `#[allow]` is a downgrade
+# with no author.
+#
 # Deliberately NOT set here, with the violation count that is the reason
-# (measured 2026-07-28 over --all-targets, so tests are included). Each is a
-# real defect class; each needs a cleanup pass before it can be denied, and a
+# (re-measured 2026-07-28 over --all-targets with all members opted in, so
+# tests are included and no crate is missing from the total). Each is a real
+# defect class; each needs a cleanup pass before it can be denied, and a
 # warn-level lint nobody can fix is just noise:
-#   clippy::all = "deny"                 23   the current baseline drift
+#   clippy::indexing_slicing            411
+#   clippy::unwrap_used / expect_used   381 / 196
+#   clippy::arithmetic_side_effects     206
+#   clippy::let_underscore_must_use      56   the `let _ =` escape from #[must_use]
 #   clippy::cast_possible_truncation     30   the `f64 as i64` dropped-fill class
-#   clippy::let_underscore_must_use      35   the `let _ =` escape from #[must_use]
-#   clippy::integer_division             43   mostly intentional civil-day math
-#   clippy::wildcard_enum_match_arm      19   fail-open `_ =>` arms
-#   clippy::unwrap_used / expect_used   277 / 161
-#   clippy::indexing_slicing            299
-#   clippy::arithmetic_side_effects     193
-# Separately, 6 rustc warnings (unused_mut x4, unused_variables, unused_assignments)
-# block `unused = "deny"`.
+#   clippy::integer_division             20   mostly intentional civil-day math
+#   clippy::wildcard_enum_match_arm      20   fail-open `_ =>` arms
+# Most of these are LARGER than the figures this comment carried before the
+# campaign (indexing_slicing 299, unwrap_used 277, expect_used 161) while
+# integer_division fell hard (43 -> 20). The cause is not established. It is
+# NOT the opt-in: `-W` on the clippy command line applies to every workspace
+# member whether or not it has a `[lints]` stanza, measured both ways on
+# 2026-07-28 and identical to the violation. The likeliest explanation is the
+# six refactor PRs that landed between the two measurements — expanding the
+# engine's macro-generated state into explicit code turns one lint site into
+# many — but nobody has checked, so do not quote these as a trend.
 #
 # No clippy lint catches the two worst defects the 2026-07-28 audit found — a
 # silent `unwrap_or` default on a money field (a missing price became "0"), and
@@ -37,11 +60,23 @@ serde_json = "1"
 # There is no `unsafe` anywhere in the workspace. `forbid` so it cannot come
 # back via a local `#[allow]` either.
 unsafe_code = "forbid"
+# Dead code, unused imports, unused `mut`, unreachable arms. Individually
+# harmless; collectively they are the reason a reader cannot tell which of two
+# similar functions is the live one. Cleared to zero on 2026-07-28.
+# `priority = -1` because a lint group in the same table as one of its own
+# members must sort below it; `unused_must_use` below is inside `unused`.
+unused = { level = "deny", priority = -1 }
 # A dropped `Result` in the order path is how a failed cancel becomes a naked
 # leg. Warn-by-default is not enough on a money path.
 unused_must_use = "deny"
 
 [workspace.lints.clippy]
+# The default clippy groups (correctness, suspicious, style, complexity, perf).
+# Cleared to zero on 2026-07-28; the seven `#[allow]`s that survive that cleanup
+# are all at the site with the reason written next to them. `priority = -1` for
+# the same reason as `unused`: several lints below are members of this group.
+all = { level = "deny", priority = -1 }
+
 # Placeholders must never reach a money path.
 todo = "deny"
 unimplemented = "deny"
