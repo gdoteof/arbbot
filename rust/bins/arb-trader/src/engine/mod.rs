@@ -828,7 +828,14 @@ impl Engine {
             // caps, and not taking that allowance is the
             // conservative direction.
             if let Some(rv) = self.cfg.risk.as_ref() {
-                let v = rv.check(&quoters[qi].rel, Venue::PolymarketUs, c.size);
+                // The venue named here is the one being QUOTED,
+                // which is now leg 1's rather than always PM-US.
+                // Behaviour is unchanged either way — `venue_costs`
+                // charges every venue the basket spends on, so a
+                // two-venue relationship reserves both whichever leg
+                // leads (risk.rs) — but the refusal reason should
+                // name the leg we were about to send first.
+                let v = rv.check(&quoters[qi].rel, c.lead, c.size);
                 if !v.allowed {
                     eprintln!(
                         "[take-take] REFUSED {} x{} apr={:.0}%/yr — {}",
@@ -840,41 +847,49 @@ impl Engine {
                     continue;
                 }
             }
-            // Leg 1 ONLY. It is the constrained leg, and
-            // its fill mints the Kalshi hedge through the
-            // same anchor path a maker fill uses — so leg 2
-            // inherits retry, escalation, the naked alarm
-            // and ledger booking rather than duplicating
-            // them. `taker` makes it a marketable IOC.
+            // Leg 1 ONLY, and it is `Candidate::lead` — the
+            // leg whose touch is likeliest to vanish before we
+            // reach it — rather than always PM-US. Its fill
+            // mints the OTHER leg through the same anchor path
+            // a maker fill uses, so leg 2 inherits retry,
+            // escalation, the naked alarm and ledger booking
+            // rather than duplicating them; `hedge_anchor`
+            // derives that leg from `rel.legs` and is symmetric
+            // in the direction, so both leads reach it.
+            // `taker` makes it a marketable IOC.
+            let (leg1_venue, leg1_market, leg1_price, leg1_side) = c.leg1();
+            let (leg1_market, leg1_price) = (leg1_market.to_string(), leg1_price.to_string());
             self.next_tt_oid += 1;
             self.n_tt_fired += 1;
+            let (first, second) = if c.lead == Venue::Kalshi {
+                (
+                    format!("buy {} @{}", c.kalshi_market, c.kalshi_ask),
+                    format!("sell {} @{}", c.pmus_market, c.pmus_bid),
+                )
+            } else {
+                (
+                    format!("sell {} @{}", c.pmus_market, c.pmus_bid),
+                    format!("buy {} @{}", c.kalshi_market, c.kalshi_ask),
+                )
+            };
             eprintln!(
                 "[take-take] FIRE {} x{} edge={} net={} apr={:.0}%/yr \
-                 (bar {:.0}%) — sell {} @{} then buy {} @{}",
-                c.rel_id,
-                c.size,
-                c.edge,
-                c.net,
-                c.apr,
-                tt_bar,
-                c.pmus_market,
-                c.pmus_bid,
-                c.kalshi_market,
-                c.kalshi_ask,
+                 (bar {:.0}%) — leg 1 {first} then leg 2 {second}",
+                c.rel_id, c.size, c.edge, c.net, c.apr, tt_bar,
             );
             self.intents.push(Intent::Place(intent::Place {
                 count: c.size,
                 old_price: None,
                 order_id: format!("t{}", self.next_tt_oid),
-                place: c.pmus_market,
-                price: c.pmus_bid,
+                place: leg1_market,
+                price: leg1_price,
                 replaces: None,
                 retry: None,
-                side: BookSide::Ask,
+                side: leg1_side,
                 tag: Some(Tag::TakeTake),
                 taker: true,
                 ts: now,
-                venue: Venue::PolymarketUs,
+                venue: leg1_venue,
             }));
             self.drain_intents(Some(&quoters[qi].rel));
         }
