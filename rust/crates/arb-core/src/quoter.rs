@@ -40,6 +40,14 @@ pub const TOXGATE_MAX_SKEW: f64 = 5.0;
 /// between a fill and its offset — it is the state of the account. Below that
 /// the old rule holds and the quote stays: a cap refusal is not, on its own,
 /// evidence that the resting price is wrong.
+///
+/// BE CLEAR ABOUT WHAT THIS BUYS. It is NOT the anti-churn bound — that comes
+/// from `resting.remove` at the pull and the single site that refills
+/// `resting`, and holds identically at 0s. What the delay buys is not going
+/// flat on a cap breach that lasts one event, and what it COSTS is up to 30s of
+/// a live quote at a price this quoter has already rejected. That is the whole
+/// trade; 30s is a judgement about which side of it hurts more, not a
+/// measurement.
 const CAP_REFUSAL_PULL_S: f64 = 30.0;
 
 /// The research toxicity shadow feed (data/exec/toxgate.json), loaded by the
@@ -204,8 +212,16 @@ pub struct Quoter {
     /// When this (leg, side) FIRST wanted a price the risk gate would not let it
     /// post. Set on the refusal, cleared the moment either half stops being
     /// true — the gate allows again, or the book comes back to the resting
-    /// price. So it measures one continuous run of "mispriced AND refused", and
-    /// nothing else; see [`CAP_REFUSAL_PULL_S`].
+    /// price — so it measures one continuous run of "mispriced AND refused";
+    /// see [`CAP_REFUSAL_PULL_S`].
+    ///
+    /// Also cleared wherever the QUOTE is destroyed (this pull, the unviable
+    /// cancel, `cancel_all`), because it times a quote and an entry outliving
+    /// its quote is a lie about how long the next one has been wrong. Nothing
+    /// today could act on such an entry — only a place refills `resting`, and a
+    /// place clears this — but a reconciliation path that adopted a live venue
+    /// order into `resting` would pull it on its first refusal, having never
+    /// been mispriced for a second.
     refused_since: HashMap<(usize, BookSide), f64>,
 }
 
@@ -481,6 +497,7 @@ impl Quoter {
                 venue: leg.venue,
             }));
             self.last_quote_ts.remove(&key);
+            self.refused_since.remove(&key);
         }
     }
 
@@ -571,6 +588,9 @@ impl Quoter {
                         // KEEP last_quote_ts: re-entry on this side is throttled
                         // like a reprice (card 6fb469da). Dropping it made a
                         // cancelled side re-postable on the very next book event.
+                        // `refused_since` is NOT kept: it times a quote, and
+                        // this one no longer exists.
+                        self.refused_since.remove(&key);
                     }
                     continue;
                 };
@@ -618,12 +638,26 @@ impl Quoter {
                 // are both behind us), and a refusal that persists leaves the
                 // old price resting and fillable forever: the refusal never
                 // touches `last_quote_ts`, so every later book event lands here
-                // too. Live, 2026-07-28/29: 354,177 consecutive `class cap`
-                // skips on one armed engine, last place 00:53:50, last cancel
-                // 22:05:00 — eleven hours in which not one quote was pulled,
-                // while a fill on any of them would have taken exposure PAST
-                // the very cap that was refusing every new order, hedged at a
-                // price the resting edge was never computed against.
+                // too.
+                //
+                // Live on the armed engine, measured 2026-07-29T09:53 (the file
+                // is still growing): 354,961 `class cap` skips over 11h55m,
+                // longest UNBROKEN run 152,914 (00:53:50 -> 02:44:15), last
+                // place 00:53:50, last cancel 22:05:00 — 11h48m in which the
+                // engine refused continuously and cancelled nothing. The runs
+                // are broken only by other skips, 27,038 of them `crossed book`
+                // on KXRATECUT-26DEC31; that path (`crossed` above) forces
+                // `target` None and cancels unconditionally, which is why the
+                // live blast radius is smaller than the skip count suggests —
+                // the market generating most of the interleaving is one where
+                // nothing was left resting anyway.
+                //
+                // WHAT THIS FIXES, precisely: a quote resting at a price the
+                // quoter has REJECTED. It does not, and cannot, stop a fill on
+                // a correctly-priced quote from carrying exposure past a
+                // breached cap — such a quote is held by the hysteresis check
+                // above and never reaches this line. Pulling those too would be
+                // cancel-all-on-cap-breach, a different and much larger policy.
                 //
                 // "The cap refuses more exposure" and "this resting price is
                 // stale" are different facts. The first is not grounds to
@@ -635,11 +669,12 @@ impl Quoter {
                     if !v.allowed {
                         intents.push(Intent::Skip(intent::Skip { skip: v.reasons, ts: now }));
                         let since = *self.refused_since.entry(key).or_insert(now);
-                        // At most ONE cancel per resting quote: `resting` is
-                        // emptied here and only a place refills it, which needs
-                        // the gate to ALLOW (clearing the clock below) and to
-                        // clear `min_requote_s`. So a jam that never lifts costs
-                        // one cancel per side, not one per book event.
+                        // At most ONE cancel per resting quote, and it is
+                        // `resting.remove` that bounds it, not the delay above:
+                        // only a place refills `resting`, and that needs the
+                        // gate to ALLOW (clearing the clock below). So a jam
+                        // that never lifts costs one cancel per side however
+                        // many events it spans.
                         if now - since >= CAP_REFUSAL_PULL_S {
                             if let Some(curq) = self.resting.remove(&key) {
                                 intents.push(Intent::Cancel(intent::Cancel {
@@ -650,8 +685,18 @@ impl Quoter {
                                     ts: now,
                                     venue: leg_venue,
                                 }));
-                                // KEEP last_quote_ts, as the unviable-quote
-                                // cancel above does: re-entry is throttled.
+                                // `last_quote_ts` is left alone, but do NOT
+                                // read that as a re-entry throttle the way the
+                                // unviable-quote cancel above gets one. That
+                                // cancel sits BEFORE the throttle; this one is
+                                // past it, so reaching here already proved
+                                // `now >= last + min_requote_s` and the pull is
+                                // a further CAP_REFUSAL_PULL_S after that. Once
+                                // the cap lifts this side re-posts on the next
+                                // book event, which is what we want: the quote
+                                // came off for want of headroom, not because
+                                // the venue was churning us.
+                                self.refused_since.remove(&key);
                             }
                         }
                         continue;
@@ -1101,11 +1146,11 @@ mod risk_gate_tests {
     /// (hysteresis and throttle are both behind it). Nothing there touches
     /// `last_quote_ts`, so once the cap is breached every later book event lands
     /// on the same `continue` and the old price rests forever. Live on the armed
-    /// engine, 2026-07-28/29: 354,177 consecutive `class cap` skips, last place
-    /// 00:53:50, last cancel 22:05:00 — eleven hours, nothing pulled. A
-    /// counterparty hitting one of those quotes buys a basket whose hedge has
-    /// moved, and the fill takes exposure past the cap that was refusing every
-    /// new order.
+    /// engine, measured 2026-07-29T09:53: 354,961 `class cap` skips over 11h55m,
+    /// longest unbroken run 152,914, last place 00:53:50, last cancel 22:05:00 —
+    /// 11h48m refusing continuously and cancelling nothing. A counterparty
+    /// hitting one of those quotes buys a basket whose hedge has moved, and the
+    /// fill takes exposure past the cap that was refusing every new order.
     ///
     /// The first refusal still holds the quote (that is the test below this
     /// one's job); what changes is that the refusal is no longer allowed to
