@@ -269,6 +269,28 @@ pub fn kalshi_fills_unreadable() -> u64 {
     KALSHI_FILLS_UNREADABLE.load(Ordering::Relaxed)
 }
 
+/// Fractional contracts filled but not yet reportable, summed across orders, in
+/// HUNDREDTHS. A live total, not a counter: it falls as siblings complete.
+///
+/// `count_fp` is fractional (see `count_fp_hundredths`) and the engine hedges
+/// whole contracts, so a `0.98` piece is banked until its `4.02` sibling makes
+/// five. Usually that is the same instant. But an order can END fractional —
+/// four in the live history do, one of them (`fee6b733`) having filled `0.41`
+/// and nothing else — and then the dust sits here forever, a real if tiny
+/// position nothing hedges.
+///
+/// It gets a gauge because the alternative is silence: a banked piece emits no
+/// line, mints no obligation and moves no other counter. The parser it replaced
+/// at least SHOUTED about these frames, by mistakenly calling them unreadable.
+/// Losing the shout without gaining the number would have made a visible bug
+/// invisible. Steady single digits are the normal resting state; hundreds mean
+/// something is filling in dust and never completing.
+static KALSHI_FILL_DUST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+pub fn kalshi_fill_dust_hundredths() -> i64 {
+    KALSHI_FILL_DUST.load(Ordering::Relaxed)
+}
+
 /// The contract count in a Kalshi fill payload, or the diagnostic to log.
 ///
 /// Split out so the unreadable path is testable and, above all, SAYS something.
@@ -296,11 +318,17 @@ pub fn kalshi_fills_unreadable() -> u64 {
 /// fill — so it is worth a line.
 fn kalshi_count(msg: &Value) -> Result<i64, String> {
     let raw = msg.get("count_fp");
-    // Fixed-point, but plain: "2.00" is 2 contracts, not scaled
-    // (`kalshi-fill-count-fp-plain-count`).
-    let n = raw
-        .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.parse::<f64>().ok())))
-        .map(|f| f as i64);
+    let n = raw.and_then(|x| match x {
+        // The observed wire form. Parsed EXACTLY, never through f64 — see
+        // `count_fp_hundredths`.
+        Value::String(s) => count_fp_hundredths(s),
+        // Speculative, as above, and the only lossy step in this function.
+        // `{:.6}` rather than `{:.2}` because `{:.2}` ROUNDS: 2.999 would
+        // become "3.00" and read as above what the venue filled, which is the
+        // one direction this must never go. Six places then truncate to two.
+        Value::Number(_) => x.as_f64().and_then(|f| count_fp_hundredths(&format!("{f:.6}"))),
+        _ => None,
+    });
     match n {
         Some(n) if n > 0 => Ok(n),
         _ => Err(format!(
@@ -311,6 +339,54 @@ fn kalshi_count(msg: &Value) -> Result<i64, String> {
             raw.map(|v| v.to_string()).unwrap_or_else(|| "field absent".into())
         )),
     }
+}
+
+/// `count_fp` in HUNDREDTHS of a contract, by exact string arithmetic.
+///
+/// THE COUNT IS NOT ALWAYS AN INTEGER, which this module assumed for as long as
+/// it has existed. 22 of the 217 live fills in `data/venue/kalshi_fills.json`
+/// are fractional, and they pair up inside one order: `2.13` and `1.87` on one
+/// 4-lot, `0.98` and `4.02` on one 5-lot. Kalshi splits a fill across price
+/// levels and the pieces sum to the order's size.
+///
+/// The old parser read the field through `as f64` and then `as i64`, which
+/// TRUNCATES each piece independently: 2.13 -> 2 and 1.87 -> 1 is three
+/// contracts on an order the venue filled four. Worse, a piece below 1.00
+/// truncated to 0, hit the non-positive arm above, and was SKIPPED — bumping
+/// `kalshi_fills_unreadable`, the gauge documented "must stay 0", while its
+/// contracts went to the venue unhedged. Replaying the whole live history
+/// through it loses **11.27 contracts** of which 9 are whole and recoverable
+/// (the remaining 2.27 is sub-contract dust this parser banks but still cannot
+/// hedge), and skips 5 frames. None of that needs a gap or a reconnect: it is a
+/// fill the engine is simply never told about, on ~6.6% of orders.
+///
+/// Accumulating in hundredths and flooring only at the point of emission makes
+/// the arithmetic the venue's: 213 + 187 = 400 is 4 contracts, exactly. All 217
+/// rows carry exactly two decimals, so this is lossless on every value the
+/// venue has been observed to send. A third decimal is TRUNCATED rather than
+/// rounded, which keeps the invariant that matters: the running total can never
+/// exceed what the venue actually filled, so `observe_cum_fill` — monotone, and
+/// clamped to the resting size — can never be made to mint a contract that does
+/// not exist.
+fn count_fp_hundredths(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    let s = s.strip_prefix('+').unwrap_or(s);
+    if s.starts_with('-') {
+        return None; // a negative fill is not a fill
+    }
+    let (whole, frac) = s.split_once('.').unwrap_or((s, ""));
+    if whole.is_empty() && frac.is_empty() {
+        return None;
+    }
+    if !whole.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let w: i64 = if whole.is_empty() { 0 } else { whole.parse().ok()? };
+    let mut cents = 0i64;
+    for (i, b) in frac.bytes().take(2).enumerate() {
+        cents += i64::from(b - b'0') * if i == 0 { 10 } else { 1 };
+    }
+    w.checked_mul(100)?.checked_add(cents)
 }
 
 /// Kalshi's `fill` channel differs from PM-US's in two ways that matter:
@@ -352,7 +428,10 @@ fn kalshi_count(msg: &Value) -> Result<i64, String> {
 #[derive(Default)]
 pub struct KalshiFills {
     seen: std::collections::HashSet<String>,
-    cum: std::collections::HashMap<String, i64>,
+    /// order id -> contracts x100. HUNDREDTHS, because `count_fp` is fractional
+    /// on about 10% of live fills and truncating each piece loses contracts —
+    /// see `count_fp_hundredths`. Floored to whole contracts once, on emission.
+    hundredths: std::collections::HashMap<String, i64>,
 }
 
 impl KalshiFills {
@@ -379,9 +458,19 @@ impl KalshiFills {
         if !self.seen.insert(trade_id.to_string()) {
             return None; // already counted — never hedge a fill twice
         }
-        let entry = self.cum.entry(order_id.to_string()).or_insert(0);
+        let entry = self.hundredths.entry(order_id.to_string()).or_insert(0);
+        let before = *entry;
         *entry += n;
-        let cum = *entry;
+        let (cum, prev) = (*entry / 100, before / 100);
+        // Track the fraction that is banked but not yet hedgeable.
+        KALSHI_FILL_DUST.fetch_add((*entry % 100) - (before % 100), Ordering::Relaxed);
+        if cum == prev {
+            // A sub-contract piece. COUNTED — its trade_id is spent and its
+            // hundredths are banked — but there is no whole contract to hedge
+            // yet, and reporting an unchanged cumulative total would be a
+            // no-op at the ledger anyway.
+            return None;
+        }
         let market = msg.get("market_ticker").and_then(|x| x.as_str()).unwrap_or_default();
         Some(
             serde_json::json!({
@@ -547,8 +636,12 @@ mod kalshi_tests {
         assert!(s.line(&frame("t1", "o1", "0.00")).is_none());
     }
 
-    /// `KALSHI_FILLS_UNREADABLE` is process-global and libtest runs these
-    /// threads in parallel, so the tests that assert a delta on it take turns.
+    /// The gauges in this module are process-global and libtest runs these
+    /// threads in parallel, so every test that asserts a DELTA on one takes
+    /// turns — and so does every test that MOVES one, even transiently.
+    /// `KALSHI_FILL_DUST` made that second half matter: a fractional fill
+    /// raises it and its sibling lowers it again, so a test that only nets to
+    /// zero still perturbs a concurrent reader mid-flight.
     static COUNTER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A frame with no readable count, otherwise well-formed.
@@ -654,5 +747,105 @@ mod kalshi_tests {
         assert_eq!(kalshi_fills_unreadable(), before + 1, "the skip must be countable");
         assert!(s.line(&frame("t2", "o1", "2.00")).is_some());
         assert_eq!(kalshi_fills_unreadable(), before + 1, "a good frame must not count");
+    }
+
+    // --------------------------------------------- fractional count_fp (K7) ---
+
+    /// `count_fp` IS FRACTIONAL — 22 of the 217 live fills in
+    /// `data/venue/kalshi_fills.json`, and they pair up inside one order. This
+    /// exact pair is one 4-lot (`d538e727`, KXBRPRES-26-FBOL, 2026-07-24).
+    ///
+    /// The old parser read the field through `as f64 as i64`, truncating each
+    /// piece on its own: 2.13 -> 2, 1.87 -> 1, three contracts on an order the
+    /// venue filled four. Nothing about this needs a gap or a reconnect — it is
+    /// a contract the engine is simply never told about.
+    #[test]
+    fn a_fractional_fill_pair_sums_to_the_venues_whole_contract() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        let a: Value = serde_json::from_str(&s.line(&frame("t1", "o1", "2.13")).unwrap()).unwrap();
+        assert_eq!(a["cum"], 2, "2.13 filled is 2 WHOLE contracts to hedge; the 0.13 is banked");
+        let b: Value = serde_json::from_str(&s.line(&frame("t2", "o1", "1.87")).unwrap()).unwrap();
+        assert_eq!(b["cum"], 4, "213 + 187 = 400, which is 4 contracts — the old parser said 3");
+    }
+
+    /// The other half of the same defect: a piece below 1.00 truncated to 0,
+    /// reached `kalshi_count`'s non-positive arm and was SKIPPED — bumping
+    /// `kalshi_fills_unreadable`, the gauge documented "must stay 0", while its
+    /// contracts went unhedged. Five of the 217 live fills are this shape.
+    /// `0.98` + `4.02` is one 5-lot (`297ddcd1`, KXPRESNOMD-28-GN).
+    #[test]
+    fn a_sub_contract_piece_is_banked_not_called_unreadable() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        let before = kalshi_fills_unreadable();
+        assert!(s.line(&frame("t1", "o1", "0.98")).is_none(), "no whole contract yet");
+        assert_eq!(kalshi_fills_unreadable(), before, "0.98 is READABLE — not a shape change");
+        let v: Value = serde_json::from_str(&s.line(&frame("t2", "o1", "4.02")).unwrap()).unwrap();
+        assert_eq!(v["cum"], 5, "98 + 402 = 500");
+    }
+
+    /// Order of arrival must not change the total. `0.01` then `4.99` reports 0
+    /// then 5; `4.99` then `0.01` reports 4 then 5. Monotone either way, and
+    /// never above the venue — both pairs are real, from KXPRESNOMD-28-GN.
+    #[test]
+    fn fractional_pieces_floor_the_same_total_in_either_order() {
+        let _g = COUNTER.lock();
+        let mut a = KalshiFills::default();
+        assert!(a.line(&frame("t1", "o1", "0.01")).is_none());
+        let v: Value = serde_json::from_str(&a.line(&frame("t2", "o1", "4.99")).unwrap()).unwrap();
+        assert_eq!(v["cum"], 5);
+
+        let mut b = KalshiFills::default();
+        let x: Value = serde_json::from_str(&b.line(&frame("t1", "o1", "4.99")).unwrap()).unwrap();
+        assert_eq!(x["cum"], 4, "4.99 filled is 4 whole contracts, never 5");
+        let y: Value = serde_json::from_str(&b.line(&frame("t2", "o1", "0.01")).unwrap()).unwrap();
+        assert_eq!(y["cum"], 5);
+    }
+
+    /// A banked piece emits no line, mints no obligation and moves no other
+    /// gauge, so without this one it is invisible — and an order CAN end
+    /// fractional: `fee6b733` in the live history filled 0.41 and nothing else.
+    /// The parser this replaced at least shouted about those frames, by
+    /// mistakenly calling them unreadable.
+    #[test]
+    fn banked_dust_is_visible_and_falls_when_its_sibling_lands() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        let before = kalshi_fill_dust_hundredths();
+        assert!(s.line(&frame("t1", "o1", "0.41")).is_none());
+        assert_eq!(kalshi_fill_dust_hundredths(), before + 41, "0.41 is banked and SAID");
+        assert!(s.line(&frame("t2", "o1", "0.59")).is_some());
+        assert_eq!(kalshi_fill_dust_hundredths(), before, "41 + 59 = 100: a whole contract, no dust");
+    }
+
+    /// Exact string arithmetic, never f64: `2.13` as a float is
+    /// 2.1299999999999998, and `* 100.0` truncated is 212 — a hundredth short,
+    /// which is a whole contract short once 47 of them accumulate.
+    #[test]
+    fn count_fp_is_parsed_as_exact_hundredths() {
+        assert_eq!(count_fp_hundredths("2.13"), Some(213));
+        assert_eq!(count_fp_hundredths("1.87"), Some(187));
+        assert_eq!(count_fp_hundredths("25.00"), Some(2500));
+        assert_eq!(count_fp_hundredths("0.01"), Some(1));
+        assert_eq!(count_fp_hundredths("3"), Some(300), "no decimal point at all");
+        assert_eq!(count_fp_hundredths("2.1"), Some(210), "one decimal is tenths, not hundredths");
+        // A third decimal TRUNCATES, never rounds up: the running total must
+        // stay a floor on what the venue actually filled.
+        assert_eq!(count_fp_hundredths("2.139"), Some(213));
+        assert_eq!(count_fp_hundredths("2.999"), Some(299));
+        assert_eq!(count_fp_hundredths("-1.00"), None, "a negative fill is not a fill");
+        assert_eq!(count_fp_hundredths("2.0e1"), None);
+        assert_eq!(count_fp_hundredths(""), None);
+    }
+
+    /// ...including on the numeric branch, which has to go through a format
+    /// string. `{:.2}` would ROUND — 2.999 to "3.00" — reporting a contract the
+    /// venue did not fill, which is the one direction the floor invariant
+    /// forbids.
+    #[test]
+    fn a_numeric_count_fp_floors_rather_than_rounds() {
+        let v: Value = serde_json::from_str(r#"{"count_fp":2.999}"#).unwrap();
+        assert_eq!(kalshi_count(&v), Ok(299), "2.999 is 2 contracts and change, not 3");
     }
 }
