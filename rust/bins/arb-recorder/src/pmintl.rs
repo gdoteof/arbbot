@@ -199,6 +199,45 @@ impl ClobRest {
 /// production is always this constant.
 const RESNAP_EVERY: Duration = Duration::from_secs(300);
 
+/// Sweep failures, counted over a cycle and reported when the cycle ends — or
+/// when the SESSION does, whichever comes first, which is why this is a `Drop`
+/// impl and not a line at the bottom of the loop.
+///
+/// Every exit from that loop is a `?` or a `bail!`, and the count is a session
+/// local, so a report that only fired on a completed cycle would discard up to
+/// 300s of failures on reconnect. The old all-at-once sweep could only ever
+/// lose ~13s of them. The correlation is adverse: network trouble drops the
+/// socket and fails REST together, so the report would go missing exactly when
+/// it matters. Live tape 2026-07-29 has cycles that emitted only 72/111 and
+/// 92/111 distinct assets — 39 and 19 silent failures in one cycle.
+struct SweepFailures {
+    failed: usize,
+    total: usize,
+}
+
+impl SweepFailures {
+    /// Report and reset. A silent failure is a book that keeps whatever state
+    /// it was left in, which is how one reached 26 HOURS old while the interval
+    /// claimed 300s. Counted rather than logged per-token: one line per
+    /// configured token would bury it.
+    fn report(&mut self) {
+        if self.failed > 0 {
+            eprintln!(
+                "[pm-ws] resnapshot sweep: {}/{} books did NOT refresh — their age is now \
+                 unbounded",
+                self.failed, self.total
+            );
+            self.failed = 0;
+        }
+    }
+}
+
+impl Drop for SweepFailures {
+    fn drop(&mut self) {
+        self.report();
+    }
+}
+
 pub async fn ws_task(
     core: Arc<Core>,
     liveness: Arc<Liveness>,
@@ -234,7 +273,7 @@ async fn ws_session(
     // The sweep, sliced: one book per step rather than all of them at once.
     let resnap_step = resnap_every / token_ids.len().max(1) as u32;
     let mut resnap_cursor = 0usize;
-    let mut resnap_failed = 0usize;
+    let mut resnap = SweepFailures { failed: 0, total: token_ids.len() };
     loop {
         let frame = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
             Err(_) => {
@@ -307,24 +346,13 @@ async fn ws_session(
                     Ok(snap) => {
                         core.on_event(&snap);
                     }
-                    Err(_) => resnap_failed += 1,
+                    Err(_) => resnap.failed += 1,
                 }
                 resnap_cursor += 1;
             }
             if resnap_cursor >= token_ids.len() {
-                // A silent failure is a book that keeps whatever state it was
-                // left in, which is how one reached 26 HOURS old while the
-                // interval claimed 300s. Counted over the cycle rather than
-                // logged per-token: one line per token would bury it.
-                if resnap_failed > 0 {
-                    eprintln!(
-                        "[pm-ws] resnapshot sweep: {resnap_failed}/{} books did NOT refresh — \
-                         their age is now unbounded",
-                        token_ids.len()
-                    );
-                }
+                resnap.report();
                 resnap_cursor = 0;
-                resnap_failed = 0;
             }
         }
     }
@@ -450,6 +478,16 @@ mod tests {
             books.get(Venue::Polymarket, "A").is_some(),
             "the book must still exist after a trade — it used to be deleted by one"
         );
+    }
+
+    /// The cycle-end report and the session-end `Drop` report are the same
+    /// counter, so a cycle that reports must not leave anything for `Drop` to
+    /// say again.
+    #[test]
+    fn a_reported_sweep_failure_is_not_reported_twice() {
+        let mut f = SweepFailures { failed: 3, total: 111 };
+        f.report();
+        assert_eq!(f.failed, 0, "a reported failure must not be repeated when the session ends");
     }
 
     /// The integrity sweep must not stop the socket being read.
