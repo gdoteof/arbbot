@@ -273,8 +273,9 @@ pub trait OrderSink: Send + Sync {
     /// accepted the request; this is the evidence that it worked.
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError>;
     /// The venue's id for a place we could not read the answer for — see
-    /// [`VenueGateway::recover_place`]. `Ok(None)` means nothing matching it is
-    /// resting, and the default is no recovery at all.
+    /// [`VenueGateway::recover_place`] for what each venue is able to look in.
+    /// `Ok(None)` means the venue's book offered nothing to hand back, and the
+    /// default is no recovery at all.
     fn recover_place(
         &self,
         _req: &PlaceRequest,
@@ -859,6 +860,50 @@ mod tests {
             "this must NOT arm: pages we never read could hold our resting orders"
         );
         assert!(e.msg.contains("cursor walk stopped"), "{}", e.msg);
+    }
+
+    /// THE PRODUCTION SEAM for Kalshi's lost-place recovery, which is the half
+    /// of it that was missing.
+    ///
+    /// `run_executor` holds an `Arc<dyn OrderSink>` and asks it to `recover_place`
+    /// for every place whose answer was lost (`place_answer_was_lost`). That sink
+    /// IS the gateway — the blanket impl above is the only adapter — and Kalshi
+    /// took the TRAIT DEFAULT here, `Ok(None)`. So a timed-out Kalshi place was
+    /// reported upward as never-placed however plainly the venue's own order list
+    /// said otherwise, and no production caller ever resolved a Kalshi
+    /// `client_order_id` for a place (only the rehearsal did, and only for a
+    /// create whose body would not parse).
+    #[test]
+    fn a_kalshi_sink_recovers_a_lost_place_by_its_client_order_id() {
+        let page = r#"{"orders":[
+            {"order_id":"someone-elses","status":"resting","client_order_id":"9f1c4b7e"},
+            {"order_id":"ours","status":"resting","client_order_id":"m42"}
+        ],"cursor":null}"#;
+        let gw = KalshiGateway::with_transport(
+            signer(),
+            RateLimiter::from_per_minute(600.0, 0),
+            Mock {
+                replies: Mutex::new(vec![(200, page.to_string())]),
+                sent: Mutex::new(Vec::new()),
+            },
+        );
+        let sink: &dyn OrderSink = &gw;
+        let req = PlaceRequest {
+            market: "KXTEST".into(),
+            side: Side::Ask,
+            price: "0.4200".into(),
+            qty: 5,
+            tif: Tif::Gtc,
+            post_only: true,
+            client_order_id: "m42".into(),
+        };
+        assert_eq!(
+            sink.recover_place(&req, &std::collections::HashSet::new())
+                .unwrap()
+                .as_deref(),
+            Some("ours"),
+            "the executor asks the SINK, and this is the sink the armed process holds"
+        );
     }
 
     /// A venue rejection surfaces as an error rather than being counted as a

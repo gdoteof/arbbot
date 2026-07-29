@@ -11,6 +11,7 @@ use crate::sign::KalshiSigner;
 use crate::transport::{NotWired, Transport};
 use crate::wire;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 /// Kalshi V2 API paths. The signature covers the FULL path including the
@@ -148,6 +149,31 @@ impl<T: Transport> KalshiGateway<T> {
     /// `resting_order_ids` returning early would be "PROVEN clean" over exactly
     /// that. Incomplete means: cancel what we did find, prove nothing.
     fn listing(&self) -> Result<Listing, VenueError> {
+        self.listing_for(None)
+    }
+
+    /// [`Self::listing`], allowed to stop once ONE named order has been found
+    /// resting.
+    ///
+    /// The sweep needs the account; [`Self::find_ours`] needs one row, and
+    /// `/portfolio/orders` is the full HISTORY — hundreds of finished rows on
+    /// this account, 100 to a page, every page a signed request on the order
+    /// path's own priority. Paging the remainder after the answer is already in
+    /// hand buys nothing and spends exactly the requests a 429 mid-cancel would
+    /// cost us (quirk `xv-shared-api-budget`).
+    ///
+    /// STOPPING EARLY IS ONLY SOUND BECAUSE THE PREFIX ALREADY ANSWERS. A
+    /// resting row carrying our tag tells the whole truth about that order, so
+    /// no later page can change it — the same reasoning `find_ours` already
+    /// applies to a walk that was cut short. Every other question — "not on the
+    /// account", "clean" — still needs the complete walk and still gets one:
+    /// nothing stops unless the row was FOUND, and `stop_at` is `None` for
+    /// every caller but one.
+    ///
+    /// It is not a claim about sort order. A venue that lists oldest-first puts
+    /// a just-placed order on the LAST page and this saves nothing; the worst
+    /// case is exactly the walk we did before.
+    fn listing_for(&self, stop_at: Option<&str>) -> Result<Listing, VenueError> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         let mut cut_short: Option<String> = None;
@@ -180,7 +206,15 @@ impl<T: Transport> KalshiGateway<T> {
                 }
                 Err(e) => return Err(e),
             };
+            let answered = stop_at.is_some_and(|coid| {
+                page.orders
+                    .iter()
+                    .any(|o| o.is_resting() && o.client_order_id.as_deref() == Some(coid))
+            });
             out.extend(page.orders);
+            if answered {
+                break;
+            }
             match page.cursor {
                 Some(c) if !c.is_empty() => cursor = Some(c),
                 _ => break,
@@ -308,8 +342,8 @@ impl<T: Transport> KalshiGateway<T> {
     /// contains the order tells the truth about it — so only the not-found arm
     /// has to care.
     fn find_ours(&self, coid: &str) -> Result<Ours, VenueError> {
-        let listing = self.listing()?;
-        let mut seen = false;
+        let listing = self.listing_for(Some(coid))?;
+        let mut gone: Option<String> = None;
         for o in listing.orders {
             if o.client_order_id.as_deref() != Some(coid) {
                 continue;
@@ -317,10 +351,13 @@ impl<T: Transport> KalshiGateway<T> {
             if o.is_resting() {
                 return Ok(Ours::Resting(o.order_id));
             }
-            seen = true;
+            // First finished row wins, and only if no resting one turns up:
+            // the walk keeps going precisely so a resting row on a later page
+            // still beats it.
+            gone.get_or_insert(o.order_id);
         }
-        if seen {
-            return Ok(Ours::Gone);
+        if let Some(id) = gone {
+            return Ok(Ours::Gone(id));
         }
         truncated(listing.cut_short)?;
         Ok(Ours::Absent)
@@ -340,7 +377,7 @@ impl<T: Transport> KalshiGateway<T> {
                 })?;
                 Ok(Some(id))
             }
-            Ours::Gone | Ours::Absent => Ok(None),
+            Ours::Gone(_) | Ours::Absent => Ok(None),
         }
     }
 }
@@ -474,8 +511,12 @@ enum Ours {
     /// Still resting, under the venue's own id.
     Resting(String),
     /// On the account but finished (canceled or executed) — a cancel has
-    /// nothing left to do.
-    Gone,
+    /// nothing left to do. It carries the venue's id anyway, because a CANCEL
+    /// is not the only thing that needs one: a fill arrives under the venue's
+    /// id and nothing else, so an order that finished by EXECUTING is exactly
+    /// the one whose id the engine still has to learn
+    /// ([`KalshiGateway::recover_place`]).
+    Gone(String),
     /// Not on the account at all.
     Absent,
 }
@@ -532,7 +573,7 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
                 Ours::Resting(id) => id,
                 // Genuinely already gone. This is the ONE case where "we
                 // cancelled nothing" is the right answer.
-                Ours::Gone => return Ok(()),
+                Ours::Gone(_) => return Ok(()),
                 // Not on the account. Still an error rather than a success —
                 // nothing was cancelled and the order list LAGS a write, so this
                 // cannot be read as proof the order is gone. Stated plainly, not
@@ -572,6 +613,70 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
             return Ok(());
         }
         Err(VenueError::Status { endpoint: "kalshi cancel", status: r.status, body: r.body })
+    }
+
+    /// Find an order this process placed but could not read the answer for.
+    ///
+    /// THE PRODUCTION CALLER for the handle this gateway has always had.
+    /// `client_order_id` goes out IN THE CREATE BODY (Kalshi requires it —
+    /// [`wire::kalshi_place_body`]), so an order the venue took is carrying our
+    /// tag before any ack exists; [`Self::cancel_by_client_order_id`] has
+    /// recovered a lost create with it since 2026-07-27 and
+    /// [`Self::cancel_all_open`] scopes itself with it. What had no caller was
+    /// this hook — `arb-trader`'s executor asks every sink for a lost place and
+    /// Kalshi answered with the trait DEFAULT, `Ok(None)`: "the venue never saw
+    /// it", asserted about an order that may well be resting. PM-US got its
+    /// implementation and Kalshi, which has the better handle of the two, kept
+    /// the default.
+    ///
+    /// ON THE ACCOUNT AT ALL is the question, not "resting". Two different
+    /// orders need the id back and only one of them is resting:
+    ///   * a resting maker, so it can be CANCELLED. Nothing else can address it
+    ///     — a fill on it would arrive under an id the engine never learned;
+    ///   * an IOC hedge that already EXECUTED, so it is not bought TWICE.
+    ///     `engine::fill::on_order_ack` is the join: the ack maps venue id to
+    ///     ours and REPLAYS a fill that beat it, which is what credits the
+    ///     obligation. Without it the fill stays held, the obligation reads
+    ///     zero, and `hedge_tick`'s retry places the hedge again — 10 Kalshi
+    ///     long against 5 PM-US short, observed 2026-07-28 with an ack that was
+    ///     merely 48 ms late. A lost response is that same race with no ack
+    ///     coming at all.
+    ///
+    /// So both arms hand the id back. Adopting a finished order costs nothing:
+    /// the ack only teaches the engine an id, and a cancel later sent to a dead
+    /// order is the 404 quirk K4 already calls success.
+    ///
+    /// ABSENT IS AN ERROR, NOT `Ok(None)`. The order list LAGS a write (see
+    /// [`Settle`]), so "not on the account" and "not on the account YET" are
+    /// the same bytes — and this is only reached when the place's answer was
+    /// LOST, where the safe reading is that the venue has it. `Ok(None)` is
+    /// silent at the caller; the error is what makes it say CHECK THE VENUE.
+    /// [`Self::cancel`] has treated the same `Ours::Absent` the same way for
+    /// the same reason.
+    ///
+    /// `claimed` is unused, and that is a property of the handle rather than an
+    /// oversight. It exists because PM-US matches on market and size, so a
+    /// resting list that lags can offer back an order this process already
+    /// owns; a `client_order_id` is minted once and identifies ONE order, so
+    /// there is no id here to confuse with another.
+    fn recover_place(
+        &self,
+        req: &PlaceRequest,
+        _claimed: &HashSet<String>,
+    ) -> Result<Option<String>, VenueError> {
+        match self.find_ours(&req.client_order_id)? {
+            Ours::Resting(id) | Ours::Gone(id) => Ok(Some(id)),
+            Ours::Absent => Err(VenueError::Status {
+                endpoint: "kalshi recover_place",
+                status: 0,
+                body: format!(
+                    "no order on this account carries client_order_id `{}`, and the order \
+                     list LAGS a write — so this cannot be read as proof the venue never \
+                     took the place whose answer we lost",
+                    req.client_order_id
+                ),
+            }),
+        }
     }
 
     fn order_status(&self, order_id: &str) -> Result<Self::Order, VenueError> {

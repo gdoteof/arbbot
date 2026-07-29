@@ -14,6 +14,7 @@ use arb_venue::ratelimit::RateLimiter;
 use arb_venue::transport::{Response, Transport};
 use arb_venue::{KalshiSigner, VenueError};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -968,6 +969,106 @@ fn the_orphan_sweep_cancels_nothing_when_no_order_is_ours() {
     let g = gw(vec![(200, page)]);
     assert_eq!(g.cancel_by_client_order_id("THE-COID").unwrap(), None);
     assert_eq!(g.transport.sent().len(), 1, "no DELETE may be sent");
+}
+
+// ------------------------------------------------- lost-response recovery ---
+//
+// `cancel_by_client_order_id` above is the REHEARSAL's recovery and has only
+// ever run there. `recover_place` is the trait hook `arb-trader`'s executor
+// calls on every place whose answer was lost, and Kalshi answered it with the
+// trait DEFAULT — `Ok(None)`, i.e. "the venue never saw it" — about an order
+// that is carrying our tag on the venue right now.
+
+/// The maker half: a place we could not read the answer for is RESTING at the
+/// venue, and the tag that went out in the create body is what finds it. Before
+/// this, the executor was told nothing was there and the order rested under an
+/// id this process could never address.
+#[test]
+fn a_place_whose_answer_was_lost_is_recovered_by_its_client_order_id() {
+    let p = page(&[
+        tagged("someone-elses", "resting", "9f1c4b7e2a6d40518c3b9e0f7a2d5c81"),
+        tagged("ours", "resting", "c-1"),
+    ]);
+    let g = gw(vec![(200, &p)]);
+    assert_eq!(
+        g.recover_place(&place_req(), &HashSet::new()).unwrap().as_deref(),
+        Some("ours"),
+        "the venue's own id for the order carrying OUR client_order_id"
+    );
+}
+
+/// The hedge half, and the one that costs money. An IOC fills in the instant it
+/// is accepted, so a lost response can hide an order that has already EXECUTED
+/// — `Ours::Gone`, not resting. The id still has to come back: a fill arrives
+/// under the venue's id and nothing else, and without the ack that names it the
+/// obligation reads zero and the retry buys the hedge a second time.
+#[test]
+fn a_lost_place_that_already_executed_still_gives_its_id_back() {
+    let p = page(&[tagged("ours", "executed", "c-1")]);
+    let g = gw(vec![(200, &p)]);
+    assert_eq!(
+        g.recover_place(&place_req(), &HashSet::new()).unwrap().as_deref(),
+        Some("ours"),
+        "an executed order is not an order the engine may forget"
+    );
+}
+
+/// NOT ON THE ACCOUNT IS NOT PROOF THE VENUE NEVER TOOK IT. The order list lags
+/// a write, and this is only reached when the answer was LOST, so `Ok(None)` —
+/// which the executor handles in silence — would be an affirmative claim of the
+/// one thing that cannot be checked. It is an error, and the caller shouts.
+///
+/// It is also the one answer that needs the COMPLETE account, so the walk must
+/// not stop early on the way to it.
+#[test]
+fn a_lost_place_the_list_does_not_show_is_never_reported_as_never_placed() {
+    let p1 = format!(
+        r#"{{"orders":[{}],"cursor":"CUR"}}"#,
+        tagged("someone-elses", "resting", "9f1c4b7e2a6d40518c3b9e0f7a2d5c81")
+    );
+    let p2 = page(&[tagged("older", "canceled", "m1")]);
+    let g = gw(vec![(200, &p1), (200, &p2)]);
+    match g.recover_place(&place_req(), &HashSet::new()) {
+        Err(VenueError::Status { endpoint: "kalshi recover_place", body, .. }) => {
+            assert!(body.contains("LAGS a write"), "{body}");
+        }
+        other => panic!("absence cannot be reported as never-placed, got {other:?}"),
+    }
+    assert_eq!(
+        g.transport.sent().len(),
+        2,
+        "and 'not on the account' is only sound over the whole account"
+    );
+}
+
+/// THE BUDGET. `/portfolio/orders` is the full HISTORY, 100 rows a page, and
+/// every page is a signed request on the order path's own priority (quirk
+/// `xv-shared-api-budget`). A recovery that has already FOUND its order learns
+/// nothing from the rest of the account, so it must not pay for it — a burst of
+/// timeouts must not turn into a burst of full history walks.
+#[test]
+fn a_recovery_that_has_its_answer_does_not_page_the_rest_of_the_account() {
+    let p1 = format!(r#"{{"orders":[{}],"cursor":"CUR"}}"#, tagged("ours", "resting", "c-1"));
+    let p2 = page(&[tagged("later", "resting", "m2")]);
+    let g = gw(vec![(200, &p1), (200, &p2)]);
+    assert_eq!(
+        g.recover_place(&place_req(), &HashSet::new()).unwrap().as_deref(),
+        Some("ours")
+    );
+    assert_eq!(g.transport.sent().len(), 1, "page 2 cannot change the answer");
+}
+
+/// ...and the early stop is scoped to the caller that has its answer. The sweep
+/// asks a different question — is this account CLEAN — which no prefix can
+/// answer, so it still walks to the cursor's end.
+#[test]
+fn the_sweep_still_pages_the_whole_account() {
+    let p1 = format!(r#"{{"orders":[{}],"cursor":"CUR"}}"#, tagged("ours", "resting", "m1"));
+    let p2 = page(&[tagged("later", "resting", "m2")]);
+    let g = gw(vec![(200, &p1), (200, &p2)]);
+    let mut ids = g.resting_order_ids().unwrap();
+    ids.sort();
+    assert_eq!(ids, vec!["later".to_string(), "ours".to_string()]);
 }
 
 /// The EXACT create body Kalshi returned on 2026-07-27. No `status`, no
