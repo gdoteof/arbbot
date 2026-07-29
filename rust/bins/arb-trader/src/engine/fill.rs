@@ -503,7 +503,7 @@ impl Engine {
         &mut self,
         v: &serde_json::Value,
         ts_local_ns: i64,
-        t_read: std::time::Instant,
+        t_deq: std::time::Instant,
     ) {
         if let (Some(ours), Some(theirs)) = (
             v.get("order_id").and_then(|x| x.as_str()),
@@ -569,7 +569,7 @@ impl Engine {
         }
         self.n_ack += 1;
         self.last_now = ts_local_ns as f64 / 1e9;
-        self.decision.record(t_read.elapsed().as_nanos() as u64);
+        self.decision.record(t_deq.elapsed().as_nanos() as u64);
     }
 
     /// One fill frame off the private feed.
@@ -579,7 +579,7 @@ impl Engine {
         venue: Venue,
         market_id: &str,
         ts_local_ns: i64,
-        t_read: std::time::Instant,
+        t_deq: std::time::Instant,
     ) {
         let (Some(reported), Some(cum)) = (
             v.get("order_id").and_then(|x| x.as_str()),
@@ -602,7 +602,7 @@ impl Engine {
         if !matches!(arm, FillArm::Hedge) {
             self.last_now = now;
         }
-        self.decision.record(t_read.elapsed().as_nanos() as u64);
+        self.decision.record(t_deq.elapsed().as_nanos() as u64);
     }
 
     /// Fills held for an `order_ack` that has not come.

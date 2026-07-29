@@ -585,7 +585,7 @@ impl Engine {
     /// thing that ever retired the obligation was `try_send` returning true,
     /// which says the executor's channel had room and nothing whatever about
     /// the venue.
-    pub(super) fn on_cancel_result(&mut self, v: &serde_json::Value, t_read: std::time::Instant) {
+    pub(super) fn on_cancel_result(&mut self, v: &serde_json::Value, t_deq: std::time::Instant) {
         let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
         // Ours when the cancel was addressed by our id (an escalation);
         // otherwise the venue's, mapped back through the ack that taught us the
@@ -604,7 +604,7 @@ impl Engine {
         if let Some(oid) = oid {
             on_venue_answer(&mut self.parked_cancels, &oid, attempt, ok);
         }
-        self.decision.record(t_read.elapsed().as_nanos() as u64);
+        self.decision.record(t_deq.elapsed().as_nanos() as u64);
     }
 }
 
