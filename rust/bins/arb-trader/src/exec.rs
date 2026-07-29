@@ -1604,6 +1604,8 @@ mod tests {
     /// to no obligation at all and that gauge still reads 0.
     #[tokio::test]
     async fn a_hedge_retry_is_not_sent_when_the_attempt_it_supersedes_filled() {
+        let _g = REFUSED_TURN.lock();
+        let before = hedge_retries_refused();
         let sink = Arc::new(Recorder { prior_filled: Some(5), ..Recorder::default() });
         let (st, told) =
             drain_reporting(Venue::Kalshi, sink.clone(), vec![retry_after("h2", "venue-h1", 0)])
@@ -1628,8 +1630,24 @@ mod tests {
         assert_eq!(told[0]["market_id"], "KXTEST");
         assert_eq!(told[0]["order_id"], "venue-h1", "the VENUE's id — the engine maps it");
         assert_eq!(told[0]["cum"], 5, "cumulative, like every other fill frame");
-        assert!(hedge_retries_refused() > 0, "a refusal an operator can see");
+        assert_eq!(
+            hedge_retries_refused() - before,
+            1,
+            "a refusal an operator can see — asserted as a DELTA, because `> 0` on a \
+             process-global is satisfiable by the OTHER refusal test's increment and stayed \
+             green with this arm's `fetch_add` deleted"
+        );
     }
+
+    /// The gauge is process-global and libtest runs these threads in parallel,
+    /// so every test that asserts a DELTA on it takes turns — the same rule
+    /// `fills.rs`'s `COUNTER` exists for, and for the same reason: a gate that
+    /// is red at random is worse than one that is slow.
+    ///
+    /// It has to cover every test that MOVES the counter, not only the ones
+    /// that read it. Both refusal arms increment the same static, so without
+    /// this the two assertions below can each be satisfied by the other's work.
+    static REFUSED_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The control, and it is what stops the fix from being "never hedge
     /// again": once the venue CONFIRMS the superseded attempt filled nothing,
@@ -1657,6 +1675,8 @@ mod tests {
     /// read: that would discharge the obligation on no evidence.
     #[tokio::test]
     async fn a_retry_whose_verification_cannot_be_read_is_not_sent_either() {
+        let _g = REFUSED_TURN.lock();
+        let before = hedge_retries_refused();
         // `prior_filled: None` — the venue could not be asked.
         let sink = Arc::new(Recorder::default());
         let (st, told) =
@@ -1668,6 +1688,10 @@ mod tests {
         assert_eq!(st.sent.load(Ordering::Relaxed), 0);
         assert!(told.is_empty(), "and it claims NOTHING about a fill nobody could read");
         assert_eq!(st.failed.load(Ordering::Relaxed), 1, "counted as a venue failure");
+        // THIS arm's own increment, pinned separately from the other refusal's:
+        // one shared `> 0` assertion let either `fetch_add` be deleted while the
+        // whole suite stayed green.
+        assert_eq!(hedge_retries_refused() - before, 1, "the unreadable refusal is counted too");
     }
 
     /// A PARTIAL fill whose frame DID arrive is not a reason to refuse the
@@ -1699,6 +1723,7 @@ mod tests {
     /// boundary is `venue > booked`, not `venue > 0`.
     #[tokio::test]
     async fn a_venue_total_one_ahead_of_our_books_still_refuses() {
+        let _g = REFUSED_TURN.lock(); // moves the counter, so it takes its turn too
         let sink = Arc::new(Recorder { prior_filled: Some(5), ..Recorder::default() });
         let (_st, told) =
             drain_reporting(Venue::Kalshi, sink.clone(), vec![retry_after("h2", "venue-h1", 4)])

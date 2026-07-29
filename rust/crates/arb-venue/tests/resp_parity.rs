@@ -102,6 +102,21 @@ fn kalshi_order_fill_count_is_plain_count() {
         Some(0),
         "...but a real zero still reads as zero, or no hedge could ever be retried"
     );
+    // A NEGATIVE is refused, and this guard fails in the PERMITTING direction
+    // if it is dropped, which is why it needs pinning rather than a comment.
+    // The hedge-verification read compares `n <= credited` to decide whether a
+    // retry may go out; a negative satisfies that against any credited count,
+    // so a floored -1 would AUTHORISE a place on an attempt whose fill nobody
+    // has read. Same for a non-finite: `inf >= 0.0` is true, so `is_finite` is
+    // load-bearing on its own and is dropped independently.
+    for bad in ["-1.00", "-0.01", "inf", "NaN"] {
+        let body = format!(r#"{{"order":{{"order_id":"o1","fill_count_fp":"{bad}"}}}}"#);
+        assert_eq!(
+            resp::kalshi_order_envelope(&body).unwrap().order.try_filled_qty(),
+            None,
+            "`{bad}` is not a fill count — it must read as UNKNOWN, never as a low number"
+        );
+    }
     // absent fill_count_fp -> 0 (never a panic)
     let env0 = resp::kalshi_order_envelope(r#"{"order":{"order_id":"o1","status":"resting"}}"#).unwrap();
     assert_eq!(env0.order.filled_qty(), 0);
@@ -161,6 +176,33 @@ const PM_ORDER_FILLED: &str = r#"{"id":"BD819026675P","marketSlug":"tpoyc-2026-z
     "state":"ORDER_STATE_FILLED","avgPx":{"value":"0.2600","currency":"USD"},
     "commissionNotionalTotalCollected":{"value":"0.0500","currency":"USD"},
     "outcomeSide":"OUTCOME_SIDE_NO"}"#;
+
+/// The PM-US half of the hedge-verification read, which had no test at all.
+///
+/// Same contract as `KalshiOrder::try_filled_qty` and the same reason for it:
+/// the caller acts on a low number by SENDING ANOTHER ORDER, so absent must be
+/// unknown and a negative must be refused rather than floored. A negative
+/// satisfies `n <= credited` against any credited count, so letting one through
+/// authorises a place on an attempt whose fill nobody has read.
+#[test]
+fn pmus_try_filled_qty_answers_unknown_rather_than_a_low_number() {
+    // Only a CREATE omits cumQuantity, and this is never read off one — but if
+    // it ever is, the answer is UNKNOWN, not "did not trade".
+    assert_eq!(resp::pmus_order(PM_CREATE).unwrap().try_filled_qty(), None, "absent is not zero");
+    // A real zero must still read as zero, or no hedge could ever be retried.
+    let zero = r#"{"id":"pm-1","marketSlug":"will-x","state":"STATE_OPEN","cumQuantity":0}"#;
+    assert_eq!(resp::pmus_order(zero).unwrap().try_filled_qty(), Some(0));
+    // ...and note this is a DIFFERENT question from `fill_state`, which also
+    // wants avgPx and so calls a perfectly readable 0 `NoFillData`.
+    assert_eq!(resp::pmus_order(zero).unwrap().fill_state(), PmFillState::NoFillData);
+    assert_eq!(resp::pmus_order(PM_ORDER_FILLED).unwrap().try_filled_qty(), Some(4));
+    let neg = r#"{"id":"pm-1","marketSlug":"will-x","cumQuantity":-1}"#;
+    assert_eq!(
+        resp::pmus_order(neg).unwrap().try_filled_qty(),
+        None,
+        "a negative is not a fill — it must never reach the `n <= credited` comparison"
+    );
+}
 
 #[test]
 fn pmus_create_omits_fill_data_typed_variant() {
