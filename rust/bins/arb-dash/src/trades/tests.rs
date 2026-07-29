@@ -1,4 +1,4 @@
-//! The 41 tests that hold this file's accounting honest.
+//! The 36 tests that hold this file's accounting honest.
 //!
 //! Every one of them is an incident: a number this tab once showed a human
 //! that was wrong, and the shape of ledger record that produced it. They are
