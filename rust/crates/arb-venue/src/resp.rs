@@ -72,6 +72,31 @@ impl KalshiOrder {
             .map(|f| f as i64)
             .unwrap_or(0)
     }
+
+    /// The same number, but `None` rather than 0 when the venue did not say.
+    ///
+    /// FOR THE ONE CALLER THAT ACTS ON "IT DID NOT FILL" BY SENDING AN ORDER.
+    /// `filled_qty` folds absent, unparseable and genuinely-zero into the same
+    /// `0`, which is right for a display or a rehearsal guard and wrong here:
+    /// this file's own header calls a defaulted money field "the one place a
+    /// wrong default is an AFFIRMATIVE CLAIM", and a claim of "did not trade"
+    /// is what authorises a second hedge. A shape change on this field family
+    /// is not hypothetical — the create response ships `fill_count` where the
+    /// docs say `fill_count_fp`, live on 2026-07-27 — so absence must be
+    /// answerable as "unknown".
+    ///
+    /// Zero is reported as `Some(0)`, and that is not a guess: every recorded
+    /// Kalshi order row carries the field explicitly when nothing has filled
+    /// (`"fill_count_fp":"0.00"` on a resting row, `"fill_count":"0.00"` on the
+    /// live create). So an ABSENT field really does mean the shape moved.
+    ///
+    /// A negative is refused rather than floored: it cannot be a fill, and
+    /// letting it through as `<= credited` would authorise a place.
+    pub fn try_filled_qty(&self) -> Option<i64> {
+        let raw = self.fill_count_fp.as_deref().or(self.fill_count.as_deref())?;
+        let n = raw.trim().parse::<f64>().ok()?;
+        (n >= 0.0 && n.is_finite()).then(|| n as i64)
+    }
 }
 
 /// `{"order": { ... }}` envelope (single-order GET, create response).
@@ -347,6 +372,19 @@ impl PmOrder {
     /// Python `int(float(o.get("cumQuantity") or 0))`.
     pub fn filled_qty(&self) -> i64 {
         self.cum_quantity.unwrap_or(0)
+    }
+
+    /// The same number, but `None` rather than 0 when the venue did not say.
+    /// See [`KalshiOrder::try_filled_qty`] for why the distinction has to exist.
+    ///
+    /// Only a CREATE response omits `cumQuantity` — it "omits execution data
+    /// entirely", as the struct above records — and this is never read off one:
+    /// the caller has an order id and re-fetches. Every recorded order ROW
+    /// carries it, `0` included. Note this is a different question from
+    /// [`Self::fill_state`], which also requires `avgPx` and so answers
+    /// `NoFillData` for a perfectly readable `cumQuantity` of 0.
+    pub fn try_filled_qty(&self) -> Option<i64> {
+        self.cum_quantity.filter(|n| *n >= 0)
     }
 }
 

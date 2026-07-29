@@ -450,28 +450,28 @@ fn cancel_work(
 /// below describes. Two live quotes for the length of the parked cancel is the
 /// lesser harm, and it is counted (`cancels_unresolved`) rather than silent.
 ///
-/// `supersedes` is OUR id for the hedge attempt this place replaces, or `None`
-/// for everything else. It is resolved to the VENUE's id here — the same map
-/// and the same reason `resolve_cancel` needs it, since the executor can only
-/// ask the venue about an id the venue issued.
+/// `supersedes` is the hedge attempt this place must reconcile against venue
+/// truth first, already resolved by [`hedge::superseded`] — which walks back
+/// past any attempt that never reached the venue, so this is always an id the
+/// venue issued. `None` for every other place, and for a chain in which nothing
+/// has been acked at all.
 ///
-/// An attempt whose `order_ack` never landed has no venue id, so the place goes
-/// out UNVERIFIED. That is deliberately somebody else's defect: it is the
-/// permanently-lost-ack case `hedge_plan`'s ack-hold names as the one it cannot
-/// close, and the remedy is to RECOVER the id (the executor's `recover_place`
-/// path, which runs only when the place's own answer was lost), not to refuse
-/// here — refusing would strand the leg for good rather than for 15s. When that
-/// recovery lands, this map is populated after the fact and the verification
-/// starts covering those attempts too, at no cost: a fill already replayed
-/// through `on_order_ack` credits the obligation, and re-reading the same
-/// cumulative total is a zero delta at `hedge_credit`.
+/// That last case goes out UNVERIFIED, deliberately, and it is somebody else's
+/// defect: it is the permanently-lost-ack case `hedge_plan`'s ack-hold names as
+/// the one it cannot close, and the remedy is to RECOVER the id (the executor's
+/// `recover_place` path, which runs only when the place's own answer was lost),
+/// not to refuse here — refusing would strand the leg for good rather than for
+/// 15s. When that recovery lands, `oid_venue` is populated after the fact and
+/// these attempts get verified too, at no cost: a fill already replayed through
+/// `on_order_ack` has credited the obligation, so the venue's total no longer
+/// runs ahead of our books and the retry is `Accounted`.
 pub(super) fn intent_actions(
     intent: &Intent,
     armed: bool,
     oid_venue: &HashMap<String, String>,
     parked: &mut HashMap<String, ParkedCancel>,
     now: std::time::Instant,
-    supersedes: Option<&str>,
+    supersedes: Option<crate::exec::Superseded>,
 ) -> Vec<Action> {
     let mut out: Vec<Action> = Vec::new();
     match intent {
@@ -488,7 +488,7 @@ pub(super) fn intent_actions(
             // `client_order_id` is our own order id, which is what makes a
             // retried place idempotent at the venue.
             out.push(Action::Place {
-                supersedes: supersedes.and_then(|o| oid_venue.get(o)).cloned(),
+                supersedes,
                 req: PlaceRequest {
                     market: p.place.clone(),
                     // THE line this whole typing pass existed for. It was
@@ -1379,25 +1379,23 @@ mod cancel_addressing_tests {
     /// own `409 order_already_exists` cannot stand in for this.
     #[test]
     fn a_hedge_retry_names_the_venue_id_of_the_attempt_it_supersedes() {
-        let mut oid_venue = HashMap::new();
-        oid_venue.insert("h1".to_string(), "venue-h1".to_string());
         let mut parked = HashMap::new();
         let retry = intent(
             r#"{"count":5,"order_id":"h2","place":"KXTEST","price":"0.30","side":"ask","tag":"hedge","retry":2,"taker":true,"ts":1.0,"venue":"kalshi"}"#,
         );
+        let want = crate::exec::Superseded { venue_order_id: "venue-h1".into(), credited: 0 };
         let acts =
-            intent_actions(&retry, true, &oid_venue, &mut parked, t0(), Some("h1"));
+            intent_actions(&retry, true, &HashMap::new(), &mut parked, t0(), Some(want.clone()));
         let Action::Place { supersedes, .. } = &acts[0] else { panic!("expected a place") };
-        assert_eq!(supersedes.as_deref(), Some("venue-h1"), "OUR id resolved to the venue's");
+        assert_eq!(supersedes.as_ref(), Some(&want), "the place carries it to the executor");
 
-        // An attempt whose `order_ack` never landed has no venue id, so there is
-        // nothing the venue can be asked about and the place goes out
-        // UNVERIFIED. That is the permanently-lost-ack case `hedge_plan`'s
-        // ack-hold already names as the one it cannot close; refusing here
-        // instead would strand the leg for good rather than for 15s.
-        let acts = intent_actions(&retry, true, &HashMap::new(), &mut parked, t0(), Some("h1"));
+        // A chain in which nothing has been acked carries nothing, and the place
+        // goes out UNVERIFIED. That is the permanently-lost-ack case
+        // `hedge_plan`'s ack-hold already names as the one it cannot close;
+        // refusing here would strand the leg for good rather than for 15s.
+        let acts = intent_actions(&retry, true, &HashMap::new(), &mut parked, t0(), None);
         let Action::Place { supersedes, .. } = &acts[0] else { panic!("expected a place") };
-        assert_eq!(*supersedes, None, "an unacked attempt cannot be asked about");
+        assert_eq!(*supersedes, None, "an unacked chain cannot be asked about");
     }
 
     /// The side an intent decided is the side the venue is asked for, both ways

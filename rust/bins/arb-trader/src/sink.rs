@@ -344,19 +344,30 @@ where
         VenueGateway::fills_since(self, min_ts)
     }
     fn filled_qty(&self, order_id: &str) -> Result<i64, VenueError> {
-        VenueGateway::order_status(self, order_id).map(|o| G::order_filled_qty(&o))
+        VenueGateway::order_filled_qty(self, order_id)
     }
 }
 
 /// What the venue says about the hedge attempt a retry is about to supersede.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PriorAttempt {
-    /// The venue filled nothing on it. The retry is safe to send.
-    Unfilled,
-    /// It FILLED. Those contracts are ours whether or not the fill frame ever
-    /// arrived, so re-placing on top of them is a double hedge.
-    Filled(i64),
-    /// The venue could not be asked. NOT the same as `Unfilled` — see
+    /// The venue has nothing on it we have not already credited. The retry is
+    /// safe to send.
+    ///
+    /// NOT "it filled nothing". The question is whether the venue knows
+    /// something we do not, so it is answered against what the engine has
+    /// ALREADY booked for that attempt (`HedgeOrder::cum_filled`), never
+    /// against zero. A 10-lot that filled 4, was credited 4, and left an
+    /// obligation still owing 6 is a completely ordinary retry: comparing it
+    /// against zero would refuse that retry for ever and the leg would never
+    /// be hedged at all.
+    Accounted,
+    /// The venue reports MORE filled than we have credited. Those contracts are
+    /// ours whether or not the fill frame ever arrived, so re-placing on top of
+    /// them is a double hedge. Carries the venue's CUMULATIVE total, which is
+    /// what the fill schema wants.
+    Unaccounted(i64),
+    /// The venue could not be asked. NOT the same as `Accounted` — see
     /// [`OrderSink::filled_qty`].
     Unreadable(String),
 }
@@ -410,27 +421,44 @@ pub enum PriorAttempt {
 /// cannot hedge profitably (`hedge_plan` -> `Wait`), waiting is alarmed
 /// (`hedges_naked`), and a double hedge is neither.
 ///
-/// `Priority::Background` all the way down (`order_status` on both gateways):
-/// it is metered against the shared read budget rather than the order path, so
-/// it can never take a token the CANCEL path needed. The cost is one extra
-/// venue read, and one extra round trip of naked time, per hedge RETRY — never
-/// per tick and never on a first attempt, which is the only attempt most
-/// obligations ever have.
+/// ON THE ORDER PATH'S PRIORITY. `VenueGateway::order_filled_qty` sends at
+/// `Priority::Critical`, not `Background`, and that is load-bearing rather than
+/// greedy: a hedge place cannot complete without this answer, which is exactly
+/// what quirk `xv-shared-api-budget`'s 2026-07-29 corollary puts inside "the
+/// order path". Background is a hard `try_acquire`, not a wait, so metering it
+/// would let an empty bucket produce `Unreadable`, and `ratelimit.rs` says what
+/// that is worth: *a hedge refused for want of a token is a naked leg*. The
+/// correlation makes it worse than it sounds — a socket flap is both what loses
+/// a fill frame and what fires the paged reconciliation that drains the
+/// background bucket, so this read would be refused precisely when it matters.
 ///
-/// ONE request, not a walk: `order_status` is the single-order GET, so this
-/// costs nothing like the paged `/portfolio/orders` history a lookup by
-/// `client_order_id` has to page through. We can address the order directly
-/// precisely because case 2 above did not happen — its ack landed, so the venue
-/// gave us its id.
+/// ONE request, not a walk: the single-order GET, so it costs nothing like the
+/// paged `/portfolio/orders` history a lookup by `client_order_id` pages
+/// through — well inside what that corollary already accepts as unmetered. We
+/// can address the order directly precisely because case 2 above did not
+/// happen: its ack landed, so the venue gave us its id.
+///
+/// WHAT IT COSTS IN TIME, stated at the tail and not the median: one venue
+/// round trip added to a hedge retry, and in the worst case the transport's 15s
+/// timeout followed by a refusal. It is also inline in the executor's serial
+/// loop, so a cancel queued behind it on the SAME venue waits that long — the
+/// loop already blocks this way on every place, cancel and recovery read, so
+/// this lengthens an existing worst case rather than adding a new one, but it
+/// does lengthen it.
 pub async fn prior_attempt(
     sink: std::sync::Arc<dyn OrderSink>,
     venue_order_id: String,
+    credited: i64,
 ) -> PriorAttempt {
     // The gateways block; running one on this worker would stall every other
     // task on it — the same reason every other venue call here is spawned.
     match tokio::task::spawn_blocking(move || sink.filled_qty(&venue_order_id)).await {
-        Ok(Ok(0)) => PriorAttempt::Unfilled,
-        Ok(Ok(n)) => PriorAttempt::Filled(n),
+        // Against what we ALREADY BOOKED for this attempt, never against zero.
+        // A partial fill whose frame DID arrive is credited, so the retry for
+        // the remainder is ordinary and must go out; only a venue total that
+        // runs AHEAD of our books is evidence of a frame we never saw.
+        Ok(Ok(n)) if n <= credited => PriorAttempt::Accounted,
+        Ok(Ok(n)) => PriorAttempt::Unaccounted(n),
         Ok(Err(e)) => PriorAttempt::Unreadable(e.to_string()),
         Err(e) => PriorAttempt::Unreadable(format!("verification task panicked: {e}")),
     }

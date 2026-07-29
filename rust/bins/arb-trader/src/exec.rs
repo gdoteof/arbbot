@@ -27,8 +27,8 @@ use tokio::sync::mpsc;
 /// on a wire. The requests are arb-venue's venue-neutral types, so the same
 /// value the executor counts today is the value a gateway will send.
 pub enum Action {
-    /// A place, plus — for a hedge RETRY only — the VENUE's id for the attempt
-    /// it supersedes, which must be confirmed unfilled before this one is sent.
+    /// A place, plus — for a hedge RETRY only — the attempt it supersedes,
+    /// which must be reconciled against venue truth before this one is sent.
     ///
     /// It rides on the place rather than arriving as its own command because
     /// the two decisions are one decision: a separate verify command could not
@@ -36,7 +36,7 @@ pub enum Action {
     /// [`crate::sink::prior_attempt`] for what a lost fill frame costs without
     /// it. `None` for everything else — a maker quote, a take-take leg, and the
     /// FIRST attempt of a hedge chain supersede nothing.
-    Place { req: PlaceRequest, supersedes: Option<String> },
+    Place { req: PlaceRequest, supersedes: Option<Superseded> },
     /// A cancel, plus the engine's ATTEMPT NUMBER for the order it names.
     ///
     /// The number never reaches a wire — it is echoed back in `cancel_result` so
@@ -53,6 +53,19 @@ pub enum Action {
     /// outcome. Halting is the one moment where "probably cancelled" is not
     /// good enough.
     SweepAndVerify,
+}
+
+/// The hedge attempt a retry is about to supersede, as the executor needs it.
+///
+/// Both halves are required and neither is redundant. The VENUE's id is the
+/// only name the venue answers to; `credited` is what the engine has already
+/// booked against that attempt (`HedgeOrder::cum_filled`), and without it the
+/// executor would have to compare the venue's total against ZERO — which
+/// refuses every retry that follows an ordinary partial fill, for ever.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Superseded {
+    pub venue_order_id: String,
+    pub credited: i64,
 }
 
 pub struct ExecCmd {
@@ -1072,20 +1085,22 @@ async fn run_executor(
         // the obligation, and is idempotent if that frame later arrives after
         // all. `Unreadable` sends nothing and places nothing.
         if let Action::Place { req, supersedes: Some(prior) } = &cmd.action {
-            match crate::sink::prior_attempt(sink.clone(), prior.clone()).await {
-                crate::sink::PriorAttempt::Unfilled => {}
-                crate::sink::PriorAttempt::Filled(n) => {
+            let pid = &prior.venue_order_id;
+            match crate::sink::prior_attempt(sink.clone(), pid.clone(), prior.credited).await {
+                crate::sink::PriorAttempt::Accounted => {}
+                crate::sink::PriorAttempt::Unaccounted(n) => {
                     HEDGE_RETRIES_REFUSED.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
                         "[exec] {venue:?}: NOT re-placing hedge {} ({} x{} @{}) — the venue \
-                         says the attempt it supersedes ({prior}) FILLED {n}. The fill frame \
-                         for it never reached this process; re-placing would have left us \
-                         long against our own short. Crediting it now. \
-                         hedge_retries_refused={}",
+                         says the attempt it supersedes ({pid}) has FILLED {n} against the {} \
+                         this process has booked. The fill frame for the difference never \
+                         reached us; re-placing would have left us long against our own \
+                         short. Crediting it now. hedge_retries_refused={}",
                         req.client_order_id,
                         req.market,
                         req.qty,
                         req.price,
+                        prior.credited,
                         hedge_retries_refused()
                     );
                     tell_engine(
@@ -1094,7 +1109,7 @@ async fn run_executor(
                             "kind": "fill",
                             "venue": venue.as_str(),
                             "market_id": req.market,
-                            "order_id": prior,
+                            "order_id": pid,
                             "cum": n,
                             "ts_local_ns": now_ns(),
                         }),
@@ -1107,10 +1122,13 @@ async fn run_executor(
                     st.failed.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
                         "[exec] {venue:?}: NOT re-placing hedge {} ({} x{} @{}) — could not \
-                         read whether the attempt it supersedes ({prior}) filled ({why}). \
+                         read whether the attempt it supersedes ({pid}) filled ({why}). \
                          This leg stays NAKED and will alarm; that is the safe direction, \
                          because placing on an unread answer is how one hedge becomes two. \
-                         The next retry asks again. hedge_retries_refused={}",
+                         The next retry asks about {pid} AGAIN — this refused place never \
+                         reached the venue, so it never becomes the thing the next retry \
+                         verifies (`drain_intents` walks back past it). \
+                         hedge_retries_refused={}",
                         req.client_order_id,
                         req.market,
                         req.qty,
@@ -1429,9 +1447,19 @@ mod tests {
     }
 
     /// ...and a hedge RETRY, which names the attempt it supersedes: the one
-    /// place that must not go out until the venue has said that attempt filled
-    /// nothing. `None` is the first attempt of a chain (`taker_place`).
-    fn hedge_retry(oid: &str, supersedes: Option<&str>) -> ExecCmd {
+    /// place that must not go out until the venue has been reconciled against
+    /// what we booked for that attempt. `None` is the first attempt of a chain
+    /// (`taker_place`); `credited` is what this process already has for it.
+    fn retry_after(oid: &str, prior: &str, credited: i64) -> ExecCmd {
+        let mut c = hedge_retry(oid, None);
+        if let Action::Place { supersedes, .. } = &mut c.action {
+            *supersedes =
+                Some(Superseded { venue_order_id: prior.into(), credited });
+        }
+        c
+    }
+
+    fn hedge_retry(oid: &str, supersedes: Option<Superseded>) -> ExecCmd {
         ExecCmd {
             t_read: Instant::now(),
             action: Action::Place {
@@ -1444,7 +1472,7 @@ mod tests {
                     post_only: false,
                     client_order_id: oid.into(),
                 },
-                supersedes: supersedes.map(str::to_string),
+                supersedes,
             },
         }
     }
@@ -1565,7 +1593,7 @@ mod tests {
     async fn a_hedge_retry_is_not_sent_when_the_attempt_it_supersedes_filled() {
         let sink = Arc::new(Recorder { prior_filled: Some(5), ..Recorder::default() });
         let (st, told) =
-            drain_reporting(Venue::Kalshi, sink.clone(), vec![hedge_retry("h2", Some("venue-h1"))])
+            drain_reporting(Venue::Kalshi, sink.clone(), vec![retry_after("h2", "venue-h1", 0)])
                 .await;
 
         assert!(
@@ -1597,7 +1625,7 @@ mod tests {
     async fn the_same_retry_is_sent_once_the_venue_says_that_attempt_filled_nothing() {
         let sink = Arc::new(Recorder { prior_filled: Some(0), ..Recorder::default() });
         let (st, told) =
-            drain_reporting(Venue::Kalshi, sink.clone(), vec![hedge_retry("h2", Some("venue-h1"))])
+            drain_reporting(Venue::Kalshi, sink.clone(), vec![retry_after("h2", "venue-h1", 0)])
                 .await;
 
         assert_eq!(*sink.placed.lock().unwrap(), vec!["h2"], "nothing filled, so re-place");
@@ -1619,7 +1647,7 @@ mod tests {
         // `prior_filled: None` — the venue could not be asked.
         let sink = Arc::new(Recorder::default());
         let (st, told) =
-            drain_reporting(Venue::Kalshi, sink.clone(), vec![hedge_retry("h2", Some("venue-h1"))])
+            drain_reporting(Venue::Kalshi, sink.clone(), vec![retry_after("h2", "venue-h1", 0)])
                 .await;
 
         assert!(sink.placed.lock().unwrap().is_empty(), "an unread answer is not a licence");
@@ -1627,6 +1655,48 @@ mod tests {
         assert_eq!(st.sent.load(Ordering::Relaxed), 0);
         assert!(told.is_empty(), "and it claims NOTHING about a fill nobody could read");
         assert_eq!(st.failed.load(Ordering::Relaxed), 1, "counted as a venue failure");
+    }
+
+    /// A PARTIAL fill whose frame DID arrive is not a reason to refuse the
+    /// retry for its remainder — it is the ordinary case.
+    ///
+    /// The question is whether the venue knows something we do not, so it is
+    /// asked against what this process has already BOOKED for that attempt, not
+    /// against zero. Against zero, a 10-lot that filled 4 and was credited 4
+    /// would refuse the retry for the missing 6 on every tick, for ever, and
+    /// the leg would simply never be hedged — the fix turning into a worse
+    /// outage than the defect.
+    #[tokio::test]
+    async fn a_partial_fill_this_process_already_booked_does_not_refuse_the_remainder() {
+        let sink = Arc::new(Recorder { prior_filled: Some(4), ..Recorder::default() });
+        let (st, told) =
+            drain_reporting(Venue::Kalshi, sink.clone(), vec![retry_after("h2", "venue-h1", 4)])
+                .await;
+
+        assert_eq!(
+            *sink.placed.lock().unwrap(),
+            vec!["h2"],
+            "venue 4, booked 4 — nothing unexplained, so the remainder MUST be hedged"
+        );
+        assert_eq!(st.sent.load(Ordering::Relaxed), 1);
+        assert_eq!(told[0]["kind"], "order_ack");
+    }
+
+    /// ...and one contract of daylight between the two is still caught. The
+    /// boundary is `venue > booked`, not `venue > 0`.
+    #[tokio::test]
+    async fn a_venue_total_one_ahead_of_our_books_still_refuses() {
+        let sink = Arc::new(Recorder { prior_filled: Some(5), ..Recorder::default() });
+        let (_st, told) =
+            drain_reporting(Venue::Kalshi, sink.clone(), vec![retry_after("h2", "venue-h1", 4)])
+                .await;
+
+        assert!(sink.placed.lock().unwrap().is_empty(), "one contract we never saw is enough");
+        assert_eq!(told[0]["kind"], "fill");
+        assert_eq!(
+            told[0]["cum"], 5,
+            "the CUMULATIVE venue total, not the delta — hedge_credit does that arithmetic"
+        );
     }
 
     /// WHAT IT COSTS. A place that supersedes nothing — every maker quote, every

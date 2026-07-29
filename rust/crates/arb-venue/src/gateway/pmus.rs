@@ -156,6 +156,27 @@ impl<T: Transport> PmusGateway<T> {
     fn order_status_settled(&self, order_id: &str) -> Result<resp::PmOrder, VenueError> {
         self.settle.retry_404("pmus order_status", order_id, || self.order_status(order_id))
     }
+
+    /// The single-order GET at a chosen priority. `order_status` is a
+    /// BACKGROUND poll; the hedge-verification read is on the order path and
+    /// must not be refusable by a token bucket (see
+    /// [`VenueGateway::order_filled_qty`]). One body, so the two cannot drift.
+    fn order_status_at(
+        &self,
+        priority: Priority,
+        order_id: &str,
+    ) -> Result<resp::PmOrder, VenueError> {
+        let path = format!("/v1/order/{order_id}");
+        let r = self.call(priority, "GET", &path, None)?;
+        if r.status != 200 {
+            return Err(VenueError::Status {
+                endpoint: "pmus order_status",
+                status: r.status,
+                body: r.body,
+            });
+        }
+        resp::pmus_order(&r.body)
+    }
 }
 
 impl<T: Transport> VenueGateway for PmusGateway<T> {
@@ -188,8 +209,18 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
         order.id.clone()
     }
 
-    fn order_filled_qty(order: &Self::Order) -> i64 {
-        order.filled_qty()
+    fn order_filled_qty(&self, order_id: &str) -> Result<i64, VenueError> {
+        let o = self.settle.retry_404("pmus order_filled_qty", order_id, || {
+            self.order_status_at(Priority::Critical, order_id)
+        })?;
+        o.try_filled_qty().ok_or_else(|| VenueError::Parse {
+            endpoint: "pmus order_filled_qty",
+            detail: format!(
+                "order {order_id} answered 200 with no readable cumQuantity. Only a CREATE \
+                 response omits it and this is a re-fetch, so this is a payload shape change — \
+                 NOT evidence the order did not trade."
+            ),
+        })
     }
 
     /// POST /v1/order/{id}/cancel, with the marketSlug in the BODY.
@@ -306,16 +337,7 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
     /// GET /v1/order/{id} — authoritative. The create response omits fill data
     /// entirely, so this is the only way to learn cumQuantity/avgPx.
     fn order_status(&self, order_id: &str) -> Result<Self::Order, VenueError> {
-        let path = format!("/v1/order/{order_id}");
-        let r = self.call(Priority::Background, "GET", &path, None)?;
-        if r.status != 200 {
-            return Err(VenueError::Status {
-                endpoint: "pmus order_status",
-                status: r.status,
-                body: r.body,
-            });
-        }
-        resp::pmus_order(&r.body)
+        self.order_status_at(Priority::Background, order_id)
     }
 
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {

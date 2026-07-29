@@ -112,6 +112,28 @@ impl<T: Transport> KalshiGateway<T> {
         self.settle.retry_404("kalshi order_status", order_id, || self.order_status(order_id))
     }
 
+    /// The single-order GET at a chosen priority. `order_status` is a
+    /// BACKGROUND poll; the hedge-verification read is on the order path and
+    /// must not be refusable by a token bucket (see
+    /// [`VenueGateway::order_filled_qty`]). One body, so the two cannot drift
+    /// about the path, the status check or the envelope.
+    fn order_status_at(
+        &self,
+        priority: Priority,
+        order_id: &str,
+    ) -> Result<resp::KalshiOrder, VenueError> {
+        let path = format!("{K_ORDERS}/{order_id}");
+        let r = self.call(priority, "GET", &path, None, None)?;
+        if r.status != 200 {
+            return Err(VenueError::Status {
+                endpoint: "kalshi order_status",
+                status: r.status,
+                body: r.body,
+            });
+        }
+        Ok(resp::kalshi_order_envelope(&r.body)?.order)
+    }
+
     /// Sign `path` (never the query — quirk K2) and send. Spends one token of
     /// `priority` first; an exhausted local budget refuses a background READ
     /// rather than earning a venue-side 429. The order path spends nothing —
@@ -616,10 +638,6 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
         order.order_id.clone()
     }
 
-    fn order_filled_qty(order: &Self::Order) -> i64 {
-        order.filled_qty()
-    }
-
     fn fills_since(&self, min_ts: i64) -> Result<Vec<resp::KalshiFillRow>, VenueError> {
         KalshiGateway::fills_since(self, min_ts)
     }
@@ -753,16 +771,22 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
     }
 
     fn order_status(&self, order_id: &str) -> Result<Self::Order, VenueError> {
-        let path = format!("{K_ORDERS}/{order_id}");
-        let r = self.call(Priority::Background, "GET", &path, None, None)?;
-        if r.status != 200 {
-            return Err(VenueError::Status {
-                endpoint: "kalshi order_status",
-                status: r.status,
-                body: r.body,
-            });
-        }
-        Ok(resp::kalshi_order_envelope(&r.body)?.order)
+        self.order_status_at(Priority::Background, order_id)
+    }
+
+    fn order_filled_qty(&self, order_id: &str) -> Result<i64, VenueError> {
+        let o = self.settle.retry_404("kalshi order_filled_qty", order_id, || {
+            self.order_status_at(Priority::Critical, order_id)
+        })?;
+        o.try_filled_qty().ok_or_else(|| VenueError::Parse {
+            endpoint: "kalshi order_filled_qty",
+            detail: format!(
+                "order {order_id} answered 200 with no readable fill count (fill_count_fp={:?} \
+                 fill_count={:?}). Every recorded row carries it, `0.00` included, so this is a \
+                 payload shape change — NOT evidence the order did not trade.",
+                o.fill_count_fp, o.fill_count
+            ),
+        })
     }
 
     /// The evidence half of the sweep, scoped to match the cancel half.

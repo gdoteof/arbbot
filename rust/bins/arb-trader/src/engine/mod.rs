@@ -667,10 +667,11 @@ impl Engine {
                 // nothing. See `HedgeOrder::supersedes`: without it a lost fill
                 // frame turns one hedge into two.
                 let supersedes = match &it {
-                    Intent::Place(p) => self
-                        .hedge_orders
-                        .get(&p.order_id)
-                        .and_then(|h| h.supersedes.clone()),
+                    Intent::Place(p) => hedge::superseded(
+                        &self.hedge_orders,
+                        &self.oid_venue,
+                        &p.order_id,
+                    ),
                     _ => None,
                 };
                 for action in intent_actions(
@@ -679,7 +680,7 @@ impl Engine {
                     &self.oid_venue,
                     &mut self.parked_cancels,
                     now,
-                    supersedes.as_deref(),
+                    supersedes.clone(),
                 ) {
                     let is_cancel = matches!(action, Action::Cancel { .. });
                     let queued = self.dispatch(venue, action);
@@ -1045,6 +1046,13 @@ impl Engine {
             // arbbot-hedge.timer is what completes them (see `orphan`).
             "hedges_undischarged": self.cfg.hedges_undischarged,
             "hedges_retried": self.n_retry,
+            // ...which counts retries the engine DECIDED on, and can therefore
+            // run ahead of the places that reached a venue: the executor
+            // withholds one whose superseded attempt turns out to have filled,
+            // or could not be read. That is the discriminant, and it only IS
+            // one if it is somewhere a monitor can read it — steady 0 is the
+            // resting state.
+            "hedge_retries_refused": crate::exec::hedge_retries_refused(),
             "hedges_naked": self.n_naked,
             // Hedge contracts filled beyond what an obligation owed — a
             // position with no maker leg to pair it with. Must stay 0.
