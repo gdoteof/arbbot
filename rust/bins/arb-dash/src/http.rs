@@ -120,3 +120,69 @@ pub fn serve(a: Args) {
         std::thread::spawn(move || handle(s, &a, &sh));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::query_param;
+
+    /// An absent key must be absent, so the caller's own default applies
+    /// rather than something this parser invented.
+    #[test]
+    fn a_missing_key_is_none() {
+        assert_eq!(query_param("n=5&day=2026-07-28", "clip"), None);
+        assert_eq!(query_param("", "n"), None);
+    }
+
+    /// `?day=` is a blank, and every caller of this feeds `day` straight into
+    /// `tob-<venue>-<day>.jsonl`. Returning `Some("")` would name a file that
+    /// cannot exist while looking like a deliberate choice; returning None
+    /// falls back to today, which is what the operator meant.
+    #[test]
+    fn an_empty_value_is_absent_not_an_empty_string() {
+        assert_eq!(query_param("day=", "day"), None);
+        assert_eq!(query_param("day=&n=5", "day"), None);
+        assert_eq!(query_param("day=&n=5", "n"), Some("5".into()), "and the rest still parses");
+    }
+
+    /// A repeated key is a client bug, not a crash and not a merge: the first
+    /// wins, deterministically.
+    #[test]
+    fn the_first_of_a_repeated_key_wins() {
+        assert_eq!(query_param("n=5&n=9", "n"), Some("5".into()));
+    }
+
+    /// Keys match WHOLE. `max_spread` must never answer a request for
+    /// `spread`, or the scenario board would silently price at a bound nobody
+    /// set.
+    #[test]
+    fn a_key_is_matched_whole_never_as_a_substring() {
+        assert_eq!(query_param("max_spread=0.02", "spread"), None);
+        assert_eq!(query_param("nn=5", "n"), None);
+        assert_eq!(query_param("n=5", "nn"), None);
+    }
+
+    /// A bare flag carries no `=`, so it reads as absent. That is why
+    /// `/api/current?all` does NOT open the untradable universe — only
+    /// `all=1` does, and the gate is written to require exactly that.
+    #[test]
+    fn a_bare_flag_with_no_equals_is_not_a_value() {
+        assert_eq!(query_param("all&n=3", "all"), None);
+        assert_eq!(query_param("all&n=3", "n"), Some("3".into()));
+        assert_eq!(query_param("all", "all"), None);
+    }
+
+    /// Relationship ids and market keys carry colons and names carry spaces
+    /// (`sports-rehedge-Tamara Korpatsch@Julia Stusek`), and a browser sends
+    /// those as `%3A` and `+`. Those two substitutions are the WHOLE decoder:
+    /// there is no general percent-decoding here, so anything else arrives
+    /// literally.
+    #[test]
+    fn only_the_colon_and_the_space_are_decoded() {
+        assert_eq!(query_param("rel=kalshi%3AKXTEST", "rel"), Some("kalshi:KXTEST".into()));
+        assert_eq!(
+            query_param("rel=Tamara+Korpatsch", "rel"),
+            Some("Tamara Korpatsch".into())
+        );
+        assert_eq!(query_param("rel=a%2Fb", "rel"), Some("a%2Fb".into()));
+    }
+}

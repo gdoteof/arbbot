@@ -127,3 +127,76 @@ fn day_range(from: &str, to: &str) -> Vec<String> {
     }
     (a0..=b0).map(iso_from_day).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::day_range;
+
+    /// Every day this returns becomes a `tob-<venue>-<day>.jsonl` stat, three
+    /// venues wide, so an unbounded or malformed range is a filesystem storm
+    /// driven straight off a URL.
+    #[test]
+    fn a_range_of_one_day_is_that_day() {
+        assert_eq!(day_range("2026-07-28", "2026-07-28"), ["2026-07-28"]);
+    }
+
+    /// `to` before `from` is a typo in a query string, and the answer is no
+    /// days.
+    ///
+    /// Be honest about what this catches: the explicit `b0 < a0` guard is
+    /// REDUNDANT, because `(a0..=b0)` with `a0 > b0` is already an empty
+    /// iterator, and deleting that guard leaves this test green. Verified by
+    /// mutation. It pins the outcome, not the line — which is what a caller
+    /// depends on, and what would break if this were ever rewritten as a
+    /// hand-rolled loop over days.
+    #[test]
+    fn a_reversed_range_is_empty_not_walked_backwards() {
+        assert!(day_range("2026-07-28", "2026-07-01").is_empty());
+        assert!(day_range("2026-07-28", "2026-07-27").is_empty(), "one day reversed");
+    }
+
+    /// The cap is on the SPAN, not the count: 400 days apart is 401 days of
+    /// files and is served, and one day further is refused outright rather
+    /// than truncated — a silently shortened range would answer a question
+    /// nobody asked.
+    #[test]
+    fn the_cap_is_four_hundred_days_apart_and_refuses_rather_than_truncates() {
+        assert_eq!(day_range("2025-01-01", "2026-02-05").len(), 401);
+        assert!(day_range("2025-01-01", "2026-02-06").is_empty());
+    }
+
+    /// This function used to carry its own days-from-civil and its own
+    /// month-length table with the leap-year rule written out. February 29th
+    /// is the day that table existed to get right.
+    #[test]
+    fn a_leap_day_is_walked_not_skipped() {
+        assert_eq!(
+            day_range("2024-02-28", "2024-03-01"),
+            ["2024-02-28", "2024-02-29", "2024-03-01"]
+        );
+        assert_eq!(
+            day_range("2026-02-27", "2026-03-01"),
+            ["2026-02-27", "2026-02-28", "2026-03-01"],
+            "2026 is not a leap year"
+        );
+    }
+
+    /// A year boundary is not a special case and must not become one.
+    #[test]
+    fn a_range_crosses_new_year_without_a_gap() {
+        assert_eq!(
+            day_range("2025-12-30", "2026-01-02"),
+            ["2025-12-30", "2025-12-31", "2026-01-01", "2026-01-02"]
+        );
+    }
+
+    /// A date this cannot read yields NO days rather than a range anchored at
+    /// the epoch: `?from=yesterday` would otherwise ask for twenty thousand.
+    #[test]
+    fn an_unreadable_date_yields_no_days_at_all() {
+        for bad in ["", "yesterday", "2026-7-28", "20260728", "2026-13-01", "2026-07-32"] {
+            assert!(day_range(bad, "2026-07-28").is_empty(), "`{bad}` was read as a from-date");
+            assert!(day_range("2026-07-28", bad).is_empty(), "`{bad}` was read as a to-date");
+        }
+    }
+}

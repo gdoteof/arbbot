@@ -254,3 +254,131 @@ fn classify(parsed: &serde_json::Value) -> &'static str {
         "other"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::classify;
+
+    /// Every line below is a real shape off the tapes this endpoint follows —
+    /// the six intent variants in `arb_core::intent`'s corpus, and a ledger
+    /// record, because `tape_sources` watches `data/exec/trades.jsonl` too.
+    fn kind(line: &str) -> &'static str {
+        classify(&serde_json::from_str(line).expect("fixture is JSON"))
+    }
+
+    /// 784,344 of the ~813,000 lines on the intent tape are skips. A tape that
+    /// cannot separate them shows only budget messages and hides every real
+    /// order, which is the reason this function exists at all.
+    #[test]
+    fn a_skip_is_a_skip() {
+        assert_eq!(
+            kind(r#"{"skip":["topic [other] gated to util<0.5: at 0.94"],"ts":1785200862.13}"#),
+            "skip"
+        );
+    }
+
+    #[test]
+    fn a_plain_place_and_a_reprice_are_both_places() {
+        assert_eq!(
+            kind(
+                r#"{"count":5,"order_id":"m1","place":"cpc-btc-150k-08-31-2026","price":"0.02",
+                    "side":"ask","ts":1785178914.29,"venue":"polymarket_us"}"#
+            ),
+            "place"
+        );
+        assert_eq!(
+            kind(
+                r#"{"count":5,"old_price":"0.27","order_id":"m138","place":"tpoyc-2026-daramo",
+                    "price":"0.26","replaces":"m84","side":"ask","ts":1785179830.11,
+                    "venue":"polymarket_us"}"#
+            ),
+            "place",
+            "a reprice is still a place"
+        );
+    }
+
+    /// The market id on a PM cancel is a CTF token id, not a slug.
+    #[test]
+    fn a_cancel_is_a_cancel() {
+        assert_eq!(
+            kind(
+                r#"{"cancel":"107505882767731489358349912513945399560393482969656700824895970500493757150417",
+                    "order_id":"m131","price":"0.05","side":"bid",
+                    "ts":1785179898.96,"venue":"polymarket"}"#
+            ),
+            "cancel"
+        );
+    }
+
+    /// The eight lines from the armed M3 run. A take-take place carries BOTH
+    /// `place` and `tag: take-take`, and the tag is tested first — which is
+    /// the point: eight real money crossings must not be indistinguishable
+    /// from 10,659 maker quotes on the one view an operator watches live.
+    #[test]
+    fn a_take_take_place_is_a_take_take_not_a_place() {
+        assert_eq!(
+            kind(
+                r#"{"count":5,"order_id":"t1","place":"tac-nobel-peace-2026-10-09-dontru",
+                    "price":"0.0800","side":"ask","tag":"take-take","taker":true,
+                    "ts":1785257179.78,"venue":"polymarket_us"}"#
+            ),
+            "take-take"
+        );
+    }
+
+    /// `hedge` is the OBLIGATION record — a naked leg that still needs
+    /// covering. The place that discharges it carries `tag: "hedge"` and no
+    /// `hedge_needed` key, so it reads as an ordinary place. The two are
+    /// deliberately different events and the tape shows them as such.
+    #[test]
+    fn hedge_is_the_obligation_and_the_place_that_discharges_it_is_a_place() {
+        assert_eq!(
+            kind(
+                r#"{"anchor_price":"0.0400","hedge_needed":"KXNOBELPEACE-26-DJT",
+                    "order_id":"t1","qty":5,"ts":1785257180.16}"#
+            ),
+            "hedge"
+        );
+        assert_eq!(
+            kind(
+                r#"{"count":5,"order_id":"h2","place":"KXTEST","price":"0.30","retry":2,
+                    "side":"bid","tag":"hedge","taker":true,"ts":1.0,"venue":"kalshi"}"#
+            ),
+            "place"
+        );
+    }
+
+    /// The ledger is one of the tape's sources, and its records are the only
+    /// ones carrying `relationship_id` — a basket the engine actually booked.
+    #[test]
+    fn a_ledger_record_is_a_basket() {
+        assert_eq!(
+            kind(
+                r#"{"ts":1785250000.0,"relationship_id":"xvus-nobel-peace-26-donaldtrump",
+                    "qty":5,"strategy":"take-take","status":"open","source":"arb-trader"}"#
+            ),
+            "basket"
+        );
+    }
+
+    /// Classification is by FIRST match, and the order is load-bearing rather
+    /// than incidental. A skip that also names a relationship is still a skip,
+    /// and a naked-leg obligation is a hedge before it is anything else.
+    #[test]
+    fn the_first_matching_test_wins() {
+        assert_eq!(kind(r#"{"skip":["x"],"relationship_id":"r","place":"M"}"#), "skip");
+        assert_eq!(kind(r#"{"hedge_needed":"M","relationship_id":"r"}"#), "hedge");
+        assert_eq!(kind(r#"{"relationship_id":"r","cancel":"M"}"#), "basket");
+    }
+
+    /// A line this cannot read is still shown. `tape` wraps an unparseable
+    /// line as `{"raw": ...}` rather than dropping it, so the classifier must
+    /// have somewhere to put it — silence on the live tape reads as an idle
+    /// engine.
+    #[test]
+    fn an_unrecognised_line_is_other_rather_than_dropped() {
+        assert_eq!(kind(r#"{"raw":"{\"ts\":1.0,\"relat"}"#), "other");
+        assert_eq!(kind(r#"{"ts":1.0}"#), "other");
+        assert_eq!(kind(r#"{"tag":"hedge"}"#), "other", "a tag alone is not an action");
+    }
+}

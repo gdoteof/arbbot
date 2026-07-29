@@ -523,3 +523,53 @@ fn every_row_either_has_a_priced_net_or_says_why_not() {
         }
     }
 }
+
+// ----- the two readers every number above goes through ------------------
+
+/// The ledger writes money as STRINGS (`"0.0800"`, `"0.3427"`) and quantities
+/// as JSON numbers, sometimes integral and sometimes not. One reader has to
+/// take both, or half the fields on disk read as absent.
+#[test]
+fn a_money_field_reads_the_same_whether_it_is_quoted_or_not() {
+    assert_eq!(num(Some(&serde_json::json!("0.0800"))), Some(0.08));
+    assert_eq!(num(Some(&serde_json::json!(0.08))), Some(0.08));
+    assert_eq!(num(Some(&serde_json::json!(5))), Some(5.0));
+    assert_eq!(num(Some(&serde_json::json!(2.0))), Some(2.0));
+    assert_eq!(num(Some(&serde_json::json!(-1.0756))), Some(-1.0756));
+}
+
+/// Absent is `None`, and so is anything that is not a number. Reading an
+/// unparseable money field as 0.0 is the exact defect the workspace lint notes
+/// call out as the worst one the audit found: a missing price became "0" and
+/// nothing said so.
+#[test]
+fn an_unreadable_field_is_absent_not_zero() {
+    assert_eq!(num(None), None);
+    assert_eq!(num(Some(&serde_json::json!(null))), None);
+    assert_eq!(num(Some(&serde_json::json!(""))), None);
+    assert_eq!(num(Some(&serde_json::json!("abc"))), None);
+    assert_eq!(num(Some(&serde_json::json!(true))), None);
+    assert_eq!(num(Some(&serde_json::json!([5]))), None);
+}
+
+/// `"NaN"` is a string Rust's float parser ACCEPTS, so this reader hands back
+/// `Some(NaN)` and cannot do otherwise without deciding policy for its
+/// callers. That is why `build` filters `qty` for `is_finite` before summing —
+/// one NaN in `open_contracts` serialises as `null` and takes the whole count
+/// with it. This test exists so the filter is never read as paranoia.
+#[test]
+fn a_nan_string_parses_which_is_why_the_caller_filters_for_finite() {
+    let v = num(Some(&serde_json::json!("NaN"))).expect("'NaN' parses as a float");
+    assert!(!v.is_finite(), "and the value it parses to is not a number");
+}
+
+/// A record with no `status` is a POSITION. Half the ledger predates the
+/// field, and defaulting the other way would retire every one of those
+/// baskets from the open book while the capital was still committed.
+#[test]
+fn a_record_with_no_status_is_open() {
+    assert_eq!(status_of(&serde_json::json!({ "qty": 5 })), "open");
+    assert_eq!(status_of(&serde_json::json!({ "status": null })), "open");
+    assert_eq!(status_of(&serde_json::json!({ "status": 7 })), "open", "not a string either");
+    assert_eq!(status_of(&serde_json::json!({ "status": "unwound" })), "unwound");
+}
