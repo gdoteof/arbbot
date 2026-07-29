@@ -33,6 +33,7 @@ use arb_core::book::{ApplyError, BookBuilder};
 use arb_core::clock::now_s as wall_now;
 use arb_core::fees::FeeSchedule;
 use arb_core::fill::{dropped_unconsumed, FillLedger};
+use arb_core::intent::{self, Intent, Tag};
 use arb_core::model::{BookSide, Level, Venue};
 use arb_core::quoter::{Quoter, RiskGate};
 use arb_core::scan::{Cx, Rel};
@@ -40,7 +41,6 @@ use cancel::{intent_actions, ParkedCancel};
 use feed_health::{required_feeds, resync_reason, Link};
 use fill::{MakerOrder, UnclaimedFill};
 use hedge::{hedge_anchor, HedgeOrder, PendingHedge};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::Write;
@@ -171,8 +171,8 @@ struct Engine {
     books: BookBuilder,
     digest: Sha256,
     decision: Hist,
-    /// Intent lines the current decision produced, awaiting `drain_intents`.
-    intents: Vec<String>,
+    /// Intents the current decision produced, awaiting `drain_intents`.
+    intents: Vec<Intent>,
     out: Option<std::io::BufWriter<std::fs::File>>,
     wal: Option<Wal>,
     t_start: std::time::Instant,
@@ -369,17 +369,24 @@ impl Engine {
         }
     }
 
-    /// Emit every pending intent line and route its effect to a venue executor.
+    /// Emit every pending intent and route its effect to a venue executor.
     ///
     /// `rel`: the relationship whose quoter emitted these intents (for the
     /// hedge-anchor lookup at place time), or None for intents that rest
     /// nothing (hedge obligations).
+    ///
+    /// `to_line` is the ONE serialisation of an intent in the process. This
+    /// used to serialise here and then immediately `from_str` the result back
+    /// into a `Value` to decide what to do with it, so the routing below read
+    /// every field through `.and_then(|x| x.as_str()).unwrap_or("")` — a
+    /// missing price became `"0"` and a missing side became a BID.
     fn drain_intents(&mut self, rel: Option<&Rel>) {
         // Swapped out of `self` rather than drained in place: the body below
         // needs `&mut self`, and swapped BACK rather than reallocated because
         // this runs on every book event. Nothing in the body pushes an intent.
         let mut pending = std::mem::take(&mut self.intents);
-        for l in pending.drain(..) {
+        for it in pending.drain(..) {
+            let l = it.to_line();
             self.digest.update(l.as_bytes());
             self.digest.update(b"\n");
             self.n_int += 1;
@@ -390,47 +397,34 @@ impl Engine {
                 }
             }
             // route the effect to its venue executor (dry-run gateway seam)
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
+            match &it {
                 // fill-ledger bookkeeping: orders enter the ledger at place
                 // time carrying their quote-time hedge anchor, so a later
                 // fill knows where to hedge without re-reading the book.
-                let ts_ev = v.get("ts").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                if let (Some(mkt), Some(oid), Some(count)) = (
-                    v.get("place").and_then(|x| x.as_str()),
-                    v.get("order_id").and_then(|x| x.as_str()),
-                    v.get("count").and_then(|x| x.as_i64()),
-                ) {
-                    let side = v.get("side").and_then(|x| x.as_str()).unwrap_or("");
+                Intent::Place(p) => {
                     // A hedge is never registered: it has no hedge of its
                     // own, and registering it would make its fill mint one.
-                    if v.get("tag").and_then(|x| x.as_str()) != Some("hedge") {
-                        let anchor =
-                            rel.and_then(|r| hedge_anchor(r, mkt, side, &self.books, ts_ev));
-                        self.fills.register_order(oid, mkt, count, anchor);
+                    if p.tag != Some(Tag::Hedge) {
+                        let anchor = rel.and_then(|r| {
+                            hedge_anchor(r, &p.place, &p.side, &self.books, p.ts)
+                        });
+                        self.fills.register_order(&p.order_id, &p.place, p.count, anchor);
                     }
                     if let Some(r) = rel {
                         self.order_rel.insert(
-                            oid.to_string(),
+                            p.order_id.clone(),
                             MakerOrder {
                                 rel_id: r.id.clone(),
                                 class: r.rtype.as_str(),
-                                venue: v
-                                    .get("venue")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                market_id: mkt.to_string(),
-                                side: side.to_string(),
-                                price: v
-                                    .get("price")
-                                    .and_then(|x| x.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
+                                venue: p.venue.as_str().to_string(),
+                                market_id: p.place.clone(),
+                                side: p.side.clone(),
+                                price: p.price.clone(),
                                 // The intent already carries who emitted
                                 // it; the ledger just has to stop
                                 // discarding that.
-                                strategy: match v.get("tag").and_then(|x| x.as_str()) {
-                                    Some("take-take") => "take-take",
+                                strategy: match p.tag {
+                                    Some(Tag::TakeTake) => "take-take",
                                     _ => "maker-hedge",
                                 },
                             },
@@ -438,41 +432,39 @@ impl Engine {
                     }
                     // an amend retires the old id, but a fill can still
                     // race it — observe_cancel KEEPS the record.
-                    if let Some(roid) = v.get("replaces").and_then(|x| x.as_str()) {
+                    if let Some(roid) = &p.replaces {
                         self.fills.observe_cancel(roid);
                     }
-                } else if let Some(oid) =
-                    v.get("cancel").and(v.get("order_id")).and_then(|x| x.as_str())
-                {
-                    self.fills.observe_cancel(oid);
                 }
-                // Build the REAL requests from the intent (see
-                // `intent_actions`: an amend is a cancel AND a place, in
-                // that order).
-                if let Some(venue) = v.get("venue").and_then(|x| x.as_str()).and_then(Venue::parse)
-                {
-                    // Only the park reads this clock, and only an armed engine
-                    // parks, so a replay's determinism cannot depend on it.
-                    let now = std::time::Instant::now();
-                    for action in intent_actions(
-                        &v,
-                        venue,
-                        self.cfg.armed,
-                        &self.oid_venue,
-                        &mut self.parked_cancels,
-                        now,
-                    ) {
-                        if !self.dispatch(venue, action) {
-                            // The commands of ONE intent are a sequence: an
-                            // amend's place must never go out without the
-                            // cancel that precedes it, or the amend doubles
-                            // the exposure it was meant to move.
-                            eprintln!(
-                                "[engine] executor {venue:?} backlogged — dropped the \
-                                 remaining command(s) of this intent"
-                            );
-                            break;
-                        }
+                Intent::Cancel(c) => self.fills.observe_cancel(&c.order_id),
+                // Records, not orders: nothing rests and nothing is pulled.
+                Intent::HedgeNeeded(_) | Intent::Skip(_) => {}
+            }
+            // Build the REAL requests from the intent (see `intent_actions`:
+            // an amend is a cancel AND a place, in that order). The venue is
+            // read off the intent, so the executor a command is SENT to and
+            // the intent it was BUILT from cannot name different venues.
+            if let Some(venue) = it.venue() {
+                // Only the park reads this clock, and only an armed engine
+                // parks, so a replay's determinism cannot depend on it.
+                let now = std::time::Instant::now();
+                for action in intent_actions(
+                    &it,
+                    self.cfg.armed,
+                    &self.oid_venue,
+                    &mut self.parked_cancels,
+                    now,
+                ) {
+                    if !self.dispatch(venue, action) {
+                        // The commands of ONE intent are a sequence: an
+                        // amend's place must never go out without the
+                        // cancel that precedes it, or the amend doubles
+                        // the exposure it was meant to move.
+                        eprintln!(
+                            "[engine] executor {venue:?} backlogged — dropped the \
+                             remaining command(s) of this intent"
+                        );
+                        break;
                     }
                 }
             }
@@ -784,12 +776,13 @@ impl Engine {
                 // KXRATECUT-26DEC31 (2026-07-28) logged
                 // nothing at all.
                 Err(crate::taketake::Skip::CrossedBook { venue }) => {
-                    self.intents.push(
-                        json!({"ts": now,
-                               "skip": [format!("crossed book {venue} take-take {}",
-                                                quoters[qi].rel.id)]})
-                        .to_string(),
-                    );
+                    self.intents.push(Intent::Skip(intent::Skip {
+                        skip: vec![format!(
+                            "crossed book {venue} take-take {}",
+                            quoters[qi].rel.id
+                        )],
+                        ts: now,
+                    }));
                     self.drain_intents(Some(&quoters[qi].rel));
                     continue;
                 }
@@ -868,14 +861,20 @@ impl Engine {
                 c.kalshi_market,
                 c.kalshi_ask,
             );
-            self.intents.push(
-                json!({"place": c.pmus_market,
-                       "order_id": format!("t{}", self.next_tt_oid),
-                       "count": c.size, "side": "ask",
-                       "price": c.pmus_bid, "venue": "polymarket_us",
-                       "tag": "take-take", "taker": true, "ts": now})
-                .to_string(),
-            );
+            self.intents.push(Intent::Place(intent::Place {
+                count: c.size,
+                old_price: None,
+                order_id: format!("t{}", self.next_tt_oid),
+                place: c.pmus_market,
+                price: c.pmus_bid,
+                replaces: None,
+                retry: None,
+                side: "ask".to_string(),
+                tag: Some(Tag::TakeTake),
+                taker: true,
+                ts: now,
+                venue: Venue::PolymarketUs,
+            }));
             self.drain_intents(Some(&quoters[qi].rel));
         }
     }
@@ -1132,7 +1131,7 @@ mod take_take_wiring_tests {
         );
         // leg 1 is an ASK-side order on the PM-US market (we sell PM YES)
         let a = hedge_anchor(&rel, "P", "ask", &books, 1.0).expect("anchor on the other leg");
-        assert_eq!(a.venue, "kalshi", "hedge must be the OTHER leg");
+        assert_eq!(a.venue, Venue::Kalshi, "hedge must be the OTHER leg");
         assert_eq!(a.market_id, "K");
         assert_eq!(a.side, "ask", "we take Kalshi's ask, i.e. we BUY");
         assert_eq!(a.price, "0.04", "at the Kalshi ask the crossing was priced against");
@@ -1153,6 +1152,8 @@ mod feed_wiring_tests {
     // is here, which is why these tests are here.
     use crate::engine::feed_health::feed_tick;
     use arb_core::scan::{RelLeg, RelType};
+    // Feed lines, not intents: these fixtures are what the engine READS.
+    use serde_json::json;
 
     /// The two shapes `run` is handed, named so the signatures below stay
     /// readable.

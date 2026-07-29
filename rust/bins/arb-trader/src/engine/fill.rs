@@ -14,6 +14,7 @@
 use super::cancel::{settle, CancelWork};
 use super::hedge::{first_attempt_acceptable, hedge_credit, taking_side, HedgeOrder, PendingHedge};
 use super::Engine;
+use arb_core::intent::{self, Intent, Tag};
 use arb_core::model::Venue;
 use arb_core::scan::Rel;
 use serde_json::json;
@@ -220,7 +221,7 @@ impl Engine {
                             None => eprintln!(
                                 "[ledger] CANNOT BOOK {}x {} ({} hedge {oid}): maker order \
                                  {} is unknown to this engine — RECOVER BY HAND.",
-                                c.book, h.market_id, h.venue, h.maker_order_id
+                                c.book, h.market_id, h.venue.as_str(), h.maker_order_id
                             ),
                         }
                     }
@@ -236,7 +237,7 @@ impl Engine {
                              ({} {}) beyond what obligation {} owed. This is directional \
                              exposure the OPPOSITE way and it is NOT booked as a basket \
                              — RECONCILE BY HAND.",
-                            c.over, oid, h.venue, h.market_id, h.chain_id
+                            c.over, oid, h.venue.as_str(), h.market_id, h.chain_id
                         );
                     }
                     if c.done {
@@ -265,11 +266,13 @@ impl Engine {
                     if let Some(a) = ob.anchor().cloned() {
                         let (f_oid, _order_market, qty, _) = ob.into_parts();
                         self.n_hedge += 1;
-                        self.intents.push(
-                            json!({"hedge_needed": a.market_id, "order_id": f_oid.clone(),
-                                   "qty": qty, "anchor_price": a.price.clone(), "ts": now})
-                            .to_string(),
-                        );
+                        self.intents.push(Intent::HedgeNeeded(intent::HedgeNeeded {
+                            anchor_price: a.price.clone(),
+                            hedge_needed: a.market_id.clone(),
+                            order_id: f_oid.clone(),
+                            qty,
+                            ts: now,
+                        }));
                         // The obligation says WHAT to hedge; the order
                         // below is the one that does it. Marketable IOC,
                         // not a resting quote: an unhedged leg is unbounded
@@ -283,8 +286,9 @@ impl Engine {
                         // place time precisely because the burst that fills
                         // you is the burst that gaps your book, so a missing
                         // level here is exactly when it is needed.
-                        let px = Venue::parse(a.venue)
-                            .and_then(|vn| self.books.get(vn, &a.market_id))
+                        let px = self
+                            .books
+                            .get(a.venue, &a.market_id)
                             .and_then(|b| {
                                 if a.side == "bid" { b.bids.first() } else { b.asks.first() }
                             })
@@ -344,12 +348,22 @@ impl Engine {
                                     cum_filled: 0,
                                 },
                             );
-                            self.intents.push(
-                                json!({"ts": now, "place": a.market_id, "venue": a.venue,
-                                       "side": order_side, "price": px, "count": qty,
-                                       "order_id": hoid, "tag": "hedge", "taker": true})
-                                .to_string(),
-                            );
+                            self.intents.push(Intent::Place(intent::Place {
+                                count: qty,
+                                old_price: None,
+                                order_id: hoid.clone(),
+                                place: a.market_id.clone(),
+                                price: px.clone(),
+                                replaces: None,
+                                // The FIRST attempt carries no `retry`, which
+                                // is what makes the retries visible in the tape.
+                                retry: None,
+                                side: order_side.to_string(),
+                                tag: Some(Tag::Hedge),
+                                taker: true,
+                                ts: now,
+                                venue: a.venue,
+                            }));
                         } else {
                             let (slip, alarm_s) = self
                                 .cfg
@@ -363,7 +377,7 @@ impl Engine {
                                  Obligation {hoid} is live and retrying; NOTHING is hedged \
                                  yet, and it alarms as NAKED if it is still open in \
                                  {alarm_s:.0}s.",
-                                a.market_id, a.venue, a.price, a.side
+                                a.market_id, a.venue.as_str(), a.price, a.side
                             );
                         }
                         self.drain_intents(Option::<&Rel>::None);
@@ -567,7 +581,7 @@ mod ledger_write_tests {
             maker_order_id: "m1".into(),
             chain_id: "h1".into(),
             market_id: "demo-slug".into(),
-            venue: "polymarket_us",
+            venue: Venue::PolymarketUs,
             side: "ask",
             price: "0.40".into(),
             qty: 5,
@@ -628,7 +642,7 @@ mod ledger_write_tests {
             maker_order_id: "t1".into(),
             chain_id: "h1".into(),
             market_id: "KXNOBELPEACE-26-DJT".into(),
-            venue: "kalshi",
+            venue: Venue::Kalshi,
             side: "bid",
             price: "0.0400".into(),
             qty: 5,
@@ -670,7 +684,7 @@ mod attribute_fill_tests {
     /// sells into it.
     fn anchor() -> HedgeAnchor {
         HedgeAnchor {
-            venue: "polymarket_us",
+            venue: Venue::PolymarketUs,
             market_id: "P".into(),
             side: "bid",
             price: "0.40".into(),
@@ -695,7 +709,7 @@ mod attribute_fill_tests {
             maker_order_id: "m1".into(),
             chain_id: "h1".into(),
             market_id: "P".into(),
-            venue: "polymarket_us",
+            venue: Venue::PolymarketUs,
             side: "ask",
             price: "0.40".into(),
             qty,

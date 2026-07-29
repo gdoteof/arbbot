@@ -12,6 +12,7 @@
 
 use super::Engine;
 use crate::exec::Action;
+use arb_core::intent::Intent;
 use arb_core::model::Venue;
 use arb_venue::gateway::{CancelBy, CancelRequest, PlaceRequest, Side as VenueSide, Tif};
 use std::collections::HashMap;
@@ -239,42 +240,49 @@ fn cancel_work(
 /// below describes. Two live quotes for the length of the parked cancel is the
 /// lesser harm, and it is counted (`cancels_unresolved`) rather than silent.
 pub(super) fn intent_actions(
-    v: &serde_json::Value,
-    venue: Venue,
+    intent: &Intent,
     armed: bool,
     oid_venue: &HashMap<String, String>,
     parked: &mut HashMap<String, ParkedCancel>,
     now: std::time::Instant,
 ) -> Vec<Action> {
     let mut out: Vec<Action> = Vec::new();
-    let oid = v.get("order_id").and_then(|x| x.as_str());
-    if let (Some(market), Some(oid)) = (v.get("place").and_then(|x| x.as_str()), oid) {
-        if let Some(roid) = v.get("replaces").and_then(|x| x.as_str()) {
-            if let Some(a) = resolve_cancel(roid, market, venue, armed, oid_venue, parked, now) {
+    match intent {
+        Intent::Place(p) => {
+            if let Some(roid) = &p.replaces {
+                if let Some(a) =
+                    resolve_cancel(roid, &p.place, p.venue, armed, oid_venue, parked, now)
+                {
+                    out.push(a);
+                }
+            }
+            // The quoter only ever rests post-only GTC makers, so tif/post_only
+            // are fixed here; a taker hedge carries its own.
+            // `client_order_id` is our own order id, which is what makes a
+            // retried place idempotent at the venue.
+            out.push(Action::Place(PlaceRequest {
+                market: p.place.clone(),
+                // The last stringly-typed field on this path. Until the hedge
+                // policy's `book_side: &str` chain is typed too, an unknown
+                // side still reads as a BID — but it can no longer be a
+                // MISSING one: `side` is a required field of a place.
+                side: if p.side == "ask" { VenueSide::Ask } else { VenueSide::Bid },
+                price: p.price.clone(),
+                qty: p.count,
+                tif: if p.taker { Tif::Ioc } else { Tif::Gtc },
+                post_only: !p.taker,
+                client_order_id: p.order_id.clone(),
+            }));
+        }
+        Intent::Cancel(c) => {
+            if let Some(a) =
+                resolve_cancel(&c.order_id, &c.cancel, c.venue, armed, oid_venue, parked, now)
+            {
                 out.push(a);
             }
         }
-        // The quoter only ever rests post-only GTC makers, so tif/post_only are
-        // fixed here; a taker hedge carries its own.
-        // `client_order_id` is our own order id, which is what makes a retried
-        // place idempotent at the venue.
-        let taker = v.get("taker").and_then(|x| x.as_bool()).unwrap_or(false);
-        out.push(Action::Place(PlaceRequest {
-            market: market.to_string(),
-            side: match v.get("side").and_then(|x| x.as_str()) {
-                Some("ask") => VenueSide::Ask,
-                _ => VenueSide::Bid,
-            },
-            price: v.get("price").and_then(|x| x.as_str()).unwrap_or("0").to_string(),
-            qty: v.get("count").and_then(|x| x.as_i64()).unwrap_or(0),
-            tif: if taker { Tif::Ioc } else { Tif::Gtc },
-            post_only: !taker,
-            client_order_id: oid.to_string(),
-        }));
-    } else if let (Some(market), Some(oid)) = (v.get("cancel").and_then(|x| x.as_str()), oid) {
-        if let Some(a) = resolve_cancel(oid, market, venue, armed, oid_venue, parked, now) {
-            out.push(a);
-        }
+        // Records, not orders: no venue command follows from either.
+        Intent::HedgeNeeded(_) | Intent::Skip(_) => {}
     }
     out
 }
@@ -345,8 +353,23 @@ mod cancel_addressing_tests {
     /// resting (5 @ 0.12 and 5 @ 0.13) where the engine believed it held one.
     const LIVE_REPRICE: &str = r#"{"count":5,"old_price":"0.12","order_id":"m1785257819053","place":"KXNOBELPEACE-27-STC","price":"0.13","replaces":"m1785257819045","side":"ask","ts":1785257814.0,"venue":"kalshi"}"#;
 
-    fn json(s: &str) -> serde_json::Value {
-        serde_json::from_str(s).expect("test fixture json")
+    fn intent(s: &str) -> Intent {
+        Intent::from_line(s).expect("test fixture json")
+    }
+
+    /// A cancel the engine has decided on. Built rather than written as JSON,
+    /// because the venue used to be handed to `intent_actions` ALONGSIDE the
+    /// line and could contradict it; it now rides on the intent, so there is
+    /// only one of it to get wrong.
+    fn cancel_of(market: &str, oid: &str, venue: Venue) -> Intent {
+        Intent::Cancel(arb_core::intent::Cancel {
+            cancel: market.into(),
+            order_id: oid.into(),
+            price: "0.12".into(),
+            side: "ask".into(),
+            ts: 1.0,
+            venue,
+        })
     }
 
     /// A fixed monotonic origin. `Instant` cannot be constructed from a number,
@@ -366,11 +389,11 @@ mod cancel_addressing_tests {
         let mut oid_venue = HashMap::new();
         oid_venue.insert("m1".to_string(), "66e1c799-507b".to_string());
         let mut parked = HashMap::new();
-        let line = json(
-            r#"{"cancel":"KXNOBELPEACE-27-STC","order_id":"m1","venue":"kalshi","side":"ask","price":"0.12","ts":1.0}"#,
+        let line = intent(
+            r#"{"cancel":"KXNOBELPEACE-27-STC","order_id":"m1","price":"0.12","side":"ask","ts":1.0,"venue":"kalshi"}"#,
         );
 
-        let acts = intent_actions(&line, Venue::Kalshi, true, &oid_venue, &mut parked, t0());
+        let acts = intent_actions(&line, true, &oid_venue, &mut parked, t0());
         assert_eq!(
             describe_all(&acts),
             vec![r#"cancel VenueId("66e1c799-507b")"#],
@@ -391,12 +414,10 @@ mod cancel_addressing_tests {
     fn a_cancel_with_no_venue_id_yet_is_parked_and_nothing_is_sent() {
         let oid_venue = HashMap::new();
         let mut parked = HashMap::new();
-        let line = json(
-            r#"{"cancel":"KXNOBELPEACE-27-STC","order_id":"m1","venue":"kalshi","ts":1.0}"#,
-        );
+        let line = cancel_of("KXNOBELPEACE-27-STC", "m1", Venue::Kalshi);
 
         let t = t0();
-        let acts = intent_actions(&line, Venue::Kalshi, true, &oid_venue, &mut parked, t);
+        let acts = intent_actions(&line, true, &oid_venue, &mut parked, t);
         assert!(acts.is_empty(), "nothing may be sent: {:?}", describe_all(&acts));
         let p = parked.get("m1").expect("the cancel must be parked, not dropped");
         assert_eq!(p.venue, Venue::Kalshi);
@@ -412,9 +433,9 @@ mod cancel_addressing_tests {
         let oid_venue = HashMap::new();
         let mut parked = HashMap::new();
         let t = t0();
-        let line = json(r#"{"cancel":"K","order_id":"m1","venue":"kalshi","ts":1.0}"#);
-        intent_actions(&line, Venue::Kalshi, true, &oid_venue, &mut parked, t);
-        intent_actions(&line, Venue::Kalshi, true, &oid_venue, &mut parked, after(t, 8.0));
+        let line = cancel_of("K", "m1", Venue::Kalshi);
+        intent_actions(&line, true, &oid_venue, &mut parked, t);
+        intent_actions(&line, true, &oid_venue, &mut parked, after(t, 8.0));
         assert_eq!(parked["m1"].since, t);
         assert_eq!(cancel_work(&parked, &oid_venue, t + CANCEL_ACK_GRACE, false).len(), 1);
     }
@@ -427,8 +448,8 @@ mod cancel_addressing_tests {
         let oid_venue = HashMap::new();
         let mut parked = HashMap::new();
         let t = t0();
-        let line = json(r#"{"cancel":"KXTEST","order_id":"m1","venue":"kalshi","ts":1.0}"#);
-        intent_actions(&line, Venue::Kalshi, true, &oid_venue, &mut parked, t);
+        let line = cancel_of("KXTEST", "m1", Venue::Kalshi);
+        intent_actions(&line, true, &oid_venue, &mut parked, t);
 
         assert!(
             cancel_work(&parked, &oid_venue, after(t, 14.9), false).is_empty(),
@@ -459,8 +480,8 @@ mod cancel_addressing_tests {
         let oid_venue = HashMap::new();
         let mut parked = HashMap::new();
         let t = t0();
-        let line = json(r#"{"cancel":"K","order_id":"m1","venue":"kalshi","ts":1.0}"#);
-        intent_actions(&line, Venue::Kalshi, true, &oid_venue, &mut parked, t);
+        let line = cancel_of("K", "m1", Venue::Kalshi);
+        intent_actions(&line, true, &oid_venue, &mut parked, t);
         // a clock reading from BEFORE the park (what an NTP step back looks like
         // to a wall clock) must not panic and must not escalate
         assert!(cancel_work(&parked, &oid_venue, t - std::time::Duration::from_secs(3600), false)
@@ -478,10 +499,8 @@ mod cancel_addressing_tests {
         let mut parked = HashMap::new();
         let t = t0();
         for oid in ["m1", "m2", "m3"] {
-            let line = json(&format!(
-                r#"{{"cancel":"K","order_id":"{oid}","venue":"kalshi","ts":1.0}}"#
-            ));
-            intent_actions(&line, Venue::Kalshi, true, &oid_venue, &mut parked, t);
+            let line = cancel_of("K", oid, Venue::Kalshi);
+            intent_actions(&line, true, &oid_venue, &mut parked, t);
         }
         let work = cancel_work(&parked, &oid_venue, t + CANCEL_ACK_GRACE, false);
         assert_eq!(work.len(), 1, "a burst drains at one per second, not all at once");
@@ -502,8 +521,8 @@ mod cancel_addressing_tests {
         let oid_venue = HashMap::new();
         let mut parked = HashMap::new();
         let t = t0();
-        let line = json(r#"{"cancel":"K","order_id":"m1","venue":"kalshi","ts":1.0}"#);
-        intent_actions(&line, Venue::Kalshi, true, &oid_venue, &mut parked, t);
+        let line = cancel_of("K", "m1", Venue::Kalshi);
+        intent_actions(&line, true, &oid_venue, &mut parked, t);
         assert!(cancel_work(&parked, &oid_venue, t + CANCEL_ACK_GRACE, true).is_empty());
         assert!(!parked.is_empty(), "still owed, so still counted");
     }
@@ -518,8 +537,8 @@ mod cancel_addressing_tests {
         let mut oid_venue = HashMap::new();
         let mut parked = HashMap::new();
         let t = t0();
-        let line = json(r#"{"cancel":"slug","order_id":"m1","venue":"polymarket_us","ts":1.0}"#);
-        intent_actions(&line, Venue::PolymarketUs, true, &oid_venue, &mut parked, t);
+        let line = cancel_of("slug", "m1", Venue::PolymarketUs);
+        intent_actions(&line, true, &oid_venue, &mut parked, t);
 
         // +15s: the escalation goes out and PM-US refuses it, by design.
         let esc = cancel_work(&parked, &oid_venue, t + CANCEL_ACK_GRACE, false);
@@ -553,8 +572,8 @@ mod cancel_addressing_tests {
         let mut oid_venue = HashMap::new();
         let mut parked = HashMap::new();
         let t = t0();
-        let line = json(r#"{"cancel":"K","order_id":"m1","venue":"kalshi","ts":1.0}"#);
-        intent_actions(&line, Venue::Kalshi, true, &oid_venue, &mut parked, t);
+        let line = cancel_of("K", "m1", Venue::Kalshi);
+        intent_actions(&line, true, &oid_venue, &mut parked, t);
         oid_venue.insert("m1".to_string(), "v-1".to_string());
 
         let w = &cancel_work(&parked, &oid_venue, t, false)[0];
@@ -576,8 +595,8 @@ mod cancel_addressing_tests {
         let oid_venue = HashMap::new();
         let mut parked = HashMap::new();
         let t = t0();
-        let line = json(r#"{"cancel":"K","order_id":"m1","venue":"kalshi","ts":1.0}"#);
-        intent_actions(&line, Venue::Kalshi, true, &oid_venue, &mut parked, t);
+        let line = cancel_of("K", "m1", Venue::Kalshi);
+        intent_actions(&line, true, &oid_venue, &mut parked, t);
         let due = t + CANCEL_ACK_GRACE;
 
         let w = &cancel_work(&parked, &oid_venue, due, false)[0];
@@ -618,10 +637,8 @@ mod cancel_addressing_tests {
         let mut parked = HashMap::new();
         let t = t0();
         for oid in ["m1", "m2"] {
-            let line = json(&format!(
-                r#"{{"cancel":"K","order_id":"{oid}","venue":"kalshi","ts":1.0}}"#
-            ));
-            intent_actions(&line, Venue::Kalshi, true, &oid_venue, &mut parked, t);
+            let line = cancel_of("K", oid, Venue::Kalshi);
+            intent_actions(&line, true, &oid_venue, &mut parked, t);
             oid_venue.insert(oid.to_string(), format!("v-{oid}"));
         }
         let work = cancel_work(&parked, &oid_venue, t, false);
@@ -637,8 +654,7 @@ mod cancel_addressing_tests {
         let mut parked = HashMap::new();
 
         let acts = intent_actions(
-            &json(LIVE_REPRICE),
-            Venue::Kalshi,
+            &intent(LIVE_REPRICE),
             true,
             &oid_venue,
             &mut parked,
@@ -662,8 +678,7 @@ mod cancel_addressing_tests {
         oid_venue.insert("m1785257819053".to_string(), "new-venue-id".to_string());
         let mut parked = HashMap::new();
         let acts = intent_actions(
-            &json(LIVE_REPRICE),
-            Venue::Kalshi,
+            &intent(LIVE_REPRICE),
             true,
             &oid_venue,
             &mut parked,
@@ -682,8 +697,7 @@ mod cancel_addressing_tests {
         let oid_venue = HashMap::new();
         let mut parked = HashMap::new();
         let acts = intent_actions(
-            &json(LIVE_REPRICE),
-            Venue::Kalshi,
+            &intent(LIVE_REPRICE),
             true,
             &oid_venue,
             &mut parked,
@@ -702,10 +716,9 @@ mod cancel_addressing_tests {
         let oid_venue = HashMap::new();
         let mut parked = HashMap::new();
         let acts = intent_actions(
-            &json(
-                r#"{"place":"KXTEST","order_id":"m9","venue":"kalshi","side":"bid","price":"0.31","count":25,"ts":1.0}"#,
+            &intent(
+                r#"{"count":25,"order_id":"m9","place":"KXTEST","price":"0.31","side":"bid","ts":1.0,"venue":"kalshi"}"#,
             ),
-            Venue::Kalshi,
             true,
             &oid_venue,
             &mut parked,
@@ -718,10 +731,9 @@ mod cancel_addressing_tests {
         assert!(matches!(p.tif, Tif::Gtc));
 
         let hedge = intent_actions(
-            &json(
-                r#"{"place":"KXTEST","order_id":"h1","venue":"kalshi","side":"ask","price":"0.30","count":25,"tag":"hedge","taker":true,"ts":1.0}"#,
+            &intent(
+                r#"{"count":25,"order_id":"h1","place":"KXTEST","price":"0.30","side":"ask","tag":"hedge","taker":true,"ts":1.0,"venue":"kalshi"}"#,
             ),
-            Venue::Kalshi,
             true,
             &oid_venue,
             &mut parked,
@@ -741,8 +753,7 @@ mod cancel_addressing_tests {
         let oid_venue = HashMap::new();
         let mut parked = HashMap::new();
         let acts = intent_actions(
-            &json(r#"{"cancel":"KXTEST","order_id":"m1","venue":"kalshi","ts":1.0}"#),
-            Venue::Kalshi,
+            &cancel_of("KXTEST", "m1", Venue::Kalshi),
             false,
             &oid_venue,
             &mut parked,

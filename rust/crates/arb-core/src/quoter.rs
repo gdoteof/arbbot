@@ -5,14 +5,15 @@
 //! deadband, no random), clip 5, min_requote_s 15.0 of TAPE time, default
 //! Market metadata (tick 0.01), risk always allows, kill switch off, mock
 //! gateway with globally sequential ids "m1","m2",... Canonical intent lines
-//! are serde_json objects (BTreeMap => sorted keys, compact separators,
-//! integral floats printed with ".0" — matching Python json.dumps).
+//! are `crate::intent::Intent` values (sorted keys, compact separators,
+//! integral floats printed with ".0" — matching Python json.dumps). This
+//! emits the DECISION; `Intent::to_line` is the only thing that emits bytes.
 
 use crate::book::BookBuilder;
 use crate::fees::FeeSchedule;
+use crate::intent::{self, Intent};
 use crate::model::Venue;
 use crate::scan::{maker_ask_quote, maker_quote, Cx, MarketMeta, Rel, RelType, D};
-use serde_json::json;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -329,10 +330,6 @@ impl Quoter {
         }
     }
 
-    fn venue_str(v: Venue) -> &'static str {
-        v.as_str()
-    }
-
     /// Emit price exactly like Python str(Decimal) of the quantized value.
     fn px(cx: &mut Cx, p: D) -> String {
         let _ = cx;
@@ -341,18 +338,20 @@ impl Quoter {
 
     /// Cancel every resting quote (kill switch / shutdown), emitting cancel
     /// intents in deterministic (leg, side) order. Mirrors Python cancel_all.
-    pub fn cancel_all(&mut self, cx: &mut Cx, now: f64, intents: &mut Vec<String>) {
+    pub fn cancel_all(&mut self, cx: &mut Cx, now: f64, intents: &mut Vec<Intent>) {
         let mut keys: Vec<(usize, &'static str)> = self.resting.keys().copied().collect();
         keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
         for key in keys {
             let curq = self.resting.remove(&key).expect("key from keys()");
             let leg = &self.rel.legs[key.0];
-            intents.push(
-                json!({"ts": now, "cancel": leg.market_id.clone(),
-                        "venue": Self::venue_str(leg.venue), "side": key.1,
-                        "price": Self::px(cx, curq.price), "order_id": curq.order_id})
-                .to_string(),
-            );
+            intents.push(Intent::Cancel(intent::Cancel {
+                cancel: leg.market_id.clone(),
+                order_id: curq.order_id,
+                price: Self::px(cx, curq.price),
+                side: key.1.to_string(),
+                ts: now,
+                venue: leg.venue,
+            }));
             self.last_quote_ts.remove(&key);
         }
     }
@@ -364,7 +363,7 @@ impl Quoter {
         books: &BookBuilder,
         now: f64,
         next_oid: &mut u64,
-        intents: &mut Vec<String>,
+        intents: &mut Vec<Intent>,
     ) {
         let leg_indices = maker_leg_indices(self.rel.rtype);
         for i in leg_indices {
@@ -382,11 +381,11 @@ impl Quoter {
             // resting price is wrong.)
             let crossed = self.crossed_reason(books, i);
             if let Some(reason) = &crossed {
-                intents.push(json!({"ts": now, "skip": [reason]}).to_string());
+                intents.push(Intent::Skip(intent::Skip { skip: vec![reason.clone()], ts: now }));
             }
             for side in ["bid", "ask"] {
                 let key = (i, side);
-                let leg_venue = Self::venue_str(self.rel.legs[i].venue);
+                let leg_venue = self.rel.legs[i].venue;
                 let leg_market = self.rel.legs[i].market_id.clone();
                 let mut target = match &crossed {
                     Some(_) => None,
@@ -403,23 +402,24 @@ impl Quoter {
                         self.toxgate.as_ref().and_then(|t| t.score(&leg_market, side, now))
                     {
                         if tox > TOXGATE_MAX {
-                            intents.push(
-                                json!({"ts": now,
-                                       "skip": [format!("toxgate {side} {tox:.3} > {TOXGATE_MAX}")]})
-                                .to_string(),
-                            );
+                            intents.push(Intent::Skip(intent::Skip {
+                                skip: vec![format!("toxgate {side} {tox:.3} > {TOXGATE_MAX}")],
+                                ts: now,
+                            }));
                             target = None;
                         }
                     }
                 }
                 let Some(target) = target else {
                     if let Some(curq) = self.resting.remove(&key) {
-                        intents.push(
-                            json!({"ts": now, "cancel": leg_market, "venue": leg_venue,
-                                    "side": side, "price": Self::px(cx, curq.price),
-                                    "order_id": curq.order_id})
-                            .to_string(),
-                        );
+                        intents.push(Intent::Cancel(intent::Cancel {
+                            cancel: leg_market,
+                            order_id: curq.order_id,
+                            price: Self::px(cx, curq.price),
+                            side: side.to_string(),
+                            ts: now,
+                            venue: leg_venue,
+                        }));
                         // KEEP last_quote_ts: re-entry on this side is throttled
                         // like a reprice (card 6fb469da). Dropping it made a
                         // cancelled side re-postable on the very next book event.
@@ -463,7 +463,7 @@ impl Quoter {
                 if let Some(gate) = &self.risk {
                     let v = gate.check(&self.rel, self.rel.legs[i].venue, self.clip);
                     if !v.allowed {
-                        intents.push(json!({"ts": now, "skip": v.reasons}).to_string());
+                        intents.push(Intent::Skip(intent::Skip { skip: v.reasons, ts: now }));
                         continue;
                     }
                 }
@@ -474,14 +474,26 @@ impl Quoter {
                 *next_oid += 1;
                 let oid = format!("m{}", *next_oid);
                 let price_s = Self::px(cx, target);
-                let mut evt = json!({"ts": now, "place": leg_market, "venue": leg_venue,
-                                     "side": side, "price": price_s, "count": self.clip,
-                                     "order_id": oid});
-                if let Some((roid, oldp)) = &replaced {
-                    evt["replaces"] = json!(roid);
-                    evt["old_price"] = json!(oldp);
-                }
-                intents.push(evt.to_string());
+                let (replaces, old_price) = match replaced {
+                    Some((roid, oldp)) => (Some(roid), Some(oldp)),
+                    None => (None, None),
+                };
+                intents.push(Intent::Place(intent::Place {
+                    count: self.clip,
+                    old_price,
+                    order_id: oid.clone(),
+                    place: leg_market,
+                    price: price_s,
+                    replaces,
+                    // The quoter rests post-only GTC makers and nothing else:
+                    // no retry chain, no strategy tag, never a taker.
+                    retry: None,
+                    side: side.to_string(),
+                    tag: None,
+                    taker: false,
+                    ts: now,
+                    venue: leg_venue,
+                }));
                 self.resting.insert(
                     key,
                     RestingQuote { order_id: oid, price: target, count: self.clip },
@@ -528,6 +540,41 @@ pub(crate) mod tests_support {
                           vec![lvl("0.99", "1")], seq, ts_ns, None);
     }
 
+    /// The place on `market`, or None. These assertions used to be substring
+    /// matches on the emitted line (`i.contains(r#""place":"P""#)`), which was
+    /// the only handle the tests had when an intent WAS a string.
+    pub(crate) fn place_on<'a>(intents: &'a [Intent], market: &str) -> Option<&'a intent::Place> {
+        intents.iter().find_map(|i| match i {
+            Intent::Place(p) if p.place == market => Some(p),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn cancel_on<'a>(intents: &'a [Intent], market: &str) -> Option<&'a intent::Cancel> {
+        intents.iter().find_map(|i| match i {
+            Intent::Cancel(c) if c.cancel == market => Some(c),
+            _ => None,
+        })
+    }
+
+    pub(crate) fn any_place(intents: &[Intent]) -> bool {
+        intents.iter().any(|i| matches!(i, Intent::Place(_)))
+    }
+
+    pub(crate) fn any_cancel(intents: &[Intent]) -> bool {
+        intents.iter().any(|i| matches!(i, Intent::Cancel(_)))
+    }
+
+    pub(crate) fn skips(intents: &[Intent]) -> Vec<String> {
+        intents
+            .iter()
+            .filter_map(|i| match i {
+                Intent::Skip(s) => Some(s.skip.join("; ")),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// `now` is TAPE time, which starts near zero. A side that has never been
     /// quoted has no timestamp and must not be throttled — an `unwrap_or(0.0)`
     /// default would suppress the very first quote of every side.
@@ -540,7 +587,7 @@ pub(crate) mod tests_support {
         // tape time 2.0 is well inside min_requote_s (15.0)
         q.on_book(&mut cx, &fees, &bb, 2.0, &mut oid, &mut intents);
         assert_eq!(intents.len(), 1, "first quote suppressed: {intents:?}");
-        assert!(intents[0].contains(r#""place":"P""#), "{}", intents[0]);
+        assert!(place_on(&intents, "P").is_some(), "{intents:?}");
     }
 
     /// An amend is ONE intent carrying `replaces` — Python performed the cancel
@@ -559,25 +606,20 @@ pub(crate) mod tests_support {
         pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
         q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
         assert_eq!(intents.len(), 1, "{intents:?}");
-        let first: serde_json::Value = serde_json::from_str(&intents[0]).unwrap();
-        assert!(first.get("replaces").is_none(), "an entry replaces nothing");
-        let old_oid = first["order_id"].as_str().unwrap().to_string();
-        let old_px = first["price"].as_str().unwrap().to_string();
+        let first = place_on(&intents, "P").expect("the entry place");
+        assert!(first.replaces.is_none(), "an entry replaces nothing");
+        let (old_oid, old_px) = (first.order_id.clone(), first.price.clone());
 
         // past min_requote_s, with a book that wants a different price
         intents.clear();
         pm_bid(&mut bb, "0.34", 2, 130_000_000_000);
         q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
 
-        let reprice: Vec<serde_json::Value> =
-            intents.iter().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert_eq!(reprice.len(), 1, "an amend is ONE intent, not a cancel + a place");
-        assert_eq!(reprice[0]["replaces"], serde_json::json!(old_oid));
-        assert_eq!(reprice[0]["old_price"], serde_json::json!(old_px));
-        assert_ne!(
-            reprice[0]["order_id"], serde_json::json!(old_oid),
-            "the replacement is a new order id"
-        );
+        assert_eq!(intents.len(), 1, "an amend is ONE intent, not a cancel + a place");
+        let reprice = place_on(&intents, "P").expect("the reprice");
+        assert_eq!(reprice.replaces.as_ref(), Some(&old_oid));
+        assert_eq!(reprice.old_price.as_ref(), Some(&old_px));
+        assert_ne!(reprice.order_id, old_oid, "the replacement is a new order id");
     }
 
     /// card 6fb469da (the fraalb sawtooth): the throttle applies to RE-ENTRY
@@ -597,7 +639,7 @@ pub(crate) mod tests_support {
         bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.30", "500")],
                           vec![lvl("0.99", "1")], 2, 101_000_000_000, None);
         q.on_book(&mut cx, &fees, &bb, 101.0, &mut oid, &mut intents);
-        assert!(intents.iter().any(|i| i.contains(r#""cancel":"P""#)),
+        assert!(cancel_on(&intents, "P").is_some(),
                 "cancel must stay prompt: {intents:?}");
 
         // K recovers 1s later: viable again, but re-entry is inside the throttle
@@ -611,7 +653,7 @@ pub(crate) mod tests_support {
         intents.clear();
         pm_bid(&mut bb, "0.30", 2, 120_000_000_000);
         q.on_book(&mut cx, &fees, &bb, 120.0, &mut oid, &mut intents);
-        assert!(intents.iter().any(|i| i.contains(r#""place":"P""#)),
+        assert!(place_on(&intents, "P").is_some(),
                 "re-entry must resume after the throttle: {intents:?}");
     }
 }
@@ -641,7 +683,7 @@ mod risk_gate_tests {
         pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
         q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
         assert_eq!(intents.len(), 1);
-        assert!(intents[0].contains(r#""place":"P""#));
+        assert!(place_on(&intents, "P").is_some(), "{intents:?}");
     }
 
     /// A refused ENTRY places nothing and says why.
@@ -655,9 +697,10 @@ mod risk_gate_tests {
         q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
 
         assert_eq!(intents.len(), 1, "{intents:?}");
-        assert!(intents[0].contains(r#""skip""#), "{}", intents[0]);
-        assert!(intents[0].contains("tail cap"), "{}", intents[0]);
-        assert!(!intents[0].contains("place"), "nothing may be placed: {}", intents[0]);
+        let why = skips(&intents);
+        assert_eq!(why.len(), 1, "{intents:?}");
+        assert!(why[0].contains("tail cap"), "{why:?}");
+        assert!(place_on(&intents, "P").is_none(), "nothing may be placed: {intents:?}");
         assert_eq!(oid, 0, "a refused order must not consume an order id");
     }
 
@@ -674,7 +717,7 @@ mod risk_gate_tests {
         // entry lands while risk still allows
         pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
         q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
-        assert!(intents[0].contains(r#""place":"P""#), "{}", intents[0]);
+        assert!(place_on(&intents, "P").is_some(), "{intents:?}");
 
         // now risk refuses, and the book moves enough to want a reprice
         q.set_risk(Some(std::sync::Arc::new(Always(false))));
@@ -682,12 +725,9 @@ mod risk_gate_tests {
         pm_bid(&mut bb, "0.34", 2, 130_000_000_000);
         q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
 
+        assert!(!skips(&intents).is_empty(), "expected a skip: {intents:?}");
         assert!(
-            intents.iter().any(|i| i.contains(r#""skip""#)),
-            "expected a skip: {intents:?}"
-        );
-        assert!(
-            !intents.iter().any(|i| i.contains(r#""cancel""#)),
+            cancel_on(&intents, "P").is_none(),
             "the resting quote must NOT be pulled: {intents:?}"
         );
     }
@@ -701,7 +741,7 @@ mod risk_gate_tests {
         let mut intents = Vec::new();
         pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
         q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
-        assert!(intents[0].contains(r#""place""#));
+        assert!(place_on(&intents, "P").is_some(), "{intents:?}");
 
         q.set_risk(Some(std::sync::Arc::new(Always(false))));
         intents.clear();
@@ -711,7 +751,7 @@ mod risk_gate_tests {
         q.on_book(&mut cx, &fees, &bb, 131.0, &mut oid, &mut intents);
 
         assert!(
-            intents.iter().any(|i| i.contains(r#""cancel":"P""#)),
+            cancel_on(&intents, "P").is_some(),
             "an unviable quote must still cancel: {intents:?}"
         );
     }
@@ -731,7 +771,7 @@ mod risk_gate_tests {
 /// the control failing.
 #[cfg(test)]
 mod crossed_book_tests {
-    use super::tests_support::lvl;
+    use super::tests_support::{any_cancel, any_place, lvl, skips};
     use super::*;
     use crate::model::Level;
     use crate::scan::RelLeg;
@@ -766,7 +806,7 @@ mod crossed_book_tests {
         vec![lvl("0.0730", "26")]
     }
 
-    fn run(q: &mut Quoter, cx: &mut Cx, fees: &FeeSchedule, bb: &BookBuilder) -> Vec<String> {
+    fn run(q: &mut Quoter, cx: &mut Cx, fees: &FeeSchedule, bb: &BookBuilder) -> Vec<Intent> {
         let mut oid = 0u64;
         let mut intents = Vec::new();
         q.on_book(cx, fees, bb, 1.0, &mut oid, &mut intents);
@@ -783,7 +823,7 @@ mod crossed_book_tests {
         let (mut cx, fees, bb, mut q) = books(vec![lvl("0.1770", "305")], phantom_asks());
         let intents = run(&mut q, &mut cx, &fees, &bb);
         assert!(
-            !intents.iter().any(|i| i.contains(r#""place""#)),
+            !any_place(&intents),
             "quoted off a crossed book: {intents:?}"
         );
     }
@@ -796,11 +836,11 @@ mod crossed_book_tests {
         let (mut cx, fees, bb, mut q) = books(vec![lvl("0.0720", "305")], phantom_asks());
         let intents = run(&mut q, &mut cx, &fees, &bb);
         assert!(
-            intents.iter().any(|i| i.contains(r#""place""#)),
+            any_place(&intents),
             "the guard silenced a sane book: {intents:?}"
         );
         assert!(
-            !intents.iter().any(|i| i.contains("crossed book")),
+            !skips(&intents).iter().any(|s| s.contains("crossed book")),
             "a sane book must raise no crossed-book skip: {intents:?}"
         );
     }
@@ -813,18 +853,18 @@ mod crossed_book_tests {
         let (mut cx, fees, bb, mut q) = books(vec![lvl("0.0730", "305")], phantom_asks());
         let locked = run(&mut q, &mut cx, &fees, &bb);
         assert!(
-            !locked.iter().any(|i| i.contains(r#""place""#)),
+            !any_place(&locked),
             "quoted off a locked book: {locked:?}"
         );
         assert!(
-            locked.iter().any(|i| i.contains("bid 0.0730 >= ask 0.0730")),
+            skips(&locked).iter().any(|s| s.contains("bid 0.0730 >= ask 0.0730")),
             "a locked book must say it is locked: {locked:?}"
         );
 
         let (mut cx, fees, bb, mut q) = books(vec![lvl("0.0720", "305")], phantom_asks());
         let tight = run(&mut q, &mut cx, &fees, &bb);
         assert!(
-            tight.iter().any(|i| i.contains(r#""place""#)),
+            any_place(&tight),
             "a one-tick spread is a normal book: {tight:?}"
         );
     }
@@ -837,11 +877,7 @@ mod crossed_book_tests {
     fn the_crossed_skip_is_distinguishable_from_a_no_edge_skip() {
         let (mut cx, fees, bb, mut q) = books(vec![lvl("0.1770", "305")], phantom_asks());
         let crossed = run(&mut q, &mut cx, &fees, &bb);
-        let reasons: Vec<String> = crossed
-            .iter()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .filter_map(|v| v.get("skip")?.as_array()?.first()?.as_str().map(str::to_owned))
-            .collect();
+        let reasons = skips(&crossed);
         assert!(!reasons.is_empty(), "six hours of corruption must log something: {crossed:?}");
         for r in &reasons {
             assert_eq!(
@@ -858,7 +894,7 @@ mod crossed_book_tests {
             books(vec![lvl("0.0100", "305")], vec![lvl("0.9900", "305")]);
         let no_edge = run(&mut q, &mut cx, &fees, &bb);
         assert!(
-            !no_edge.iter().any(|i| i.contains("crossed book")),
+            !skips(&no_edge).iter().any(|s| s.contains("crossed book")),
             "a no-edge book must not be reported as crossed: {no_edge:?}"
         );
     }
@@ -870,7 +906,7 @@ mod crossed_book_tests {
     fn a_book_that_crosses_under_a_resting_quote_pulls_it() {
         let (mut cx, fees, mut bb, mut q) = books(vec![lvl("0.0720", "305")], phantom_asks());
         let placed = run(&mut q, &mut cx, &fees, &bb);
-        assert!(placed.iter().any(|i| i.contains(r#""place""#)), "{placed:?}");
+        assert!(any_place(&placed), "{placed:?}");
 
         // the 2026-07-28 corruption arrives: a bid above the standing ask
         bb.apply_snapshot(Venue::Kalshi, KMKT, vec![lvl("0.1770", "305")], phantom_asks(),
@@ -879,11 +915,11 @@ mod crossed_book_tests {
         let mut intents = Vec::new();
         q.on_book(&mut cx, &fees, &bb, 2.0, &mut oid, &mut intents);
         assert!(
-            intents.iter().any(|i| i.contains(r#""cancel""#)),
+            any_cancel(&intents),
             "a quote resting on a corrupt book must be pulled: {intents:?}"
         );
         assert!(
-            !intents.iter().any(|i| i.contains(r#""place""#)),
+            !any_place(&intents),
             "and nothing may be re-posted: {intents:?}"
         );
     }
