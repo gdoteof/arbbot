@@ -579,107 +579,93 @@ fn build_pmus_sink(
     )))
 }
 
-#[tokio::main]
-async fn main() {
-    let args = parse_args();
-    // replay is a bench-shaped run: offline source, digest emitted, so its
-    // output can be diffed byte-for-byte against the run that wrote the WAL.
-    let bench = args.bench_tape.is_some() || args.replay_wal.is_some();
-    // rate budget: off in bench (pure decision throughput), 8/s/venue shadow
-    let rate = if args.rate_per_s >= 0.0 {
-        args.rate_per_s
-    } else if bench {
-        0.0
-    } else {
-        8.0
-    };
+/// The capital gate every quoter consults, sized from `--exec-config` /
+/// `--topics` and seeded with the exposure already on the book.
+fn build_risk_view(
+    args: &Args,
+    quoters: &mut [Quoter],
+    rel_meta: &HashMap<String, (String, String)>,
+) -> std::sync::Arc<risk::RiskView> {
+    let rv = std::sync::Arc::new(risk::RiskView::load(
+        &args.exec_yaml,
+        &args.topics_yaml,
+        args.balances.clone(),
+        rel_meta.iter().map(|(k, (o, _))| (k.clone(), o.clone())).collect(),
+    ));
+    eprintln!("[risk] {}", rv.describe());
+    if args.balances.is_empty() {
+        eprintln!(
+            "[risk] NO --balance given: the per-venue cash check sees $0 and \
+             will refuse every order. Pass --balance kalshi=<usd> etc."
+        );
+    }
+    seed_exposure_from_ledger(&rv, &args.ledger, rel_meta);
+    for q in quoters.iter_mut() {
+        q.set_risk(Some(rv.clone() as std::sync::Arc<dyn arb_core::quoter::RiskGate>));
+    }
+    rv
+}
 
-    let (mut quoters, by_market, rel_meta) =
-        load_quoters(&args.registry, &args.tradable, &args.rel_prefixes);
-
-    // Risk is OFF in bench/replay: those pin a decision digest, and a capital
-    // gate is not part of that contract.
-    let risk = (!bench).then(|| {
-        let rv = std::sync::Arc::new(risk::RiskView::load(
-            &args.exec_yaml,
-            &args.topics_yaml,
-            args.balances.clone(),
-            rel_meta.iter().map(|(k, (o, _))| (k.clone(), o.clone())).collect(),
-        ));
-        eprintln!("[risk] {}", rv.describe());
-        if args.balances.is_empty() {
-            eprintln!(
-                "[risk] NO --balance given: the per-venue cash check sees $0 and \
-                 will refuse every order. Pass --balance kalshi=<usd> etc."
-            );
-        }
-        // Seed exposure from the open baskets in the trade ledger
-        // (exec/main.py:264). Without this the caps reset on every restart and
-        // the engine believes the whole book is free.
-        match ledger::read(&args.ledger) {
-            Ok(recs) => {
-                let open = ledger::open_exposure(recs);
-                let mut total = 0.0;
-                let mut unknown = 0usize;
-                let mut seeded: Vec<(String, f64)> = Vec::new();
-                for (rel_id, qty) in open {
-                    // An id missing from the registry cannot be classified, so
-                    // it is booked under `unknown`: it still counts toward the
-                    // GLOBAL cap (which sums per-relationship exposure) without
-                    // inflating a class cap it may not belong to. Python
-                    // skipped these entirely, which understated the book.
-                    let class = match rel_meta.get(&rel_id) {
-                        Some((_, k)) => k.as_str(),
-                        None => {
-                            unknown += 1;
-                            "unknown"
-                        }
-                    };
-                    rv.record_open(&rel_id, class, qty);
-                    total += qty;
-                    seeded.push((rel_id, qty));
-                }
-                seeded.sort_by(|a, b| b.1.total_cmp(&a.1));
-                eprintln!(
-                    "[risk] seeded {:.0} open contracts across {} relationships from {}{}",
-                    total,
-                    seeded.len(),
-                    args.ledger,
-                    if unknown > 0 {
-                        format!(" ({unknown} not in the registry, booked as `unknown`)")
-                    } else {
-                        String::new()
+/// Seed exposure from the open baskets in the trade ledger (exec/main.py:264).
+/// Without this the caps reset on every restart and the engine believes the
+/// whole book is free.
+fn seed_exposure_from_ledger(
+    rv: &risk::RiskView,
+    ledger_path: &str,
+    rel_meta: &HashMap<String, (String, String)>,
+) {
+    match ledger::read(ledger_path) {
+        Ok(recs) => {
+            let open = ledger::open_exposure(recs);
+            let mut total = 0.0;
+            let mut unknown = 0usize;
+            let mut seeded: Vec<(String, f64)> = Vec::new();
+            for (rel_id, qty) in open {
+                // An id missing from the registry cannot be classified, so
+                // it is booked under `unknown`: it still counts toward the
+                // GLOBAL cap (which sums per-relationship exposure) without
+                // inflating a class cap it may not belong to. Python
+                // skipped these entirely, which understated the book.
+                let class = match rel_meta.get(&rel_id) {
+                    Some((_, k)) => k.as_str(),
+                    None => {
+                        unknown += 1;
+                        "unknown"
                     }
-                );
-                for (id, q) in seeded.iter().take(5) {
-                    eprintln!("[risk]   {q:>7.0}  {id}");
+                };
+                rv.record_open(&rel_id, class, qty);
+                total += qty;
+                seeded.push((rel_id, qty));
+            }
+            seeded.sort_by(|a, b| b.1.total_cmp(&a.1));
+            eprintln!(
+                "[risk] seeded {:.0} open contracts across {} relationships from {}{}",
+                total,
+                seeded.len(),
+                ledger_path,
+                if unknown > 0 {
+                    format!(" ({unknown} not in the registry, booked as `unknown`)")
+                } else {
+                    String::new()
                 }
-            }
-            Err(e) => {
-                // Fail LOUD: an unreadable ledger means unknown exposure, and
-                // an engine that silently assumes zero would size up into a
-                // book it cannot see.
-                eprintln!("[risk] CANNOT READ THE TRADE LEDGER: {e}");
-                eprintln!("[risk] exposure is UNKNOWN — caps cannot be trusted this run");
+            );
+            for (id, q) in seeded.iter().take(5) {
+                eprintln!("[risk]   {q:>7.0}  {id}");
             }
         }
-        for q in quoters.iter_mut() {
-            q.set_risk(Some(rv.clone() as std::sync::Arc<dyn arb_core::quoter::RiskGate>));
+        Err(e) => {
+            // Fail LOUD: an unreadable ledger means unknown exposure, and
+            // an engine that silently assumes zero would size up into a
+            // book it cannot see.
+            eprintln!("[risk] CANNOT READ THE TRADE LEDGER: {e}");
+            eprintln!("[risk] exposure is UNKNOWN — caps cannot be trusted this run");
         }
-        rv
-    });
-    eprintln!(
-        "arb-trader up: {} quoters, {} markets, mode={}",
-        quoters.len(),
-        by_market.len(),
-        if bench { "bench" } else { "shadow" }
-    );
+    }
+}
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<feed::FeedMsg>(65536);
-    // An extra sender keeps the channel OPEN, so the engine would never see the
-    // feed's EOF — which in bench/replay means it never terminates. Only clone
-    // when there is genuinely something to send back (order acks and fills).
-    let tx_acks = args.enable_orders.then(|| tx.clone());
+/// Start the single event source `parse_args` has already guaranteed: a tape, a
+/// WAL replay, or the live socket.
+fn spawn_feed(args: &Args, tx: tokio::sync::mpsc::Sender<feed::FeedMsg>) {
     if let Some(tape) = args.bench_tape.clone() {
         let (max, pace) = (args.max_events, args.pace_x);
         std::thread::spawn(move || feed::tape_feed(tape, max, pace, tx));
@@ -689,24 +675,29 @@ async fn main() {
     } else if let Some(sock) = args.socket.clone() {
         tokio::spawn(feed::socket_feed(sock, tx));
     }
+}
 
-    // --enable-orders alone only REPORTS. Arming needs the second flag, so
-    // checking the preconditions can never place an order by accident.
-    if args.enable_orders && !args.sweep_only && !args.confirm_live {
-        match order_preconditions(&args, bench) {
-            Ok(_) => {
-                eprintln!("[exec] preconditions OK — arming would place REAL orders.");
-                eprintln!("[exec] add --yes-trade-live to actually arm. Nothing was sent.");
-            }
-            Err(missing) => {
-                eprintln!("[exec] --enable-orders blocked. Unmet preconditions:");
-                for m in &missing {
-                    eprintln!("[exec]   - {m}");
-                }
+/// Print the arming checklist and send nothing. This is what `--enable-orders`
+/// does on its own.
+fn report_preconditions(args: &Args, bench: bool) {
+    match order_preconditions(args, bench) {
+        Ok(_) => {
+            eprintln!("[exec] preconditions OK — arming would place REAL orders.");
+            eprintln!("[exec] add --yes-trade-live to actually arm. Nothing was sent.");
+        }
+        Err(missing) => {
+            eprintln!("[exec] --enable-orders blocked. Unmet preconditions:");
+            for m in &missing {
+                eprintln!("[exec]   - {m}");
             }
         }
-        return;
     }
+}
+
+/// The venues this process may write to. Empty unless `--enable-orders`, and
+/// the process dies rather than return a partial set: an engine that quotes on
+/// one venue because the other refused is a naked-leg machine.
+fn arm_venues(args: &Args, bench: bool) -> HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> {
     if args.sweep_only {
         // BLAST RADIUS, said out loud, and said BEFORE the preconditions are
         // even checked so it is on screen whether or not the run proceeds.
@@ -719,103 +710,90 @@ async fn main() {
             eprintln!("{l}");
         }
     }
-    let sinks = if args.enable_orders {
-        // A pure cancel run is held to the CANCEL checklist, not the place one.
-        let checked = if args.sweep_only {
-            cancel_preconditions(&args, bench)
-        } else {
-            order_preconditions(&args, bench)
-        };
-        match checked {
-            Ok(s) => {
-                if args.sweep_only {
-                    eprintln!("[exec] sweep-only: reconciling the book, then exiting");
-                } else {
-                    eprintln!("[exec] ORDERS ARMED — this process can place real orders");
-                }
-                s
-            }
-            Err(missing) => {
-                eprintln!("[exec] --enable-orders REFUSED. Unmet preconditions:");
-                for m in &missing {
-                    eprintln!("[exec]   - {m}");
-                }
-                std::process::exit(9);
-            }
-        }
+    if !args.enable_orders {
+        return HashMap::new();
+    }
+    // A pure cancel run is held to the CANCEL checklist, not the place one.
+    let checked = if args.sweep_only {
+        cancel_preconditions(args, bench)
     } else {
-        HashMap::new()
+        order_preconditions(args, bench)
     };
-    // Reconcile BEFORE anything can quote: the engine has no memory of orders a
-    // previous run left resting, and it cannot cancel what it never had an id
-    // for. Start from a book we know is empty.
-    if !sinks.is_empty() {
-        // Hand the sinks to the halt path and arm the panic hook BEFORE the
-        // first venue write, so every way out of this process — SIGTERM, a WAL
-        // crash-stop, a panic on any thread — cancels first. Previously only
-        // SIGTERM did, and only after the engine was already quoting.
-        exec::register_sinks(sinks.clone());
-        exec::install_armed_panic_hook();
-        if let Err(e) = startup_sweep(&sinks, &sink::SweepPolicy::default()).await {
-            eprintln!("[exec] STARTUP SWEEP FAILED: {e}");
-            eprintln!("[exec] refusing to arm: the book could not be proven clean");
-            std::process::exit(10);
+    match checked {
+        Ok(s) => {
+            if args.sweep_only {
+                eprintln!("[exec] sweep-only: reconciling the book, then exiting");
+            } else {
+                eprintln!("[exec] ORDERS ARMED — this process can place real orders");
+            }
+            s
         }
-        if args.sweep_only {
-            eprintln!("[exec] --sweep-only: book reconciled, exiting without quoting");
-            return;
+        Err(missing) => {
+            eprintln!("[exec] --enable-orders REFUSED. Unmet preconditions:");
+            for m in &missing {
+                eprintln!("[exec]   - {m}");
+            }
+            std::process::exit(9);
         }
-        spawn_shutdown_sweep();
     }
-    // The fill feed runs whenever the order path does: a live order with no
-    // fill feed is an unhedged position waiting to happen.
-    if !sinks.is_empty() {
-        let sfx = args
-            .cred_suffix
-            .iter()
-            .find(|(k, _)| k == "pmus" || k == "polymarket_us")
-            .map(|(_, v)| v.clone());
-        let infix = sfx.map(|s| format!("_{s}")).unwrap_or_default();
-        match (
-            credential(&format!("polymarket_usa{infix}_key_id")),
-            credential(&format!("polymarket_usa{infix}_private_key")),
-        ) {
-            (Ok(kid), Ok(sec)) => {
-                if let Some(t) = tx_acks.clone() {
-                    tokio::spawn(fills::pmus_fill_feed(kid, sec, t));
-                }
-            }
-            (a, b) => {
-                eprintln!(
-                    "[fills] cannot start polymarket_us fill feed: {}",
-                    a.err().or(b.err()).unwrap_or_default()
-                );
-            }
-        }
+}
 
-        let ksfx = args.cred_suffix.iter().find(|(k, _)| k == "kalshi").map(|(_, v)| v.clone());
-        let (kid_n, pem_n) = match &ksfx {
-            Some(x) => (format!("kalshi_{x}_api_key_id"), format!("kalshi_{x}_private_key.pem")),
-            None => ("kalshi_api_key_id".into(), "kalshi_private_key.pem".into()),
-        };
-        match (credential(&kid_n), credential(&pem_n)) {
-            (Ok(kid), Ok(pem)) => {
-                if let Some(t) = tx_acks.clone() {
-                    tokio::spawn(fills::kalshi_fill_feed(kid, pem, t));
-                }
-            }
-            (a, b) => {
-                eprintln!(
-                    "[fills] cannot start kalshi fill feed: {}",
-                    a.err().or(b.err()).unwrap_or_default()
-                );
+/// The fill feed runs whenever the order path does: a live order with no
+/// fill feed is an unhedged position waiting to happen.
+fn spawn_fill_feeds(args: &Args, tx_acks: Option<&tokio::sync::mpsc::Sender<feed::FeedMsg>>) {
+    let sfx = args
+        .cred_suffix
+        .iter()
+        .find(|(k, _)| k == "pmus" || k == "polymarket_us")
+        .map(|(_, v)| v.clone());
+    let infix = sfx.map(|s| format!("_{s}")).unwrap_or_default();
+    match (
+        credential(&format!("polymarket_usa{infix}_key_id")),
+        credential(&format!("polymarket_usa{infix}_private_key")),
+    ) {
+        (Ok(kid), Ok(sec)) => {
+            if let Some(t) = tx_acks {
+                tokio::spawn(fills::pmus_fill_feed(kid, sec, t.clone()));
             }
         }
+        (a, b) => {
+            eprintln!(
+                "[fills] cannot start polymarket_us fill feed: {}",
+                a.err().or(b.err()).unwrap_or_default()
+            );
+        }
     }
-    let armed = !sinks.is_empty();
-    let acks = if sinks.is_empty() { None } else { tx_acks.clone() };
-    let (exec_txs, exec_stats) = exec::spawn_executors(rate, sinks, acks);
-    let cfg = engine::RunCfg {
+
+    let ksfx = args.cred_suffix.iter().find(|(k, _)| k == "kalshi").map(|(_, v)| v.clone());
+    let (kid_n, pem_n) = match &ksfx {
+        Some(x) => (format!("kalshi_{x}_api_key_id"), format!("kalshi_{x}_private_key.pem")),
+        None => ("kalshi_api_key_id".into(), "kalshi_private_key.pem".into()),
+    };
+    match (credential(&kid_n), credential(&pem_n)) {
+        (Ok(kid), Ok(pem)) => {
+            if let Some(t) = tx_acks {
+                tokio::spawn(fills::kalshi_fill_feed(kid, pem, t.clone()));
+            }
+        }
+        (a, b) => {
+            eprintln!(
+                "[fills] cannot start kalshi fill feed: {}",
+                a.err().or(b.err()).unwrap_or_default()
+            );
+        }
+    }
+}
+
+/// What the engine is allowed to do this run. Every "off in bench/replay" and
+/// "off unless armed" decision is spelled out here rather than inferred later.
+fn run_cfg(
+    args: Args,
+    bench: bool,
+    armed: bool,
+    has_executors: bool,
+    risk: Option<std::sync::Arc<risk::RiskView>>,
+) -> engine::RunCfg {
+    engine::RunCfg {
         out_path: args.out,
         kill_file: args.kill_file,
         stats_every_s: args.stats_every_s,
@@ -823,10 +801,10 @@ async fn main() {
         wal_path: args.wal,
         // bench/replay must stay byte-deterministic and have no live feed.
         health_file: (!bench && !args.health.is_empty()).then(|| args.health.clone()),
-        risk: risk.clone(),
+        risk,
         // Only an ARMED engine books baskets. A dry run writing here would
         // invent exposure that the next startup would seed from as if real.
-        ledger_path: (!exec_txs.is_empty() && armed).then(|| args.ledger.clone()),
+        ledger_path: (has_executors && armed).then(|| args.ledger.clone()),
         // Off in bench/replay (byte-determinism) and pointless unarmed, but
         // kept ON in the dry-run shadow so the retry policy is exercised
         // against the live book long before it is trusted with money.
@@ -851,23 +829,97 @@ async fn main() {
             cooldown_s: if args.tt_detect_only || !armed { 5.0 } else { args.hedge_alarm_s },
         }),
         armed,
+    }
+}
+
+/// `engine::run` returns when the feed channel closes, which in bench/replay
+/// is EOF and correct. ARMED it should be unreachable — `socket_feed`
+/// reconnects forever and holds its sender — but "unreachable" is not a reason
+/// to make it the one exit that does not cancel. Every other way out of this
+/// process sweeps; so does this one.
+async fn sweep_after_engine_exit() {
+    eprintln!("[exec] the engine loop ended while ARMED — sweeping before exit");
+    let out = exec::halt_and_sweep("engine loop ended").await;
+    for l in out.report() {
+        eprintln!("{l}");
+    }
+    if !out.already_halting {
+        std::process::exit(out.exit_code());
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let args = parse_args();
+    // replay is a bench-shaped run: offline source, digest emitted, so its
+    // output can be diffed byte-for-byte against the run that wrote the WAL.
+    let bench = args.bench_tape.is_some() || args.replay_wal.is_some();
+    // rate budget: off in bench (pure decision throughput), 8/s/venue shadow
+    let rate = if args.rate_per_s >= 0.0 {
+        args.rate_per_s
+    } else if bench {
+        0.0
+    } else {
+        8.0
     };
+
+    let (mut quoters, by_market, rel_meta) =
+        load_quoters(&args.registry, &args.tradable, &args.rel_prefixes);
+    // Risk is OFF in bench/replay: those pin a decision digest, and a capital
+    // gate is not part of that contract.
+    let risk = (!bench).then(|| build_risk_view(&args, &mut quoters, &rel_meta));
+    eprintln!(
+        "arb-trader up: {} quoters, {} markets, mode={}",
+        quoters.len(),
+        by_market.len(),
+        if bench { "bench" } else { "shadow" }
+    );
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<feed::FeedMsg>(65536);
+    // An extra sender keeps the channel OPEN, so the engine would never see the
+    // feed's EOF — which in bench/replay means it never terminates. Only clone
+    // when there is genuinely something to send back (order acks and fills).
+    let tx_acks = args.enable_orders.then(|| tx.clone());
+    spawn_feed(&args, tx);
+
+    // --enable-orders alone only REPORTS. Arming needs the second flag, so
+    // checking the preconditions can never place an order by accident.
+    if args.enable_orders && !args.sweep_only && !args.confirm_live {
+        report_preconditions(&args, bench);
+        return;
+    }
+    let sinks = arm_venues(&args, bench);
+    // Reconcile BEFORE anything can quote: the engine has no memory of orders a
+    // previous run left resting, and it cannot cancel what it never had an id
+    // for. Start from a book we know is empty.
+    if !sinks.is_empty() {
+        // Hand the sinks to the halt path and arm the panic hook BEFORE the
+        // first venue write, so every way out of this process — SIGTERM, a WAL
+        // crash-stop, a panic on any thread — cancels first. Previously only
+        // SIGTERM did, and only after the engine was already quoting.
+        exec::register_sinks(sinks.clone());
+        exec::install_armed_panic_hook();
+        if let Err(e) = startup_sweep(&sinks, &sink::SweepPolicy::default()).await {
+            eprintln!("[exec] STARTUP SWEEP FAILED: {e}");
+            eprintln!("[exec] refusing to arm: the book could not be proven clean");
+            std::process::exit(10);
+        }
+        if args.sweep_only {
+            eprintln!("[exec] --sweep-only: book reconciled, exiting without quoting");
+            return;
+        }
+        spawn_shutdown_sweep();
+        spawn_fill_feeds(&args, tx_acks.as_ref());
+    }
+
+    let armed = !sinks.is_empty();
+    let acks = if sinks.is_empty() { None } else { tx_acks.clone() };
+    let (exec_txs, exec_stats) = exec::spawn_executors(rate, sinks, acks);
+    let cfg = run_cfg(args, bench, armed, !exec_txs.is_empty(), risk);
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;
     println!("{summary}");
-    // `engine::run` returns when the feed channel closes, which in bench/replay
-    // is EOF and correct. ARMED it should be unreachable — `socket_feed`
-    // reconnects forever and holds its sender — but "unreachable" is not a reason
-    // to make it the one exit that does not cancel. Every other way out of this
-    // process sweeps; so does this one.
     if armed {
-        eprintln!("[exec] the engine loop ended while ARMED — sweeping before exit");
-        let out = exec::halt_and_sweep("engine loop ended").await;
-        for l in out.report() {
-            eprintln!("{l}");
-        }
-        if !out.already_halting {
-            std::process::exit(out.exit_code());
-        }
+        sweep_after_engine_exit().await;
     }
 }
 
