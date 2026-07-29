@@ -78,19 +78,33 @@ pub const MAX_COVERAGE_AGE_S: i64 = 1800;
 /// one market and not one chunk — the 88 pm-us legs span ten families spread
 /// across the whole slug list, so losing any single 150-slug subscribe window
 /// (`pmus.rs:166`) leaves dozens still ticking and `min` over the survivors
-/// does not move. The reachable shape is the catalog itself: the pm-us slug
-/// list is whatever `markets_by_tags` returned at startup, filtered `!closed`
-/// (`main.rs:206`), so a catalog that omits our markets subscribes 600+ others
-/// and none of ours. That is the `UNSUBSCRIBED` state below, and it is the one
-/// this basis exists for.
+/// does not move. The only shape that COULD produce it is the catalog: the
+/// pm-us slug list is whatever `markets_by_tags` (`main.rs:207`) returned at
+/// startup, filtered `!closed` (`:210`), handed to one `ws_task` and never
+/// refreshed. 17 of the tape's 124 events carry all 88 legs, so a catalog that
+/// omitted exactly those would subscribe the other 638 markets and none of
+/// ours — the `UNSUBSCRIBED` state below.
+///
+/// COULD, and no further: no single fault is known to produce that total form.
+/// A failed catalog call `Err`s the whole request and leaves NO ROLLUP instead;
+/// a dropped tag is partial, because the 88 span ten families; `!closed` is
+/// per-market. This basis is therefore a FAIL-SAFE against a shape the code
+/// permits and nobody has demonstrated, not a repair for an observed outage.
+/// What justifies it is the measurement below, which does not depend on that
+/// shape ever occurring.
 ///
 /// What it buys, measured on the 07-28 tape rather than argued: at every one of
 /// the 18 hourly checkpoints across that day, `min` over all 749 markets reads
 /// 0-4s. It is a socket-liveness bit and nothing finer — anything short of the
 /// whole feed dying is invisible to it. `min` over the 88 ranges 1-151s on the
 /// same checkpoints, so it is at least CAPABLE of registering less than total
-/// death. That is the improvement; see the residual below for what it still is
-/// not.
+/// death.
+///
+/// That is the improvement, and it is a capability rather than a catch: 151s is
+/// still 12x inside `MAX_COVERAGE_AGE_S`, so on the only real day measured the
+/// new basis would not have tripped the gate either. What it buys is a reading
+/// that CAN move before the socket dies, not a warning that day would have
+/// fired. See the residual below for what it still is not.
 ///
 /// NOT the whole-socket death, which the old `min` over 749 already caught
 /// (pm-us is one task over the whole list). NOT this repo's documented silent
@@ -157,9 +171,10 @@ pub fn venue_age_s(cov: &Coverage, venue: &str) -> i64 {
 /// One number for the whole rollup: its STALEST venue, because the board is
 /// only as current as the worst leg it prices off.
 ///
-/// Only venues the rollup actually carries. A venue with no samples is a HOLE
-/// in the board — pairs on it are never evaluated, and the views count them as
-/// such — not a claim that the samples the rollup does have are old.
+/// Only venues `cov` actually carries, which since the basis change means only
+/// venues with a REGISTRY-BACKED sample. A venue without one is a HOLE in the
+/// board — pairs on it are never evaluated, and the views count them as such —
+/// not a claim that the samples the rollup does have are old.
 pub fn stalest_age_s(cov: &Coverage) -> i64 {
     cov.values().copied().max().unwrap_or(i64::MAX)
 }
@@ -306,9 +321,10 @@ mod tests {
     /// The hole the per-venue gate left, and the one this basis closes. `min`
     /// over EVERY market reports the venue's NOISIEST one, and on pm-us 661 of
     /// the 749 markets in the tape are catalog markets no pair prices. The
-    /// market ids here are real ones from the 07-28 tape; the tradable leg is
-    /// frozen six hours back and two Billboard markets nothing references are
-    /// ticking, which is what a partial freeze looks like from the rollup.
+    /// market ids here are real ones from the 07-28 tape; the venue's only
+    /// registry leg is frozen six hours back and two Billboard markets nothing
+    /// references are ticking. TOTAL in registry terms — every leg the basis
+    /// counts has stopped — which is the only form this catches.
     #[test]
     fn a_market_we_do_not_price_does_not_certify_the_ones_we_do() {
         let c = cov_backed(

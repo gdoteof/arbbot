@@ -424,14 +424,17 @@ relationships:
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The same defect one market finer. Most of a venue's tape is markets no
-    /// pair prices — the pm-us universe comes from `polymarket_us_tags`, 749
-    /// markets against 88 registry legs on the real 07-28 tape — and the
-    /// recorder freezes markets ONE AT A TIME: a gap whose resnapshot fails
-    /// leaves that market "dark until the next sweep", `evict_book` drops a
-    /// single book, and a subscribe chunk that never lands takes 150 slugs with
-    /// it. Coverage taken over every market on the venue then read one second
-    /// off a Billboard market and called this row actionable.
+    /// The same defect, on the population that actually makes it reachable.
+    /// Most of a venue's tape is markets no pair prices — the pm-us universe
+    /// comes from `polymarket_us_tags`, 749 markets against 88 registry legs on
+    /// the real 07-28 tape — so coverage taken over every market read one
+    /// second off a Billboard market and called this row actionable while the
+    /// only book it is priced off had stopped six hours earlier.
+    ///
+    /// P1 is the row's own leg and it is the venue's whole registry coverage
+    /// here: this is the TOTAL form, every counted leg stopped. A single frozen
+    /// market is not what this catches, on this venue or any other — see
+    /// `coverage_by_venue`'s residual.
     #[test]
     fn a_market_we_do_not_price_does_not_certify_the_one_this_row_needs() {
         let (a, base) = args("unpriced-noise");
