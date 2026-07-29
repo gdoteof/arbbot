@@ -247,6 +247,28 @@ WATCH = [
         "fill. The repair for it (kalshi_reconcile_failures) pages separately",
     ),  # 1 is the documented per-process FLOOR, so this is the one gauge where
     # a 0 threshold would fire on every single restart. Present in 252/892.
+    (
+        "sweeps_owed",
+        "RISE",
+        "PAGE",
+        0,
+        "a venue's kill sweep was never proven — the book this process halted "
+        "over was not confirmed empty, and orders may be resting on it",
+    ),  # Added by #44, which landed while this branch was in review, and whose
+    # own doc ends "Nothing reads it automatically" — the exact defect this file
+    # exists to close, recurring in the same tree. Watching it is the point.
+    #
+    # NO OBSERVED HISTORY AT ALL: it did not exist when the 920 armed stats lines
+    # were written, so the presence counts above have nothing to say about it.
+    # What bounds the noise here is STRUCTURAL, not empirical — `sweeps_owed` is
+    # a BTreeMap keyed by Venue, so `.len()` is 0, 1 or 2, and a RISE rule can
+    # therefore fire at most twice in the life of a process.
+    #
+    # RISE and not SUSTAINED because it is a deliberate RATCHET: its doc says it
+    # "does NOT come back down when a halt clears over an unproven book", so a
+    # session that fully recovered from a morning outage reads non-zero for the
+    # rest of its life. A level rule would page about that for ever; a rise rule
+    # says "a book just went unproven", which is the event, and then goes quiet.
     # ---- SUSTAINED. See the two-rules note above.
     (
         "cancels_unresolved",

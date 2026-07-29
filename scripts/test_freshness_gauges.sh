@@ -104,7 +104,8 @@ d = {"mode": "live", "elapsed_s": float(sys.argv[1]), "events": 1, "killed": Fal
      "fills_unattributed": 0, "hedges_overfilled": 0, "dropped_unconsumed": 0,
      "hedges_naked": 0, "exec_dropped": 0, "exec_recovered": 0,
      "kalshi_fills_unreadable": 0, "exec_failed": 0,
-     "kalshi_reconcile_failures": 0, "cancels_unresolved": 0}
+     "kalshi_reconcile_failures": 0, "cancels_unresolved": 0,
+     "sweeps_owed": 0}
 for a in sys.argv[2:]:
     k, v = a.split("=", 1)
     if v == "DROP":
@@ -313,6 +314,17 @@ check "...at low priority on its own stamp" "PRIORITY=low"
 fresh; stats 300 > "$TMP/journal"; run
 stats 360 kalshi_reconcile_failures=5 > "$TMP/journal"; run
 check "kalshi_reconcile_failures +5 pages" "kalshi_reconcile_failures +5"
+
+# sweeps_owed (#44) is a deliberate RATCHET: its doc says it does NOT come back
+# down when a halt clears over an unproven book, so a session that fully
+# recovered reads non-zero for the rest of its life. It must page on the EVENT
+# and then go quiet — the 2026-07-29 DNS outage failed the sweep on both venues
+# inside thirty seconds, which is the +2 here.
+fresh; stats 300 > "$TMP/journal"; run
+stats 360 sweeps_owed=2 > "$TMP/journal"; run
+check "sweeps_owed 0->2 pages the unproven book" "sweeps_owed +2"
+cooldown_clear; stats 420 sweeps_owed=2 > "$TMP/journal"; run
+check "...and the standing ratchet never pages again" silent
 
 echo "=== the gauge check reporting its own absence ==="
 
