@@ -350,6 +350,66 @@ pub struct LiveResult {
     pub elapsed_s: f64,
 }
 
+/// How long `connect()` may take before the gate calls it a wedge.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run a blocking call on a thread and give up waiting after `timeout`.
+///
+/// The thread is abandoned if it never returns. That is acceptable here and
+/// only here: the one caller is about to print a verdict and exit.
+fn bounded<T: Send + 'static>(
+    timeout: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout).ok()
+}
+
+/// The verdict for a `connect()` that never came back.
+///
+/// Separate from the call so the operator-facing text is pinned by a test: the
+/// wedge itself is not reproducible in one, because filling a listen backlog
+/// from inside the test needs as many file descriptors as the backlog is deep.
+fn wedge_error(socket: &Path, timeout: Duration) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "connect({}) did not return within {}s. The socket is LISTENing but the recorder is \
+             not accepting — once the listen backlog fills, a blocking connect() waits with no \
+             deadline of its own. Do NOT just re-run this; look at the recorder process.",
+            socket.display(),
+            timeout.as_secs()
+        ),
+    )
+}
+
+/// `UnixStream::connect` with a bound on how long it may block.
+///
+/// std has no `connect_timeout` for AF_UNIX, and the blocking case is exactly
+/// the failure this stage exists to find: a recorder that has stopped calling
+/// `accept()` fills its listen backlog, and `connect()` then has no deadline.
+/// Verified on this box against a listener that never accepts — with a backlog
+/// of 128 the 130th connect has nowhere to queue, and a blocking connect from
+/// that point on was still parked when a 3s alarm fired.
+///
+/// Unbounded, that parks the gate until `TimeoutStartSec=600` SIGTERMs it —
+/// which reports as `SHADOW GATE: NO VERDICT`, and the runbook's table used to
+/// answer a NO VERDICT with "re-run it". For a wedged recorder that is an
+/// instruction to loop, ten minutes at a time, over the one finding this stage
+/// was built for. So it gets a DISTINCT verdict instead: a real `SHADOW GATE:
+/// FAIL` naming the socket. A genuine connect error — no such file, permission
+/// — is passed through unchanged; only the timeout is synthesised.
+pub fn connect_with_timeout(socket: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    let path = socket.to_owned();
+    match bounded(timeout, move || UnixStream::connect(&path)) {
+        Some(r) => r,
+        None => Err(wedge_error(socket, timeout)),
+    }
+}
+
 /// Attach for `seconds`, with `workers` CPU burners alongside.
 ///
 /// Read-only in the strongest sense available: a subscriber never sends, and
@@ -366,7 +426,7 @@ pub fn attach(
     let mut load_aborted = false;
     let started = Instant::now();
 
-    let stream = UnixStream::connect(socket)?;
+    let stream = connect_with_timeout(socket, CONNECT_TIMEOUT)?;
     // A read timeout is what makes a SILENT recorder distinguishable from a
     // busy one: without it a wedged recorder parks this gate forever, which is
     // the failure mode the whole exercise is about.
@@ -498,6 +558,67 @@ mod tests {
         assert_eq!(nice_from_stat("nonsense with no paren"), None);
         // and it reads the real thing, or the parse describes nothing
         assert!(own_nice().is_some(), "could not read this process's own nice value");
+    }
+
+    /// THE HANG THIS STAGE EXISTS TO FIND, reproduced: a socket that LISTENs
+    /// and whose owner never calls `accept()`. Once the listen backlog fills,
+    /// `connect()` blocks forever, and unbounded that means the gate is killed
+    /// by `TimeoutStartSec` and reports `NO VERDICT` — which the runbook used
+    /// to answer with "re-run it".
+    #[test]
+    fn a_recorder_that_stopped_accepting_is_a_verdict_not_a_hang() {
+        let e = wedge_error(Path::new("data/arbbot-rs.sock"), CONNECT_TIMEOUT);
+        assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+        let msg = e.to_string();
+        assert!(msg.contains("data/arbbot-rs.sock"), "name the socket: {msg}");
+        assert!(msg.contains("not accepting"), "name the cause: {msg}");
+        assert!(
+            msg.contains("Do NOT just re-run"),
+            "the runbook answers NO VERDICT with 're-run it', so this verdict has to say \
+             otherwise or the operator loops: {msg}"
+        );
+        // and it must reach a caller as a FAILURE, not as a hang: `attach`
+        // returns it, `live_stage` turns it into `SHADOW GATE: FAIL`.
+        let path = std::env::temp_dir().join(format!("arb-sgate-live-{}", std::process::id()));
+        let Err(e) = attach(&path, 0, 0, DEFAULT_LOAD_CEILING) else {
+            panic!("attaching to a socket that does not exist must fail");
+        };
+        assert_ne!(e.kind(), std::io::ErrorKind::TimedOut, "a missing socket is not a wedge: {e}");
+    }
+
+    /// A real connect error must survive as itself — only the timeout is
+    /// synthesised. Otherwise "the recorder is not up" reads as "the recorder
+    /// is wedged".
+    #[test]
+    fn a_socket_that_is_not_there_is_not_reported_as_a_wedge() {
+        let e = connect_with_timeout(Path::new("/nonexistent/arbbot-rs.sock"), CONNECT_TIMEOUT)
+            .expect_err("must fail");
+        assert_ne!(e.kind(), std::io::ErrorKind::TimedOut, "{e}");
+    }
+
+    /// The other half: a recorder that IS accepting must still be connected to.
+    /// Bounding the connect is worthless if the bound also breaks the normal
+    /// path, and `bounded` moves the stream across a channel to get there.
+    #[test]
+    fn a_socket_that_is_accepting_is_connected_to_normally() {
+        let dir = std::env::temp_dir().join(format!("arb-sgate-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("live.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        let s = connect_with_timeout(&path, CONNECT_TIMEOUT).expect("a listening socket connects");
+        let (mut peer, _) = listener.accept().expect("accept");
+        use std::io::Write;
+        peer.write_all(b"{\"kind\":\"x\"}\n").expect("write");
+        let mut got = String::new();
+        BufReader::new(s).read_line(&mut got).expect("read");
+        assert_eq!(got, "{\"kind\":\"x\"}\n", "the stream must survive the channel hop");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_call_that_never_returns_is_given_up_on() {
+        assert_eq!(bounded(Duration::from_millis(50), || std::thread::sleep(Duration::from_secs(30))), None);
+        assert_eq!(bounded(Duration::from_secs(30), || 7), Some(7));
     }
 
     #[test]
