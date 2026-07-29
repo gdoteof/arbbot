@@ -160,8 +160,7 @@ fn summarize_one(src: &Source, only: Option<&str>) -> Result<HashMap<String, Acc
                 let n = std::thread::available_parallelism()
                     .map(|v| v.get())
                     .unwrap_or(4)
-                    .min(16)
-                    .max(1);
+                    .clamp(1, 16);
                 let bounds = chunk_bounds(&text, n);
                 let parts: Vec<HashMap<String, Acc>> = std::thread::scope(|s| {
                     let hs: Vec<_> = bounds

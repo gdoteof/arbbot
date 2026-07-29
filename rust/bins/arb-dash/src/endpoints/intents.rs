@@ -129,7 +129,7 @@ fn routes_for(
             return;
         };
         if let Ok(e) = p.edge_per_contract.parse::<f64>() {
-            if best.map_or(true, |(b, _)| e > b) {
+            if best.is_none_or(|(b, _)| e > b) {
                 *best = Some((e, label));
             }
         }
@@ -189,7 +189,7 @@ fn feasible(p: &Pair, best_route: &str) -> Feasible {
         _ => None,
     };
     const MAX_REST_SPREAD: f64 = 0.05;
-    let fillable = rest_spread.map_or(true, |s| s <= MAX_REST_SPREAD);
+    let fillable = rest_spread.is_none_or(|s| s <= MAX_REST_SPREAD);
     let have_books = p.qa.is_some() && p.qb.is_some();
 
     // Depth at the touch on the legs this route CROSSES. A rested leg
@@ -339,7 +339,7 @@ pub fn json(a: &Args) -> String {
         "rollup_current": rollup_current,
         "rollup_coverage_age_s": if coverage_age_s == i64::MAX { -1 } else { coverage_age_s },
         "max_coverage_age_s": MAX_COVERAGE_AGE_S,
-        "engine_live": age >= 0.0 && age < 120.0,
+        "engine_live": (0.0..120.0).contains(&age),
         "last_intent_age_s": age.round() as i64,
         "resting_orders": st.live.len(),
         "pairs": rows.len(),

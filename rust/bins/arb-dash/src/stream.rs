@@ -225,7 +225,7 @@ pub fn tape(mut s: TcpStream, a: &Args) {
             return;
         }
         // Keepalive so an idle engine does not look like a dead connection.
-        if tick % 100 == 0 && s.write_all(b": ping\n\n").is_err() {
+        if tick.is_multiple_of(100) && s.write_all(b": ping\n\n").is_err() {
             return;
         }
         tick = tick.wrapping_add(1);

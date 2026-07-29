@@ -88,8 +88,7 @@ pub async fn pmus_fill_feed(key_id: String, secret_b64: String, tx: Sender<FeedM
                 serde_json::json!({"subscribe": {
                     "requestId": "orders",
                     "subscriptionType": "SUBSCRIPTION_TYPE_ORDER"}})
-                .to_string()
-                .into(),
+                .to_string(),
             ))
             .await
             .map_err(|e| format!("subscribe: {e}"))?;
@@ -281,8 +280,7 @@ pub async fn kalshi_fill_feed(key_id: String, pem: String, tx: Sender<FeedMsg>) 
             ws.send(Message::Text(
                 serde_json::json!({"id": 1, "cmd": "subscribe",
                                    "params": {"channels": ["fill"]}})
-                .to_string()
-                .into(),
+                .to_string(),
             ))
             .await
             .map_err(|e| format!("subscribe: {e}"))?;
