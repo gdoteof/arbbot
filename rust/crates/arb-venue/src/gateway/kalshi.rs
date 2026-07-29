@@ -183,9 +183,21 @@ impl<T: Transport> KalshiGateway<T> {
     /// but finished" and "not here at all" call for three different answers
     /// from a cancel, and collapsing them is how a cancel reports success for
     /// an order it never touched.
+    /// A TRUNCATED walk cannot answer "not here at all". `all_orders` discards
+    /// `cut_short` — a refactor artifact of this change — and reading a PREFIX
+    /// of the account as the account is how `Ours::Absent` becomes a wrong
+    /// diagnosis: the caller then prints "the place may have been rejected, or
+    /// the order list has not caught up" about an order that is simply on a page
+    /// nobody read. `Absent` is only sound over a COMPLETE list, so the
+    /// truncation is surfaced instead.
+    ///
+    /// Finding it despite the truncation is still an answer — a prefix that
+    /// contains the order tells the truth about it — so only the not-found arm
+    /// has to care.
     fn find_ours(&self, coid: &str) -> Result<Ours, VenueError> {
+        let listing = self.listing()?;
         let mut seen = false;
-        for o in self.all_orders()? {
+        for o in listing.orders {
             if o.client_order_id.as_deref() != Some(coid) {
                 continue;
             }
@@ -194,7 +206,11 @@ impl<T: Transport> KalshiGateway<T> {
             }
             seen = true;
         }
-        Ok(if seen { Ours::Gone } else { Ours::Absent })
+        if seen {
+            return Ok(Ours::Gone);
+        }
+        truncated(listing.cut_short)?;
+        Ok(Ours::Absent)
     }
 
     /// Find a RESTING order by our own `client_order_id` and cancel it.

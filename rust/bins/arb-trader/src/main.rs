@@ -1812,10 +1812,28 @@ mod sweep_tests {
         let m = std::sync::Arc::new(Unreadable { cancelled: std::sync::Mutex::new(false) });
         let mut h: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> = HashMap::new();
         h.insert(Venue::PolymarketUs, m.clone());
-        startup_sweep(&h, &fast())
+        let unconfirmed = startup_sweep(&h, &fast())
             .await
             .expect("an unread list is not a leak, and must not manufacture an outage");
         assert!(*m.cancelled.lock().unwrap(), "the cancel-all still went in");
+        // THE RETURNED VALUE, not just the Ok. It is what drives the `###`
+        // banner and, on `--sweep-only`, exit 18 — and this assertion was
+        // missing, so deleting the `unconfirmed.push` left every test green
+        // while `--sweep-only` exited 0 over a book no venue could confirm.
+        assert_eq!(unconfirmed.len(), 1, "the venue must be REPORTED, not just tolerated");
+        assert!(unconfirmed[0].contains("PolymarketUs"), "{unconfirmed:?}");
+        assert!(
+            unconfirmed[0].contains("could NOT be proven clean"),
+            "carries the verdict the banner prints: {unconfirmed:?}"
+        );
+    }
+
+    /// ...and a book that IS proven clean reports nothing, or the banner and
+    /// exit 18 would fire on every ordinary start.
+    #[tokio::test]
+    async fn a_clean_book_reports_nothing_unconfirmed() {
+        let (h, _m) = sinks(&[], &[]);
+        assert!(startup_sweep(&h, &fast()).await.unwrap().is_empty());
     }
 
     /// ...but the leniency is exactly that narrow. A cancel-all the venue never

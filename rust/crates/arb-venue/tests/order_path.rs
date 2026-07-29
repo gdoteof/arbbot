@@ -496,6 +496,47 @@ fn a_continuation_page_that_cannot_be_read_ends_the_walk_without_proving_anythin
     }
 }
 
+/// A PREFIX of the account cannot answer "not on the account at all".
+///
+/// `all_orders` discards `cut_short` — an artifact of this change's refactor —
+/// so a client-id lookup over a truncated walk reported `Ours::Absent`, and the
+/// caller then diagnoses it as "the place may have been rejected, or the order
+/// list has not caught up" about an order that is simply on a page nobody read.
+/// Wrong diagnosis, stated confidently, on the recovery path for an order whose
+/// id we never learned.
+///
+/// Finding it despite the truncation is still an answer, so only the not-found
+/// arm changes.
+#[test]
+fn a_client_id_not_found_in_a_truncated_walk_is_not_reported_absent() {
+    let p1 = format!(
+        r#"{{"orders":[{}],"cursor":"CUR"}}"#,
+        tagged("other", "resting", "m1")
+    );
+    let p2 = r#"{"cursor":""}"#;
+
+    // not found in the prefix — must NOT read as "absent from the account"
+    let g = gw(vec![(200, &p1), (200, p2)]);
+    match g.cancel_by_client_order_id("m1785257819045") {
+        Err(VenueError::Parse { endpoint: "kalshi:orders", detail }) => {
+            assert!(detail.contains("cursor walk stopped"), "{detail}");
+        }
+        other => panic!("a prefix cannot prove absence, got {other:?}"),
+    }
+
+    // ...but a hit inside the prefix is still a hit, truncation or not.
+    let p1b = format!(
+        r#"{{"orders":[{}],"cursor":"CUR"}}"#,
+        tagged("found", "resting", "m1785257819045")
+    );
+    let g = gw(vec![(200, &p1b), (200, p2), (200, "{}")]);
+    assert_eq!(
+        g.cancel_by_client_order_id("m1785257819045").unwrap().as_deref(),
+        Some("found"),
+        "the prefix that CONTAINS the order tells the truth about it"
+    );
+}
+
 /// ...and the FIRST page keeps the hard error, or the whole of defect A is back:
 /// with nothing read at all, "no orders key" would be indistinguishable from an
 /// empty book.

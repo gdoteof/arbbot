@@ -107,8 +107,20 @@ pub const EXIT_ORDERS_LEFT_RESTING: i32 = 17;
 /// UNPROVEN. The refusal path already exits 10 and trips `is-failed`, so the
 /// outcome a human was told about was the one where nothing had been left
 /// resting, while the outcome where the book was genuinely unknown looked like
-/// a clean stop. Whenever a new "we could not tell" case is added here, check
-/// which way round it pages.
+/// a clean stop.
+///
+/// SO, FOR EVERY NEW "we could not tell" STATE ADDED HERE — name BOTH outcomes
+/// it splits into, give each one an exit code, and confirm the one that
+/// PROCEEDS is not quieter than the one that REFUSES. It is a procedure and not
+/// a question because both paths feel conservative from the inside, and the
+/// asymmetry is only visible once the two codes are written down next to each
+/// other.
+///
+/// It has already caught one: `Unproven::cancel_accepted` was a latch, so a
+/// sweep whose FIRST round succeeded and whose later rounds were cut short came
+/// out as merely unconfirmed — proceeding, quietly, over a real resting order on
+/// a page nobody read. Running the procedure finds it; asking "which way round
+/// does this page" does not.
 pub const EXIT_BOOK_UNCONFIRMED: i32 = 18;
 
 /// Wall-clock budget for in-flight PLACES to settle before we verify.
@@ -498,9 +510,16 @@ impl ShutdownOutcome {
 /// How an abnormal stop's own exit code composes with what the sweep proved.
 ///
 /// The stop's code survives a CLEAN book — a WAL hole is still a WAL hole, and a
-/// panic is still a panic — but an unproven book overrides it, because
-/// `EXIT_ORDERS_LEFT_RESTING` is the one code a human must never have to
+/// panic is still a panic — but a book that is not clean overrides it, because
+/// what the sweep found is the one thing a human must never have to
 /// disambiguate. Split out from the `exit()` so it can be asserted on.
+///
+/// "Not clean" means BOTH non-zero verdicts, and that is deliberate:
+/// `EXIT_BOOK_UNCONFIRMED` (18) overrides a WAL stop's 70 and a panic's 101 the
+/// same way `EXIT_ORDERS_LEFT_RESTING` (17) does. A panic whose sweep could not
+/// read the book is a panic AND an unknown book, and the unknown book is the
+/// half that needs a human at the venue. 17 still beats 18 — that ordering is
+/// in `ShutdownOutcome::exit_code`, not here.
 pub fn halt_exit_code(clean_code: i32, out: &ShutdownOutcome) -> i32 {
     if out.exit_code() == 0 { clean_code } else { out.exit_code() }
 }

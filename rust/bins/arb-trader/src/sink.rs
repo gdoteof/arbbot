@@ -86,9 +86,15 @@ impl Default for SweepPolicy {
 pub struct Unproven {
     pub msg: String,
     /// Orders were positively OBSERVED still resting. Not "unproven" — leaked.
+    /// Latches: an order seen once is never unseen, which is fail-CLOSED.
     pub orders_seen: bool,
-    /// At least one cancel-all was ACCEPTED by the venue. False means the sweep
-    /// never even got its instruction in, which is fail-closed on any premise.
+    /// Whether the MOST RECENT cancel-all was accepted by the venue — not
+    /// whether any ever was. False means the last thing this sweep did to the
+    /// venue failed, which is fail-closed on any premise.
+    ///
+    /// "At least one" is what this said, and it was wrong in the one direction
+    /// that matters: a latch here latches fail-OPEN. See the assignment in
+    /// `cancel_all_and_verify_blocking` for the trace.
     pub cancel_accepted: bool,
 }
 
@@ -156,9 +162,25 @@ pub fn cancel_all_and_verify_blocking(
             break;
         }
         rounds_done += 1;
+        // The state of the LAST cancel-all, not a latch. `left` latching is
+        // right — it latches fail-CLOSED, so an order seen once is never
+        // unseen — and this is the same shape pointing the other way.
+        //
+        // Latched, round 1 succeeding was enough to make the whole sweep
+        // `is_only_unconfirmed()` for ever. That is the `rounds > 1` incident
+        // itself: round 1 walks the whole list and cancels cleanly, a queued
+        // place lands at the venue a moment later, rounds 2-4 are cut short by
+        // an unreadable continuation page and so cancel only the pages they
+        // reached, and the late arrival sits on a page nobody read. Every
+        // resting-list read errors, so `left` stays empty and `orders_seen`
+        // stays false — and a real resting order came out as "the cancel went
+        // in, nothing was seen resting".
         match sink.cancel_all_open() {
             Ok(()) => cancel_accepted = true,
-            Err(e) => last_err = Some(format!("cancel_all_open: {e}")),
+            Err(e) => {
+                cancel_accepted = false;
+                last_err = Some(format!("cancel_all_open: {e}"));
+            }
         }
         for _ in 0..pol.polls_per_round.max(1) {
             if !pol.poll_delay.is_zero() {
@@ -538,6 +560,63 @@ mod sweep_tests {
         assert!(e.cancel_accepted, "the venue took the cancel");
         assert!(e.is_only_unconfirmed(), "absence of evidence, not evidence of a leak");
         assert!(e.msg.contains("could NOT be proven clean"), "{}", e.msg);
+    }
+
+    /// **A cancel-all that worked ONCE does not make the sweep unconfirmed.**
+    ///
+    /// The latch bug, in the incident `rounds > 1` exists for. Round 1 walks the
+    /// whole list and cancels cleanly; a queued place lands at the venue a
+    /// moment later; rounds 2-4 are cut short and cancel only the pages they
+    /// reached; every resting-list read errors, so nothing is ever OBSERVED.
+    ///
+    /// With `cancel_accepted` latched from round 1 this came out
+    /// `is_only_unconfirmed()` — so the halt exited 18 and printed
+    /// "the cancel went in, nothing was seen resting" over a book with a real
+    /// order on an unread page, and a start would have armed on top of it.
+    #[test]
+    fn a_cancel_all_that_worked_once_does_not_make_a_later_failure_unconfirmed() {
+        struct FirstRoundOnly {
+            rounds: Mutex<u32>,
+        }
+        impl OrderSink for FirstRoundOnly {
+            fn place(&self, _r: &PlaceRequest) -> Result<String, VenueError> {
+                unreachable!()
+            }
+            fn cancel(&self, _r: &CancelRequest) -> Result<(), VenueError> {
+                unreachable!()
+            }
+            fn cancel_all_open(&self) -> Result<(), VenueError> {
+                let mut n = self.rounds.lock().unwrap();
+                *n += 1;
+                if *n == 1 {
+                    return Ok(()); // the full walk, everything cancelled
+                }
+                // ...and from here every walk is cut short by an unreadable
+                // continuation page, so only pages 1..k were cancelled.
+                Err(VenueError::Parse {
+                    endpoint: "kalshi:orders",
+                    detail: "the cursor walk stopped at a page that could not be read".into(),
+                })
+            }
+            fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+                Err(VenueError::Parse {
+                    endpoint: "kalshi:orders",
+                    detail: "the cursor walk stopped at a page that could not be read".into(),
+                })
+            }
+        }
+        let s = FirstRoundOnly { rounds: Mutex::new(0) };
+        let e = cancel_all_and_verify_blocking(&s, &fast()).unwrap_err();
+        assert!(*s.rounds.lock().unwrap() > 1, "the sweep really did re-issue the cancel");
+        assert!(!e.orders_seen, "nothing was ever observed — that half is honest");
+        assert!(
+            !e.cancel_accepted,
+            "the LAST cancel-all failed; round 1's success must not still be speaking"
+        );
+        assert!(
+            !e.is_only_unconfirmed(),
+            "a late arrival on a page nobody read is not a book we merely could not confirm"
+        );
     }
 
     /// A cancel-all the venue never accepted is fail-closed on any premise —
