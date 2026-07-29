@@ -869,12 +869,19 @@ fn install_policy(args: &Args, quoters: &mut [Quoter], risk: Option<&risk::RiskV
     Policy { toxgate_file: Some(path.to_string()), apr, apr_installed }
 }
 
+/// The trade ledger as read ONCE at startup.
+///
+/// Both seeds fold over the SAME snapshot, and that is a correctness
+/// requirement rather than an optimisation — see `seed_exposure_from_census`.
+type LedgerRead = Result<Vec<serde_json::Value>, String>;
+
 /// The capital gate every quoter consults, sized from `--exec-config` /
 /// `--topics` and seeded with the exposure already on the book.
 fn build_risk_view(
     args: &Args,
     quoters: &mut [Quoter],
     rel_meta: &HashMap<String, (String, String)>,
+    ledger: &LedgerRead,
 ) -> std::sync::Arc<risk::RiskView> {
     let rv = std::sync::Arc::new(risk::RiskView::load(
         &args.exec_yaml,
@@ -889,7 +896,7 @@ fn build_risk_view(
              will refuse every order. Pass --balance kalshi=<usd> etc."
         );
     }
-    seed_exposure_from_ledger(&rv, &args.ledger, rel_meta);
+    seed_exposure_from_ledger(&rv, ledger, &args.ledger, rel_meta);
     for q in quoters.iter_mut() {
         q.set_risk(Some(rv.clone() as std::sync::Arc<dyn arb_core::quoter::RiskGate>));
     }
@@ -901,12 +908,13 @@ fn build_risk_view(
 /// whole book is free.
 fn seed_exposure_from_ledger(
     rv: &risk::RiskView,
+    ledger: &LedgerRead,
     ledger_path: &str,
     rel_meta: &HashMap<String, (String, String)>,
 ) {
-    match ledger::read(ledger_path) {
+    match ledger {
         Ok(recs) => {
-            let open = ledger::open_exposure(recs);
+            let open = ledger::open_exposure(recs.clone());
             let mut total = 0.0;
             let mut unknown = 0usize;
             let mut seeded: Vec<(String, f64)> = Vec::new();
@@ -965,9 +973,42 @@ fn seed_exposure_from_ledger(
 /// Returns the contract count for the standing `hedges_undischarged` gauge, so
 /// this is visible to a monitor every stats tick and not only in the scrollback
 /// of a startup nobody was watching.
+///
+/// AND SEEDS THE RISK VIEW WITH IT. The census was a display line and nothing
+/// else: its only consumer was `RunCfg::hedges_undischarged`, which `summary()`
+/// prints. So a restart that correctly REPORTED an undischarged obligation
+/// still believed the relationship was flat, and would size a fresh basket up
+/// to the full per-relationship cap on top of a real, unhedged position. The
+/// leg is at the venue; it belongs in the number the caps are measured against.
+///
+/// NO DOUBLE COUNT, by construction rather than by care: `Undischarged::missing`
+/// is `owed - booked`, and `booked` is exactly the ledger's own record — the one
+/// `seed_exposure_from_ledger` has already seeded from. What is seeded here is
+/// the remainder that the ledger does not contain. When the obligation is later
+/// completed (by `arbbot-hedge.timer`, which owns naked-leg completion) a basket
+/// is appended and the NEXT startup's census reads `owed - booked = 0`, so the
+/// same contracts move from this seed to the ledger seed without ever being in
+/// both. Nothing in THIS process can book them: the maker order belongs to a
+/// previous run, so `book_basket`'s `order_rel` lookup misses and says so.
+///
+/// THAT PARTITION HOLDS ONLY IF BOTH SEEDS FOLD OVER THE SAME SNAPSHOT, which
+/// is why the ledger is read ONCE in `main` and passed to both. It used to be
+/// read twice, with `startup_sweep`'s venue round-trip — seconds — in between,
+/// and `arbbot-hedge.timer` fires every 5 minutes. A completing basket landing
+/// in that window is seen by NEITHER seed: the ledger read already happened, so
+/// it books nothing, and the census read does see it, so `draw_down` discharges
+/// the obligation and `missing()` is 0. The contracts are then invisible to
+/// every cap for the life of the process — the exact direction this whole
+/// change exists to close, and reached through its own fix. The ordering was
+/// the unlucky one of the two: census-first would have DOUBLE counted, which is
+/// merely conservative. Nor is it a low-correlation race — a restart carrying a
+/// naked leg is precisely the state in which that timer is trying to write.
 fn report_undischarged_hedges(
     args: &Args,
     quoters: &[Quoter],
+    risk: Option<&risk::RiskView>,
+    rel_meta: &HashMap<String, (String, String)>,
+    ledger: &LedgerRead,
     armed: bool,
     bench: bool,
 ) -> u64 {
@@ -990,7 +1031,7 @@ fn report_undischarged_hedges(
         );
         return 0;
     };
-    let Ok(ledger) = ledger::read(&args.ledger) else {
+    let Ok(ledger) = ledger else {
         // `place_preconditions` already refuses to arm on this and names the
         // damage; saying it twice here would only bury it.
         return 0;
@@ -1006,11 +1047,95 @@ fn report_undischarged_hedges(
             );
         }
     }
-    let found = orphan::undischarged(&std::fs::read_to_string(out).unwrap_or_default(), ledger);
+    let found =
+        orphan::undischarged(&std::fs::read_to_string(out).unwrap_or_default(), ledger.clone());
     for l in orphan::report(&found, &rel_of, arb_core::clock::now_s()) {
         eprintln!("{l}");
     }
+    if let Some(rv) = risk {
+        seed_exposure_from_census(rv, &found, &registry_class_of(&args.registry, rel_meta));
+    }
     found.iter().map(|u| u.missing() as u64).sum()
+}
+
+/// Hedge market -> (relationship id, class) over the FULL registry.
+///
+/// Deliberately NOT `rel_of` above, which is built from the QUOTERS. That map
+/// answers "could this run hedge it", which is the report's question. The CLASS
+/// of the exposure is a different question and a registry fact: it is still in
+/// hand for a relationship merely outside `--rel-prefix` or gated out this run,
+/// and every obligation in `--out` was minted by a run that did quote it. Using
+/// the quoting subset there routed those to `unknown`, which is strictly LOOSER
+/// — no quoter can carry rtype `unknown`, so that bucket is inert against the
+/// class cap and only the global cap holds it. `rel_meta` is the same
+/// full-registry classification `seed_exposure_from_ledger` uses, keyed by id;
+/// this only supplies the id.
+///
+/// A registry that will not load leaves this empty, and the caller falls back
+/// to `unknown` — `load_quoters` has already `expect`ed the same file several
+/// frames earlier, so this is unreachable in practice and is not a second place
+/// to die.
+fn registry_class_of(
+    registry: &str,
+    rel_meta: &HashMap<String, (String, String)>,
+) -> HashMap<String, (String, String)> {
+    let mut out = HashMap::new();
+    let Ok(reg) = arb_registry::Registry::load(registry) else { return out };
+    for r in &reg.relationships {
+        let Some((_, class)) = rel_meta.get(&r.id) else { continue };
+        for l in &r.legs {
+            out.insert(l.market_id.clone(), (r.id.clone(), class.clone()));
+        }
+    }
+    out
+}
+
+/// Book the census as open exposure, so the caps are measured against the leg
+/// that is actually at the venue.
+///
+/// THIS TIGHTENS A CAP THAT IS ALREADY NEARLY FULL. The seeded contracts land
+/// in the same class the ledger seed has already largely filled, so the class
+/// refusal tightens by exactly the seeded quantity and the remaining headroom
+/// there is materially reduced: a clip that passes today can be refused once
+/// this lands. That is the intended behaviour — the contracts are real and the
+/// point of this change is that the gate should see them — but it is worth
+/// knowing before it happens rather than after. `utilization()` does not move,
+/// because the same exposure already clamps it to its ceiling.
+///
+/// Figures deliberately omitted: this repository is public, while
+/// `config/registry.yaml` and `data/` (which carries the position ledger) are
+/// gitignored. `config/exec.yaml` is tracked, so the bankroll and the class
+/// ratio are public by the owner's choice; what is open against them is not.
+///
+/// The classification rule is `seed_exposure_from_ledger`'s, because it is the
+/// same problem: what cannot be classified is booked under `unknown`, which
+/// counts toward the GLOBAL cap (a sum over per-relationship exposure) without
+/// inflating a class cap it may not belong to. An obligation on a market the
+/// registry no longer carries at all has no relationship id here, so it is
+/// booked under the market instead, which keeps it in the global sum and in the
+/// per-relationship listing an operator reads.
+fn seed_exposure_from_census(
+    rv: &risk::RiskView,
+    found: &[orphan::Undischarged],
+    class_of: &HashMap<String, (String, String)>,
+) {
+    for u in found {
+        let qty = u.missing() as f64;
+        if qty <= 0.0 {
+            continue;
+        }
+        let (rel_id, class) = match class_of.get(&u.hedge_market) {
+            Some((rel_id, class)) => (rel_id.clone(), class.clone()),
+            None => (format!("unknown:{}", u.hedge_market), "unknown".to_string()),
+        };
+        rv.record_open(&rel_id, &class, qty);
+        eprintln!(
+            "[risk] seeded {qty:.0} undischarged contract(s) on {rel_id} (class {class}, \
+             hedge owed on {}) — the ledger does not carry them, because `book_basket` \
+             writes only when the HEDGE fills. The caps now see this leg.",
+            u.hedge_market
+        );
+    }
 }
 
 /// Start the single event source `parse_args` has already guaranteed: a tape, a
@@ -1221,10 +1346,15 @@ async fn main() {
 
     let (mut quoters, by_market, rel_meta) =
         load_quoters(&args.registry, &args.tradable, &args.rel_prefixes);
+    // ONE read of the trade ledger, folded by BOTH seeds. Reading it twice
+    // straddles `startup_sweep`'s venue round-trip, and a basket appended by
+    // arbbot-hedge.timer inside that window reaches neither seed — see
+    // `seed_exposure_from_census`.
+    let ledger = ledger::read(&args.ledger);
     // Risk is OFF in bench/replay: those pin a decision digest, and a capital
     // gate is not part of that contract. It is built BEFORE the policy because
     // the maker APR hurdle floats with the utilization this view holds.
-    let risk = (!bench).then(|| build_risk_view(&args, &mut quoters, &rel_meta));
+    let risk = (!bench).then(|| build_risk_view(&args, &mut quoters, &rel_meta, &ledger));
     let policy = install_policy(&args, &mut quoters, risk.as_deref());
     eprintln!(
         "arb-trader up: {} quoters, {} markets, mode={}",
@@ -1272,7 +1402,18 @@ async fn main() {
 
     let armed = !sinks.is_empty();
     // Before the first quote: what did the LAST run of this unit leave naked?
-    let undischarged = report_undischarged_hedges(&args, &quoters, armed, bench);
+    // ...and it does not merely REPORT it: an obligation the ledger cannot see
+    // is still exposure, so it is seeded into the same risk view the ledger
+    // seeded, before the first quote consults it.
+    let undischarged = report_undischarged_hedges(
+        &args,
+        &quoters,
+        risk.as_deref(),
+        &rel_meta,
+        &ledger,
+        armed,
+        bench,
+    );
     let acks = if sinks.is_empty() { None } else { tx_acks.clone() };
     let (exec_txs, exec_stats) = exec::spawn_executors(rate, sinks, acks);
     let cfg =
@@ -1998,5 +2139,275 @@ relationships:
         let (mut oid, mut intents) = (0u64, Vec::new());
         quoters[0].on_book(&mut cx, &fees, &bb, 1_000.0, &mut oid, &mut intents);
         assert_eq!(place_on(&intents, "P").map(|p| p.price.as_str()), Some("0.56"));
+    }
+}
+
+/// A hedge obligation a previous run never discharged is EXPOSURE, and the caps
+/// have to see it.
+///
+/// `book_basket` writes `data/exec/trades.jsonl` only when the HEDGE fills, so
+/// an obligation whose hedge never filled leaves no ledger record —
+/// `seed_exposure_from_ledger` seeds that relationship at zero. `orphan`
+/// computed the missing contracts correctly and the number went into
+/// `RunCfg::hedges_undischarged`, whose ONLY consumer is the display line in
+/// `Engine::summary`. Nothing called `record_open` for it, so the new run
+/// believed the relationship was flat and would size a fresh basket up to the
+/// full per-relationship cap on top of a real, unhedged position.
+#[cfg(test)]
+mod undischarged_seed_tests {
+    use super::*;
+    use arb_core::model::Venue;
+    use arb_core::quoter::RiskGate;
+    use arb_core::scan::{Rel, RelLeg, RelType};
+
+    /// The 2026-07-29 incident's pair, already named in `arb_core`'s own
+    /// crossed-book fixtures. The qty is sized so that the $150
+    /// per-relationship cap is the thing that answers; it is not the live one.
+    const REL: &str = "xvus-fedcut-26-usfed-2026-cut";
+    const KMKT: &str = "KXRATECUT-26DEC31";
+    const MAKER: &str = "t1785282065001";
+
+    fn mint(qty: i64) -> String {
+        format!(
+            r#"{{"anchor_price":"0.1080","hedge_needed":"{KMKT}","order_id":"{MAKER}","qty":{qty},"ts":1785300830.6798358}}"#
+        )
+    }
+
+    /// The basket `book_basket` writes once the hedge finally fills, with leg 1
+    /// naming the maker order the obligation was minted from.
+    fn basket(qty: i64) -> serde_json::Value {
+        serde_json::from_str(&format!(
+            r#"{{"ts":1.0,"relationship_id":"{REL}","qty":{qty},"status":"open","legs":[
+                 {{"venue":"polymarket_us","market_id":"P","qty":{qty},"order_id":"{MAKER}"}},
+                 {{"venue":"kalshi","market_id":"{KMKT}","qty":{qty}}}]}}"#
+        ))
+        .expect("fixture")
+    }
+
+    /// A scratch dir per TEST, not per process: these run in parallel and each
+    /// removes its own on the way out.
+    fn dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("arb-undischarged-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("exec.yaml"), "bankroll_usd: 980\nper_class_cap: 0.35\n")
+            .unwrap();
+        d
+    }
+
+    /// A fresh risk view, as `build_risk_view` makes one: $980 bankroll, both
+    /// venues funded, this relationship classified `low` (so the per-rel cap is
+    /// the full $150).
+    fn view(d: &std::path::Path) -> risk::RiskView {
+        risk::RiskView::load(
+            d.join("exec.yaml").to_str().unwrap(),
+            "/nonexistent/topics.yaml",
+            vec![
+                ("kalshi".to_string(), "1000".to_string()),
+                ("polymarket_us".to_string(), "1000".to_string()),
+            ],
+            HashMap::from([(REL.to_string(), "low".to_string())]),
+        )
+    }
+
+    fn rel() -> Rel {
+        Rel {
+            id: REL.into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: KMKT.into() },
+                RelLeg { venue: Venue::PolymarketUs, market_id: "P".into() },
+            ],
+        }
+    }
+
+    /// What `registry_class_of` builds from the FULL registry: the hedge
+    /// market's relationship and its class.
+    fn class_of() -> HashMap<String, (String, String)> {
+        HashMap::from([(
+            KMKT.to_string(),
+            (REL.to_string(), "cross-venue-equivalent".to_string()),
+        )])
+    }
+
+    /// THE DEFECT. The obligation is 148 contracts against a $150 cap, so a
+    /// clip of 5 must be refused — and was allowed, because the census reached
+    /// a gauge and not the gate.
+    #[test]
+    fn an_undischarged_obligation_does_not_re_authorise_the_per_rel_cap() {
+        let d = dir("no-reauth");
+        let found = orphan::undischarged(&mint(148), vec![]);
+        assert_eq!(found.len(), 1, "the census still finds it");
+        assert_eq!(found[0].missing(), 148);
+
+        // Unseeded — the state every restart came up in.
+        let flat = view(&d);
+        assert!(
+            flat.check(&rel(), Venue::Kalshi, 5, None).allowed,
+            "an unseeded view believes the relationship is flat"
+        );
+
+        let v = view(&d);
+        seed_exposure_from_census(&v, &found, &class_of());
+        assert_eq!(v.open_ct(REL), 148.0, "the leg is real at the venue");
+        let dec = v.check(&rel(), Venue::Kalshi, 5, None);
+        assert!(!dec.allowed, "148 open against a 150 cap leaves no room for 5");
+        assert!(
+            dec.reasons.iter().any(|r| r.contains("per-relationship")),
+            "{:?}",
+            dec.reasons
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// NO DOUBLE COUNT, and it is structural rather than careful: `missing()`
+    /// is `owed - booked`, and `booked` is the ledger's own record — the one
+    /// `seed_exposure_from_ledger` has already seeded from. The moment
+    /// `arbbot-hedge.timer` completes the hedge and a basket is appended, the
+    /// census reads 0 and seeds nothing, so the same contracts move from this
+    /// seed to the ledger seed without ever being in both.
+    #[test]
+    fn a_booked_obligation_is_seeded_by_the_ledger_and_not_again_here() {
+        let d = dir("booked-once");
+        let ledger = vec![basket(148)];
+        assert_eq!(
+            crate::ledger::open_exposure(ledger.clone()).get(REL),
+            Some(&148.0),
+            "the ledger seed carries it once the hedge fills"
+        );
+        let found = orphan::undischarged(&mint(148), ledger);
+        assert!(found.is_empty(), "and the census then finds nothing to add");
+
+        let v = view(&d);
+        seed_exposure_from_census(&v, &found, &class_of());
+        assert_eq!(v.open_ct(REL), 0.0, "nothing may be counted twice");
+
+        // ...and a PARTIAL booking seeds only the remainder.
+        let part = orphan::undischarged(&mint(148), vec![basket(100)]);
+        let v = view(&d);
+        seed_exposure_from_census(&v, &part, &class_of());
+        assert_eq!(v.open_ct(REL), 48.0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ...AND THAT HOLDS FOR THE PROCESS THAT ACTUALLY DISCHARGES THESE.
+    ///
+    /// `book_basket` stamps leg 1 with its maker order id, but this engine does
+    /// not complete these obligations — `arbbot-hedge.timer` does, from venue
+    /// truth, and `scripts/hedge_naked_legs.py` writes legs with NO `order_id`.
+    /// So the two seeds keyed on different things: `ledger::open_exposure`
+    /// counts the basket under `relationship_id` while the census's `booked`
+    /// found no order to credit, and the SAME contracts were seeded twice
+    /// under the same relationship and the same class. `--out` is append-only
+    /// across restarts, so it repeated on every startup and never healed.
+    ///
+    /// The assertion is the sum of BOTH seeds against the truth, because that
+    /// sum is what the caps are measured on.
+    #[test]
+    fn the_two_seeds_sum_to_the_truth_when_the_python_timer_completes_the_hedge() {
+        let d = dir("python-timer");
+        // The timer's own record shape: no `order_id` on either leg.
+        let hedged: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"ts":1785300900.0,"relationship_id":"{REL}","title":"{REL} (naked-leg hedge)",
+                 "qty":148,"strategy":"take-take","status":"open","legs":[
+                 {{"venue":"kalshi","market_id":"{KMKT}","side":"yes","role":"taker",
+                   "qty":148,"yes_price":"0.11"}},
+                 {{"venue":"polymarket_us","market_id":"P","side":"no","role":"taker",
+                   "qty":148,"yes_price":"0.86"}}]}}"#
+        ))
+        .expect("fixture");
+
+        // Seed 1: the ledger, keyed on relationship_id.
+        let ledger_open = crate::ledger::open_exposure(vec![hedged.clone()]);
+        assert_eq!(ledger_open.get(REL), Some(&148.0));
+
+        // Seed 2: the census. The basket is younger than the obligation and
+        // names its hedge market, so it discharges it.
+        let found = orphan::undischarged(&mint(148), vec![hedged]);
+        assert!(found.is_empty(), "the timer completed it");
+
+        let v = view(&d);
+        v.record_open(REL, "cross-venue-equivalent", ledger_open[REL]);
+        seed_exposure_from_census(&v, &found, &class_of());
+        assert_eq!(
+            v.open_ct(REL),
+            148.0,
+            "148 contracts exist; seeding 296 is a phantom that repeats every startup"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// THE WINDOW between two reads, which is why there is now only one.
+    ///
+    /// `startup_sweep`'s venue round-trip used to sit between the ledger read
+    /// and the census read, and `arbbot-hedge.timer` appends every 5 minutes. A
+    /// completing basket landing in that window is seen by NEITHER seed: the
+    /// ledger read already happened so it books nothing, and the census read
+    /// does see it, so `draw_down` discharges the obligation and `missing()` is
+    /// 0. What this pins is the ARITHMETIC of that loss — the structural
+    /// guarantee is the shared `&LedgerRead` both seeds now take, which is the
+    /// compiler's job rather than a test's.
+    #[test]
+    fn two_snapshots_lose_the_basket_that_lands_between_them() {
+        let d = dir("split-read");
+        let hedged: serde_json::Value = serde_json::from_str(&format!(
+            r#"{{"ts":1785300900.0,"relationship_id":"{REL}","qty":148,"status":"open",
+                 "legs":[{{"venue":"kalshi","market_id":"{KMKT}","qty":148}},
+                         {{"venue":"polymarket_us","market_id":"P","qty":148}}]}}"#
+        ))
+        .expect("fixture");
+
+        // TWO snapshots: the ledger seed reads before the append, the census
+        // reads after it.
+        let v = view(&d);
+        for (rel, q) in crate::ledger::open_exposure(vec![]) {
+            v.record_open(&rel, "cross-venue-equivalent", q);
+        }
+        let after = orphan::undischarged(&mint(148), vec![hedged.clone()]);
+        seed_exposure_from_census(&v, &after, &class_of());
+        assert_eq!(
+            v.open_ct(REL),
+            0.0,
+            "the window: the ledger seed missed the basket and the census \
+             discharged the obligation against it, so neither carries the contracts"
+        );
+
+        // ONE snapshot, both seeds — whichever side of the append it falls.
+        for snapshot in [vec![], vec![hedged]] {
+            let v = view(&d);
+            for (rel, q) in crate::ledger::open_exposure(snapshot.clone()) {
+                v.record_open(&rel, "cross-venue-equivalent", q);
+            }
+            let found = orphan::undischarged(&mint(148), snapshot);
+            seed_exposure_from_census(&v, &found, &class_of());
+            assert_eq!(v.open_ct(REL), 148.0, "the contracts are real either way");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// An obligation on a market this run does not quote has no relationship id
+    /// here at all — it is outside `--rel-prefix`. `seed_exposure_from_ledger`'s
+    /// rule applies: what cannot be classified is booked under `unknown`, which
+    /// counts toward the GLOBAL cap without inflating a class cap it may not
+    /// belong to.
+    #[test]
+    fn an_obligation_outside_this_run_still_counts_toward_the_global_cap() {
+        let d = dir("outside-run");
+        // 450 against the $490 global cap (980 x 0.50) leaves room for 40.
+        let found = orphan::undischarged(&mint(450), vec![]);
+        let v = view(&d);
+        seed_exposure_from_census(&v, &found, &HashMap::new());
+        assert_eq!(v.open_ct(&format!("unknown:{KMKT}")), 450.0);
+
+        let dec = v.check(&rel(), Venue::Kalshi, 50, None);
+        assert!(!dec.allowed, "450 + 50 > 490");
+        assert!(dec.reasons.iter().any(|r| r.contains("global cap")), "{:?}", dec.reasons);
+        assert!(
+            !dec.reasons.iter().any(|r| r.contains("class cap")),
+            "an unclassifiable id must not inflate a class cap it may not belong to: {:?}",
+            dec.reasons
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

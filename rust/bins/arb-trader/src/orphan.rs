@@ -25,6 +25,16 @@
 //!   undischarged  = owed - booked   > 0
 //! ```
 //!
+//! ...with ONE addition, because the join has a blind spot with a live writer
+//! in it. `book_basket` always stamps leg 1 with the maker order id, but the
+//! process that actually completes these obligations is not this one:
+//! `scripts/hedge_naked_legs.py` (arbbot-hedge.timer, every 5 minutes) writes
+//! legs carrying no `order_id` at all. Its baskets are the discharge and the
+//! join cannot see them. So a basket naming no order on any leg is credited
+//! against the obligation's HEDGE MARKET instead, bounded by its own `qty` and
+//! by the obligation being OLDER than it — see `draw_down`, which also explains
+//! why leaving this out was not the conservative choice it looks like.
+//!
 //! That join is why this module reads no venue at all, and it is worth being
 //! explicit about what that buys, because the alternative — differencing venue
 //! positions against the ledger — fails on all four counts:
@@ -117,17 +127,58 @@ pub fn undischarged(intents: &str, ledger: Vec<Value>) -> Vec<Undischarged> {
     // position that was hedged; the hedge still happened. Netting it out here
     // would resurrect every closed basket as an orphan.
     let mut booked: BTreeMap<String, i64> = BTreeMap::new();
+    let mut unjoined: Vec<Unjoined> = Vec::new();
     for r in &ledger {
         if r.get("status").and_then(|v| v.as_str()) != Some("open") {
             continue;
         }
-        let qty = r.get("qty").and_then(|v| v.as_i64()).unwrap_or(0);
-        for leg in r.get("legs").and_then(|v| v.as_array()).into_iter().flatten() {
+        // Read as f64 and truncate, because `ledger::open_exposure` reads this
+        // same field with `f64_of` — and `as_i64()` answers None to a JSON
+        // `2.0`. A float `qty` would then be seeded by the ledger while
+        // producing neither a `booked` credit nor an `unjoined` entry here,
+        // which is the double count this whole path exists to close, reopened
+        // by a type.
+        //
+        // The field is NOT integer-typed in this file, whatever the records
+        // that happen to exist today look like: `settle_baskets.py` writes
+        // `float(t.get("qty", 0))` and its records are already there. They are
+        // `status: "unwound"`, so they reach neither this collection nor
+        // `open_exposure`'s open sum, and no writer emits a float `qty` on an
+        // OPEN basket right now — so this is latent rather than live. What is
+        // not latent is the divergence: two readers of one field disagreeing
+        // about its type is a defect whoever writes the next record, and the
+        // ledger's own reader is the one to match.
+        //
+        // Truncation errs toward a smaller credit, i.e. toward reporting
+        // exposure rather than hiding it — the same FLOOR rule #42 established
+        // for Kalshi's fractional fill counts, and for the same reason: a total
+        // that can only understate what was discharged can only over-report
+        // what is still naked.
+        let qty = r.get("qty").and_then(|v| v.as_f64()).unwrap_or(0.0) as i64;
+        let legs: Vec<&Value> =
+            r.get("legs").and_then(|v| v.as_array()).into_iter().flatten().collect();
+        let mut names_an_order = false;
+        for leg in &legs {
             if let Some(oid) = leg.get("order_id").and_then(|v| v.as_str()) {
                 *booked.entry(oid.to_string()).or_default() += qty;
+                names_an_order = true;
             }
         }
+        if !names_an_order && qty > 0 {
+            unjoined.push(Unjoined {
+                ts: r.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                markets: legs
+                    .iter()
+                    .filter_map(|l| l.get("market_id").and_then(|v| v.as_str()))
+                    .map(str::to_string)
+                    .collect(),
+                left: qty,
+            });
+        }
     }
+    // Oldest first, so the drawdown below is a deterministic function of the
+    // file rather than of its ordering.
+    unjoined.sort_by(|a, b| a.ts.total_cmp(&b.ts));
 
     let mut owed: BTreeMap<String, Undischarged> = BTreeMap::new();
     for l in intents.lines() {
@@ -141,7 +192,21 @@ pub fn undischarged(intents: &str, ledger: Vec<Value>) -> Vec<Undischarged> {
             continue;
         };
         let anchor = v.get("anchor_price").and_then(|x| x.as_str()).unwrap_or_default();
-        let ts = v.get("ts").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        // UNDATED IS `INFINITY`, NOT ZERO, AND THE SIGN OF THAT DEFAULT IS THE
+        // WHOLE SAFETY RULE. `draw_down` refuses a basket OLDER than the
+        // obligation (`b.ts < first_ts`), so on the basket side `unwrap_or(0.0)`
+        // fails closed — an undated basket is never eligible. The identical
+        // default here INVERTS it: `first_ts = 0.0` makes every real basket
+        // newer, so every unjoined basket on that market becomes eligible, the
+        // obligation is fully credited, and `retain` below drops it — silently
+        // adopting a naked leg with no report line at all. `serde_json`
+        // serialises a non-finite `f64` as `null`, which is one way in, so the
+        // filter is on usability and not just presence.
+        let ts = v
+            .get("ts")
+            .and_then(|x| x.as_f64())
+            .filter(|f| f.is_finite())
+            .unwrap_or(f64::INFINITY);
         let e = owed.entry(oid.to_string()).or_insert_with(|| Undischarged {
             maker_order_id: oid.to_string(),
             hedge_market: market.to_string(),
@@ -160,12 +225,102 @@ pub fn undischarged(intents: &str, ledger: Vec<Value>) -> Vec<Undischarged> {
             u.booked = booked.get(&u.maker_order_id).copied().unwrap_or(0);
             u
         })
-        .filter(|u| u.missing() > 0)
         .collect();
     // Oldest first: the longest-naked leg is the one to read about first. The
-    // map is already ordered by id, so ties are still deterministic.
+    // map is already ordered by id and `sort_by` is stable, so ties are still
+    // deterministic — which the drawdown below depends on.
     out.sort_by(|a, b| a.first_ts.total_cmp(&b.first_ts));
+    for u in out.iter_mut() {
+        u.booked += draw_down(&mut unjoined, &u.hedge_market, u.first_ts, u.missing());
+    }
+    out.retain(|u| u.missing() > 0);
     out
+}
+
+/// An open basket that names NO maker order on any leg, and so cannot be joined
+/// by the identity this module is built on.
+///
+/// There is a live writer of exactly these, and it is the one that DISCHARGES
+/// the obligations counted here: `scripts/hedge_naked_legs.py` completes naked
+/// legs from venue truth every 5 minutes (`arbbot-hedge.timer`, enabled) and
+/// emits legs carrying only venue/market_id/side/role/qty/yes_price. The Rust
+/// `book_basket` always stamps leg 1 with its maker order id, so "no leg names
+/// an order" is precisely "this engine did not book it".
+struct Unjoined {
+    ts: f64,
+    /// Both legs' markets. The obligation is owed on ONE of them and the record
+    /// does not say which, so either may match — but `left` is shared, so one
+    /// basket can never discharge more than its own `qty`.
+    markets: Vec<String>,
+    left: i64,
+}
+
+/// Contracts an unjoined basket can be said to have discharged for an
+/// obligation on `market` minted at `first_ts`, up to `need`.
+///
+/// WHY THIS EXISTS. `main.rs` seeds the census into the risk view, and
+/// `seed_exposure_from_ledger` seeds `ledger::open_exposure` — which keys on
+/// `relationship_id` (ledger.rs) while `booked` above keys on a LEG's
+/// `order_id`. For a basket carrying no leg `order_id` the two disagree: the
+/// ledger seed counts it, `booked` does not, so `missing()` stays at the full
+/// amount and the SAME contracts are seeded twice, under the same relationship
+/// and the same class. `--out` is append-only across restarts, so that phantom
+/// never self-heals and repeats on every startup — a monotone overstatement
+/// against a class cap that is already close to its ceiling.
+///
+/// WHY THE TIME BOUND IS THE DISCRIMINATOR. A basket written BEFORE an
+/// obligation was minted cannot have discharged it — that is physics, not a
+/// heuristic — and it is what keeps this from crediting the historical Python
+/// baskets against a Rust obligation on the same market. They are about half of
+/// today's open records, counted AFTER `apply_corrections` because that is the
+/// only population this function ever sees; only a small minority of them are
+/// naked-leg-hedge records, and the rest predate the Rust engine's obligations
+/// on the same markets. (Counts omitted: the ledger lives under the gitignored
+/// `data/` and this repository is public.)
+///
+/// Simulated against the live intent tape and ledger, this credits NOTHING
+/// today — no unjoined basket even names an obligation's hedge market — so the
+/// bound is not currently load-bearing. It exists for the writer that will.
+///
+/// Going forward the population is narrower still. Of the enabled timers,
+/// `arbbot-hedge.timer` is the only writer of a NEW unjoined `open` basket, and
+/// completing these obligations is its entire job. `arbbot-settle.timer` is
+/// also enabled and also writes this file, but `scripts/settle_baskets.py`
+/// emits `unwound` closing records, which the `status == "open"` filter above
+/// never collects. `arbbot-taketake.timer`, `arbbot-unwind.timer` and every
+/// Python trader unit are disabled.
+///
+/// A basket later UNWOUND is still offered here, deliberately and on the same
+/// rule as `booked`: unwinding closes a position that was hedged, and the hedge
+/// still happened. It costs nothing — `open_exposure` already nets that basket
+/// to zero, so crediting the obligation against it leaves both seeds at zero,
+/// which is the truth for a closed position.
+///
+/// The remaining error modes, both bounded:
+///   * OVER-crediting — silencing a naked leg — needs an unjoined basket on the
+///     same market, written after the mint, that is not the discharge.
+///   * UNDER-crediting, from the oldest-first greedy: where two obligations on
+///     one market are both eligible, the older takes the basket even if the
+///     newer is what it discharged. The newer is then reported naked and
+///     seeded. Deterministic and bounded by the basket's `qty`, and it errs
+///     toward reporting exposure rather than hiding it.
+///
+/// Doing nothing was not the safe alternative it looks like: it reports a
+/// completed basket as naked forever AND double counts its capital forever.
+fn draw_down(unjoined: &mut [Unjoined], market: &str, first_ts: f64, need: i64) -> i64 {
+    let mut taken = 0;
+    for b in unjoined.iter_mut() {
+        if taken >= need {
+            break;
+        }
+        if b.left <= 0 || b.ts < first_ts || !b.markets.iter().any(|m| m == market) {
+            continue;
+        }
+        let take = (need - taken).min(b.left);
+        b.left -= take;
+        taken += take;
+    }
+    taken
 }
 
 /// What to print. A pure function of the census so the wording — which is the
@@ -192,9 +347,18 @@ pub fn report(
                      process could not hedge even if it were allowed to"
                 .to_string(),
         };
+        // An obligation whose `ts` was unusable carries `INFINITY` (see
+        // `undischarged`), which is what keeps it out of the drawdown. Saying
+        // "0 minutes ago" for it would read as "just now", which is the one
+        // thing it definitely is not.
+        let age = if o.first_ts.is_finite() {
+            format!("{:.0} minutes ago", ((now - o.first_ts) / 60.0).max(0.0))
+        } else {
+            "at an unreadable time (no usable `ts` on the mint)".to_string()
+        };
         out.push(format!(
             "[hedge] UNDISCHARGED FROM A PREVIOUS RUN: {}x {} {where_} — obligation(s) \
-             minted by order {} (owed {}, booked {}) at anchor {}, {:.0} minutes ago. \
+             minted by order {} (owed {}, booked {}) at anchor {}, {age}. \
              The other leg is REAL at the venue and this basket is NOT complete.",
             o.missing(),
             o.hedge_market,
@@ -202,7 +366,6 @@ pub fn report(
             o.owed,
             o.booked,
             o.anchor_price,
-            ((now - o.first_ts) / 60.0).max(0.0),
         ));
     }
     // Said once, after the list: the reason is the same for all of them, and a
@@ -387,5 +550,139 @@ mod tests {
     #[test]
     fn a_clean_start_is_silent() {
         assert!(report(&[], &BTreeMap::new(), 0.0).is_empty());
+    }
+
+    // ---- the writer that discharges these obligations names no order id ----
+
+    /// A basket exactly as `scripts/hedge_naked_legs.py` writes it: legs
+    /// carrying venue/market_id/side/role/qty/yes_price and no `order_id`.
+    fn python_hedge(ts: f64, qty: i64, kalshi: &str) -> Value {
+        v(&format!(
+            r#"{{"ts":{ts},"relationship_id":"r1","title":"r1 (naked-leg hedge)",
+                 "qty":{qty},"strategy":"take-take","status":"open","legs":[
+                 {{"venue":"kalshi","market_id":"{kalshi}","side":"yes","role":"taker",
+                   "qty":{qty},"yes_price":"0.11"}},
+                 {{"venue":"polymarket_us","market_id":"P","side":"no","role":"taker",
+                   "qty":{qty},"yes_price":"0.86"}}]}}"#
+        ))
+    }
+
+    /// THE DEFECT the `order_id` join could not see. `arbbot-hedge.timer` owns
+    /// naked-leg completion — this module's own startup banner says so — and it
+    /// writes no leg `order_id`, so `booked` stayed 0 while
+    /// `ledger::open_exposure` (which keys on `relationship_id`) counted the
+    /// basket. The obligation was reported naked forever, and `main.rs` seeded
+    /// the same contracts a second time on every startup.
+    #[test]
+    fn a_basket_that_names_no_maker_order_still_discharges_the_obligation() {
+        let mint = r#"{"anchor_price":"0.04","hedge_needed":"K","order_id":"m1","qty":5,"ts":10.0}"#;
+        assert_eq!(undischarged(mint, vec![]).len(), 1, "naked while nothing has hedged it");
+        assert!(
+            undischarged(mint, vec![python_hedge(20.0, 5, "K")]).is_empty(),
+            "the timer completed it; the ledger seed already carries those contracts"
+        );
+    }
+
+    /// ...and only the REMAINDER survives a partial completion, exactly as a
+    /// partial `order_id` booking does.
+    #[test]
+    fn a_partial_unjoined_booking_leaves_only_the_remainder() {
+        let mint = r#"{"anchor_price":"0.04","hedge_needed":"K","order_id":"m1","qty":5,"ts":10.0}"#;
+        let got = undischarged(mint, vec![python_hedge(20.0, 2, "K")]);
+        assert_eq!((got[0].owed, got[0].booked, got[0].missing()), (5, 2, 3));
+    }
+
+    /// THE BOUND that keeps this from crediting history. A basket written
+    /// BEFORE the obligation was minted cannot have discharged it — and open
+    /// baskets with no leg `order_id` dominate the live ledger, only a small
+    /// minority of them naked-leg-hedge records. The rest predate the Rust
+    /// engine's obligations on the same markets. Crediting one would silence a
+    /// genuinely naked leg, which is the false adoption this module's header
+    /// exists to refuse.
+    #[test]
+    fn a_basket_written_before_the_obligation_cannot_have_discharged_it() {
+        let mint = r#"{"anchor_price":"0.04","hedge_needed":"K","order_id":"m1","qty":5,"ts":10.0}"#;
+        let got = undischarged(mint, vec![python_hedge(5.0, 5, "K")]);
+        assert_eq!(got.len(), 1, "an older basket is somebody else's position");
+        assert_eq!(got[0].missing(), 5);
+    }
+
+    /// ...AND THE DEFAULT FOR AN UNDATED OBLIGATION MUST FAIL THE SAME WAY.
+    ///
+    /// The basket side defaults an unreadable `ts` to 0.0, which fails CLOSED —
+    /// `b.ts < first_ts` holds, so it is never eligible. The identical default
+    /// on the OBLIGATION side inverts the rule: `first_ts = 0.0` makes every
+    /// real basket newer, so every unjoined basket on that market becomes
+    /// eligible, the obligation is fully credited, and `retain` drops it — a
+    /// naked leg adopted in silence, with no report line at all. `INFINITY` is
+    /// the default that keeps the sign of the comparison honest.
+    #[test]
+    fn an_obligation_with_no_usable_timestamp_is_never_credited_away() {
+        for bad_ts in ["null", "\"nope\""] {
+            let mint = format!(
+                r#"{{"anchor_price":"0.04","hedge_needed":"K","order_id":"m1","qty":5,"ts":{bad_ts}}}"#
+            );
+            let got = undischarged(&mint, vec![python_hedge(20.0, 5, "K")]);
+            assert_eq!(got.len(), 1, "ts {bad_ts} silently adopted a naked leg");
+            assert_eq!(got[0].missing(), 5);
+            // ...and it says the age is unknown rather than claiming "0 minutes
+            // ago", which would read as "this just happened".
+            let lines = report(&got, &BTreeMap::new(), 1e9);
+            assert!(lines[0].contains("unreadable time"), "{}", lines[0]);
+        }
+    }
+
+    /// A basket whose `qty` is a JSON float is still a basket. `as_i64()`
+    /// answers None to `2.0` while `ledger::open_exposure` reads the same field
+    /// as an f64 — so the ledger would seed those contracts while this path
+    /// credited nothing, which is the double count reopened by a type.
+    /// `settle_baskets.py` already writes a float `qty`, so the field is not
+    /// integer-typed in this file; its records are `unwound`, which is why no
+    /// OPEN basket trips this today. Two readers of one field must agree about
+    /// its type regardless of which records happen to exist.
+    #[test]
+    fn a_float_qty_basket_is_read_the_same_way_the_ledger_reads_it() {
+        let mint = r#"{"anchor_price":"0.04","hedge_needed":"K","order_id":"m1","qty":5,"ts":10.0}"#;
+        let float_qty = v(
+            r#"{"ts":20.0,"relationship_id":"r1","qty":5.0,"status":"open","legs":[
+                 {"venue":"kalshi","market_id":"K","qty":5.0},
+                 {"venue":"polymarket_us","market_id":"P","qty":5.0}]}"#,
+        );
+        assert_eq!(
+            crate::ledger::open_exposure(vec![float_qty.clone()]).get("r1"),
+            Some(&5.0),
+            "the ledger seed counts it"
+        );
+        assert!(undischarged(mint, vec![float_qty]).is_empty(), "so this must too");
+    }
+
+    /// ...and a basket on a DIFFERENT market never matches, however recent.
+    #[test]
+    fn an_unjoined_basket_on_another_market_is_not_this_obligations_hedge() {
+        let mint = r#"{"anchor_price":"0.04","hedge_needed":"K","order_id":"m1","qty":5,"ts":10.0}"#;
+        let got = undischarged(mint, vec![python_hedge(20.0, 5, "OTHER")]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].missing(), 5);
+    }
+
+    /// ONE basket discharges at most its own `qty`, however many obligations
+    /// could match it. The record names BOTH legs' markets and does not say
+    /// which one the hedge was owed on, so either may match — the shared budget
+    /// is what stops a 5-lot basket from clearing 10 contracts of obligation.
+    #[test]
+    fn one_unjoined_basket_cannot_discharge_more_than_it_bought() {
+        let mints = concat!(
+            r#"{"anchor_price":"0.04","hedge_needed":"K","order_id":"m1","qty":5,"ts":10.0}"#,
+            "\n",
+            // the other leg of the same relationship, owed the other way
+            r#"{"anchor_price":"0.86","hedge_needed":"P","order_id":"m2","qty":5,"ts":11.0}"#,
+        );
+        let got = undischarged(mints, vec![python_hedge(20.0, 5, "K")]);
+        assert_eq!(got.len(), 1, "one of the two is discharged, not both");
+        assert_eq!(
+            (got[0].maker_order_id.as_str(), got[0].missing()),
+            ("m2", 5),
+            "and the OLDER obligation is credited first, deterministically"
+        );
     }
 }

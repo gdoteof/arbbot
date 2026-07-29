@@ -87,11 +87,17 @@ pub struct RunCfg {
     /// log-based monitor would say NOT TRADING while it placed real orders.
     pub armed: bool,
     /// Contracts this unit's PREVIOUS run owed a hedge for and never booked,
-    /// counted at startup by `orphan::undischarged`. Carried only to be
-    /// reported: the standing gauge is the half of that census a monitor sees,
-    /// and it is what makes `hedges_pending: 0` honest after a restart that
-    /// forgot an obligation (2026-07-29 01:34). The engine never acts on it —
-    /// `orphan` documents why the second hedger would be a double hedge.
+    /// counted at startup by `orphan::undischarged`. Carried to be REPORTED:
+    /// the standing gauge is the half of that census a monitor sees, and it is
+    /// what makes `hedges_pending: 0` honest after a restart that forgot an
+    /// obligation (2026-07-29 01:34). The engine never HEDGES it — `orphan`
+    /// documents why the second hedger would be a double hedge.
+    ///
+    /// It is no longer the only thing done with the census: those contracts are
+    /// also seeded into `risk` at startup (`seed_exposure_from_census`), because
+    /// a leg that is real at the venue is exposure whatever the ledger says.
+    /// While this field WAS the only consumer, a restart re-authorised the full
+    /// per-relationship cap on top of an unhedged position.
     pub hedges_undischarged: u64,
 }
 
@@ -779,6 +785,12 @@ impl Engine {
             "maker_apr_bar": self.apr_bar,
             "risk_allowed": self.cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
             "risk_rejected": self.cfg.risk.as_ref().map(|r| r.stats().1).unwrap_or(0),
+            // Contracts held against the caps by quotes that are RESTING and
+            // have not filled. The caps refuse on this number, so without it
+            // they refuse on invisible state: it should track the resting book
+            // and come back down: one that only ever rises is a reservation
+            // leak, which ratchets the caps shut and stops all trading.
+            "risk_reserved": self.cfg.risk.as_ref().map(|r| r.reserved_ct()).unwrap_or(0.0),
             // Cancels the engine has DECIDED and the venue has not yet
             // confirmed: waiting on an ack to become addressable, on the wire,
             // or refused and due for a retry. Healthy is 0, or a transient
@@ -1173,7 +1185,20 @@ impl Engine {
                 // two-venue relationship reserves both whichever leg
                 // leads (risk.rs) — but the refusal reason should
                 // name the leg we were about to send first.
-                let v = rv.check(&quoters[qi].rel, c.lead, c.size);
+                //
+                // `rests_on: None` — leg 1 is a marketable IOC, so it does
+                // not rest and reserves nothing. Nothing would ever release a
+                // reservation for it: an IOC that does not fill dies at the
+                // venue and produces no cancel, and reserving would COLLIDE
+                // with the maker quote on the same leg, which shares the slot
+                // key (see `MakerOrder::rested`).
+                //
+                // The window between this check and the fill that books it is
+                // therefore still unreserved. `tt_gate` narrows it PER
+                // RELATIONSHIP only — it stops the same crossing re-firing on
+                // every book event, and does nothing about N relationships
+                // each firing one clip against the same unmoved exposure.
+                let v = rv.check(&quoters[qi].rel, c.lead, c.size, None);
                 if !v.allowed {
                     eprintln!(
                         "[take-take] REFUSED {} x{} apr={:.0}%/yr — {}",
