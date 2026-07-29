@@ -883,11 +883,22 @@ impl Engine {
             // posture the reconciliation exists to end.
             "kalshi_reconcile_failures": crate::fills::kalshi_reconcile_failures(),
             // ...and orders whose venue rows were REFUSED because merging them
-            // would have exceeded the venue's own total for the window. Must
-            // stay 0. A transient count is the REST list lagging the socket; a
-            // number that climbs with the fill rate means WS and REST
-            // trade_ids are different id spaces, which makes the whole
-            // reconciliation inert (see `fills::kalshi_reconcile_rejected`).
+            // would have exceeded the venue's own total for the window.
+            //
+            // NOT a must-stay-0 gauge, unlike the two above. The reconciliation
+            // runs immediately after resubscribe — exactly when a post-gap
+            // burst is landing — and Kalshi is not read-your-writes, so an
+            // order the socket has counted ahead of the REST list is refused
+            // and retried. On a busy account that is expected.
+            //
+            // This number alone cannot say whether the cause is that lag or the
+            // one that matters (WS and REST `trade_id` being different id
+            // spaces). Nothing derivable from a count can: see
+            // `fills::kalshi_reconcile_rejected` for two earlier claims here
+            // that were wrong in both directions. The discriminant is the
+            // ORDER ID in the `[fills] kalshi reconcile REFUSED` log line —
+            // under a mismatch the same id repeats on every reconcile for the
+            // life of the process, under lag it merges once REST catches up.
             "kalshi_reconcile_rejected": crate::fills::kalshi_reconcile_rejected(),
             "would_place": self.exec_stats.placed.load(std::sync::atomic::Ordering::Relaxed),
             "would_cancel": self.exec_stats.cancelled.load(std::sync::atomic::Ordering::Relaxed),

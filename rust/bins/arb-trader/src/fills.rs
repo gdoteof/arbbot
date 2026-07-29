@@ -370,16 +370,40 @@ pub fn kalshi_reconcile_failures() -> u64 {
 /// the same response, which is to merge nothing for that order and try again on
 /// the next reconnect.
 ///
-/// THIS GAUGE CANNOT TELL THE TWO APART, and an earlier version of this comment
-/// claimed it could ("lag is transient, a mismatch climbs with the fill rate").
-/// Both climb with the fill rate. The reconciliation fires immediately after
-/// resubscribe, which is exactly when a post-gap burst is landing, so on a busy
-/// account lag-driven rejections are expected rather than alarming. What
-/// separates them is the OTHER gauges: under lag, `kalshi_fills_recovered`
-/// keeps moving, because the orders that were not racing still merge. A run
-/// where rejections climb while recovered stays pinned at zero is the id spaces
-/// differing — and that means this mechanism is inert rather than dangerous,
-/// which is the property it exists to guarantee.
+/// TELLING THE TWO APART IS NOT THIS COUNTER'S JOB, IT IS THE LOG'S. Two
+/// earlier versions of this comment claimed otherwise and both were wrong, so
+/// the retractions are worth keeping: "lag is transient, a mismatch climbs with
+/// the fill rate" is false because BOTH climb with the fill rate — the
+/// reconciliation fires immediately after resubscribe, exactly when a post-gap
+/// burst is landing, so lag-driven rejections are expected on a busy account
+/// rather than alarming. "Under lag `kalshi_fills_recovered` keeps moving" is
+/// false in both directions: recovering nothing is the COMMON case on a healthy
+/// reconnect, so recovered sits at zero under lag too; and under a mismatch it
+/// still MOVES, because an order the socket never saw has `local == 0`, passes
+/// the guard by construction, and merges.
+///
+/// The discriminant that IS true is the ORDER ID in the refusal log below.
+/// `local` never shrinks and the window never advances, so under a mismatch the
+/// guard reduces to `local > 0` and the same order is refused on every
+/// reconcile for the life of the process; the per-reconcile refusal count also
+/// equals the number of orders this process has counted a fill on, not the one
+/// or two that were racing. Under lag the order merges as soon as REST catches
+/// up and its id stops appearing. So: THE SAME ORDER ID REPEATING ACROSS
+/// CONSECUTIVE REFUSALS is the mismatch signature. Evidence, not proof — an
+/// order that is filling continuously could race two reconciles 30s apart —
+/// but it is the only signal here that distinguishes rather than merely counts.
+///
+/// What the guard does and does not contain, stated exactly, because the
+/// tempting summary ("a mismatch makes this inert") is another overclaim: for
+/// an order this process has already counted a fill on, a mismatch is refused
+/// and nothing is double-hedged. For an order with `local == 0` the merge is
+/// CORRECT even under a mismatch — the venue's rows are that order's real fills
+/// and there is nothing local to double them against. The residual is a
+/// mismatch AND a replay together: the socket would redeliver that fill under
+/// an id the merge has not banked, and it would count twice. That needs both
+/// unproven venue behaviours at once, and it is self-detecting afterwards —
+/// `local` is then above venue truth, so the order is refused from the next
+/// reconcile on, which is exactly the signature above.
 static KALSHI_RECONCILE_REJECTED: AtomicU64 = AtomicU64::new(0);
 
 pub fn kalshi_reconcile_rejected() -> u64 {
@@ -636,8 +660,11 @@ impl KalshiFills {
                  take this process to {} hundredths against the venue's own {} for the same \
                  window. Either the REST fill list lags the socket (Kalshi is not \
                  read-your-writes) or WS and REST trade_ids are different id spaces — and the \
-                 second would double-hedge. NOTHING merged for this order; the next reconnect \
-                 retries. kalshi_reconcile_rejected={}",
+                 second would double-hedge. TELL THEM APART BY THIS ORDER ID: under lag it \
+                 merges once REST catches up and stops appearing; under a mismatch the SAME \
+                 id is refused on every reconcile for the life of this process. NOTHING \
+                 merged for this order; the next reconnect retries. \
+                 kalshi_reconcile_rejected={}",
                 self.hundredths.get(*oid).copied().unwrap_or(0)
                     + projected.get(*oid).copied().unwrap_or(0),
                 venue.get(*oid).copied().unwrap_or(0),
