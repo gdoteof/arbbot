@@ -30,6 +30,18 @@ pub const TOXGATE_MAX_AGE: f64 = 120.0;
 /// because the failure it catches is unbounded in the permissive direction.
 pub const TOXGATE_MAX_SKEW: f64 = 5.0;
 
+/// How long a resting quote may want a DIFFERENT price, continuously, while the
+/// risk gate refuses the replacement, before the quote is pulled instead of
+/// frozen. Same clock as `min_requote_s` (the book event's `ts_local_ns` live,
+/// tape time in replay).
+///
+/// 2x `min_requote_s`. The quoter's own unit of "a price that has settled" is
+/// one requote window, so a refusal that outlives TWO of them is not a blip
+/// between a fill and its offset — it is the state of the account. Below that
+/// the old rule holds and the quote stays: a cap refusal is not, on its own,
+/// evidence that the resting price is wrong.
+const CAP_REFUSAL_PULL_S: f64 = 30.0;
+
 /// The research toxicity shadow feed (data/exec/toxgate.json), loaded by the
 /// caller (file I/O stays outside arb-core). Mirrors quoter.py `_toxgate`
 /// EXCEPT that a stale feed (doc ts older than TOXGATE_MAX_AGE vs `now`) no
@@ -189,6 +201,12 @@ pub struct Quoter {
     risk: Option<Arc<dyn RiskGate>>,
     resting: HashMap<(usize, BookSide), RestingQuote>,
     last_quote_ts: HashMap<(usize, BookSide), f64>,
+    /// When this (leg, side) FIRST wanted a price the risk gate would not let it
+    /// post. Set on the refusal, cleared the moment either half stops being
+    /// true — the gate allows again, or the book comes back to the resting
+    /// price. So it measures one continuous run of "mispriced AND refused", and
+    /// nothing else; see [`CAP_REFUSAL_PULL_S`].
+    refused_since: HashMap<(usize, BookSide), f64>,
 }
 
 fn default_meta(cx: &mut Cx) -> MarketMeta {
@@ -207,6 +225,7 @@ impl Quoter {
             risk: None,
             resting: HashMap::new(),
             last_quote_ts: HashMap::new(),
+            refused_since: HashMap::new(),
         }
     }
 
@@ -485,9 +504,9 @@ impl Quoter {
             // Both sides then fall through to `target` None, which is the
             // existing cancel path, and that is deliberate: a book we can no
             // longer trust is a book we cannot leave a quote resting against.
-            // (Contrast the risk gate below, which must NOT cancel — a cap
-            // refusal is a reason not to add exposure, not evidence that the
-            // resting price is wrong.)
+            // (Contrast the risk gate below, which cancels only on DURATION —
+            // a cap refusal is a reason not to add exposure, and on its own is
+            // not evidence that the resting price is wrong.)
             let crossed = self.crossed_reason(books, i);
             if let Some(reason) = &crossed {
                 intents.push(Intent::Skip(intent::Skip { skip: vec![reason.clone()], ts: now }));
@@ -558,6 +577,10 @@ impl Quoter {
                 // hysteresis: exact-match hold (deadband 0)
                 if let Some(curq) = self.resting.get(&key) {
                     if cx.cmp(curq.price, target) == Ordering::Equal {
+                        // The book agrees with what we rest, so this quote is
+                        // not stale whatever risk thinks — the pull clock
+                        // restarts from the next time it drifts.
+                        self.refused_since.remove(&key);
                         continue;
                     }
                 }
@@ -589,12 +612,51 @@ impl Quoter {
                 // existing quote resting instead of pulling a good one to make
                 // room for an order risk will not allow. Emits a `skip` intent
                 // naming the breached caps.
+                //
+                // ...but only for CAP_REFUSAL_PULL_S. Reaching this line means
+                // the quoter wants to MOVE this price (hysteresis and throttle
+                // are both behind us), and a refusal that persists leaves the
+                // old price resting and fillable forever: the refusal never
+                // touches `last_quote_ts`, so every later book event lands here
+                // too. Live, 2026-07-28/29: 354,177 consecutive `class cap`
+                // skips on one armed engine, last place 00:53:50, last cancel
+                // 22:05:00 — eleven hours in which not one quote was pulled,
+                // while a fill on any of them would have taken exposure PAST
+                // the very cap that was refusing every new order, hedged at a
+                // price the resting edge was never computed against.
+                //
+                // "The cap refuses more exposure" and "this resting price is
+                // stale" are different facts. The first is not grounds to
+                // cancel and never becomes so; the second is, and it is what
+                // the duration measures. A cancel is a REDUCTION of exposure,
+                // which no cap has an interest in refusing.
                 if let Some(gate) = &self.risk {
                     let v = gate.check(&self.rel, self.rel.legs[i].venue, self.clip);
                     if !v.allowed {
                         intents.push(Intent::Skip(intent::Skip { skip: v.reasons, ts: now }));
+                        let since = *self.refused_since.entry(key).or_insert(now);
+                        // At most ONE cancel per resting quote: `resting` is
+                        // emptied here and only a place refills it, which needs
+                        // the gate to ALLOW (clearing the clock below) and to
+                        // clear `min_requote_s`. So a jam that never lifts costs
+                        // one cancel per side, not one per book event.
+                        if now - since >= CAP_REFUSAL_PULL_S {
+                            if let Some(curq) = self.resting.remove(&key) {
+                                intents.push(Intent::Cancel(intent::Cancel {
+                                    cancel: leg_market,
+                                    order_id: curq.order_id,
+                                    price: Self::px(cx, curq.price),
+                                    side,
+                                    ts: now,
+                                    venue: leg_venue,
+                                }));
+                                // KEEP last_quote_ts, as the unviable-quote
+                                // cancel above does: re-entry is throttled.
+                            }
+                        }
                         continue;
                     }
+                    self.refused_since.remove(&key);
                 }
                 let mut replaced: Option<(String, String)> = None;
                 if let Some(curq) = self.resting.remove(&key) {
@@ -1030,6 +1092,141 @@ mod risk_gate_tests {
             cancel_on(&intents, "P").is_none(),
             "the resting quote must NOT be pulled: {intents:?}"
         );
+    }
+
+    /// **A cap that stays breached must PULL the quote it has frozen.**
+    ///
+    /// The refusal above `continue`s past the cancel/replace block, and it is
+    /// reached exactly when the quoter has decided the resting price is WRONG
+    /// (hysteresis and throttle are both behind it). Nothing there touches
+    /// `last_quote_ts`, so once the cap is breached every later book event lands
+    /// on the same `continue` and the old price rests forever. Live on the armed
+    /// engine, 2026-07-28/29: 354,177 consecutive `class cap` skips, last place
+    /// 00:53:50, last cancel 22:05:00 — eleven hours, nothing pulled. A
+    /// counterparty hitting one of those quotes buys a basket whose hedge has
+    /// moved, and the fill takes exposure past the cap that was refusing every
+    /// new order.
+    ///
+    /// The first refusal still holds the quote (that is the test below this
+    /// one's job); what changes is that the refusal is no longer allowed to
+    /// hold it indefinitely.
+    #[test]
+    fn a_cap_refusal_that_outlives_the_pull_delay_pulls_the_stale_quote() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        let (roid, rpx) = {
+            let p = place_on(&intents, "P").expect("the entry place");
+            (p.order_id.clone(), p.price.clone())
+        };
+
+        // capital is now fully deployed: the class cap refuses everything
+        q.set_risk(Some(std::sync::Arc::new(Always(false))));
+
+        // the hedge drifts and the resting price stops clearing the edge. The
+        // FIRST refusal could still be a blip between a fill and its offset, so
+        // the quote stays — see the anti-churn test below.
+        intents.clear();
+        pm_bid(&mut bb, "0.34", 2, 130_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        assert!(!skips(&intents).is_empty(), "expected the cap skip: {intents:?}");
+        assert!(
+            cancel_on(&intents, "P").is_none(),
+            "a single refusal must not pull: {intents:?}"
+        );
+
+        // ...the same refusal one pull-delay later is not a blip.
+        intents.clear();
+        pm_bid(&mut bb, "0.34", 3, 160_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 130.0 + CAP_REFUSAL_PULL_S, &mut oid, &mut intents);
+        let c = cancel_on(&intents, "P").expect("the frozen quote must be pulled");
+        assert_eq!(c.order_id, roid, "and it must name the resting order: {intents:?}");
+        assert_eq!(c.price, rpx);
+        assert!(!any_place(&intents), "the cap still refuses a replacement: {intents:?}");
+    }
+
+    /// **The cap refusing MORE exposure is not evidence this price is stale.**
+    ///
+    /// The two facts the old code conflated. The clock the test above runs is a
+    /// clock on being MISPRICED under refusal, so a book that comes back to what
+    /// we rest restarts it: at that moment the quote is exactly the quote the
+    /// quoter would post, and pulling it would be pure churn.
+    #[test]
+    fn a_book_that_agrees_with_the_resting_price_restarts_the_pull_clock() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert!(place_on(&intents, "P").is_some(), "{intents:?}");
+        q.set_risk(Some(std::sync::Arc::new(Always(false))));
+
+        // mispriced and refused: the clock starts here
+        intents.clear();
+        pm_bid(&mut bb, "0.34", 2, 130_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        assert!(cancel_on(&intents, "P").is_none(), "{intents:?}");
+
+        // INSIDE the delay the book returns to the price we rest. The cap is
+        // still refusing, and this quote is still the right one.
+        intents.clear();
+        pm_bid(&mut bb, "0.30", 3, 155_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 155.0, &mut oid, &mut intents);
+        assert!(intents.is_empty(), "a correctly-priced quote is not even asked about: {intents:?}");
+
+        // it drifts away again PAST the original deadline — but this run of
+        // being mispriced is one event old, so the quote stays.
+        intents.clear();
+        pm_bid(&mut bb, "0.34", 4, 165_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 165.0, &mut oid, &mut intents);
+        assert!(
+            cancel_on(&intents, "P").is_none(),
+            "the clock must restart from the new mispricing: {intents:?}"
+        );
+
+        // ...and a full delay from THAT point, it goes.
+        intents.clear();
+        pm_bid(&mut bb, "0.34", 5, 196_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 165.0 + CAP_REFUSAL_PULL_S, &mut oid, &mut intents);
+        assert!(cancel_on(&intents, "P").is_some(), "{intents:?}");
+    }
+
+    /// **THE ANTI-CHURN BOUND: one cancel per resting quote, not one per event.**
+    ///
+    /// Pulling on every book event of a jam is its own failure — the venue sees
+    /// churn and the maker loses queue position permanently. The bound is
+    /// structural rather than a second timer: the pull empties `resting`, and
+    /// only a PLACE refills it, which needs the gate to allow (clearing the
+    /// clock) and to clear `min_requote_s`. So the ceiling under a cap that
+    /// never lifts is exactly one cancel per (leg, side) for the whole jam,
+    /// however many events it spans.
+    ///
+    /// The skips keep coming for all of them: a persistent refusal that produced
+    /// no record is how eleven hours of this went unnoticed.
+    #[test]
+    fn a_cap_that_never_lifts_pulls_a_side_once_and_not_once_per_event() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert!(place_on(&intents, "P").is_some(), "{intents:?}");
+        q.set_risk(Some(std::sync::Arc::new(Always(false))));
+
+        // 500 book events over 5000s of jam, all wanting the same wrong price
+        intents.clear();
+        let n = 500;
+        for k in 0..n {
+            let now = 130.0 + 10.0 * k as f64;
+            pm_bid(&mut bb, "0.34", 2 + k as u64, (now * 1e9) as i64);
+            q.on_book(&mut cx, &fees, &bb, now, &mut oid, &mut intents);
+        }
+        let cancels = intents.iter().filter(|i| matches!(i, Intent::Cancel(_))).count();
+        assert_eq!(cancels, 1, "the jam must cost ONE cancel, not {cancels}");
+        assert!(!any_place(&intents), "and place nothing under the cap: {intents:?}");
+        assert_eq!(skips(&intents).len(), n, "every refusal must still be recorded");
     }
 
     /// An UNVIABLE quote is still cancelled promptly when risk refuses — the
