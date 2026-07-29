@@ -154,10 +154,9 @@ fn main() {
                 books.apply_snapshot(venue, &market_id, bids, asks, seq, ts_local_ns, ts_venue);
             }
             "delta" => {
-                let side = match v.get("side").and_then(|x| x.as_str()) {
-                    Some("bid") => BookSide::Bid,
-                    Some("ask") => BookSide::Ask,
-                    _ => continue,
+                let Some(side) = v.get("side").and_then(|x| x.as_str()).and_then(BookSide::parse)
+                else {
+                    continue;
                 };
                 let (Some(price), Some(size)) = (
                     v.get("price").and_then(|x| x.as_str()),

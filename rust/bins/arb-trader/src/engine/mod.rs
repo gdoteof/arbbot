@@ -405,9 +405,8 @@ impl Engine {
                     // A hedge is never registered: it has no hedge of its
                     // own, and registering it would make its fill mint one.
                     if p.tag != Some(Tag::Hedge) {
-                        let anchor = rel.and_then(|r| {
-                            hedge_anchor(r, &p.place, &p.side, &self.books, p.ts)
-                        });
+                        let anchor =
+                            rel.and_then(|r| hedge_anchor(r, &p.place, p.side, &self.books));
                         self.fills.register_order(&p.order_id, &p.place, p.count, anchor);
                     }
                     if let Some(r) = rel {
@@ -418,7 +417,7 @@ impl Engine {
                                 class: r.rtype.as_str(),
                                 venue: p.venue.as_str().to_string(),
                                 market_id: p.place.clone(),
-                                side: p.side.clone(),
+                                side: p.side,
                                 price: p.price.clone(),
                                 // The intent already carries who emitted
                                 // it; the ledger just has to stop
@@ -623,10 +622,12 @@ impl Engine {
                 }
             }
             "delta" => {
-                let side = match v.get("side").and_then(|x| x.as_str()) {
-                    Some("bid") => BookSide::Bid,
-                    Some("ask") => BookSide::Ask,
-                    _ => return,
+                // THE inbound boundary for a side: an untrusted venue tape
+                // line. Parsed once, here, and a line whose side is neither
+                // spelling is dropped rather than guessed at.
+                let Some(side) = v.get("side").and_then(|x| x.as_str()).and_then(BookSide::parse)
+                else {
+                    return;
                 };
                 let (Some(price), Some(size)) = (
                     v.get("price").and_then(|x| x.as_str()),
@@ -869,7 +870,7 @@ impl Engine {
                 price: c.pmus_bid,
                 replaces: None,
                 retry: None,
-                side: "ask".to_string(),
+                side: BookSide::Ask,
                 tag: Some(Tag::TakeTake),
                 taker: true,
                 ts: now,
@@ -1130,14 +1131,16 @@ mod take_take_wiring_tests {
             None,
         );
         // leg 1 is an ASK-side order on the PM-US market (we sell PM YES)
-        let a = hedge_anchor(&rel, "P", "ask", &books, 1.0).expect("anchor on the other leg");
+        let a = hedge_anchor(&rel, "P", BookSide::Ask, &books).expect("anchor on the other leg");
         assert_eq!(a.venue, Venue::Kalshi, "hedge must be the OTHER leg");
         assert_eq!(a.market_id, "K");
-        assert_eq!(a.side, "ask", "we take Kalshi's ask, i.e. we BUY");
+        assert_eq!(a.side, BookSide::Ask, "we take Kalshi's ask, i.e. we BUY");
         assert_eq!(a.price, "0.04", "at the Kalshi ask the crossing was priced against");
-        // and the engine turns an 'ask' anchor into a bid-side (buy) order
-        let order_side = if a.side == "bid" { "ask" } else { "bid" };
-        assert_eq!(order_side, "bid", "leg 2 must BUY Kalshi");
+        // and the engine turns an 'ask' anchor into a bid-side (buy) order.
+        // Asked of the real `taking_side` rather than of a copy of its rule
+        // written out here — a copy is exactly how the mint path and the retry
+        // path could come to disagree about which way a hedge trades.
+        assert_eq!(super::hedge::taking_side(a.side), BookSide::Bid, "leg 2 must BUY Kalshi");
     }
 }
 

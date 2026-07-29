@@ -13,7 +13,7 @@ use super::{Engine, HedgeRetry};
 use arb_core::book::BookBuilder;
 use arb_core::fill::HedgeAnchor;
 use arb_core::intent::{self, Intent, Tag};
-use arb_core::model::Venue;
+use arb_core::model::{BookSide, Venue};
 use arb_core::scan::{Cx, Rel};
 use std::collections::HashMap;
 
@@ -125,11 +125,13 @@ pub(super) struct PendingHedge {
 /// only if profitable; otherwise find a profitable hedge in the future". The
 /// naked alarm is what keeps waiting from being silent.
 ///
-/// `book_side` is the side of the hedge leg's book we take: "bid" means we are
-/// SELLING into it (worse = lower), "ask" means BUYING from it (worse = higher).
+/// `book_side` is the side of the hedge leg's book we take: `Bid` means we are
+/// SELLING into it (worse = lower), `Ask` means BUYING from it (worse = higher).
+/// It was a `&str`, and the arms below were an `if == "bid"` with the buy case
+/// as the else — so a side that was neither made the budget run the wrong way.
 fn hedge_price_acceptable(
     cx: &mut Cx,
-    book_side: &str,
+    book_side: BookSide,
     touch: &str,
     anchor: &str,
     max_slip: &str,
@@ -137,12 +139,15 @@ fn hedge_price_acceptable(
     let a = cx.parse_exact(anchor);
     let slip = cx.parse_exact(max_slip);
     let t = cx.parse_exact(touch);
-    if book_side == "bid" {
-        let floor = cx.sub(a, slip);
-        cx.cmp(t, floor) != std::cmp::Ordering::Less
-    } else {
-        let ceil = cx.add(a, slip);
-        cx.cmp(t, ceil) != std::cmp::Ordering::Greater
+    match book_side {
+        BookSide::Bid => {
+            let floor = cx.sub(a, slip);
+            cx.cmp(t, floor) != std::cmp::Ordering::Less
+        }
+        BookSide::Ask => {
+            let ceil = cx.add(a, slip);
+            cx.cmp(t, ceil) != std::cmp::Ordering::Greater
+        }
     }
 }
 
@@ -159,7 +164,9 @@ pub(super) struct HedgeOrder {
     pub(super) chain_id: String,
     pub(super) market_id: String,
     pub(super) venue: Venue,
-    pub(super) side: &'static str,
+    /// The ORDER side — what we send — not the book side we take. `taking_side`
+    /// is the only thing that produces one from the other.
+    pub(super) side: BookSide,
     pub(super) price: String,
     pub(super) qty: i64,
     /// Cumulative contracts THIS attempt has been reported filled for. Venue
@@ -171,11 +178,10 @@ pub(super) struct HedgeOrder {
 /// The order side that TAKES `book_side` of the hedge leg's book: taking a bid
 /// means SELLING (an ask-side order), taking an ask means BUYING. Written once
 /// because the mint path and the retry path must never disagree about it.
-pub(super) fn taking_side(book_side: &str) -> &'static str {
-    if book_side == "bid" {
-        "ask"
-    } else {
-        "bid"
+pub(super) fn taking_side(book_side: BookSide) -> BookSide {
+    match book_side {
+        BookSide::Bid => BookSide::Ask,
+        BookSide::Ask => BookSide::Bid,
     }
 }
 
@@ -267,7 +273,7 @@ fn hedge_plan(
     owed: i64,
     filled: i64,
     anchor_price: &str,
-    book_side: &str,
+    book_side: BookSide,
     touch: Option<&str>,
     last_try_at: std::time::Instant,
     now: std::time::Instant,
@@ -332,7 +338,7 @@ fn hedge_plan(
 pub(super) fn first_attempt_acceptable(
     cx: &mut Cx,
     pol: Option<&HedgeRetry>,
-    book_side: &str,
+    book_side: BookSide,
     touch: &str,
     anchor: &str,
 ) -> bool {
@@ -379,25 +385,21 @@ fn naked_alarm_due(
 pub(super) fn hedge_anchor(
     rel: &Rel,
     market_id: &str,
-    side: &str,
+    side: BookSide,
     books: &BookBuilder,
-    ts: f64,
 ) -> Option<HedgeAnchor> {
-    let side: &'static str = match side {
-        "bid" => "bid",
-        "ask" => "ask",
-        _ => return None,
-    };
     let i = rel.legs.iter().position(|l| l.market_id == market_id)?;
     let hedge = rel.legs.get(1 - i)?;
     let book = books.get(hedge.venue, &hedge.market_id).filter(|b| !b.is_crossed())?;
-    let lvl = if side == "bid" { book.bids.first() } else { book.asks.first() }?;
+    let lvl = match side {
+        BookSide::Bid => book.bids.first(),
+        BookSide::Ask => book.asks.first(),
+    }?;
     Some(HedgeAnchor {
         venue: hedge.venue,
         market_id: hedge.market_id.clone(),
         side,
         price: lvl.price.clone(),
-        ts,
     })
 }
 
@@ -448,7 +450,10 @@ fn hedge_tick_plans(
         // crossed hedge book is instead reported in the naked alarm, so
         // an operator learns WHY it will not clear.
         let touch = hedge_book
-            .and_then(|b| if book_side == "bid" { b.bids.first() } else { b.asks.first() })
+            .and_then(|b| match book_side {
+                BookSide::Bid => b.bids.first(),
+                BookSide::Ask => b.asks.first(),
+            })
             .map(|l| l.price.clone());
         // Does THIS obligation have an attempt at the venue whose
         // `order_ack` has not landed? Only then can an unattributed
@@ -498,7 +503,9 @@ fn hedge_tick_plans(
                 mono.saturating_duration_since(p.first_at).as_secs_f64(),
                 p.tries,
                 p.anchor.price,
-                book_side,
+                // The operator reads this line; `{book_side:?}` would spell it
+                // `Bid`, and the alarm has always said `bid`.
+                book_side.as_str(),
                 pol.max_slip,
             )
         });
@@ -620,7 +627,7 @@ impl Engine {
                         price: ho.price.clone(),
                         replaces: None,
                         retry: Some(tries),
-                        side: ho.side.to_string(),
+                        side: ho.side,
                         tag: Some(Tag::Hedge),
                         taker: true,
                         ts: self.last_now,
@@ -816,7 +823,7 @@ mod hedge_deadline_tests {
 mod hedge_retry_tests {
     use super::*;
 
-    fn ok(book_side: &str, touch: &str, anchor: &str, slip: &str) -> bool {
+    fn ok(book_side: BookSide, touch: &str, anchor: &str, slip: &str) -> bool {
         let mut cx = Cx::default();
         hedge_price_acceptable(&mut cx, book_side, touch, anchor, slip)
     }
@@ -824,40 +831,40 @@ mod hedge_retry_tests {
     /// Selling into a bid: a HIGHER bid is better than we expected, always fine.
     #[test]
     fn selling_takes_any_price_at_or_above_the_anchor() {
-        assert!(ok("bid", "0.40", "0.40", "0.00"), "exactly the anchor");
-        assert!(ok("bid", "0.45", "0.40", "0.00"), "better than the anchor");
+        assert!(ok(BookSide::Bid, "0.40", "0.40", "0.00"), "exactly the anchor");
+        assert!(ok(BookSide::Bid, "0.45", "0.40", "0.00"), "better than the anchor");
     }
 
     /// ...and gives up at most max_slip of the edge below it.
     #[test]
     fn selling_gives_up_at_most_max_slip() {
-        assert!(ok("bid", "0.39", "0.40", "0.01"), "exactly at the tolerance");
-        assert!(!ok("bid", "0.38", "0.40", "0.01"), "past it => WAIT, never chase");
+        assert!(ok(BookSide::Bid, "0.39", "0.40", "0.01"), "exactly at the tolerance");
+        assert!(!ok(BookSide::Bid, "0.38", "0.40", "0.01"), "past it => WAIT, never chase");
     }
 
     /// Buying from an ask: worse means paying MORE.
     #[test]
     fn buying_gives_up_at_most_max_slip() {
-        assert!(ok("ask", "0.40", "0.40", "0.00"));
-        assert!(ok("ask", "0.35", "0.40", "0.00"), "cheaper than expected is fine");
-        assert!(ok("ask", "0.41", "0.40", "0.01"));
-        assert!(!ok("ask", "0.42", "0.40", "0.01"));
+        assert!(ok(BookSide::Ask, "0.40", "0.40", "0.00"));
+        assert!(ok(BookSide::Ask, "0.35", "0.40", "0.00"), "cheaper than expected is fine");
+        assert!(ok(BookSide::Ask, "0.41", "0.40", "0.01"));
+        assert!(!ok(BookSide::Ask, "0.42", "0.40", "0.01"));
     }
 
     /// Zero tolerance means the anchor is a hard floor/ceiling — the setting
     /// that never gives up a cent of the basket's edge.
     #[test]
     fn zero_slip_refuses_any_worse_price() {
-        assert!(!ok("bid", "0.3999", "0.40", "0"));
-        assert!(!ok("ask", "0.4001", "0.40", "0"));
+        assert!(!ok(BookSide::Bid, "0.3999", "0.40", "0"));
+        assert!(!ok(BookSide::Ask, "0.4001", "0.40", "0"));
     }
 
     /// The direction must not be symmetric — swapping the side must flip which
     /// way is "worse", or a retry would chase in one direction.
     #[test]
     fn the_two_sides_are_not_symmetric() {
-        assert!(ok("bid", "0.50", "0.40", "0.00"), "selling higher is better");
-        assert!(!ok("ask", "0.50", "0.40", "0.00"), "buying higher is worse");
+        assert!(ok(BookSide::Bid, "0.50", "0.40", "0.00"), "selling higher is better");
+        assert!(!ok(BookSide::Ask, "0.50", "0.40", "0.00"), "buying higher is worse");
     }
 }
 
@@ -901,7 +908,8 @@ mod hedge_accounting_tests {
         let mut cx = Cx::default();
         let t = t0();
         hedge_plan(
-            &mut cx, pol, owed, filled, anchor, "bid", Some(touch), t, after(t, 100.0), false,
+            &mut cx, pol, owed, filled, anchor, BookSide::Bid, Some(touch), t,
+            after(t, 100.0), false,
         )
     }
 
@@ -1053,13 +1061,17 @@ mod hedge_accounting_tests {
         assert_eq!(plan(&p, 5, 9, "0.40", "0.40"), HedgePlan::Retire);
         let t = t0();
         assert_eq!(
-            hedge_plan(&mut cx, &p, 5, 0, "0.40", "bid", Some("0.40"), t, after(t, 4.9), false),
+            hedge_plan(
+
+                &mut cx, &p, 5, 0, "0.40", BookSide::Bid, Some("0.40"), t, after(t, 4.9), false,
+
+            ),
             HedgePlan::Hold,
             "interval_s gates PLACEMENTS"
         );
         // no level on the side we take is a WAIT, not a silent skip
         assert_eq!(
-            hedge_plan(&mut cx, &p, 5, 0, "0.40", "bid", None, t, after(t, 100.0), false),
+            hedge_plan(&mut cx, &p, 5, 0, "0.40", BookSide::Bid, None, t, after(t, 100.0), false),
             HedgePlan::Wait
         );
     }
@@ -1095,7 +1107,7 @@ mod hedge_accounting_tests {
                     10,
                     0,
                     &against,
-                    "bid",
+                    BookSide::Bid,
                     Some(touch),
                     t,
                     after(t, 100.0 + i as f64 * 10.0),
@@ -1136,18 +1148,18 @@ mod hedge_accounting_tests {
         let mut cx = Cx::default();
         let p = pol("0.01");
         // selling into a bid: the touch may be at most 1c below the anchor
-        assert!(first_attempt_acceptable(&mut cx, Some(&p), "bid", "0.39", "0.40"));
+        assert!(first_attempt_acceptable(&mut cx, Some(&p), BookSide::Bid, "0.39", "0.40"));
         assert!(
-            !first_attempt_acceptable(&mut cx, Some(&p), "bid", "0.36", "0.40"),
+            !first_attempt_acceptable(&mut cx, Some(&p), BookSide::Bid, "0.36", "0.40"),
             "a 4c move against us between place and fill is not a hedge, it is a loss"
         );
         // buying from an ask: worse is paying more
-        assert!(first_attempt_acceptable(&mut cx, Some(&p), "ask", "0.41", "0.40"));
-        assert!(!first_attempt_acceptable(&mut cx, Some(&p), "ask", "0.45", "0.40"));
+        assert!(first_attempt_acceptable(&mut cx, Some(&p), BookSide::Ask, "0.41", "0.40"));
+        assert!(!first_attempt_acceptable(&mut cx, Some(&p), BookSide::Ask, "0.45", "0.40"));
         // ...and with NO retry policy there is nothing to carry a refusal
         // forward, so bench/replay fires unconditionally and stays byte-exact.
         assert!(
-            first_attempt_acceptable(&mut cx, None, "bid", "0.36", "0.40"),
+            first_attempt_acceptable(&mut cx, None, BookSide::Bid, "0.36", "0.40"),
             "no policy means no gate — a refusal here would drop the obligation"
         );
     }
@@ -1161,11 +1173,19 @@ mod hedge_accounting_tests {
         let t = t0();
         // buying: worse is paying more
         assert_eq!(
-            hedge_plan(&mut cx, &p, 5, 0, "0.40", "ask", Some("0.41"), t, after(t, 100.0), false),
+            hedge_plan(
+
+                &mut cx, &p, 5, 0, "0.40", BookSide::Ask, Some("0.41"), t, after(t, 100.0), false,
+
+            ),
             HedgePlan::Retry { qty: 5, price: "0.41".into() }
         );
         assert_eq!(
-            hedge_plan(&mut cx, &p, 5, 0, "0.40", "ask", Some("0.42"), t, after(t, 100.0), false),
+            hedge_plan(
+
+                &mut cx, &p, 5, 0, "0.40", BookSide::Ask, Some("0.42"), t, after(t, 100.0), false,
+
+            ),
             HedgePlan::Wait
         );
         // selling: worse is receiving less
@@ -1174,8 +1194,8 @@ mod hedge_accounting_tests {
             price: "0.39".into()
         });
         assert_eq!(plan(&p, 5, 0, "0.40", "0.38"), HedgePlan::Wait);
-        assert_eq!(taking_side("bid"), "ask", "taking a bid SELLS");
-        assert_eq!(taking_side("ask"), "bid", "taking an ask BUYS");
+        assert_eq!(taking_side(BookSide::Bid), BookSide::Ask, "taking a bid SELLS");
+        assert_eq!(taking_side(BookSide::Ask), BookSide::Bid, "taking an ask BUYS");
     }
 
     // ------------------------------------------- a fill we cannot attribute ---
@@ -1238,12 +1258,20 @@ mod hedge_accounting_tests {
         let t = t0();
         // placed 10s ago, retry due, nothing ambiguous
         assert_eq!(
-            hedge_plan(&mut cx, &p, 5, 0, "0.40", "bid", Some("0.40"), t, after(t, 10.0), false),
+            hedge_plan(
+
+                &mut cx, &p, 5, 0, "0.40", BookSide::Bid, Some("0.40"), t, after(t, 10.0), false,
+
+            ),
             HedgePlan::Retry { qty: 5, price: "0.40".into() },
             "with nothing outstanding this retry is due and priced fine"
         );
         assert_eq!(
-            hedge_plan(&mut cx, &p, 5, 0, "0.40", "bid", Some("0.40"), t, after(t, 10.0), true),
+            hedge_plan(
+
+                &mut cx, &p, 5, 0, "0.40", BookSide::Bid, Some("0.40"), t, after(t, 10.0), true,
+
+            ),
             HedgePlan::HoldForAck,
             "an unattributed fill on this market may BE this hedge — do not re-place over it"
         );
@@ -1272,7 +1300,7 @@ mod hedge_accounting_tests {
                     5,
                     0,
                     "0.40",
-                    "bid",
+                    BookSide::Bid,
                     Some("0.40"),
                     t,
                     after(t, due - 0.1),
@@ -1282,7 +1310,10 @@ mod hedge_accounting_tests {
                 "inside the grace the ack may still land (alarm {alarm_after_s})"
             );
             assert_eq!(
-                hedge_plan(&mut cx, &p, 5, 0, "0.40", "bid", Some("0.40"), t, after(t, due), true),
+                hedge_plan(
+                    &mut cx, &p, 5, 0, "0.40", BookSide::Bid, Some("0.40"), t, after(t, due),
+                    true,
+                ),
                 HedgePlan::Retry { qty: 5, price: "0.40".into() },
                 "past the grace, being naked is the larger harm (alarm {alarm_after_s})"
             );
@@ -1315,7 +1346,7 @@ mod hedge_accounting_tests {
             5,
             0,
             "0.40",
-            "bid",
+            BookSide::Bid,
             Some("0.40"),
             fill_at,
             after(fill_at, 30.0),
@@ -1343,7 +1374,7 @@ mod hedge_accounting_tests {
                 5,
                 0,
                 "0.40",
-                "bid",
+                BookSide::Bid,
                 Some("0.40"),
                 after(fill_at, 3600.0),
                 fill_at,
@@ -1398,7 +1429,7 @@ mod hedge_accounting_tests {
             None,
         );
         assert!(
-            hedge_anchor(&rel, "P", "ask", &books, 1.0).is_none(),
+            hedge_anchor(&rel, "P", BookSide::Ask, &books).is_none(),
             "an inverted hedge book must not mint an anchor"
         );
         // ...and the same book, un-crossed, anchors normally
@@ -1411,9 +1442,9 @@ mod hedge_accounting_tests {
             0,
             None,
         );
-        let a = hedge_anchor(&rel, "P", "ask", &books, 1.0).expect("a sane book anchors");
+        let a = hedge_anchor(&rel, "P", BookSide::Ask, &books).expect("a sane book anchors");
         assert_eq!(a.price, "0.1820");
-        assert_eq!(a.side, "ask");
+        assert_eq!(a.side, BookSide::Ask);
     }
 
     /// The ledger side of I2, through the real writer: two credits for one
@@ -1431,7 +1462,7 @@ mod hedge_accounting_tests {
             class: "cross-venue-equivalent",
             venue: "kalshi".into(),
             market_id: "SYNTH-K-YES".into(),
-            side: "bid".into(),
+            side: BookSide::Bid,
             price: "0.31".into(),
             strategy: "maker-hedge",
         };
@@ -1440,7 +1471,7 @@ mod hedge_accounting_tests {
             chain_id: "h1".into(),
             market_id: "SYNTH-P-YES".into(),
             venue: Venue::PolymarketUs,
-            side: "ask",
+            side: BookSide::Ask,
             price: "0.40".into(),
             qty: 10,
             cum_filled: 0,
@@ -1498,9 +1529,8 @@ mod hedge_tick_tests {
             anchor: HedgeAnchor {
                 venue: Venue::PolymarketUs,
                 market_id: "P".into(),
-                side: "bid",
+                side: BookSide::Bid,
                 price: "0.40".into(),
-                ts: 1.0,
             },
             first_at: at,
             last_try_at: at,
@@ -1684,7 +1714,7 @@ mod hedge_tick_tests {
         let ho = &e.hedge_orders["h2"];
         assert_eq!(ho.chain_id, "h1", "the obligation's name does not move across retries");
         assert_eq!((ho.qty, ho.cum_filled), (5, 0));
-        assert_eq!(ho.side, "ask", "taking a bid SELLS");
+        assert_eq!(ho.side, BookSide::Ask, "taking a bid SELLS");
         assert_eq!(e.n_retry, 1);
 
         // ...and a Retire really retires, while leaving the attempts behind

@@ -67,7 +67,7 @@ fn main() {
     let mut min_apr: f64 = 0.0;
     let mut resolve_years: Option<f64> = None;
     let mut toxgate_file: Option<String> = None;
-    let mut suppress: std::collections::HashSet<(String, &'static str)> =
+    let mut suppress: std::collections::HashSet<(String, BookSide)> =
         std::collections::HashSet::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -85,11 +85,7 @@ fn main() {
                 // "market_id:side" — side must be bid|ask
                 let v = it.next().expect("--suppress market:side");
                 let (m, s) = v.rsplit_once(':').expect("market:side");
-                let side: &'static str = match s {
-                    "bid" => "bid",
-                    "ask" => "ask",
-                    other => panic!("bad suppress side {other}"),
-                };
+                let side = BookSide::parse(s).unwrap_or_else(|| panic!("bad suppress side {s}"));
                 suppress.insert((m.to_owned(), side));
             }
             other => panic!("unknown arg {other}"),
@@ -197,10 +193,9 @@ fn main() {
                 books.apply_snapshot(venue, &market_id, bids, asks, seq, ts_local_ns, ts_venue);
             }
             "delta" => {
-                let side = match v.get("side").and_then(|x| x.as_str()) {
-                    Some("bid") => BookSide::Bid,
-                    Some("ask") => BookSide::Ask,
-                    _ => continue,
+                let Some(side) = v.get("side").and_then(|x| x.as_str()).and_then(BookSide::parse)
+                else {
+                    continue;
                 };
                 let (Some(price), Some(size)) = (
                     v.get("price").and_then(|x| x.as_str()),

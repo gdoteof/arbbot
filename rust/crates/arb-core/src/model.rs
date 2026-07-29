@@ -43,12 +43,38 @@ impl Venue {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Which side of a book. Deliberately NOT `Ord`: the one place a pair of sides
+/// is sorted (`Quoter::cancel_all`) has to sort by the WIRE spelling, where
+/// `"ask" < "bid"`, and a derived `Ord` would silently order them the other way
+/// round — a different cancel order for the same tape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum BookSide {
     #[serde(rename = "bid")]
     Bid,
     #[serde(rename = "ask")]
     Ask,
+}
+
+impl BookSide {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BookSide::Bid => "bid",
+            BookSide::Ask => "ask",
+        }
+    }
+
+    /// Inverse of [`BookSide::as_str`], for the boundaries that still receive a
+    /// side as text: the venue tape's `delta` events and the `--suppress` CLI
+    /// pair. `None` means the string is not a side, and every caller treats
+    /// that as a refusal — there is no arm that turns an unrecognised side into
+    /// a bid.
+    pub fn parse(s: &str) -> Option<BookSide> {
+        Some(match s {
+            "bid" => BookSide::Bid,
+            "ask" => BookSide::Ask,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
