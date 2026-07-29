@@ -602,6 +602,23 @@ impl Engine {
             // programming-bug alarm: an obligation that was minted and
             // never hedged (arb_core::fill) — must stay 0.
             "dropped_unconsumed": dropped_unconsumed(),
+            // Windows in which a Kalshi fill may have gone unseen: the boot
+            // window plus every reconnect, so 1 is the FLOOR and 0 means the
+            // feed never started. That feed sums per-fill deltas locally and
+            // its state does not survive a restart, so a gap is only harmless
+            // if the venue replays on resubscribe — unestablished (see
+            // `fills`). Every other gauge here is blind to it: no frame
+            // arrived, so nothing was unattributed and no obligation was
+            // minted. This one is per-process and NOT seeded from persisted
+            // state, unlike `hedges_undischarged` above, so it says "there was
+            // a window", never "nothing was lost". `fills::kalshi_fill_gaps`
+            // carries the runbook for checking a window against venue truth.
+            "kalshi_fill_gaps": crate::fills::kalshi_fill_gaps(),
+            // Kalshi fill frames whose count could not be read — a payload
+            // shape change, which this field family has had before. Must stay
+            // 0: while it is rising, `fills` reads 0 and every other gauge
+            // here looks healthy.
+            "kalshi_fills_unreadable": crate::fills::kalshi_fills_unreadable(),
             "would_place": self.exec_stats.placed.load(std::sync::atomic::Ordering::Relaxed),
             "would_cancel": self.exec_stats.cancelled.load(std::sync::atomic::Ordering::Relaxed),
             "exec_dropped": self.exec_stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
