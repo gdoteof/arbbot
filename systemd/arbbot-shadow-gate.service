@@ -1,0 +1,68 @@
+# Daily M1 recorder-cutover gate. Replaces the unit of the same name deleted in
+# c382ea5, which invoked `.claude/worktrees/rust-rewrite/scripts/shadow_gate.py`
+# — a worktree that no longer exists. Its last three runs produced a 153-byte
+# "can't open file" and the unit still exited 0 every time, because the old
+# ExecStart ended in `tail -3` and threw the gate's own status away. So the M1
+# evidence trail records three green service runs over three reports that had no
+# RESULT line in them at all.
+#
+# THREE CORRECTIONS TO THAT SHAPE, all deliberate:
+#
+#  1. THE EXIT STATUS IS THE GATE. `set -o pipefail` plus `tee` keeps the
+#     binary's status, so a red gate is a FAILED unit and shows up in
+#     `systemctl --user list-units --failed`. A gate whose result nothing reads
+#     is not a gate.
+#
+#  2. IT COMPARES TODAY, NOT YESTERDAY. The old unit ran at 07:40 UTC against
+#     the previous day — ten minutes after `archive_to_parquet` deletes exactly
+#     those Python JSONL files at 07:30. `data/raw` today holds no 2026-07-28
+#     tape for any venue while `data/parquet` holds all three, so a
+#     yesterday-shaped gate would now find nothing to compare on the Python
+#     side. The gate reads a trailing window of the CURRENT day's tapes, which
+#     are both live, both present, and never touched by the ETL.
+#
+#  3. IT IS ALLOWED TO FINISH. `TimeoutStartSec=` is unset on every other unit
+#     in this directory because every other unit is SHORT; this one is a
+#     long-running oneshot and there was no precedent to inherit. The user
+#     manager's `DefaultTimeoutStartUSec` is 1min 30s, and the `--live-s 120`
+#     below is on its own longer than that: every timer-driven run would be
+#     SIGTERM'd mid-attach, before the gate printed a verdict at all.
+#
+#     What that leaves behind is the exact artefact this unit exists to
+#     abolish — a truncated report with no verdict in it, indistinguishable in
+#     the runbook's soak grep from "the gate was never installed". 600s is
+#     roughly 4x a full run (tape slices + 120s live + venue sweeps).
+#
+# Install (manual, deployment-time):
+#   cp systemd/arbbot-shadow-gate.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now arbbot-shadow-gate.timer
+
+[Unit]
+Description=arbbot M1 recorder-cutover gate (tape comparison + live subscriber under load)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/claude/arbbot
+# Nice=19: the live stage deliberately generates CPU load, and the Python
+# recorder that the ARMED engine is subscribed to runs at Nice=0. This must lose
+# every contest with it. The binary refuses to start its workers at all if the
+# 1-minute load average plus the workers would cross its ceiling.
+Nice=19
+# See correction 3 in the header. Without this the live stage alone outlives the
+# 90s default and the unit is killed before it can print PASS or FAIL.
+TimeoutStartSec=600
+# `tee -a`, not `tee`: a hand-run from the runbook on the same day would
+# otherwise erase the timer's report, and the timer's report is the soak
+# evidence. Each run stakes out `SHADOW GATE: NO VERDICT` as it starts and
+# overwrites nothing, so the LAST `SHADOW GATE:` line in the file is always the
+# last run's verdict — including when that verdict is "killed before deciding".
+ExecStart=/bin/bash -c 'set -o pipefail; mkdir -p data/reports; \
+    day=$(date -u +%%Y-%%m-%%d); \
+    rust/target/release/arb-shadow-gate --day $day \
+        --py-dir data/raw --rs-dir data/raw-rs \
+        --socket data/arbbot-rs.sock \
+        --window-s 900 --live-s 120 --load 6 \
+        2>&1 | tee -a data/reports/shadow-gate-$day.txt'
+
+[Install]
+WantedBy=default.target
