@@ -181,6 +181,12 @@ fn row(
         "leg_b": format!("{}:{}", lb.venue, lb.market_id),
         "quote_age_a_s": (now_ns - sa.ts_local_ns) / 1_000_000_000,
         "quote_age_b_s": (now_ns - sb.ts_local_ns) / 1_000_000_000,
+        // Raw, unlike the intents view, which maps `i64::MAX` to -1 here. It
+        // cannot arise on this row: reaching it required BOTH legs' markets in
+        // `latest`, and both are registry legs, so each of the two venues has a
+        // registry-backed sample and neither can be the absent case. The page
+        // reads -1 as "no coverage" on both views, so if that invariant ever
+        // breaks this line has to map too.
         "coverage_age_s": coverage_age_s,
         "actionable": actionable,
         "edge_per_contract": priced.edge_per_contract,
@@ -489,11 +495,13 @@ relationships:
     /// the row is ACTIONABLE, and its coverage reads the venue's, not the
     /// market's.
     ///
-    /// P2 is the REJECTED pair's leg, and it certifies the venue anyway: the
-    /// basis is ALL registry legs because coverage is a claim about the
-    /// recorder, which subscribes off exactly those legs, while a verdict is a
-    /// claim about a pair. Narrowing it to the tradable ones would let a
-    /// vetting decision change what a venue's freshness reads.
+    /// P2 is the REJECTED pair's leg, and it certifies the venue anyway. The
+    /// basis is ALL registry legs because coverage is a claim about what the
+    /// recorder is delivering and a verdict is a claim about a pair, so
+    /// narrowing it to the tradable ones would let a vetting decision change
+    /// what a venue's freshness reads — and does, measurably: six tradable
+    /// polymarket legs put that venue at 10,832-62,617s on three real tapes
+    /// with the feed alive.
     #[test]
     fn a_quiet_arb_leg_on_a_covered_venue_still_makes_an_actionable_row() {
         let (a, base) = args("quiet-leg");

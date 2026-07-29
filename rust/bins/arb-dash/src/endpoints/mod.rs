@@ -73,22 +73,39 @@ pub const MAX_COVERAGE_AGE_S: i64 = 1800;
 /// the registry, so 88% of the population certifying the venue is a population
 /// no pair is priced off.
 ///
-/// The freeze this catches is PARTIAL, market-by-market, and the recorder has
-/// several ways to produce one. A gap DELETES the book and the REST resnapshot
-/// can fail — the recorder's own words are "that market is dark until the next
-/// sweep" (`pmintl.rs:303`, `kalshi.rs:406`). `Core::evict_book`
-/// (`core.rs:227`) drops one market and holds it out of the integrity sweep
-/// until the venue reports it live again. And pm-us is subscribed in CHUNKS of
-/// 150 slugs (`pmus.rs:166`) off a slug list that is whatever the tag catalog
-/// returned at startup, so a chunk that never subscribes, or a registry market
-/// the catalog omits, goes quiet while 600 others keep flowing.
+/// WHAT THIS CATCHES, stated no wider than it is: a failure that takes out
+/// EVERY registry leg on a venue while its catalog markets keep flowing. Not
+/// one market and not one chunk — the 88 pm-us legs span ten families spread
+/// across the whole slug list, so losing any single 150-slug subscribe window
+/// (`pmus.rs:166`) leaves dozens still ticking and `min` over the survivors
+/// does not move. The reachable shape is the catalog itself: the pm-us slug
+/// list is whatever `markets_by_tags` returned at startup, filtered `!closed`
+/// (`main.rs:206`), so a catalog that omits our markets subscribes 600+ others
+/// and none of ours. That is the `UNSUBSCRIBED` state below, and it is the one
+/// this basis exists for.
 ///
-/// NOT the whole-socket death, and not this repo's documented silent
-/// subscriber eviction: pm-us is one task over the whole list, so if the socket
-/// dies all 749 stop and the old `min` caught that; and the eviction is
-/// DOWNSTREAM of the tape — `Core::on_event` writes the tape at `core.rs:116`
-/// and only then publishes to the broadcaster at `:121` — so it cannot freeze
-/// 88 markets in the rollup while 661 keep arriving.
+/// What it buys, measured on the 07-28 tape rather than argued: at every one of
+/// the 18 hourly checkpoints across that day, `min` over all 749 markets reads
+/// 0-4s. It is a socket-liveness bit and nothing finer — anything short of the
+/// whole feed dying is invisible to it. `min` over the 88 ranges 1-151s on the
+/// same checkpoints, so it is at least CAPABLE of registering less than total
+/// death. That is the improvement; see the residual below for what it still is
+/// not.
+///
+/// NOT the whole-socket death, which the old `min` over 749 already caught
+/// (pm-us is one task over the whole list). NOT this repo's documented silent
+/// subscriber eviction, which is DOWNSTREAM of the tape — `Core::on_event`
+/// writes at `core.rs:116` and only then publishes to the broadcaster at
+/// `:121`. And on polymarket_us specifically, NOT the per-market repair paths
+/// either: `pmus::parse_ws_message` emits only snapshots and trades
+/// (`pmus.rs:40`), gaps arise only in `apply_delta` (`book.rs:155`) and the
+/// snapshot arm returns `Ok(())` unconditionally, so no pm-us event ever asks
+/// for a resnapshot; and `evict_book`'s only callers are Kalshi
+/// (`main.rs:364`) and Polymarket (`main.rs:374`). Where those paths DO apply,
+/// a dropped book is restored by the 300s sweep (`RESNAP_EVERY`,
+/// `RESNAP_FULL_S`), well inside `MAX_COVERAGE_AGE_S`, so they cannot move a
+/// chip. The unbounded one is an EVICTED market, which leaves the sweep until
+/// the venue reports it live again.
 ///
 /// ALL registry legs, not the tradable ones, and this half is measured rather
 /// than argued. Only 6 polymarket markets back a tradable pair, and the newest
@@ -100,11 +117,13 @@ pub const MAX_COVERAGE_AGE_S: i64 = 1800;
 /// a venue's freshness reads.
 ///
 /// The residual, so nobody reads this as more than it is: `min` over 88 is
-/// still "one live market certifies the other 87". On the healthy 07-28 tape
-/// polymarket chips green at 36s while all six tradable polymarket legs are
-/// 62,617s old. Narrowing the population to the one the board prices is all
-/// this does; sourcing coverage from the recorder's own per-feed liveness,
-/// rather than from an emit-on-change tape, is the answer to the rest.
+/// still "one live market certifies the other 87", so a single frozen market —
+/// on any venue, by any of the mechanisms above — is as invisible now as it was
+/// before. On the healthy 07-28 tape polymarket chips green at 36s while all
+/// six tradable polymarket legs are 62,617s old. Narrowing the population to
+/// the one the board prices is all this does; sourcing coverage from the
+/// recorder's own per-feed liveness, rather than from an emit-on-change tape,
+/// is the answer to the rest.
 ///
 /// The clock is the caller's because the two views that ask derive it
 /// differently.
