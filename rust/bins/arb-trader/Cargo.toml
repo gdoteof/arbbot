@@ -20,3 +20,11 @@ tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 sha2 = "0.10"
+
+[dev-dependencies]
+# `test-util` only, for `#[tokio::test(start_paused = true)]`: the halt-sweep
+# retry is a 1s DEADLINE, and the alternative to a virtual clock is a test that
+# really sleeps past it — on a box whose whole point is that an armed engine
+# owns the CPU. Dev-only under resolver 2, so the shipped binary is built
+# without it.
+tokio = { version = "1", features = ["full", "test-util"] }
