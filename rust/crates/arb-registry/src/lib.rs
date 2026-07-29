@@ -54,14 +54,33 @@ impl Relationship {
             && self.vetted_by.as_deref() == Some("human")
     }
 
+    /// The registry's REVOCATION channel, and the verdict that triggered it.
+    /// Deciding a pair is not equivalent is recorded by editing the entry in
+    /// place to `verdict: rejected` — that is how the four `neh2026-*-REJECTED`
+    /// entries are stored. Anything else the gate cannot read as approval
+    /// (missing, misspelled, a half-finished edit) vetoes too: a verdict nobody
+    /// can classify is not permission.
+    pub fn veto(&self) -> Option<&str> {
+        match self.verdict.as_deref() {
+            Some("equivalent") | Some("equivalent-with-caveat") => None,
+            other => Some(other.unwrap_or("(missing)")),
+        }
+    }
+
     /// The FULL gate the runner actually applies (`exec/main.py:131-146`):
     /// human-vetted in the registry OR explicitly listed in
     /// `config/tradable.yaml`. The allowlist exists for pairs approved through
     /// board cards before the registry tracked `vetted_by`, and it records that
     /// provenance WITHOUT stamping a false "human" verdict on the entry — so
     /// checking only the registry half understates what is permitted.
+    ///
+    /// A veto beats BOTH halves. Approval and revocation are not symmetric:
+    /// the allowlist supplies an approval the registry never recorded, but
+    /// nothing may override an approval the registry has withdrawn — otherwise
+    /// `verdict: rejected`, the only revocation the registry has, is a no-op on
+    /// exactly the ids most likely to be trading.
     pub fn tradable(&self, allowlist: &Allowlist) -> bool {
-        self.human_vetted() || allowlist.contains(&self.id)
+        self.veto().is_none() && (self.human_vetted() || allowlist.contains(&self.id))
     }
 }
 
@@ -151,6 +170,17 @@ relationships:
         market_id: P
     verdict: equivalent
     vetted_by: human
+  - id: rejected-but-allowlisted
+    verdict: rejected
+    vetted_by: agent
+  - id: rejected-human
+    verdict: rejected
+    vetted_by: human
+  - id: unknown-verdict
+    verdict: not-equivalent
+    vetted_by: human
+  - id: no-verdict
+    vetted_by: human
 "#;
 
     #[test]
@@ -158,7 +188,7 @@ relationships:
         let p = std::env::temp_dir().join(format!("arb-reg-{}.yaml", std::process::id()));
         std::fs::write(&p, YAML).unwrap();
         let reg = Registry::load(p.to_str().unwrap()).expect("loads");
-        assert_eq!(reg.relationships.len(), 2);
+        assert_eq!(reg.relationships.len(), 6);
 
         let r = reg.get("xvus-time-poty-26-zohranmamdani").expect("found");
         assert_eq!(r.legs.len(), 2);
@@ -193,6 +223,50 @@ relationships:
         assert!(!r.tradable(&none));
         let _ = std::fs::remove_file(ap);
         assert!(reg.get("nope").is_none());
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// A rejection is a VETO the allowlist cannot override. `verdict: rejected`
+    /// in place is the registry's only way to say "looked at it, NOT
+    /// equivalent" (the four `neh2026-*-REJECTED` entries), and on an
+    /// allowlisted id it used to be a no-op: `human_vetted()` went false while
+    /// `contains()` stayed true, so the gate still opened.
+    #[test]
+    fn an_explicit_rejection_vetoes_the_allowlist() {
+        let p = std::env::temp_dir().join(format!("arb-reg-veto-{}.yaml", std::process::id()));
+        std::fs::write(&p, YAML).unwrap();
+        let reg = Registry::load(p.to_str().unwrap()).expect("loads");
+        let ap = std::env::temp_dir().join(format!("arb-allow-veto-{}.yaml", std::process::id()));
+        std::fs::write(
+            &ap,
+            "allow:\n  - xvus-time-poty-26-zohranmamdani\n  - rejected-but-allowlisted\n  \
+             - unknown-verdict\n  - no-verdict\n",
+        )
+        .unwrap();
+        let allow = Allowlist::load(ap.to_str().unwrap());
+
+        let r = reg.get("rejected-but-allowlisted").unwrap();
+        assert_eq!(r.veto(), Some("rejected"));
+        assert!(!r.tradable(&allow), "a rejection the allowlist can override is not a rejection");
+
+        // ...and the allowlist keeps doing its job for everything else
+        assert!(reg.get("xvus-time-poty-26-zohranmamdani").unwrap().tradable(&allow));
+
+        // a human vetting cannot outvote a rejection either
+        let h = reg.get("rejected-human").unwrap();
+        assert!(!h.human_vetted());
+        assert!(!h.tradable(&allow));
+
+        // PINNED: an unrecognised or absent verdict vetoes too. Fail closed —
+        // a revocation spelled some other way must still revoke.
+        let u = reg.get("unknown-verdict").unwrap();
+        assert_eq!(u.veto(), Some("not-equivalent"));
+        assert!(!u.tradable(&allow));
+        let n = reg.get("no-verdict").unwrap();
+        assert_eq!(n.veto(), Some("(missing)"));
+        assert!(!n.tradable(&allow));
+
+        let _ = std::fs::remove_file(ap);
         let _ = std::fs::remove_file(p);
     }
 }
