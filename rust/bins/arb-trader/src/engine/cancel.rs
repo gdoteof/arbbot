@@ -1253,6 +1253,12 @@ mod cancel_addressing_tests {
         assert!(is_ours(&p.client_order_id), "the sweep must be able to claim it");
 
         // every counter, on both seeds: bench (0) and a live wall-clock base.
+        //
+        // `m` is pinned end to end above and `h` is pinned by
+        // `hedge::…::a_retry_mints_a_new_attempt_under_the_same_chain_id`, which
+        // asserts on an id the engine minted. `t` is NOT: firing take-take needs
+        // books, a registry and a marks bar, so its format is only covered here,
+        // by construction rather than by exercise. Named, not papered over.
         let live = arb_core::clock::now_s() as u64 * 1000;
         for base in [0u64, live] {
             for id in [format!("m{}", base + 1), format!("h{base}"), format!("t{}", base + 42)] {

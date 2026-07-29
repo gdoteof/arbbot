@@ -32,6 +32,7 @@ pub struct KalshiGateway<T: Transport = NotWired> {
     pub limiter: Mutex<RateLimiter>,
     pub transport: T,
     settle: Settle,
+    unscoped_sweep: bool,
 }
 
 impl KalshiGateway<NotWired> {
@@ -49,12 +50,32 @@ impl<T: Transport> KalshiGateway<T> {
             limiter: Mutex::new(limiter),
             transport,
             settle: Settle::default(),
+            unscoped_sweep: false,
         }
     }
 
     /// Override the create-visibility poll (tests use a zero delay).
     pub fn with_settle(mut self, delay: std::time::Duration, attempts: u32) -> Self {
         self.settle = Settle { delay, attempts };
+        self
+    }
+
+    /// THE OPERATOR ESCAPE HATCH (`--sweep-unscoped`): go back to cancelling
+    /// every resting order on the account, whoever placed it.
+    ///
+    /// It exists because this change added a way for the engine to REFUSE TO
+    /// START. If the venue stops echoing `client_order_id` on its order list,
+    /// a scoped sweep can neither attribute nor prove, `startup_sweep` fails and
+    /// `main` exits 10 — and the documented manual remedy,
+    /// `scripts/kalshi_cancel_all.py`, is Python and forbidden by the Rust-only
+    /// scope. A safety gate with no override is an outage waiting for a venue
+    /// change nobody controls.
+    ///
+    /// It is OFF by default and must stay that way: on it re-arms the exact
+    /// shared-account failure `docs/venue-quirks.md`
+    /// §`xv-graceful-shutdown-cancels-orders` names.
+    pub fn with_unscoped_sweep(mut self, unscoped: bool) -> Self {
+        self.unscoped_sweep = unscoped;
         self
     }
 
@@ -162,35 +183,82 @@ impl<T: Transport> KalshiGateway<T> {
     }
 }
 
-/// Whose resting order this row is, as far as a SHARED account can tell.
+/// The account history, partitioned the way a scoped sweep needs it.
 ///
-/// Three states, not two, for the same reason [`Ours`] below has three: a
-/// sweep's two jobs — cancel what is ours, prove nothing of ours is left —
-/// answer differently for each, and collapsing them is how one of the two goes
-/// silently wrong.
-enum Owner {
-    /// Minted by this stack ([`super::is_ours`]). Cancel it, and it must be
+/// Built from ONE paginated read, because the premise the scope rests on has to
+/// be checked against the same bytes the scope is applied to.
+struct Book {
+    /// Resting orders carrying a tag of ours — cancel these, and they must be
     /// gone before the book is proven.
-    Ours,
-    /// Carries somebody else's tag. Leave it alone AND leave it out of the
-    /// proof: `arbbot-hedge.timer` runs on this key every 5 minutes, and a
-    /// sweep that counted its orders could never come back clean.
-    Theirs,
-    /// No `client_order_id` on the row at all. Kalshi's create body REQUIRES
-    /// one ([`crate::wire::kalshi_place_body`]) so no live order can produce
-    /// this — it means the LIST has stopped reporting the tag the whole scope
-    /// rests on. Not cancelled, because nothing claims it; NOT proven clean
-    /// either, because an unattributable row is the ownership-level form of the
-    /// unreadable list `bins/arb-trader/src/sink.rs` already refuses to accept
-    /// as proof. Scoping the sweep must not re-open that door one layer down.
-    Untagged,
+    ours: Vec<String>,
+    /// Resting rows with NO `client_order_id` at all. Not cancelled — nothing
+    /// claims them — and not counted against the proof either: an order a human
+    /// places through Kalshi's own web UI has no tag, and must not be able to
+    /// stop this process arming.
+    untagged: usize,
+    /// Did ANY row in the whole history — resting or finished, ours or theirs —
+    /// carry a `client_order_id`?
+    ///
+    /// THIS IS THE PREMISE, CHECKED RATHER THAN ASSUMED. Every scoping decision
+    /// below is worthless if the list does not echo the tag, and NOTHING in this
+    /// repo has ever demonstrated that it does: the only live-provenance list
+    /// row on record (`tests/test_venue_contracts.py`, 2026-07-21) does not
+    /// carry the field, and the one production path that reads it —
+    /// [`Self::find_ours`] — has never fired on the armed unit, so its
+    /// deliberately quiet "nothing cancelled" would have hidden a non-echoing
+    /// list indefinitely.
+    ///
+    /// History is the right place to look and costs nothing extra: this account
+    /// has hundreds of finished rows, both stacks have always sent a
+    /// `client_order_id` (Kalshi's create body REQUIRES it —
+    /// [`crate::wire::kalshi_place_body`]), so one tag anywhere proves the field
+    /// survives the round trip. Zero tags across a non-empty history is the
+    /// signature of the premise being false, and is the only case that refuses.
+    echoes_tags: bool,
+    /// Rows seen at all, so an empty account is not mistaken for a broken one.
+    rows: usize,
 }
 
-fn owner(o: &resp::KalshiOrder) -> Owner {
-    match o.client_order_id.as_deref() {
-        Some(c) if super::is_ours(c) => Owner::Ours,
-        Some(_) => Owner::Theirs,
-        None => Owner::Untagged,
+impl Book {
+    fn read(orders: Vec<resp::KalshiOrder>) -> Self {
+        let mut b = Book { ours: Vec::new(), untagged: 0, echoes_tags: false, rows: orders.len() };
+        for o in orders {
+            match o.client_order_id.as_deref() {
+                Some(c) => {
+                    b.echoes_tags = true;
+                    if o.is_resting() && super::is_ours(c) {
+                        b.ours.push(o.order_id);
+                    }
+                }
+                None if o.is_resting() => b.untagged += 1,
+                None => {}
+            }
+        }
+        b
+    }
+
+    /// The refusal, when the premise the scope rests on is demonstrably false.
+    ///
+    /// Deliberately NOT a silent fallback in either direction. Cancelling the
+    /// whole account anyway is the documented failure this change exists to
+    /// stop; answering "clean" is the defect the other half of this change
+    /// exists to stop. So it is named, it carries the numbers, and it names the
+    /// flag that overrides it — `--sweep-unscoped` restores the old
+    /// account-wide behaviour for an operator who has decided to accept it.
+    fn premise_broken(&self) -> Option<VenueError> {
+        (!self.echoes_tags && self.rows > 0).then(|| VenueError::Status {
+            endpoint: "kalshi orders",
+            status: 0,
+            body: format!(
+                "not one of {} order(s) in this account's history carries a \
+                 `client_order_id`, so the order list is not echoing the tag a scoped \
+                 sweep needs and NOTHING here can be attributed to this process. \
+                 Refusing to cancel blind on a SHARED key, and refusing to call the \
+                 book clean. Re-run with --sweep-unscoped to cancel EVERY resting \
+                 order on the account instead (the pre-2026-07-29 behaviour)",
+                self.rows
+            ),
+        })
     }
 }
 
@@ -309,15 +377,21 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
         Ok(resp::kalshi_order_envelope(&r.body)?.order)
     }
 
-    /// The evidence half of the sweep, scoped to match the cancel half:
-    /// [`Owner::Theirs`] is excluded, [`Owner::Untagged`] is NOT.
+    /// The evidence half of the sweep, scoped to match the cancel half.
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
-        Ok(self
-            .all_orders()?
-            .into_iter()
-            .filter(|o| o.is_resting() && !matches!(owner(o), Owner::Theirs))
-            .map(|o| o.order_id)
-            .collect())
+        let orders = self.all_orders()?;
+        if self.unscoped_sweep {
+            return Ok(orders
+                .into_iter()
+                .filter(|o| o.is_resting())
+                .map(|o| o.order_id)
+                .collect());
+        }
+        let book = Book::read(orders);
+        match book.premise_broken() {
+            Some(e) => Err(e),
+            None => Ok(book.ours),
+        }
     }
 
     /// Kill-switch sweep. `/portfolio/orders` returns history (canceled and
@@ -333,21 +407,37 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
     /// SCOPING DOES NOT COST THE UNACKED-ORDER CATCH, which is the reason an
     /// unscoped sweep was worth keeping. The `client_order_id` goes out IN THE
     /// CREATE BODY, so an order whose ack we never read is already carrying our
-    /// tag when it starts resting: it is `Owner::Ours` on the very next list
-    /// read, with no ack, no venue id and no local record needed. That is a
-    /// STRONGER handle than the sweep had before — the old blanket cancel could
-    /// only catch it by catching everything — and it is the same handle
+    /// tag when it starts resting: it is ours on the very next list read, with
+    /// no ack, no venue id and no local record needed. That is a STRONGER
+    /// handle than the sweep had before — the old blanket cancel could only
+    /// catch it by catching everything — and it is the same handle
     /// [`Self::cancel_by_client_order_id`] recovers a lost create with. Orders a
     /// PREVIOUS run left behind are caught for the same reason: `is_ours` is a
     /// property of this codebase's ids, not of one process's seed.
+    ///
+    /// AND THE SCOPE IS NEVER ASSUMED. All of the above is void if the order
+    /// list does not echo the tag, which nothing in this repo has ever shown it
+    /// does — so [`Book`] checks that against the same read, and refuses rather
+    /// than quietly cancelling nothing. See [`Book::echoes_tags`].
     fn cancel_all_open(&self) -> Result<(), VenueError> {
-        for o in self.all_orders()? {
-            if o.is_resting() && matches!(owner(&o), Owner::Ours) {
-                self.cancel(&CancelRequest {
-                    by: CancelBy::VenueId(o.order_id),
-                    market_slug: None,
-                })?;
+        let orders = self.all_orders()?;
+        if self.unscoped_sweep {
+            for o in orders {
+                if o.is_resting() {
+                    self.cancel(&CancelRequest {
+                        by: CancelBy::VenueId(o.order_id),
+                        market_slug: None,
+                    })?;
+                }
             }
+            return Ok(());
+        }
+        let book = Book::read(orders);
+        if let Some(e) = book.premise_broken() {
+            return Err(e);
+        }
+        for oid in book.ours {
+            self.cancel(&CancelRequest { by: CancelBy::VenueId(oid), market_slug: None })?;
         }
         Ok(())
     }

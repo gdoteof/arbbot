@@ -81,6 +81,9 @@ struct Args {
     /// Run the startup sweep against the live venues and EXIT, without ever
     /// quoting. The safe way to exercise the reconciliation path.
     sweep_only: bool,
+    /// Restore the pre-2026-07-29 account-wide sweep when ownership cannot be
+    /// determined. Loud, off by default — see `KalshiGateway::with_unscoped_sweep`.
+    sweep_unscoped: bool,
     /// Credential suffixes for the order path (`--cred-suffix pmus=rs_trader`).
     cred_suffix: Vec<(String, String)>,
     /// Append-only trade ledger; open baskets seed the risk view's exposure.
@@ -187,6 +190,7 @@ fn default_args() -> Args {
         enable_orders: false,
         confirm_live: false,
         sweep_only: false,
+        sweep_unscoped: false,
         cred_suffix: Vec::new(),
         ledger: "data/exec/trades.jsonl".into(),
         hedge_retry_s: 5.0,
@@ -233,6 +237,7 @@ fn parse_args() -> Args {
                 a.enable_orders = true;
                 a.sweep_only = true;
             }
+            "--sweep-unscoped" => a.sweep_unscoped = true,
             "--cred-suffix" => {
                 let kv = it.next().expect("--cred-suffix venue=suffix");
                 let (v, sfx) = kv.split_once('=').expect("--cred-suffix wants venue=suffix");
@@ -438,7 +443,7 @@ fn cancel_preconditions(
     let suffix = |v: &str| {
         args.cred_suffix.iter().find(|(k, _)| k == v).map(|(_, s)| s.clone())
     };
-    match build_kalshi_sink(suffix("kalshi").as_deref()) {
+    match build_kalshi_sink(suffix("kalshi").as_deref(), args.sweep_unscoped) {
         Ok(s) => {
             sinks.insert(Venue::Kalshi, s);
         }
@@ -568,7 +573,7 @@ fn spawn_shutdown_sweep() {
 /// A pure function so it can be tested without credentials — proving the banner
 /// says "PRIMARY" when no suffix was given is the whole point, and doing it for
 /// real would mean a live venue call.
-fn sweep_only_blast_radius(cred_suffix: &[(String, String)]) -> Vec<String> {
+fn sweep_only_blast_radius(cred_suffix: &[(String, String)], unscoped: bool) -> Vec<String> {
     let ident = |keys: &[&str]| {
         cred_suffix
             .iter()
@@ -576,15 +581,26 @@ fn sweep_only_blast_radius(cred_suffix: &[(String, String)]) -> Vec<String> {
             .map(|(_, s)| format!("suffix `{s}`"))
             .unwrap_or_else(|| "PRIMARY key — SHARED WITH THE PYTHON STACK".into())
     };
-    vec![
+    let kalshi_scope = if unscoped {
+        vec![
+            "[exec]     --sweep-unscoped IS SET: THE WHOLE ACCOUNT, including every".into(),
+            "[exec]     order another workstream placed under this key.".into(),
+        ]
+    } else {
+        vec![
+            "[exec]     scoped to ids THIS STACK minted (m…/h…/t…/rehearse-…/sweep-…);".into(),
+            "[exec]     another workstream's orders under this key are LEFT RESTING.".into(),
+        ]
+    };
+    let mut out = vec![
         "[exec] --sweep-only DESTROYS REAL RESTING ORDERS. Keys in use:".into(),
         format!("[exec]   kalshi        -> {}", ident(&["kalshi"])),
-        "[exec]     scoped to ids THIS STACK minted (m…/h…/t…/rehearse-…/sweep-…);".into(),
-        "[exec]     another workstream's orders under this key are LEFT RESTING.".into(),
-        format!("[exec]   polymarket_us -> {}", ident(&["pmus", "polymarket_us"])),
-        "[exec]     THE WHOLE ACCOUNT — PM-US carries no id of ours to scope by,".into(),
-        "[exec]     so this cancels orders this stack never placed.".into(),
-    ]
+    ];
+    out.extend(kalshi_scope);
+    out.push(format!("[exec]   polymarket_us -> {}", ident(&["pmus", "polymarket_us"])));
+    out.push("[exec]     THE WHOLE ACCOUNT — PM-US carries no id of ours to scope by,".into());
+    out.push("[exec]     so this cancels orders this stack never placed.".into());
+    out
 }
 
 /// Cancel every resting order on every armed venue, then PROVE the book is
@@ -645,6 +661,7 @@ fn credential(name: &str) -> Result<String, String> {
 
 fn build_kalshi_sink(
     suffix: Option<&str>,
+    unscoped_sweep: bool,
 ) -> Result<std::sync::Arc<dyn sink::OrderSink>, String> {
     let (id, pem) = match suffix {
         Some(s) => (format!("kalshi_{s}_api_key_id"), format!("kalshi_{s}_private_key.pem")),
@@ -655,11 +672,14 @@ fn build_kalshi_sink(
     let transport =
         arb_venue::transport::HttpTransport::new("https://api.elections.kalshi.com/trade-api/v2", 15)
             .map_err(|e| e.to_string())?;
-    Ok(std::sync::Arc::new(arb_venue::gateway::KalshiGateway::with_transport(
-        signer,
-        arb_venue::ratelimit::RateLimiter::from_per_minute(60.0, 0),
-        transport,
-    )))
+    Ok(std::sync::Arc::new(
+        arb_venue::gateway::KalshiGateway::with_transport(
+            signer,
+            arb_venue::ratelimit::RateLimiter::from_per_minute(60.0, 0),
+            transport,
+        )
+        .with_unscoped_sweep(unscoped_sweep),
+    ))
 }
 
 fn build_pmus_sink(
@@ -1179,12 +1199,14 @@ fn arm_venues(args: &Args, bench: bool) -> HashMap<Venue, std::sync::Arc<dyn sin
     if args.sweep_only {
         // BLAST RADIUS, said out loud, and said BEFORE the preconditions are
         // even checked so it is on screen whether or not the run proceeds.
-        // `cancel_all_open` is account-wide — not per-relationship and not
-        // per-process — so with no `--cred-suffix` this is the PRIMARY key and it
-        // cancels the Python stack's resting orders too. Clearing the 15:40
-        // orphan was run exactly that way; it happened to find one order, which
-        // was luck, not safety.
-        for l in sweep_only_blast_radius(&args.cred_suffix) {
+        //
+        // Kalshi's `cancel_all_open` is scoped to ids this stack minted, so it
+        // no longer cancels the Python stack's resting orders — but PM-US's
+        // still cancels its whole account (no client-order-id on the wire), and
+        // `--sweep-unscoped` puts Kalshi back that way on purpose. Neither is
+        // per-relationship. Clearing the 15:40 orphan was run account-wide; it
+        // happened to find one order, which was luck, not safety.
+        for l in sweep_only_blast_radius(&args.cred_suffix, args.sweep_unscoped) {
             eprintln!("{l}");
         }
     }
@@ -1744,7 +1766,7 @@ mod precondition_tests {
     /// so nothing was lost, but the command said nothing about the risk.
     #[test]
     fn sweep_only_names_the_key_it_will_cancel_under() {
-        let none = sweep_only_blast_radius(&[]).join("\n");
+        let none = sweep_only_blast_radius(&[], false).join("\n");
         assert!(none.contains("WHOLE ACCOUNT"), "{none}");
         assert_eq!(
             none.matches("PRIMARY key").count(),
@@ -1758,16 +1780,25 @@ mod precondition_tests {
         assert!(!k.contains("WHOLE ACCOUNT"), "kalshi is scoped now: {k}");
         assert!(p.contains("WHOLE ACCOUNT"), "PM-US has no id of ours to scope by: {p}");
 
-        let both = sweep_only_blast_radius(&[
-            ("kalshi".into(), "rs_trader".into()),
-            ("pmus".into(), "rs_trader".into()),
-        ])
+        // ...and the override moves Kalshi back, which the banner MUST say: the
+        // flag exists to re-arm the shared-account risk, so a run that is about
+        // to take it has to see that on screen.
+        let un = sweep_only_blast_radius(&[], true).join("\n");
+        let (uk, _) = un.split_once("polymarket_us").expect("{un}");
+        assert!(uk.contains("--sweep-unscoped IS SET"), "{uk}");
+        assert!(uk.contains("WHOLE ACCOUNT"), "the wider radius must be stated: {uk}");
+
+        let both = sweep_only_blast_radius(
+            &[("kalshi".into(), "rs_trader".into()), ("pmus".into(), "rs_trader".into())],
+            false,
+        )
         .join("\n");
         assert!(!both.contains("PRIMARY key"), "a suffixed run is scoped: {both}");
         assert_eq!(both.matches("suffix `rs_trader`").count(), 2);
 
         // The real trap: a pmus suffix given, kalshi forgotten.
-        let half = sweep_only_blast_radius(&[("pmus".into(), "rs_trader".into())]).join("\n");
+        let half =
+            sweep_only_blast_radius(&[("pmus".into(), "rs_trader".into())], false).join("\n");
         assert!(half.contains("kalshi        -> PRIMARY key"), "{half}");
         assert!(half.contains("polymarket_us -> suffix `rs_trader`"), "{half}");
     }

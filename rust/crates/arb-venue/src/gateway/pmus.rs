@@ -101,12 +101,21 @@ impl<T: Transport> PmusGateway<T> {
         struct Envelope {
             orders: Vec<resp::PmOrder>,
         }
-        serde_json::from_str::<Envelope>(&r.body)
-            .map(|e| e.orders)
-            .map_err(|e| VenueError::Parse {
+        serde_json::from_str::<Envelope>(&r.body).map(|e| e.orders).map_err(|e| {
+            // The RAW body, as `kalshi_created_order` already does for the same
+            // reason: this is the one shape nobody has captured. An EMPTY BOOK
+            // on either documented shape (`[]`, `{"orders":[]}`) parses above,
+            // so reaching here means PM-US sent a third thing — and the only
+            // record of what that third thing is, is this line. Guessing it
+            // twice is what the defect above cost.
+            VenueError::Parse {
                 endpoint: "pmus:open_orders",
-                detail: e.to_string(),
-            })
+                detail: format!(
+                    "{e} — body was: {}",
+                    r.body.chars().take(600).collect::<String>()
+                ),
+            }
+        })
     }
 
     /// POST /v1/order/preview — projected fills and fees. NEVER submits, so it

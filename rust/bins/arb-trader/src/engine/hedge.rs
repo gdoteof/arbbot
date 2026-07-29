@@ -1712,6 +1712,15 @@ mod hedge_tick_tests {
         let p = &e.pending_hedges["h1"];
         assert_eq!(p.tries, 2);
         assert_eq!(p.latest_attempt.as_deref(), Some("h2"), "a new attempt");
+        // ...and the kill sweep can claim it. This id was MINTED by the code
+        // under test, not written here, so it pins the `h` counter's format
+        // against `arb_venue::gateway::is_ours` end to end — a hedge id the
+        // sweep cannot recognise is a hedge the sweep silently stops cancelling.
+        assert!(
+            arb_venue::gateway::is_ours(p.latest_attempt.as_deref().unwrap()),
+            "a minted hedge id must be sweepable: {:?}",
+            p.latest_attempt
+        );
         assert_eq!(p.last_try_at, mono, "and `interval_s` runs from this placement");
         assert!(!p.hold_logged, "a new attempt is a new ack that can go missing");
         assert_eq!((p.owed, p.filled), (5, 0), "the obligation itself is unchanged");

@@ -91,6 +91,27 @@ fn gw(replies: Vec<(u16, &str)>) -> KalshiGateway<MockTransport> {
 
 const ORDER_RESTING: &str = r#"{"order":{"order_id":"o-1","status":"resting","ticker":"KXTEST","side":"yes","action":"buy"}}"#;
 
+/// A list row CARRYING `client_order_id` — and the tag's presence here is
+/// **UNVERIFIED**, deliberately labelled so rather than folded into the
+/// recorded fixtures above.
+///
+/// No capture in this repo shows Kalshi echoing the tag on a LIST row. The only
+/// live-provenance list shape on record — `tests/test_venue_contracts.py`
+/// `_order()`, "shape from live GET /portfolio/orders rows (2026-07-21)" — does
+/// NOT carry it, and `find_ours`, the one production reader, has never fired on
+/// the armed unit. The scoped sweep needs this shape to exist; `Book::echoes_tags`
+/// is the runtime check for whether it does, and these tests must not be read as
+/// evidence that it does.
+fn tagged(oid: &str, status: &str, coid: &str) -> String {
+    format!(
+        r#"{{"order_id":"{oid}","status":"{status}","ticker":"KXTIME-26-ZOH","side":"yes","action":"buy","fill_count_fp":"0.00","client_order_id":"{coid}"}}"#
+    )
+}
+
+fn page(rows: &[String]) -> String {
+    format!(r#"{{"orders":[{}],"cursor":null}}"#, rows.join(","))
+}
+
 fn place_req() -> PlaceRequest {
     PlaceRequest {
         market: "KXTEST".into(),
@@ -292,11 +313,18 @@ fn an_empty_order_id_never_reaches_the_wire() {
 /// K1: /portfolio/orders is paginated and `?status=resting` returns nothing,
 /// so the sweep pages the FULL list and filters client-side. Without this,
 /// older resting orders are never cancelled — naked-leg risk.
+///
+/// The rows are the RECORDED shape (`tests/test_venue_contracts.py::_order`,
+/// live 2026-07-21) and carry no `client_order_id`, so this drives the
+/// `--sweep-unscoped` path: on that shape a SCOPED sweep can attribute nothing
+/// and refuses, which is its own test below. Pagination and the resting filter
+/// are what K1 is about and they are identical either way.
 #[test]
 fn cancel_all_open_pages_the_full_history_and_cancels_only_resting() {
-    let page1 = r#"{"orders":[{"order_id":"a","status":"resting","client_order_id":"m1"},{"order_id":"b","status":"canceled","client_order_id":"m2"}],"cursor":"CUR"}"#;
-    let page2 = r#"{"orders":[{"order_id":"c","status":"executed","client_order_id":"m3"},{"order_id":"d","status":"resting","client_order_id":"m4"}],"cursor":null}"#;
-    let g = gw(vec![(200, page1), (200, page2), (200, "{}"), (200, "{}")]);
+    let page1 = r#"{"orders":[{"order_id":"a","status":"resting"},{"order_id":"b","status":"canceled"}],"cursor":"CUR"}"#;
+    let page2 = r#"{"orders":[{"order_id":"c","status":"executed"},{"order_id":"d","status":"resting"}],"cursor":null}"#;
+    let g = gw(vec![(200, page1), (200, page2), (200, "{}"), (200, "{}")])
+        .with_unscoped_sweep(true);
     g.cancel_all_open().unwrap();
 
     let sent = g.transport.sent();
@@ -361,11 +389,11 @@ fn a_200_with_no_orders_key_is_unreadable_not_an_empty_book() {
 #[test]
 fn the_sweep_cancels_this_stacks_orders_and_leaves_another_workstreams_alone() {
     // the Python gateway tags every order `uuid.uuid4().hex` — 32 hex chars.
-    let page = r#"{"orders":[
-        {"order_id":"theirs","status":"resting","client_order_id":"9f1c4b7e2a6d40518c3b9e0f7a2d5c81"},
-        {"order_id":"ours","status":"resting","client_order_id":"m1785257819045"}
-    ],"cursor":null}"#;
-    let g = gw(vec![(200, page), (200, "{}")]);
+    let p = page(&[
+        tagged("theirs", "resting", "9f1c4b7e2a6d40518c3b9e0f7a2d5c81"),
+        tagged("ours", "resting", "m1785257819045"),
+    ]);
+    let g = gw(vec![(200, &p), (200, "{}")]);
     g.cancel_all_open().unwrap();
     let sent = g.transport.sent();
     assert_eq!(sent.len(), 2, "one list read, ONE cancel: {sent:?}");
@@ -374,11 +402,100 @@ fn the_sweep_cancels_this_stacks_orders_and_leaves_another_workstreams_alone() {
         "the other workstream's order must never reach a cancel"
     );
 
-    let g = gw(vec![(200, page)]);
+    let g = gw(vec![(200, &p)]);
     assert_eq!(
         g.resting_order_ids().unwrap(),
         vec!["ours"],
         "and it must not count against a proof this sweep cannot act on"
+    );
+}
+
+// ---------------------------------------- the premise, checked not assumed ---
+
+/// THE BLOCKING REVIEW FINDING. Every scoping decision above is void if the
+/// order list does not echo `client_order_id`, and NOTHING in this repo shows
+/// that it does — the only live-provenance list row on record does not carry
+/// the field.
+///
+/// So a history in which not one row carries a tag is treated as what it is:
+/// the signature of that premise being FALSE. Cancelling everything anyway is
+/// the shared-account failure this change exists to stop; answering "clean" is
+/// the defect the other half exists to stop. It refuses, says which, and names
+/// the flag that overrides it.
+///
+/// Without this check the same list would have made `cancel_all_open` a no-op
+/// that returned `Ok(())` — silently worse than the account-wide sweep it
+/// replaced, because the engine would ALSO have refused to arm with no idea why.
+#[test]
+fn a_list_that_echoes_no_tags_at_all_is_a_named_refusal_not_a_silent_no_op() {
+    // the RECORDED shape: resting and finished rows, none tagged.
+    let p = r#"{"orders":[
+        {"order_id":"r1","status":"resting","ticker":"KXTIME-26-ZOH","side":"yes","action":"buy","fill_count_fp":"0.00"},
+        {"order_id":"x1","status":"executed","ticker":"KXTIME-26-ZOH","side":"yes","action":"buy","fill_count_fp":"5.00"}
+    ],"cursor":null}"#;
+    for r in [gw(vec![(200, p)]).cancel_all_open(), gw(vec![(200, p)]).resting_order_ids().map(|_| ())]
+    {
+        match r {
+            Err(VenueError::Status { endpoint: "kalshi orders", body, .. }) => {
+                assert!(body.contains("not one of 2 order(s)"), "{body}");
+                assert!(body.contains("--sweep-unscoped"), "names the way out: {body}");
+            }
+            other => panic!("a non-echoing list must refuse, got {other:?}"),
+        }
+    }
+    // and nothing was cancelled on the way to that refusal
+    let g = gw(vec![(200, p)]);
+    let _ = g.cancel_all_open();
+    assert_eq!(g.transport.sent().len(), 1, "the list read and nothing else");
+}
+
+/// ONE tag anywhere in the history — even on a finished row, even somebody
+/// else's — proves the field survives the round trip, and that is all the
+/// premise needs. History is where to look because it is never empty on this
+/// account and both stacks have always sent the field.
+#[test]
+fn one_tag_anywhere_in_the_history_is_enough_to_trust_the_scope() {
+    let p = page(&[
+        tagged("finished", "executed", "9f1c4b7e2a6d40518c3b9e0f7a2d5c81"),
+        r#"{"order_id":"webui","status":"resting","ticker":"KXTIME-26-ZOH"}"#.to_string(),
+    ]);
+    let g = gw(vec![(200, &p)]);
+    assert!(
+        g.resting_order_ids().unwrap().is_empty(),
+        "nothing of ours rests, and the untagged row is not ours to claim"
+    );
+}
+
+/// An empty account is not a broken one. No rows means no evidence either way,
+/// and it must arm — this is the ordinary state of a fresh key.
+#[test]
+fn an_empty_history_is_clean_not_unproven() {
+    let g = gw(vec![(200, r#"{"orders":[],"cursor":null}"#)]);
+    assert!(g.resting_order_ids().unwrap().is_empty());
+    let g = gw(vec![(200, r#"{"orders":[],"cursor":null}"#)]);
+    g.cancel_all_open().expect("an empty book cannot be a premise failure");
+}
+
+/// The operator escape hatch. This change added a way for the engine to REFUSE
+/// TO START, and the documented manual remedy (`scripts/kalshi_cancel_all.py`)
+/// is forbidden by the Rust-only scope. `--sweep-unscoped` restores exactly the
+/// pre-2026-07-29 behaviour: cancel every resting order, whoever placed it.
+#[test]
+fn sweep_unscoped_restores_the_account_wide_cancel() {
+    let p = r#"{"orders":[
+        {"order_id":"r1","status":"resting"},
+        {"order_id":"theirs","status":"resting","client_order_id":"9f1c4b7e2a6d40518c3b9e0f7a2d5c81"}
+    ],"cursor":null}"#;
+    let g = gw(vec![(200, p), (200, "{}"), (200, "{}")]).with_unscoped_sweep(true);
+    g.cancel_all_open().expect("the override must not refuse");
+    let cancelled: Vec<String> = g.transport.sent()[1..].iter().map(|s| s.path.clone()).collect();
+    assert_eq!(
+        cancelled,
+        vec![
+            "/trade-api/v2/portfolio/events/orders/r1",
+            "/trade-api/v2/portfolio/events/orders/theirs",
+        ],
+        "everything resting, including another workstream's — that is the point of the flag"
     );
 }
 
@@ -394,11 +511,11 @@ fn the_sweep_cancels_this_stacks_orders_and_leaves_another_workstreams_alone() {
 /// so both of the ids below are ours despite neither being minted here.
 #[test]
 fn a_place_whose_ack_never_came_back_is_still_caught_by_the_sweep() {
-    let page = r#"{"orders":[
-        {"order_id":"never-acked","status":"resting","client_order_id":"m1785257819053"},
-        {"order_id":"last-run","status":"resting","client_order_id":"h1785171419001"}
-    ],"cursor":null}"#;
-    let g = gw(vec![(200, page), (200, "{}"), (200, "{}")]);
+    let p = page(&[
+        tagged("never-acked", "resting", "m1785257819053"),
+        tagged("last-run", "resting", "h1785171419001"),
+    ]);
+    let g = gw(vec![(200, &p), (200, "{}"), (200, "{}")]);
     g.cancel_all_open().unwrap();
     let cancelled: Vec<String> = g.transport.sent()[1..].iter().map(|s| s.path.clone()).collect();
     assert_eq!(
@@ -411,23 +528,32 @@ fn a_place_whose_ack_never_came_back_is_still_caught_by_the_sweep() {
     );
 }
 
-/// A resting row with NO `client_order_id` is unattributable, and that is the
-/// ownership-level form of the unreadable list the sweep already refuses to
-/// treat as proof. Kalshi's create body REQUIRES the field, so this shape means
-/// the LIST has stopped reporting the tag the whole scope rests on — fail
-/// closed rather than let scoping quietly re-open the defect above.
+/// A human placing ONE order through Kalshi's own web UI must not be able to
+/// stop this process arming.
+///
+/// That order carries no `client_order_id` at all. An earlier cut of this
+/// change counted every untagged resting row against the proof, which would
+/// have turned a routine manual order into `startup_sweep` failing and `main`
+/// exiting 10. It is not ours to cancel and not ours to prove — the premise
+/// check above is what stops that leniency from hiding a non-echoing list,
+/// and it is satisfied here by the tagged row alongside.
 #[test]
-fn a_resting_order_with_no_client_order_id_is_neither_cancelled_nor_proven_clean() {
-    let page = r#"{"orders":[{"order_id":"untagged","status":"resting"}],"cursor":null}"#;
-    let g = gw(vec![(200, page)]);
+fn a_web_ui_order_with_no_tag_is_left_alone_and_does_not_block_arming() {
+    let p = page(&[
+        tagged("ours", "resting", "m1785257819045"),
+        r#"{"order_id":"webui","status":"resting","ticker":"KXTIME-26-ZOH"}"#.to_string(),
+    ]);
+    let g = gw(vec![(200, &p), (200, "{}")]);
     g.cancel_all_open().unwrap();
-    assert_eq!(g.transport.sent().len(), 1, "nothing of ours claims it, so no cancel");
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 2, "one list read, one cancel — not the human's order");
+    assert_eq!(sent[1].path, "/trade-api/v2/portfolio/events/orders/ours");
 
-    let g = gw(vec![(200, page)]);
+    let g = gw(vec![(200, &p)]);
     assert_eq!(
         g.resting_order_ids().unwrap(),
-        vec!["untagged"],
-        "...but the book is NOT proven clean over it"
+        vec!["ours"],
+        "the untagged row must not sit in the proof forever and wedge the sweep"
     );
 }
 
@@ -448,6 +574,10 @@ fn ownership_is_decided_by_the_tag_this_stack_mints() {
     ] {
         assert!(!is_ours(id), "{id} must never be swept as ours");
     }
+    // `t` shadows any longer prefix starting with it. Today no id reaches a
+    // second arm, but the loop must keep looking rather than answer on the
+    // first prefix that matches — the bug would be a silently NARROWER sweep.
+    assert!(!is_ours("take-1"), "a `take-` id must not be answered by the `t` arm");
 }
 
 /// The rehearsal contract: place 1 contract at 1c, confirm it RESTS, cancel.
@@ -586,19 +716,23 @@ fn repricing_starves_neither_the_hedge_nor_the_read_budget() {
 /// bucket, which is the hazard this whole change exists to remove.
 #[test]
 fn a_drained_budget_does_not_refuse_the_kill_sweep() {
-    let page = r#"{"orders":[{"order_id":"66e1c799-507b","status":"resting","client_order_id":"m1"}],"cursor":null}"#;
+    // the RECORDED row shape, so this asserts nothing about the tag; the
+    // property under test is the budget, and it holds on either sweep path.
+    let page = r#"{"orders":[{"order_id":"66e1c799-507b","status":"resting"}],"cursor":null}"#;
     let g = KalshiGateway::with_transport(
         signer(),
         RateLimiter::from_per_minute(0.0, 0), // not one token, ever
         MockTransport::new(vec![(200, page), (200, "{}")]),
-    );
+    )
+    .with_unscoped_sweep(true);
     assert_eq!(g.resting_order_ids().unwrap(), vec!["66e1c799-507b"], "the proof read goes");
 
     let g = KalshiGateway::with_transport(
         signer(),
         RateLimiter::from_per_minute(0.0, 0),
         MockTransport::new(vec![(200, page), (200, "{}")]),
-    );
+    )
+    .with_unscoped_sweep(true);
     g.cancel_all_open().expect("a halt must not be refusable by a local budget");
     let sent = g.transport.sent();
     assert_eq!(sent.len(), 2, "the list read, then the DELETE");

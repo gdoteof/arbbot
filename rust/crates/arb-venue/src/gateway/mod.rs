@@ -119,9 +119,15 @@ pub enum CancelBy {
 /// digits for the same reason: it is what the counters actually emit, and it
 /// keeps a bare word that happens to start with `t` from reading as ours.
 pub fn is_ours(client_order_id: &str) -> bool {
+    // `continue`, not `return`, on a prefix that matches but whose tail is not a
+    // counter. With today's five prefixes no id can reach a second arm, but
+    // `t` shadows any future `take-…` and the bug would be a SILENTLY NARROWER
+    // sweep — the exact class this function exists to prevent.
     for p in ["m", "h", "t", "rehearse-", "sweep-"] {
         if let Some(n) = client_order_id.strip_prefix(p) {
-            return !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+            if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
+                return true;
+            }
         }
     }
     false
@@ -188,10 +194,18 @@ pub trait VenueGateway {
     /// evidence, since a 200 from cancel_all_open only says the venue accepted
     /// the request.
     ///
-    /// It must report exactly what [`Self::cancel_all_open`] is able to cancel,
-    /// or the two disagree in one of two bad directions: wider, and a sweep can
-    /// never come back clean while another workstream is quoting; narrower, and
-    /// it proves less than it claims.
+    /// It reports what [`Self::cancel_all_open`] is able to cancel, with ONE
+    /// deliberate exception on Kalshi: a resting row carrying no tag at all is
+    /// not cancelled (nothing claims it) and is not counted either (a human
+    /// order placed through the venue's own web UI has no `client_order_id`,
+    /// and must not be able to stop this process arming). What stops that
+    /// exception from silently narrowing the sweep to nothing is a separate
+    /// check — see `KalshiGateway::cancel_all_open` — that the venue is
+    /// echoing the tag AT ALL before any of this scoping is trusted.
+    ///
+    /// Beyond that the two must agree, or they disagree in one of two bad
+    /// directions: wider, and a sweep can never come back clean while another
+    /// workstream is quoting; narrower, and it proves less than it claims.
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError>;
     /// Place one far-off-touch contract, confirm it rests, cancel it. Live
     /// auth rehearsal — returns the order id on success.
