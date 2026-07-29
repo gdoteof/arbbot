@@ -272,10 +272,147 @@ fn resnap_batch(total: usize, chunks: usize) -> usize {
     total.div_ceil(chunks.max(1))
 }
 
-fn ws_snapshot_request(sids: &[i64]) -> String {
-    json!({"id": 99, "cmd": "update_subscription",
-           "params": {"sids": sids, "action": "get_snapshot"}})
-        .to_string()
+/// One slice of the integrity sweep: `resnap_batch` tickers from `cursor`,
+/// refreshed THROUGH `book` (see `on_rest_snapshot`). Returns how far to
+/// advance the cursor — the FULL slice width, skipped tickers included, so a
+/// closed market cannot shift the sweep's phase and cost the universe the
+/// coverage guarantee `a_full_cycle_refreshes_every_ticker` pins.
+///
+/// It walks the ticker list built at STARTUP, which is why it has to ask which
+/// of those markets is still live. `main`'s universe maintainer evicts the
+/// books of markets the venue no longer reports as active, precisely so the 30s
+/// rebroadcast stops feeding the engine a frozen book — and from the moment
+/// this sweep stopped being a no-op it re-fetched those same tickers within
+/// 300s, republished them into the BookBuilder and undid the eviction. The
+/// eviction was written against a sweep that did nothing.
+async fn resnap_slice(
+    core: &Core,
+    book: &mut KalshiWsBook,
+    mseq: &mut SeqCounter,
+    catalog: &KalshiCatalog,
+    tickers: &[String],
+    cursor: usize,
+) -> usize {
+    let batch = resnap_batch(tickers.len(), RESNAP_CHUNKS);
+    let (mut tried, mut failed) = (0usize, 0usize);
+    for i in 0..batch {
+        let t = &tickers[(cursor + i) % tickers.len()];
+        if core.is_evicted(Venue::Kalshi, t) {
+            continue;
+        }
+        tried += 1;
+        let s = mseq.next(t);
+        match catalog.orderbook_fp(t).await {
+            Ok(fp) => {
+                if let Some(snap) = book.on_rest_snapshot(t, &fp, s) {
+                    core.on_event(&snap);
+                }
+            }
+            Err(_) => failed += 1,
+        }
+    }
+    // A silent failure here is a book that keeps whatever state it was left in,
+    // which is how one reached 74,082s old against a 300s interval. Counted,
+    // not logged per ticker.
+    if failed > 0 {
+        eprintln!(
+            "[kalshi-ws] resnapshot slice: {failed}/{tried} books did NOT refresh — \
+             their age is now unbounded"
+        );
+    }
+    batch
+}
+
+/// One WS message: wire-seq bookkeeping, then the book or tape update. Returns
+/// the ticker whose book needs a REST resnapshot, if the BookBuilder found a
+/// per-market desync applying it.
+///
+/// Split out of the read loop so the gap branch below can be exercised without
+/// a socket and a signing key.
+fn on_ws_message(
+    core: &Core,
+    book: &mut KalshiWsBook,
+    sid_seq: &mut HashMap<i64, i64>,
+    mseq: &mut SeqCounter,
+    m: &Value,
+) -> Option<String> {
+    let typ = m.get("type").and_then(Value::as_str).unwrap_or("");
+    let sid = m.get("sid").and_then(Value::as_i64);
+    let seq = m.get("seq").and_then(Value::as_i64);
+    if matches!(typ, "orderbook_snapshot" | "orderbook_delta") {
+        if let (Some(sid), Some(seq)) = (sid, seq) {
+            // A gap in the wire sequence is NOT a reason to drop THIS message.
+            //
+            // `seq` counts messages on the SID, and one sid carries every
+            // subscribed ticker, so a gap says "a message was lost somewhere in
+            // the universe" and cannot say whose. The message in hand is
+            // meanwhile intact: a valid `delta_fp` for a NAMED ticker. Take the
+            // two cases and dropping it never wins. If that ticker is not the
+            // one that lost a frame, its accumulator was CORRECT and the drop
+            // is the only thing that puts an offset in it. If it is, the
+            // accumulator is already short the lost change and applying leaves
+            // it short by exactly that — while dropping makes it short by the
+            // lost change PLUS this one. Skipping only ever added a second
+            // offset to react to damage it could not locate.
+            //
+            // `delta_fp` is a CHANGE, so each one skipped is an offset that
+            // lasts until the sweep heals that ticker: 0.93% of 64,553 sweep
+            // comparisons over 7.6h of live tape disagreed with REST truth, 27
+            // levels holding the SAME nonzero offset across >=3 consecutive
+            // sweeps.
+            //
+            // Skipping also bypassed the only per-market recovery this file
+            // has. Applying the delta is what makes the BookBuilder report a
+            // desync, and that is what triggers the targeted REST resnapshot
+            // the caller does. What the branch did instead was ask the WS for
+            // `get_snapshot`, which the 2026-07-20 note below records as having
+            // produced zero snapshots in practice.
+            //
+            // So there is nothing to do here but re-anchor, say it happened,
+            // and leave the damage to the sweep that bounds it.
+            if let Some(exp) = sid_seq.insert(sid, seq) {
+                if typ == "orderbook_delta" && seq != exp + 1 {
+                    eprintln!(
+                        "[kalshi-ws] sid {sid} seq {exp} -> {seq}: a book message was lost; \
+                         which ticker it belonged to is unknowable (seq is per-sid) and its \
+                         running sizes are off until the next REST sweep heals it"
+                    );
+                }
+            }
+        }
+    }
+    let payload = m.get("msg").cloned().unwrap_or(Value::Object(Default::default()));
+    match typ {
+        "orderbook_snapshot" => {
+            if let Some(t) = payload.get("market_ticker").and_then(Value::as_str) {
+                let s = mseq.next(t);
+                if let Some(ev) = book.on_snapshot(&payload, s) {
+                    core.on_event(&ev);
+                }
+            }
+        }
+        "orderbook_delta" => {
+            if let Some(t) = payload.get("market_ticker").and_then(Value::as_str) {
+                let t = t.to_owned();
+                let s = mseq.next(&t);
+                if let Some(ev) = book.on_delta(&payload, s) {
+                    if core.on_event(&ev).is_some() {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+        "trade" => {
+            if let Some(t) = payload.get("market_ticker").and_then(Value::as_str) {
+                let s = mseq.next(&format!("{t}|tape"));
+                if let Some(ev) = normalize_ws_trade(&payload, s) {
+                    core.on_event(&ev);
+                }
+            }
+        }
+        _ => {}
+    }
+    None
 }
 
 pub async fn ws_task(
@@ -324,30 +461,9 @@ async fn ws_session(
         // were the ones the sweep skipped. It refreshes THROUGH `book`, which is
         // what bounds the damage of a dropped delta — see `on_rest_snapshot`.
         if last_resnap.elapsed() > Duration::from_secs(RESNAP_TICK_S) && !tickers.is_empty() {
-            let batch = resnap_batch(tickers.len(), RESNAP_CHUNKS);
-            let mut failed = 0usize;
-            for i in 0..batch {
-                let t = &tickers[(resnap_cursor + i) % tickers.len()];
-                let s = mseq.next(t);
-                match catalog.orderbook_fp(t).await {
-                    Ok(fp) => {
-                        if let Some(snap) = book.on_rest_snapshot(t, &fp, s) {
-                            core.on_event(&snap);
-                        }
-                    }
-                    Err(_) => failed += 1,
-                }
-            }
-            resnap_cursor = (resnap_cursor + batch) % tickers.len();
-            // A silent failure here is a book that keeps whatever state it was
-            // left in, which is how one reached 74,082s old against a 300s
-            // interval. Counted, not logged per ticker.
-            if failed > 0 {
-                eprintln!(
-                    "[kalshi-ws] resnapshot slice: {failed}/{batch} books did NOT refresh — \
-                     their age is now unbounded"
-                );
-            }
+            let advance =
+                resnap_slice(core, &mut book, &mut mseq, catalog, tickers, resnap_cursor).await;
+            resnap_cursor = (resnap_cursor + advance) % tickers.len();
             last_resnap = tokio::time::Instant::now();
         }
         let frame = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
@@ -376,62 +492,16 @@ async fn ws_session(
             Ok(v) => v,
             Err(_) => continue,
         };
-        let typ = m.get("type").and_then(Value::as_str).unwrap_or("");
-        let sid = m.get("sid").and_then(Value::as_i64);
-        let seq = m.get("seq").and_then(Value::as_i64);
-        if matches!(typ, "orderbook_snapshot" | "orderbook_delta") {
-            if let (Some(sid), Some(seq)) = (sid, seq) {
-                let expected = sid_seq.get(&sid).copied();
-                if typ == "orderbook_delta" {
-                    if let Some(exp) = expected {
-                        if seq != exp + 1 {
-                            ws.send(Message::Text(ws_snapshot_request(&[sid]))).await?;
-                            sid_seq.remove(&sid);
-                            continue;
-                        }
-                    }
-                }
-                sid_seq.insert(sid, seq);
-            }
-        }
-        let payload = m.get("msg").cloned().unwrap_or(Value::Object(Default::default()));
-        match typ {
-            "orderbook_snapshot" => {
-                if let Some(t) = payload.get("market_ticker").and_then(Value::as_str) {
-                    let s = mseq.next(t);
-                    if let Some(ev) = book.on_snapshot(&payload, s) {
-                        core.on_event(&ev);
-                    }
+        if let Some(t) = on_ws_message(core, &mut book, &mut sid_seq, &mut mseq, &m) {
+            // gap: REST snapshot resync (auth-free, proven — the WS
+            // get_snapshot path produced zero snapshots in practice,
+            // 2026-07-20)
+            let s2 = mseq.next(&t);
+            if let Ok(fp) = catalog.orderbook_fp(&t).await {
+                if let Some(snap) = book.on_rest_snapshot(&t, &fp, s2) {
+                    core.on_event(&snap);
                 }
             }
-            "orderbook_delta" => {
-                if let Some(t) = payload.get("market_ticker").and_then(Value::as_str) {
-                    let t = t.to_owned();
-                    let s = mseq.next(&t);
-                    if let Some(ev) = book.on_delta(&payload, s) {
-                        if core.on_event(&ev).is_some() {
-                            // gap: REST snapshot resync (auth-free, proven —
-                            // the WS get_snapshot path produced zero
-                            // snapshots in practice, 2026-07-20)
-                            let s2 = mseq.next(&t);
-                            if let Ok(fp) = catalog.orderbook_fp(&t).await {
-                                if let Some(snap) = book.on_rest_snapshot(&t, &fp, s2) {
-                                    core.on_event(&snap);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            "trade" => {
-                if let Some(t) = payload.get("market_ticker").and_then(Value::as_str) {
-                    let s = mseq.next(&format!("{t}|tape"));
-                    if let Some(ev) = normalize_ws_trade(&payload, s) {
-                        core.on_event(&ev);
-                    }
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -469,6 +539,142 @@ pub async fn poll_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_core(tag: &str) -> (Core, std::path::PathBuf) {
+        use arb_tape::broadcast::{Broadcaster, MAX_BUFFER};
+        use arb_tape::writer::JsonlWriter;
+        let dir = std::env::temp_dir().join(format!("arb-kalshi-{tag}-{}", std::process::id()));
+        (Core::new(JsonlWriter::new(&dir).expect("writer"), Broadcaster::new(MAX_BUFFER)), dir)
+    }
+
+    /// A wire-seq gap must not cost a SECOND delta.
+    ///
+    /// `seq` is per-SID and one sid carries the whole universe, so the lost
+    /// message and the message after it need not be the same market's — and
+    /// when they are not, dropping the second one takes a CORRECT accumulator
+    /// and puts a permanent offset in it, in addition to the one the gap
+    /// already caused elsewhere. Here the frame lost at seq 3 is A's and the
+    /// delta at seq 4 is B's: B's book was never wrong, and its change must
+    /// land.
+    #[test]
+    fn a_wire_gap_does_not_discard_the_next_tickers_delta() {
+        let (core, dir) = test_core("gap");
+        let mut book = KalshiWsBook::default();
+        let mut sid_seq: HashMap<i64, i64> = HashMap::new();
+        let mut mseq = SeqCounter::default();
+        for (t, seq) in [("A", 1), ("B", 2)] {
+            let m = json!({"type": "orderbook_snapshot", "sid": 1, "seq": seq,
+                           "msg": {"market_ticker": t,
+                                   "yes_dollars_fp": [["0.4300", "697.00"]],
+                                   "no_dollars_fp": [["0.5000", "600.00"]]}});
+            assert_eq!(on_ws_message(&core, &mut book, &mut sid_seq, &mut mseq, &m), None);
+        }
+        let d = json!({"type": "orderbook_delta", "sid": 1, "seq": 4,
+                       "msg": {"market_ticker": "B", "side": "yes",
+                               "price_dollars": "0.4300", "delta_fp": "-100.00"}});
+        assert_eq!(
+            on_ws_message(&core, &mut book, &mut sid_seq, &mut mseq, &d),
+            None,
+            "a wire gap is not a per-market desync — there is nothing named to resnapshot"
+        );
+        let lines = core.snapshot_lines();
+        let b = lines.iter().find(|l| l.contains(r#""market_id":"B""#)).expect("B has a book");
+        assert!(b.contains("597.00"), "B's change was discarded with A's gap: {b}");
+        assert_eq!(core.gap_count(), 0, "a wire gap must not be reported as a per-market gap");
+        // ...and the next message re-anchors rather than being read as a gap too.
+        let d2 = json!({"type": "orderbook_delta", "sid": 1, "seq": 5,
+                        "msg": {"market_ticker": "B", "side": "yes",
+                                "price_dollars": "0.4300", "delta_fp": "-97.00"}});
+        on_ws_message(&core, &mut book, &mut sid_seq, &mut mseq, &d2);
+        let lines = core.snapshot_lines();
+        let b = lines.iter().find(|l| l.contains(r#""market_id":"B""#)).expect("B has a book");
+        assert!(b.contains("500.00"), "the delta after the gapped one was discarded: {b}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An evicted book must not come back on the next sweep.
+    ///
+    /// The universe maintainer evicts a market the venue stopped reporting as
+    /// active so the 30s rebroadcast stops shipping its frozen book to the
+    /// engine. The sweep walks the STARTUP ticker list, so before this it
+    /// re-fetched that market by REST within 300s and republished it — the
+    /// eviction had a 30-second half-life.
+    #[tokio::test]
+    async fn the_sweep_does_not_resurrect_an_evicted_book() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // an /orderbook endpoint that records what it was asked for
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let http = TcpListener::bind("127.0.0.1:0").await.expect("bind http");
+        let base = format!("http://{}", http.local_addr().expect("http addr"));
+        {
+            let asked = asked.clone();
+            tokio::spawn(async move {
+                while let Ok((mut s, _)) = http.accept().await {
+                    let asked = asked.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 2048];
+                        let n = s.read(&mut buf).await.unwrap_or(0);
+                        asked
+                            .lock()
+                            .expect("asked lock")
+                            .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                        let body = r#"{"orderbook_fp":{"yes_dollars":[["0.4300","697.00"]],"no_dollars":[]}}"#;
+                        let _ = s
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                    });
+                }
+            });
+        }
+
+        let (core, dir) = test_core("evict");
+        let catalog = KalshiCatalog {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("client"),
+            base,
+        };
+        let tickers: Vec<String> = ["A", "B", "C"].iter().map(|t| (*t).to_owned()).collect();
+        let mut book = KalshiWsBook::default();
+        let mut mseq = SeqCounter::default();
+
+        // B was live, then the venue stopped calling it active
+        let fp = json!({"yes_dollars": [["0.4300", "697.00"]], "no_dollars": []});
+        core.on_event(&normalize_orderbook("B", &fp, mseq.next("B")));
+        core.evict_book(Venue::Kalshi, "B");
+
+        let mut cursor = 0usize;
+        for _ in 0..RESNAP_CHUNKS {
+            let advance =
+                resnap_slice(&core, &mut book, &mut mseq, &catalog, &tickers, cursor).await;
+            assert_eq!(advance, resnap_batch(tickers.len(), RESNAP_CHUNKS));
+            cursor = (cursor + advance) % tickers.len();
+        }
+        let books = core.snapshot_lines().join("");
+        assert!(
+            !books.contains(r#""market_id":"B""#),
+            "the sweep resurrected an evicted book: {books}"
+        );
+        assert!(
+            !asked.lock().expect("asked lock").iter().any(|r| r.contains("/markets/B/")),
+            "the sweep asked the venue for an evicted ticker"
+        );
+        // ...and it is still a sweep: the live tickers were refreshed.
+        for t in ["A", "C"] {
+            assert!(books.contains(&format!(r#""market_id":"{t}""#)), "{t} was never swept");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn delta_accumulates_changes_into_totals() {

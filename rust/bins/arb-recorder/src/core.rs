@@ -18,6 +18,7 @@ struct Inner {
     writer: JsonlWriter,
     books: BookBuilder,
     pub gap_count: u64,
+    evicted: std::collections::HashSet<(arb_core::model::Venue, String)>,
 }
 
 /// Shared JSON helper: a venue field that may arrive as string or number,
@@ -98,7 +99,12 @@ impl SeqCounter {
 impl Core {
     pub fn new(writer: JsonlWriter, broadcaster: Broadcaster) -> Self {
         Self {
-            inner: Mutex::new(Inner { writer, books: BookBuilder::new(), gap_count: 0 }),
+            inner: Mutex::new(Inner {
+                writer,
+                books: BookBuilder::new(),
+                gap_count: 0,
+                evicted: Default::default(),
+            }),
             broadcaster,
         }
     }
@@ -142,8 +148,28 @@ impl Core {
         }
     }
 
+    /// Drop a book AND remember that it was dropped.
+    ///
+    /// Deleting the map entry is not eviction on its own: every refresher in
+    /// the recorder walks the STARTUP universe, so whatever the universe
+    /// maintainer closed is re-fetched and re-published by the next integrity
+    /// sweep, and the 30s rebroadcast resumes shipping the frozen book to the
+    /// engine — which is the exact thing the eviction exists to stop
+    /// (2026-07-20 review). The sweep therefore has to be able to ASK, and this
+    /// is the object it asks: the eviction decision keeps its one owner (the
+    /// venue status poll in `main`) instead of gaining a second copy next to
+    /// each sweep.
+    ///
+    /// One-way, for the process's lifetime. A settled Kalshi market does not
+    /// reopen; a restart rebuilds the universe from the registry.
     pub fn evict_book(&self, venue: arb_core::model::Venue, market_id: &str) {
-        self.inner.lock().expect("core lock").books.remove(venue, market_id);
+        let mut inner = self.inner.lock().expect("core lock");
+        inner.books.remove(venue, market_id);
+        inner.evicted.insert((venue, market_id.to_owned()));
+    }
+
+    pub fn is_evicted(&self, venue: arb_core::model::Venue, market_id: &str) -> bool {
+        self.inner.lock().expect("core lock").evicted.contains(&(venue, market_id.to_owned()))
     }
 
     pub fn gap_count(&self) -> u64 {
