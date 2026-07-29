@@ -549,16 +549,44 @@ function dur(sec){
 
 /* Coverage is per VENUE, so the badge is too. One recorder dying leaves the
    other venues sampling, and a single ROLLUP CURRENT badge off the newest
-   sample anywhere said "go" over a six-hour-dead book. Three chips instead:
-   green = covering now, red = covering but behind, amber = not in the rollup
-   at all, which is a different fact and gets a different colour. */
+   sample anywhere said "go" over a six-hour-dead book. Green = covering now,
+   red = covering but behind, amber = no coverage at all — which is a different
+   fact and gets a different colour.
+
+   Amber says which REPAIR, because the two ways to have no coverage take
+   opposite ones. NO ROLLUP: the venue is not in the rollup, so rebuild it.
+   UNSUBSCRIBED: the rollup is being written for this venue and holds not one
+   market the registry names, so the recorder's subscription is what is short —
+   rebuilding replays the same markets and changes nothing. Not "NO BOOK",
+   which is what the banner below calls a single missing market. */
 function venueChips(vs){
   return (vs||[]).map(v=>{
     const cls = v.current ? 'ok' : (v.coverage_age_s<0 ? 'warn' : 'bad');
-    const age = v.coverage_age_s<0 ? 'NO ROLLUP' : dur(v.coverage_age_s);
+    const age = v.coverage_age_s>=0 ? dur(v.coverage_age_s)
+              : (v.recorded ? 'UNSUBSCRIBED' : 'NO ROLLUP');
     return `<span class="badge ${cls}">${esc(v.venue)} ${age}</span>`;
   }).join(' ');
 }
+/* The venues whose books we price are absent while their tape is still being
+   written: a rebuild would replay the same markets, so the banner must not ask
+   for one. */
+const unsubscribedVenues = (d) => (d.venues||[])
+  .filter(v=>v.coverage_age_s<0 && v.recorded).map(v=>v.venue);
+
+/* A row's coverage cell. -1 is NO coverage on one of its venues, not a small
+   age: `dur()` renders it as an em dash, which in a numeric column reads like
+   "nothing to report" — the opposite of what it means. It is the reason the
+   row can never be actionable, so it is spelled and it is red.
+
+   `covSort` is why -1 is not enough on its own: sorted as a number it is the
+   SMALLEST, so ascending by coverage put the venues we know nothing about above
+   a genuine 5s. No evidence is the stalest thing on the board, so it sorts as
+   the stalest. MAX_SAFE_INTEGER and not Infinity: the comparator below maps
+   every non-finite value to -Infinity, which is the bug this line fixes. */
+const covCls  = (r,d) =>
+  (r.coverage_age_s<0 || r.coverage_age_s>d.max_coverage_age_s ? 'bad' : 'dim');
+const covText = (r) => r.coverage_age_s<0 ? 'none' : dur(r.coverage_age_s);
+const covSort = (r) => r.coverage_age_s<0 ? Number.MAX_SAFE_INTEGER : r.coverage_age_s;
 const staleVenues = (d) => (d.venues||[]).filter(v=>!v.current && v.coverage_age_s>=0)
   .map(v=>v.venue);
 
@@ -571,10 +599,19 @@ function unevalBanner(d, noun, evaluated){
   const by = d.unevaluated_by_venue || {};
   const parts = Object.keys(by).map(v=>`${by[v]} missing a ${esc(v)} book`);
   if(!parts.length) return '';
+  // The remedy, not a generic one: a rollup that is being written and carries
+  // none of our markets is a subscription that stopped covering them, and
+  // "rebuild the rollup" sends the operator to replay the same tape.
+  const unsub = unsubscribedVenues(d).filter(v=>by[v]);
+  const fix = unsub.length
+    ? `The ${unsub.join(' and ')} rollup is being written but holds no market any pair
+       names, so it is the recorder's subscription that no longer covers them — rebuilding
+       the rollup would replay the same markets.`
+    : 'Rebuild the rollup above.';
   return `<div class="warn" style="margin-bottom:8px">▲ ${d.unevaluated_pairs} ${noun} were
     NOT evaluated (${parts.join(', ')}). They are absent from every count above, including
     &ldquo;${d.actionable} actionable&rdquo; — that number is about the ${evaluated} pair(s)
-    that had books, not the whole set. Rebuild the rollup above.</div>`;
+    that had books, not the whole set. ${fix}</div>`;
 }
 
 const ROUTE_LABEL={'take-take':'take / take','make-a-take-b':'make A → take B',
@@ -695,7 +732,7 @@ function intentsPanel(d){
     fee_b:r.priced?+r.priced.fee_b:null, edge_f:r.edge_f,
     rest_spread:r.rest_spread, take_depth:r.take_depth,
     reprices:(r.leg_a.reprices??0)+(r.leg_b.reprices??0),
-    since_change_s:r.since_change_s, coverage_age_s:r.coverage_age_s,
+    since_change_s:r.since_change_s, coverage_age_s:covSort(r),
   })[k];
 
   const all=(d.rows||[]).slice();
@@ -740,7 +777,7 @@ function intentsPanel(d){
       <td class="num ${r.deep_enough?'dim':'warn'}">${r.take_depth==null?'?':Math.floor(r.take_depth).toLocaleString()}</td>
       <td class="num dim">${(r.leg_a.reprices??0)+(r.leg_b.reprices??0)}</td>
       <td class="num dim">${dur(r.since_change_s)}</td>
-      <td class="num ${r.coverage_age_s>d.max_coverage_age_s?'bad':'dim'}" title="${esc(r.leg_a.venue)} / ${esc(r.leg_b.venue)}">${dur(r.coverage_age_s)}</td>
+      <td class="num ${covCls(r,d)}" title="${esc(r.leg_a.venue)} / ${esc(r.leg_b.venue)}">${covText(r)}</td>
     </tr>${S.expanded===r.relationship_id ? expanderRow(r.relationship_id) : ''}`;}).join('');
 
   // An empty table is a claim, and it must say which claim. Filters hiding
@@ -751,13 +788,22 @@ function intentsPanel(d){
     ${all.length === 0
       ? 'The engine is resting ' + d.resting_orders + ' order(s), but none of them are on a '
         + 'pair with both books in the rollup.'
+      // The remedy belongs to the branch that diagnosed the problem. Chosen
+      // independently, "it is the subscription, not the rollup" lands on a
+      // STALE venue whose rollup genuinely does need rebuilding, the moment one
+      // venue is behind and another is unsubscribed.
       : (!d.rollup_current
         ? 'All ' + all.length + ' pair(s) are filtered out, and ' + (staleVenues(d).length
             ? 'no pair with a ' + staleVenues(d).join(' or ') + ' leg can be actionable '
-              + 'while that rollup is ' + dur(d.rollup_coverage_age_s) + ' behind'
-            : 'nothing can be actionable while the rollup carries no samples at all')
-          + ' — rebuild it above, or turn off <b>actionable only</b> to see the pairs '
-          + 'as last priced.'
+              + 'while that rollup is ' + dur(d.rollup_coverage_age_s) + ' behind — rebuild it '
+              + 'above'
+            : 'nothing can be actionable while the rollup carries no book for any pair we quote'
+              + ' — ' + (unsubscribedVenues(d).length
+                ? 'the tape for ' + unsubscribedVenues(d).join(' and ') + ' is still being '
+                  + 'written, so it is the subscription that stopped covering our markets, '
+                  + 'not the rollup'
+                : 'rebuild it above'))
+          + ', or turn off <b>actionable only</b> to see the pairs as last priced.'
         : 'All ' + all.length + ' pair(s) are hidden by the filters above.')}</div>`;
 
   const rbtn=(k,l)=>`<a href="#" data-route="${k}" class="rf ${S.filter.route===k?'on':''}">${l}</a>`;
@@ -886,7 +932,7 @@ function currentPanel(d){
       <td class="num ${p.take_depth==null||Number(p.take_depth)<Number(d.clip)?'warn':'dim'}">
         ${p.take_depth==null?'?':Math.floor(Number(p.take_depth)).toLocaleString()}</td>
       <td class="num ${stale>3600?'warn':'dim'}">${dur(stale)}</td>
-      <td class="num ${r.coverage_age_s>d.max_coverage_age_s?'bad':'dim'}">${dur(r.coverage_age_s)}</td>
+      <td class="num ${covCls(r,d)}">${covText(r)}</td>
       <td class="dim" style="font-size:11px">${esc(alt)}</td>
     </tr>`;
   }).join('');
@@ -904,8 +950,12 @@ function currentPanel(d){
       ? stales.join(' and ') + ' stopped covering ' + dur(d.rollup_coverage_age_s)
         + ' ago. Every row with a leg there is priced off a dead book and cannot be '
         + 'actionable until the rollup is rebuilt — the other venues are unaffected.'
-      : 'The rollup carries no samples at all, so nothing on this board is evidence '
-        + 'about now. Rebuild it above.'}</div>`}
+      : 'The rollup carries no book for any pair on this board, so nothing here is '
+        + 'evidence about now. ' + (unsubscribedVenues(d).length
+          ? 'The tape is still being written for ' + unsubscribedVenues(d).join(' and ')
+            + ' — it is the subscription that no longer covers our markets, and a rebuild '
+            + 'would replay the same ones.'
+          : 'Rebuild it above.')}</div>`}
     ${unevalBanner(d, d.only_tradable ? 'permitted pair(s)' : 'pair(s)', d.priced_pairs)}
     <nav style="padding:0;border:0;margin-bottom:6px">${SCENARIOS.map(([k,l])=>tab(k,l)).join('')}</nav>
     <div class="sub" style="margin-bottom:10px">clip size:
@@ -1129,9 +1179,12 @@ const DRAW = {
   '/intents': (f) => {
     const d = S.data.intents;
     if(!d) return loading(f, 'engine intents');
-    // `rollup_current` is the stalest venue the rollup CARRIES, so a venue
-    // missing entirely leaves it true — and that is exactly the state where the
-    // rebuild is the fix, so the un-evaluated count has to open this too.
+    // `rollup_current` is the stalest venue the rollup CARRIES, so a venue with
+    // no coverage at all leaves it true, and the un-evaluated count is what
+    // opens the rollup panel in that state. The panel is not always the FIX:
+    // when the venue is UNSUBSCRIBED its tape is being written and a rebuild
+    // replays the same markets. The banner beside it says which; this is only
+    // what puts the rebuild button within reach.
     if(!d.error && (!d.rollup_current || d.unevaluated_pairs)) f.append(rollupHost(S.stream.today || ''));
     f.append(topSeriesPanel(S.data.top || {rows:[]}));
     f.append(intentsPanel(d));

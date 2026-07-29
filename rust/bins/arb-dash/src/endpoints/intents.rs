@@ -274,7 +274,7 @@ pub fn json(a: &Args) -> String {
 
     let day = integrity::build(&a.data_dir).today;
     let latest = series::latest_by_market(&rollup_paths(&a.rollup_dir, &day));
-    let cov = coverage_by_venue(&latest, (now * 1e9) as i64);
+    let cov = coverage_by_venue(&latest, &reg, (now * 1e9) as i64);
     let coverage_age_s = stalest_age_s(&cov);
     let rollup_current = coverage_age_s <= MAX_COVERAGE_AGE_S;
 
@@ -356,7 +356,12 @@ pub fn json(a: &Args) -> String {
             // Unlike `since_change_s` this IS the staleness flag: how far the
             // rollup covers on the older of the row's two venues. It is what
             // `actionable` is gated on, so the row has to show it.
-            "coverage_age_s": coverage_age_s,
+            //
+            // -1 for a venue with no coverage at all, the same sentinel
+            // `coverage_json` uses. Raw, `i64::MAX` reached the cell and
+            // rendered as "106751991167300d 15h" — a number no operator can
+            // read as "we have no evidence about this venue".
+            "coverage_age_s": if coverage_age_s == i64::MAX { -1 } else { coverage_age_s },
             "actionable": actionable,
             "edge": priced.as_ref().and_then(|p| p["edge_per_contract"].as_str().map(String::from)),
             "last_ts": p.rest_a.map(|o| o.ts).into_iter()
@@ -375,7 +380,7 @@ pub fn json(a: &Args) -> String {
         "min_take_depth": 25,
         "rollup_current": rollup_current,
         "rollup_coverage_age_s": if coverage_age_s == i64::MAX { -1 } else { coverage_age_s },
-        "venues": coverage_json(&cov),
+        "venues": coverage_json(&cov, &latest),
         "max_coverage_age_s": MAX_COVERAGE_AGE_S,
         "engine_live": (0.0..120.0).contains(&age),
         "last_intent_age_s": age.round() as i64,

@@ -11,10 +11,11 @@ pub mod opportunities;
 pub mod pairs;
 pub mod trades;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::UNIX_EPOCH;
 
 use arb_core::clock::now_secs;
+use arb_registry::Registry;
 
 use crate::VENUES;
 
@@ -22,8 +23,8 @@ use crate::VENUES;
 /// rollup knows it.
 pub type Latest = HashMap<(String, String), arb_tob::TobSample>;
 
-/// Seconds of coverage age per VENUE. A venue the rollup carries no sample for
-/// is ABSENT, not zero.
+/// Seconds of coverage age per VENUE. A venue the rollup carries no
+/// registry-backed sample for is ABSENT, not zero.
 pub type Coverage = HashMap<String, i64>;
 
 pub fn age_secs(path: &str) -> Option<u64> {
@@ -64,11 +65,93 @@ pub const MAX_COVERAGE_AGE_S: i64 = 1800;
 /// painted the board ROLLUP CURRENT over a six-hour-dead book — the same wrong
 /// headline this gate was built to stop, one venue too coarse.
 ///
+/// Over the REGISTRY-BACKED markets only, because `min` over the whole venue
+/// reports the freshness of its NOISIEST market and most of a venue's markets
+/// are not ones this board prices. The 2026-07-28 polymarket_us tape carries
+/// 749 markets and the registry names 88: the other 661 are there because the
+/// pm-us universe is built from `polymarket_us_tags` (`main.rs:206`), not from
+/// the registry, so 88% of the population certifying the venue is a population
+/// no pair is priced off.
+///
+/// WHAT THIS CATCHES, stated no wider than it is: a failure that takes out
+/// EVERY registry leg on a venue while its catalog markets keep flowing. Not
+/// one market and not one chunk — the 88 pm-us legs span ten families spread
+/// across the whole slug list, so losing any single 150-slug subscribe window
+/// (`pmus.rs:166`) leaves dozens still ticking and `min` over the survivors
+/// does not move. The only shape that COULD produce it is the catalog: the
+/// pm-us slug list is whatever `markets_by_tags` (`main.rs:207`) returned at
+/// startup, filtered `!closed` (`:210`), handed to one `ws_task` and never
+/// refreshed. 17 of the tape's 124 events carry all 88 legs, so a catalog that
+/// omitted exactly those would subscribe the other 638 markets and none of
+/// ours — the `UNSUBSCRIBED` state below.
+///
+/// COULD, and no further: no single fault is known to produce that total form.
+/// A failed catalog call `Err`s the whole request and leaves NO ROLLUP instead;
+/// a dropped tag is partial, because the 88 span ten families; `!closed` is
+/// per-market. This basis is therefore a FAIL-SAFE against a shape the code
+/// permits and nobody has demonstrated, not a repair for an observed outage.
+/// What justifies it is the measurement below, which does not depend on that
+/// shape ever occurring.
+///
+/// What it buys, measured on the 07-28 tape rather than argued: at every one of
+/// the 18 hourly checkpoints across that day, `min` over all 749 markets reads
+/// 0-4s. It is a socket-liveness bit and nothing finer — anything short of the
+/// whole feed dying is invisible to it. `min` over the 88 ranges 1-151s on the
+/// same checkpoints, so it is at least CAPABLE of registering less than total
+/// death.
+///
+/// That is the improvement, and it is a capability rather than a catch: 151s is
+/// still 12x inside `MAX_COVERAGE_AGE_S`, so on the only real day measured the
+/// new basis would not have tripped the gate either. What it buys is a reading
+/// that CAN move before the socket dies, not a warning that day would have
+/// fired. See the residual below for what it still is not.
+///
+/// NOT the whole-socket death, which the old `min` over 749 already caught
+/// (pm-us is one task over the whole list). NOT this repo's documented silent
+/// subscriber eviction, which is DOWNSTREAM of the tape — `Core::on_event`
+/// writes at `core.rs:116` and only then publishes to the broadcaster at
+/// `:121`. And on polymarket_us specifically, NOT the per-market repair paths
+/// either: `pmus::parse_ws_message` emits only snapshots and trades
+/// (`pmus.rs:40`), gaps arise only in `apply_delta` (`book.rs:155`) and the
+/// snapshot arm returns `Ok(())` unconditionally, so no pm-us event ever asks
+/// for a resnapshot; and `evict_book`'s only callers are Kalshi
+/// (`main.rs:364`) and Polymarket (`main.rs:374`). Where those paths DO apply,
+/// a dropped book is restored by the 300s sweep (`RESNAP_EVERY`,
+/// `RESNAP_FULL_S`), well inside `MAX_COVERAGE_AGE_S`, so they cannot move a
+/// chip. The unbounded one is an EVICTED market, which leaves the sweep until
+/// the venue reports it live again.
+///
+/// ALL registry legs, not the tradable ones, and this half is measured rather
+/// than argued. Only 6 polymarket markets back a tradable pair, and the newest
+/// of those 6 is 10,832s / 13,473s / 62,617s old on the 07-26, 07-27 and 07-28
+/// tapes while the feed is demonstrably alive — a basis that narrow re-enters
+/// the quiet-market trap this doc comment opens with. It is also the wrong
+/// SUBJECT: coverage is a claim about what the recorder is delivering, and
+/// vetting is a claim about a pair, so a `verdict: rejected` must not move what
+/// a venue's freshness reads.
+///
+/// The residual, so nobody reads this as more than it is: `min` over 88 is
+/// still "one live market certifies the other 87", so a single frozen market —
+/// on any venue, by any of the mechanisms above — is as invisible now as it was
+/// before. On the healthy 07-28 tape polymarket chips green at 36s while all
+/// six tradable polymarket legs are 62,617s old. Narrowing the population to
+/// the one the board prices is all this does; sourcing coverage from the
+/// recorder's own per-feed liveness, rather than from an emit-on-change tape,
+/// is the answer to the rest.
+///
 /// The clock is the caller's because the two views that ask derive it
 /// differently.
-pub fn coverage_by_venue(latest: &Latest, now_ns: i64) -> Coverage {
+pub fn coverage_by_venue(latest: &Latest, reg: &Registry, now_ns: i64) -> Coverage {
+    let backed: HashSet<(&str, &str)> = reg
+        .relationships
+        .iter()
+        .flat_map(|r| r.legs.iter().map(|l| (l.venue.as_str(), l.market_id.as_str())))
+        .collect();
     let mut cov = Coverage::new();
-    for ((venue, _), s) in latest {
+    for ((venue, market), s) in latest {
+        if !backed.contains(&(venue.as_str(), market.as_str())) {
+            continue;
+        }
         let age = (now_ns - s.ts_local_ns) / 1_000_000_000;
         let e = cov.entry(venue.clone()).or_insert(age);
         *e = (*e).min(age);
@@ -76,8 +159,11 @@ pub fn coverage_by_venue(latest: &Latest, now_ns: i64) -> Coverage {
     cov
 }
 
-/// `i64::MAX` for a venue the rollup carried no sample for at all. Zero would
-/// read as "sampled this instant" over no book whatsoever.
+/// `i64::MAX` for a venue the rollup carried no registry-backed sample for.
+/// Zero would read as "sampled this instant" over no book whatsoever — and a
+/// rollup holding only markets no pair prices is exactly that: evidence that
+/// the venue's tape is being written, and none at all about the books this
+/// board prices off.
 pub fn venue_age_s(cov: &Coverage, venue: &str) -> i64 {
     cov.get(venue).copied().unwrap_or(i64::MAX)
 }
@@ -85,9 +171,10 @@ pub fn venue_age_s(cov: &Coverage, venue: &str) -> i64 {
 /// One number for the whole rollup: its STALEST venue, because the board is
 /// only as current as the worst leg it prices off.
 ///
-/// Only venues the rollup actually carries. A venue with no samples is a HOLE
-/// in the board — pairs on it are never evaluated, and the views count them as
-/// such — not a claim that the samples the rollup does have are old.
+/// Only venues `cov` actually carries, which since the basis change means only
+/// venues with a REGISTRY-BACKED sample. A venue without one is a HOLE in the
+/// board — pairs on it are never evaluated, and the views count them as such —
+/// not a claim that the samples the rollup does have are old.
 pub fn stalest_age_s(cov: &Coverage) -> i64 {
     cov.values().copied().max().unwrap_or(i64::MAX)
 }
@@ -95,7 +182,14 @@ pub fn stalest_age_s(cov: &Coverage) -> i64 {
 /// Per-venue coverage as the board renders it: ALL THREE venues, always, so a
 /// venue missing from the rollup is visible as missing rather than as merely
 /// absent from a list.
-pub fn coverage_json(cov: &Coverage) -> serde_json::Value {
+///
+/// `recorded` separates the two ways coverage can be ABSENT, because they take
+/// different repairs and the board tells the operator which one to do. No
+/// rollup for the venue at all is a rollup to rebuild. A rollup that is being
+/// written but carries not one market the registry names is a SUBSCRIPTION
+/// that no longer covers the pairs, and rebuilding the rollup would replay the
+/// same markets and change nothing.
+pub fn coverage_json(cov: &Coverage, latest: &Latest) -> serde_json::Value {
     VENUES
         .iter()
         .map(|v| {
@@ -104,6 +198,7 @@ pub fn coverage_json(cov: &Coverage) -> serde_json::Value {
                 "venue": v,
                 "coverage_age_s": if age == i64::MAX { -1 } else { age },
                 "current": age <= MAX_COVERAGE_AGE_S,
+                "recorded": latest.keys().any(|(venue, _)| venue == v),
             })
         })
         .collect::<Vec<_>>()
@@ -132,10 +227,44 @@ mod tests {
         )
     }
 
+    /// A registry naming exactly these legs. The coverage basis is all
+    /// `coverage_by_venue` reads off a registry, so that is all this builds.
+    fn registry(legs: &[(String, String)]) -> arb_registry::Registry {
+        arb_registry::Registry {
+            relationships: legs
+                .iter()
+                .map(|(v, m)| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": format!("{v}-{m}"),
+                        "legs": [{ "venue": v, "market_id": m }],
+                    }))
+                    .expect("a relationship")
+                })
+                .collect(),
+        }
+    }
+
+    /// Coverage over a rollup where the registry names only `backed` — the
+    /// venue's other markets are recorded (the tag catalog brings in 661 of the
+    /// 749 on pm-us) and priced by nothing.
+    fn cov_backed(
+        backed: &[(&str, &str)],
+        samples: impl IntoIterator<Item = ((String, String), arb_tob::TobSample)>,
+    ) -> Coverage {
+        let mut latest = Latest::new();
+        latest.extend(samples);
+        let legs: Vec<(String, String)> =
+            backed.iter().map(|(v, m)| (v.to_string(), m.to_string())).collect();
+        coverage_by_venue(&latest, &registry(&legs), NOW_NS)
+    }
+
+    /// Every sampled market backed by the registry: the tests below this one
+    /// are about freshness, not about which markets we subscribed to.
     fn cov(samples: impl IntoIterator<Item = ((String, String), arb_tob::TobSample)>) -> Coverage {
         let mut latest = Latest::new();
         latest.extend(samples);
-        coverage_by_venue(&latest, NOW_NS)
+        let legs: Vec<(String, String)> = latest.keys().cloned().collect();
+        coverage_by_venue(&latest, &registry(&legs), NOW_NS)
     }
 
     fn aged(samples: impl IntoIterator<Item = ((String, String), arb_tob::TobSample)>) -> i64 {
@@ -187,5 +316,47 @@ mod tests {
         assert!(venue_age_s(&c, "polymarket_us") > MAX_COVERAGE_AGE_S);
         assert_eq!(stalest_age_s(&c), 6 * 3600, "a rollup is as current as its worst venue");
         assert_eq!(venue_age_s(&c, "polymarket"), i64::MAX, "a venue with no samples is unknown");
+    }
+
+    /// The hole the per-venue gate left, and the one this basis closes. `min`
+    /// over EVERY market reports the venue's NOISIEST one, and on pm-us 661 of
+    /// the 749 markets in the tape are catalog markets no pair prices. The
+    /// market ids here are real ones from the 07-28 tape; the venue's only
+    /// registry leg is frozen six hours back and two Billboard markets nothing
+    /// references are ticking. TOTAL in registry terms — every leg the basis
+    /// counts has stopped — which is the only form this catches.
+    #[test]
+    fn a_market_we_do_not_price_does_not_certify_the_ones_we_do() {
+        let c = cov_backed(
+            &[("polymarket_us", "tac-nobel-peace-2026-10-09-elomus")],
+            [
+                book("polymarket_us", "tac-nobel-peace-2026-10-09-elomus", 6 * 3600),
+                book("polymarket_us", "ccpc-bilbrd-1album-any2026-eminem", 1),
+                book("polymarket_us", "ccpc-bilbrd-1album-any2026-ladgag", 2),
+            ],
+        );
+        assert_eq!(venue_age_s(&c, "polymarket_us"), 6 * 3600, "only priced books certify");
+        assert!(venue_age_s(&c, "polymarket_us") > MAX_COVERAGE_AGE_S);
+    }
+
+    /// The end of that same road: not one market the registry names is in the
+    /// venue's rollup. UNKNOWN, not fresh — a tape still being written for
+    /// markets nothing prices is evidence about the tape and none at all about
+    /// the books this board prices. The headline is unchanged because it
+    /// reports the venues the rollup COVERS; what carries the hole is the
+    /// venue's own chip and the row gate, both of which read `venue_age_s`.
+    #[test]
+    fn a_venue_whose_rollup_holds_no_market_we_price_is_unknown_not_fresh() {
+        let c = cov_backed(
+            &[("kalshi", "KXONE")],
+            [
+                book("kalshi", "KXONE", 10),
+                book("polymarket_us", "ccpc-bilbrd-1album-any2026-eminem", 1),
+            ],
+        );
+        assert_eq!(venue_age_s(&c, "kalshi"), 10, "kalshi is genuinely current");
+        assert_eq!(venue_age_s(&c, "polymarket_us"), i64::MAX, "an unpriced tape is not coverage");
+        assert!(venue_age_s(&c, "polymarket_us") > MAX_COVERAGE_AGE_S, "so no row on it is live");
+        assert_eq!(stalest_age_s(&c), 10, "a venue we have no evidence about is a hole, not an age");
     }
 }

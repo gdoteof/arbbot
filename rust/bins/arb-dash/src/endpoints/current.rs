@@ -181,6 +181,12 @@ fn row(
         "leg_b": format!("{}:{}", lb.venue, lb.market_id),
         "quote_age_a_s": (now_ns - sa.ts_local_ns) / 1_000_000_000,
         "quote_age_b_s": (now_ns - sb.ts_local_ns) / 1_000_000_000,
+        // Raw, unlike the intents view, which maps `i64::MAX` to -1 here. It
+        // cannot arise on this row: reaching it required BOTH legs' markets in
+        // `latest`, and both are registry legs, so each of the two venues has a
+        // registry-backed sample and neither can be the absent case. The page
+        // reads -1 as "no coverage" on both views, so if that invariant ever
+        // breaks this line has to map too.
         "coverage_age_s": coverage_age_s,
         "actionable": actionable,
         "edge_per_contract": priced.edge_per_contract,
@@ -238,7 +244,7 @@ pub fn json(a: &Args, query: &str) -> String {
     // built this morning is ranking this morning's board. Per-market sample age
     // cannot stand in for it: the series emits on change, so a quiet market's
     // old sample is still the current book.
-    let cov = coverage_by_venue(&latest, now_ns);
+    let cov = coverage_by_venue(&latest, &reg, now_ns);
     let coverage_age_s = stalest_age_s(&cov);
     let rollup_current = coverage_age_s <= MAX_COVERAGE_AGE_S;
 
@@ -288,7 +294,7 @@ pub fn json(a: &Args, query: &str) -> String {
         "unevaluated_by_venue": no_book,
         "rollup_current": rollup_current,
         "rollup_coverage_age_s": if coverage_age_s == i64::MAX { -1 } else { coverage_age_s },
-        "venues": coverage_json(&cov),
+        "venues": coverage_json(&cov, &latest),
         "max_coverage_age_s": MAX_COVERAGE_AGE_S,
         "max_spread": q.max_spread_s,
         "fee_category": FEE_CATEGORY,
@@ -415,6 +421,110 @@ relationships:
         assert_eq!(d["rollup_current"], false, "one dead venue is not a current rollup: {d}");
         assert_eq!(venue(&d, "kalshi")["current"], true, "kalshi is genuinely still live: {d}");
         assert_eq!(venue(&d, "polymarket_us")["current"], false, "{d}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The same defect, on the population that actually makes it reachable.
+    /// Most of a venue's tape is markets no pair prices — the pm-us universe
+    /// comes from `polymarket_us_tags`, 749 markets against 88 registry legs on
+    /// the real 07-28 tape — so coverage taken over every market read one
+    /// second off a Billboard market and called this row actionable while the
+    /// only book it is priced off had stopped six hours earlier.
+    ///
+    /// P1 is the row's own leg and it is the venue's whole registry coverage
+    /// here: this is the TOTAL form, every counted leg stopped. A single frozen
+    /// market is not what this catches, on this venue or any other — see
+    /// `coverage_by_venue`'s residual.
+    #[test]
+    fn a_market_we_do_not_price_does_not_certify_the_one_this_row_needs() {
+        let (a, base) = args("unpriced-noise");
+        rolled_up(&base, "kalshi", &[sample("kalshi", "K1", 10, "0.29", "0.30")]);
+        rolled_up(
+            &base,
+            "polymarket_us",
+            &[
+                sample("polymarket_us", "P1", 6 * 3600, "0.75", "0.76"),
+                sample("polymarket_us", "ccpc-bilbrd-1album-any2026-eminem", 1, "0.50", "0.51"),
+                sample("polymarket_us", "ccpc-bilbrd-1album-any2026-ladgag", 2, "0.44", "0.45"),
+            ],
+        );
+        let d = board(&a);
+        assert_eq!(d["priced_pairs"], 1, "the arb book is old, not absent — it still prices: {d}");
+        assert_eq!(d["profitable"], 1, "and still profitable at those prices: {d}");
+        assert_eq!(d["actionable"], 0, "a Billboard tick is not evidence about P1: {d}");
+        assert_eq!(d["rows"][0]["coverage_age_s"], 6 * 3600, "{d}");
+        assert_eq!(venue(&d, "polymarket_us")["coverage_age_s"], 6 * 3600, "{d}");
+        assert_eq!(venue(&d, "polymarket_us")["current"], false, "{d}");
+        assert_eq!(venue(&d, "polymarket_us")["recorded"], true, "the tape is being written: {d}");
+        assert_eq!(d["rollup_current"], false, "{d}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// And the state the operator has to be able to tell apart from the one
+    /// below: the venue's rollup is being written, and not one market the
+    /// registry names is in it. Coverage is ABSENT, exactly as for a missing
+    /// file — but `recorded` is TRUE, because the repair is the recorder's
+    /// subscription and not the rollup, and a board that says "rebuild the
+    /// rollup" here sends the operator to replay the same markets again.
+    #[test]
+    fn a_rollup_of_markets_we_never_price_is_a_subscription_hole_not_a_rollup_one() {
+        let (a, base) = args("unpriced-only");
+        rolled_up(&base, "kalshi", &[sample("kalshi", "K1", 10, "0.29", "0.30")]);
+        rolled_up(
+            &base,
+            "polymarket_us",
+            &[
+                sample("polymarket_us", "ccpc-bilbrd-1album-any2026-eminem", 1, "0.50", "0.51"),
+                sample("polymarket_us", "ccpc-bilbrd-1album-any2026-ladgag", 2, "0.44", "0.45"),
+            ],
+        );
+        let d = board(&a);
+        assert_eq!(venue(&d, "polymarket_us")["coverage_age_s"], -1, "unpriced is not covered: {d}");
+        assert_eq!(venue(&d, "polymarket_us")["current"], false, "{d}");
+        assert_eq!(venue(&d, "polymarket_us")["recorded"], true, "the tape IS there: {d}");
+        assert_eq!(venue(&d, "polymarket")["recorded"], false, "and this one is not: {d}");
+        assert_eq!(d["priced_pairs"], 0, "no book for P1, so nothing prices: {d}");
+        assert_eq!(d["unevaluated_pairs"], 1, "counted, not silently dropped: {d}");
+        assert_eq!(d["unevaluated_by_venue"]["polymarket_us"], 1, "{d}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// And the regression this must not become. Per-MARKET age cannot be the
+    /// gate: the series emits on change and 33 of the 40 priceable tradable
+    /// pairs in the real 07-28 tape have a leg more than six hours behind, so
+    /// gating on it would empty the board. Here P1 — the priced row's own leg —
+    /// last moved 19 hours ago, while P2 (also a registry leg) ticked 50s ago
+    /// and an unpriced catalog market ticks constantly. The venue is COVERED,
+    /// the row is ACTIONABLE, and its coverage reads the venue's, not the
+    /// market's.
+    ///
+    /// P2 is the REJECTED pair's leg, and it certifies the venue anyway. The
+    /// basis is ALL registry legs because coverage is a claim about what the
+    /// recorder is delivering and a verdict is a claim about a pair, so
+    /// narrowing it to the tradable ones would let a vetting decision change
+    /// what a venue's freshness reads — and does, measurably: six tradable
+    /// polymarket legs put that venue at 10,832-62,617s on three real tapes
+    /// with the feed alive.
+    #[test]
+    fn a_quiet_arb_leg_on_a_covered_venue_still_makes_an_actionable_row() {
+        let (a, base) = args("quiet-leg");
+        rolled_up(&base, "kalshi", &[sample("kalshi", "K1", 10, "0.29", "0.30")]);
+        rolled_up(
+            &base,
+            "polymarket_us",
+            &[
+                sample("polymarket_us", "P1", 19 * 3600, "0.75", "0.76"),
+                sample("polymarket_us", "P2", 50, "0.60", "0.61"),
+                sample("polymarket_us", "ccpc-bilbrd-1album-any2026-eminem", 1, "0.50", "0.51"),
+            ],
+        );
+        let d = board(&a);
+        assert_eq!(d["rollup_current"], true, "a quiet market is not a dead venue: {d}");
+        assert_eq!(venue(&d, "polymarket_us")["coverage_age_s"], 50, "P2's tick covers it: {d}");
+        assert_eq!(d["actionable"], 1, "the board must not empty: {d}");
+        assert_eq!(d["rows"][0]["actionable"], true, "{d}");
+        assert_eq!(d["rows"][0]["quote_age_b_s"], 19 * 3600, "the leg really is that quiet: {d}");
+        assert_eq!(d["rows"][0]["coverage_age_s"], 50, "and that is not what gates it: {d}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
