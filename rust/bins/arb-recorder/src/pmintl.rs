@@ -86,7 +86,22 @@ fn parse_ws_frame(frame: &str, seq: &mut SeqCounter) -> Vec<TapeEvent> {
             Some("last_trade_price") => {
                 if let Some(asset) = m.get("asset_id") {
                     let asset = dec_string(asset);
-                    let s = seq.next(&asset);
+                    // Trades get their OWN seq stream. Sharing the book's
+                    // per-asset counter spends a sequence number that no book
+                    // update ever consumes, so the NEXT delta arrives one ahead
+                    // of what `apply_delta` expects, is read as a gap, and the
+                    // book is DELETED — on every trade, forever. The busier the
+                    // market the faster it dies.
+                    //
+                    // Kalshi and PM-US have always taken `|tape` here and
+                    // Python's recorder carries the scar in a comment ("the
+                    // traded-markets-die P1"); this path is the one that missed
+                    // it, and it is also the only one of the three with no test
+                    // pinning it. Measured on the live rs socket 2026-07-29
+                    // before the fix: INTL books p90 22,520s stale, 49.5% older
+                    // than the 300s resnapshot that is supposed to be their
+                    // floor, and 6 of 11 crossed books on the venue.
+                    let s = seq.next(&format!("{asset}|tape"));
                     let buy = m
                         .get("side")
                         .and_then(Value::as_str)
@@ -234,19 +249,45 @@ async fn ws_session(
             };
             for ev in parse_ws_frame(&text, &mut seq) {
                 if let Some(need) = core.on_event(&ev) {
+                    // A gap DELETED this book (`BookBuilder::apply_delta`
+                    // removes it so a desynced book can never be read as live),
+                    // so this REST call is the only thing that brings it back.
+                    // Swallowing the error left the market dark until the 300s
+                    // sweep happened to catch it, or forever if that failed too.
                     let s = seq.next(&need);
-                    if let Ok(snap) = clob.book(&need, s).await {
-                        core.on_event(&snap);
+                    match clob.book(&need, s).await {
+                        Ok(snap) => {
+                            core.on_event(&snap);
+                        }
+                        Err(e) => eprintln!(
+                            "[pm-ws] gap on {need}: book was dropped and the REST resnapshot \
+                             FAILED ({e:#}) — that market is dark until the next sweep"
+                        ),
                     }
                 }
             }
         }
         if last_resnap.elapsed() > Duration::from_secs(300) {
+            let mut failed = 0usize;
             for tid in token_ids {
                 let s = seq.next(tid);
-                if let Ok(snap) = clob.book(tid, s).await {
-                    core.on_event(&snap);
+                match clob.book(tid, s).await {
+                    Ok(snap) => {
+                        core.on_event(&snap);
+                    }
+                    Err(_) => failed += 1,
                 }
+            }
+            // The sweep is the floor under every book's age. A silent failure
+            // here is a book that keeps whatever state it was left in, which is
+            // how one reached 26 HOURS old while the interval claimed 300s.
+            // Counted rather than logged per-token: 222 lines would bury it.
+            if failed > 0 {
+                eprintln!(
+                    "[pm-ws] resnapshot sweep: {failed}/{} books did NOT refresh — their age is \
+                     now unbounded",
+                    token_ids.len()
+                );
             }
             last_resnap = tokio::time::Instant::now();
         }
@@ -285,5 +326,93 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    /// A trade must NOT consume a sequence number from the book's stream.
+    ///
+    /// This is the whole bug. `apply_delta` demands `seq == book.seq + 1`; a
+    /// trade that eats a number no book update consumes makes the next delta
+    /// look like a gap, and a gap DELETES the book. So every trade killed its
+    /// own market, and the busiest markets died fastest — INTL books were
+    /// measured at p90 22,520s stale on 2026-07-29, against a 300s resnapshot
+    /// that is meant to be their ceiling.
+    ///
+    /// `pmus.rs` has had `trade_takes_tape_seq_stream` since it was written and
+    /// `kalshi.rs` takes `|tape` too. This path had neither the suffix nor a
+    /// test, which is exactly why it was the one that broke.
+    #[test]
+    fn a_trade_does_not_consume_the_books_sequence() {
+        let mut seq = SeqCounter::default();
+        let book = json!({"event_type": "book", "asset_id": "A",
+                          "bids": [{"price": "0.55", "size": "50"}],
+                          "asks": [{"price": "0.60", "size": "50"}],
+                          "timestamp": 1700000000123i64})
+        .to_string();
+        let snap_seq = match &parse_ws_frame(&book, &mut seq)[0] {
+            TapeEvent::Snapshot { seq, .. } => *seq,
+            _ => panic!("expected a snapshot"),
+        };
+
+        // A trade lands between the snapshot and the next delta.
+        let trade = json!({"event_type": "last_trade_price", "asset_id": "A",
+                           "side": "BUY", "price": "0.57", "size": "3",
+                           "timestamp": 1700000000456i64})
+        .to_string();
+        match &parse_ws_frame(&trade, &mut seq)[0] {
+            TapeEvent::Trade { seq, .. } => {
+                assert_eq!(*seq, 1, "a trade rides its own |tape stream, starting at 1")
+            }
+            _ => panic!("expected a trade"),
+        }
+
+        // ...and the delta after it must still be the snapshot's successor.
+        let pc = json!([{"event_type": "price_change", "timestamp": "17",
+                         "price_changes": [{"asset_id": "A", "side": "SELL",
+                                            "price": "0.61", "size": "9"}]}])
+        .to_string();
+        match &parse_ws_frame(&pc, &mut seq)[0] {
+            TapeEvent::Delta { seq, .. } => assert_eq!(
+                *seq,
+                snap_seq + 1,
+                "the delta after a trade must be seq+1 or apply_delta reads a gap and drops \
+                 the book"
+            ),
+            _ => panic!("expected a delta"),
+        }
+    }
+
+    /// The same thing proven end-to-end through the book builder, because the
+    /// seq arithmetic above is only interesting for what it does to the book.
+    #[test]
+    fn a_trade_does_not_destroy_the_book() {
+        use arb_core::book::BookBuilder;
+        let mut seq = SeqCounter::default();
+        let mut books = BookBuilder::new();
+        let book = json!({"event_type": "book", "asset_id": "A",
+                          "bids": [{"price": "0.55", "size": "50"}],
+                          "asks": [{"price": "0.60", "size": "50"}],
+                          "timestamp": 1700000000123i64})
+        .to_string();
+        for ev in parse_ws_frame(&book, &mut seq) {
+            books.apply_event(&ev).expect("snapshot applies");
+        }
+        let trade = json!({"event_type": "last_trade_price", "asset_id": "A",
+                           "side": "BUY", "price": "0.57", "size": "3",
+                           "timestamp": 1700000000456i64})
+        .to_string();
+        for ev in parse_ws_frame(&trade, &mut seq) {
+            books.apply_event(&ev).expect("a trade is not applied to the book");
+        }
+        let pc = json!([{"event_type": "price_change", "timestamp": "17",
+                         "price_changes": [{"asset_id": "A", "side": "SELL",
+                                            "price": "0.61", "size": "9"}]}])
+        .to_string();
+        for ev in parse_ws_frame(&pc, &mut seq) {
+            books.apply_event(&ev).expect("the delta after a trade must NOT be a gap");
+        }
+        assert!(
+            books.get(Venue::Polymarket, "A").is_some(),
+            "the book must still exist after a trade — it used to be deleted by one"
+        );
     }
 }
