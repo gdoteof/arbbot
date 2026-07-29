@@ -578,7 +578,7 @@ fn build_kalshi_sink(
             .map_err(|e| e.to_string())?;
     Ok(std::sync::Arc::new(arb_venue::gateway::KalshiGateway::with_transport(
         signer,
-        arb_venue::ratelimit::RateLimiter::from_per_minute(60.0, 60.0, 0),
+        arb_venue::ratelimit::RateLimiter::from_per_minute(60.0, 0),
         transport,
     )))
 }
@@ -596,7 +596,7 @@ fn build_pmus_sink(
         .map_err(|e| e.to_string())?;
     Ok(std::sync::Arc::new(arb_venue::gateway::PmusGateway::with_transport(
         signer,
-        arb_venue::ratelimit::RateLimiter::from_per_minute(60.0, 60.0, 0),
+        arb_venue::ratelimit::RateLimiter::from_per_minute(60.0, 0),
         transport,
     )))
 }

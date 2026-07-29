@@ -138,7 +138,15 @@ fn ts_ms() -> String {
 }
 
 /// Spend one token of `priority` before a venue call. An exhausted LOCAL budget
-/// refuses here rather than earning a venue-side 429.
+/// refuses a background READ here rather than earning a venue-side 429.
+///
+/// [`Priority::Critical`] — the order path — spends nothing and can never be
+/// refused (quirk `xv-shared-api-budget`). It used to be metered by a bucket
+/// that ordinary quoting drained two tokens at a time, so a hedge for a maker
+/// leg that had ALREADY filled could be turned into an `exec_failed` counter
+/// before it was signed, leaving the position naked while the bucket refilled
+/// at 1/s. What keeps the order path off a venue's 429 list is arb-trader's
+/// per-venue executor shaper, which WAITS instead of failing.
 ///
 /// Shared because both gateways opened every call with the same sixteen lines,
 /// and a rate limit that is enforced in two places is a rate limit that can be

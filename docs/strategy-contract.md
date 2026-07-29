@@ -414,9 +414,14 @@ Control(KILL) mid-replay → zero intents from any strategy afterward; inject
 Control(pause, id) → zero intents from that id only.
 
 **(f) Venue budget shares enforced in the executors.**
-Per-venue executor tasks own the rate limiters (critical/background buckets
-per the P3 design); each strategy's manifest `budget_share` is enforced
-there, so no strategy can starve another's hedge path.
+Per-venue executor tasks own the rate limiters; each strategy's manifest
+`budget_share` is enforced there, so no strategy can starve another's
+background reads. It cannot starve another's HEDGE path either, but not by
+sharing it out: since 2026-07-29 the order path draws from no local budget at
+all (`rust/crates/arb-venue/src/ratelimit.rs` — the critical bucket is gone,
+because a bucket the order path must bypass is not a budget). What shapes the
+write path is the per-venue executor token bucket in `exec.rs`, which WAITS
+rather than refusing.
 *Replaces:* the cross-process `rate_budget` table + `consume_budget`
 (`src/arbbot/venues/pmus.py:34,53`) whose `priority="critical"` path
 bypasses metering entirely (`pmus.py:14` — "critical ... never wait[s] —

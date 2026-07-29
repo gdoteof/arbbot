@@ -37,17 +37,28 @@ fn non_monotonic_now_never_mints_time() {
     assert!(!b.try_acquire(50 * SEC));
 }
 
+/// The order path draws from NO budget. `xv-shared-api-budget`: "the
+/// order/hedge path must bypass it and never wait." A critical bucket, however
+/// large, is still a bucket that CAN run out, and the call it would run out on
+/// is the one that must never fail.
 #[test]
-fn critical_and_background_are_independent() {
-    // 60/min critical, 30/min background; start full.
-    let mut rl = RateLimiter::from_per_minute(60.0, 30.0, 0);
-    // drain background to empty (30 tokens) without touching critical
+fn the_order_path_is_never_refused_and_spends_nothing() {
+    // 30/min background; starts full.
+    let mut rl = RateLimiter::from_per_minute(30.0, 0);
     for _ in 0..30 {
         assert!(rl.try_acquire(Priority::Background, 0));
     }
-    assert!(!rl.try_acquire(Priority::Background, 0), "background empty");
-    // critical bucket is untouched — the hedge path is not starved
-    assert!(rl.try_acquire(Priority::Critical, 0));
+    assert!(!rl.try_acquire(Priority::Background, 0), "the read budget is spent");
+
+    // Nothing left to give, and the order path goes anyway — a thousand times,
+    // at the same instant, with the clock never advancing.
+    for _ in 0..1000 {
+        assert!(rl.try_acquire(Priority::Critical, 0), "a hedge is never refused");
+    }
+    // ...and none of that came out of the read budget: at 30/min exactly one
+    // token is back two seconds later, which is all that ever should be.
+    assert!(rl.try_acquire(Priority::Background, 2 * SEC));
+    assert!(!rl.try_acquire(Priority::Background, 2 * SEC));
 }
 
 // ------------------------------------------------------ NotWired seam ----
@@ -62,7 +73,7 @@ fn kalshi_stub() -> KalshiGateway {
         v["kalshi"]["private_key_pkcs8_pem"].as_str().unwrap(),
     )
     .unwrap();
-    KalshiGateway::new(signer, RateLimiter::from_per_minute(60.0, 30.0, 0))
+    KalshiGateway::new(signer, RateLimiter::from_per_minute(30.0, 0))
 }
 
 #[test]
@@ -92,7 +103,7 @@ fn gateways_are_not_wired() {
     // PM-US stub is likewise inert.
     let pm = PmusGateway::new(
         PmusSigner::from_seed("k", &[7u8; 32]),
-        RateLimiter::from_per_minute(30.0, 30.0, 0),
+        RateLimiter::from_per_minute(30.0, 0),
     );
     assert_eq!(pm.positions().unwrap_err(), VenueError::NotWired);
     assert_eq!(pm.balances().unwrap_err(), VenueError::NotWired);

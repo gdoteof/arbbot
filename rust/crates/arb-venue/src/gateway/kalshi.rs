@@ -65,8 +65,9 @@ impl<T: Transport> KalshiGateway<T> {
     }
 
     /// Sign `path` (never the query — quirk K2) and send. Spends one token of
-    /// `priority` first; an exhausted local budget refuses rather than earning
-    /// a venue-side 429.
+    /// `priority` first; an exhausted local budget refuses a background READ
+    /// rather than earning a venue-side 429. The order path spends nothing —
+    /// see [`super::spend_token`].
     fn call(
         &self,
         priority: Priority,
@@ -85,13 +86,22 @@ impl<T: Transport> KalshiGateway<T> {
     /// cursor) and `?status=resting` returns NOTHING, so page the full list and
     /// filter status client-side. Skipping pagination orphans older resting
     /// orders — that is naked-leg risk, not a cosmetic bug.
+    ///
+    /// [`Priority::Critical`], not Background, because this is not a poll: it
+    /// is a limb of the cancel path. Every caller is one — [`Self::find_ours`]
+    /// resolves a client-id cancel through it, [`Self::cancel_all_open`] is the
+    /// kill sweep, and `resting_order_ids` is the only evidence
+    /// `cancel_all_and_verify` accepts. A read the order path cannot complete
+    /// without is the order path, so refusing it locally refuses the cancel:
+    /// a halt that a token bucket can turn into "NOT CLEAN at exit" is the same
+    /// hazard as the hedge this priority exists to protect.
     pub fn all_orders(&self) -> Result<Vec<resp::KalshiOrder>, VenueError> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
             let q = cursor.as_ref().map(|c| format!("limit=100&cursor={c}"));
             let r = self.call(
-                Priority::Background,
+                Priority::Critical,
                 "GET",
                 K_ORDERS,
                 q.as_deref().or(Some("limit=100")),

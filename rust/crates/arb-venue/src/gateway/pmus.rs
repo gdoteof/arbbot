@@ -68,8 +68,15 @@ impl<T: Transport> PmusGateway<T> {
     /// GET /v1/orders/open — resting orders. The body is either a bare array
     /// or `{"orders": [...]}` (Python: `j if isinstance(j, list) else
     /// j.get("orders", [])`).
+    ///
+    /// [`Priority::Critical`] for the same reason as Kalshi's
+    /// [`super::KalshiGateway::all_orders`]: its one caller is
+    /// `resting_order_ids`, which is the only evidence `cancel_all_and_verify`
+    /// accepts that a sweep worked. A refused read there is a halt that cannot
+    /// prove itself clean. (Python agrees — `open_orders` there is
+    /// `priority="critical"` too.)
     pub fn open_orders(&self) -> Result<Vec<resp::PmOrder>, VenueError> {
-        let r = self.call(Priority::Background, "GET", P_OPEN, None)?;
+        let r = self.call(Priority::Critical, "GET", P_OPEN, None)?;
         if r.status != 200 {
             return Err(VenueError::Status {
                 endpoint: "pmus open_orders",

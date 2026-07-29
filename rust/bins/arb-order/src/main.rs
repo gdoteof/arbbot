@@ -203,7 +203,7 @@ fn main() {
         Ok(t) => t,
         Err(e) => die(5, e),
     };
-    let limiter = || RateLimiter::from_per_minute(60.0, 60.0, 0);
+    let limiter = || RateLimiter::from_per_minute(60.0, 0);
 
     println!();
     match args.venue {

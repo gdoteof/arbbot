@@ -533,7 +533,7 @@ mod tests {
         };
         let gw = KalshiGateway::with_transport(
             signer(),
-            RateLimiter::from_per_minute(600.0, 600.0, 0),
+            RateLimiter::from_per_minute(600.0, 0),
             mock,
         );
         let oid = OrderSink::place(
@@ -575,7 +575,7 @@ mod tests {
         };
         let gw = KalshiGateway::with_transport(
             signer(),
-            RateLimiter::from_per_minute(600.0, 600.0, 0),
+            RateLimiter::from_per_minute(600.0, 0),
             mock,
         );
         OrderSink::cancel(
@@ -601,7 +601,7 @@ mod tests {
         };
         let gw = KalshiGateway::with_transport(
             signer(),
-            RateLimiter::from_per_minute(600.0, 600.0, 0),
+            RateLimiter::from_per_minute(600.0, 0),
             mock,
         );
         assert!(OrderSink::place(

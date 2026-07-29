@@ -173,9 +173,11 @@ pub(super) fn settle(parked: &mut HashMap<String, ParkedCancel>, work: &CancelWo
 ///   * a client-id cancel costs `all_orders()`, a paginated read of the FULL
 ///     order history, taken inside the venue executor's one-command-at-a-time
 ///     `spawn_blocking` — so a burst of them blocks every place and cancel for
-///     that venue, and competes for the same Background budget as
-///     `resting_order_ids`, which is the only evidence `cancel_all_and_verify`
-///     accepts. Starving that turns a clean shutdown into "NOT CLEAN at exit".
+///     that venue, including `resting_order_ids`, which is the only evidence
+///     `cancel_all_and_verify` accepts. Delaying that turns a clean shutdown
+///     into "NOT CLEAN at exit". (It no longer STARVES it: since 2026-07-29
+///     that read is order-path priority and draws from no budget — but the
+///     serialisation this cap exists for is unchanged.)
 ///   * while killed, `Action::SweepAndVerify` is already queued and is a
 ///     strictly better remedy: it reaches orders we hold no id for at all, and
 ///     it proves the outcome.
