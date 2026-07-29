@@ -60,27 +60,66 @@ pub fn dec_string(v: &serde_json::Value) -> Option<String> {
     }
 }
 
-/// Say it ONCE per process, with the offending payload.
+/// Composite values refused since process start, for the heartbeat.
+///
+/// Without this the fix is a DETECTABILITY REGRESSION, which is the one thing
+/// it must not be. Today a composite reaches the tape as visible garbage that a
+/// parse-compat gate can be pointed at; after this change the field, level or
+/// event simply is not there, and an absence leaves no trace on the tape at
+/// all. `warn_composite` alone does not close that gap: it is ONE flag for
+/// three feeds and every field, so the first composite anywhere in the process
+/// permanently silences every later one — PM-intl emits one malformed frame at
+/// 03:00, PM-US changes `px`'s shape at 14:00, and every PM-US book quietly
+/// loses levels for the rest of the process lifetime with nothing logged and
+/// nothing written. A monotone count is what stays true after the log has been
+/// spent.
+///
+/// Counts refused VALUES, not dropped events: a trade with two bad legs is one
+/// lost print and two increments, because `parse_ws_message` resolves both legs
+/// before deciding. Read it as "the venue sent us something unreadable N
+/// times", not as a tape-line deficit.
+static DROPPED_COMPOSITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Monotone since process start; printed by the heartbeat next to `gaps`.
+pub fn dropped_composite() -> u64 {
+    DROPPED_COMPOSITE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count it always, and say it ONCE per process with the offending payload.
 ///
 /// A venue shape change is not a per-event condition, it is a standing one: the
 /// feeds run at ~7/87/140 events per second, so a line each would be a flooded
 /// journal and an unreadable one. Same reasoning as `evict_book`, which logs on
-/// the transition rather than on every poll that re-reports it.
+/// the transition rather than on every poll that re-reports it. The COUNT has
+/// no such problem and is not rate-limited — see `DROPPED_COMPOSITE`.
 fn warn_composite(v: &serde_json::Value) {
+    DROPPED_COMPOSITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        // `chars().take()`, not `String::truncate` — truncate panics unless the
-        // byte offset lands on a char boundary, and venue payloads carry
-        // non-ASCII (market titles, subject names). A diagnostic that can panic
-        // inside the feed loop is worse than the defect it reports. Same
-        // spelling as `gateway/pmus.rs`'s raw-body diagnostic.
-        let shape: String = v.to_string().chars().take(300).collect();
+        let shape = shape_preview(v);
         eprintln!(
             "[recorder] a venue sent a COMPOSITE where a scalar belongs: {shape}\n\
              [recorder] the field/level/event is being DROPPED rather than written to the tape \
-             as a stringified object (ticket #58). Logged once per process."
+             as a stringified object (ticket #58). Logged once per process; the running count \
+             is on the [hb] line as dropped_composite."
         );
     }
+}
+
+/// The offending payload, bounded for the journal.
+///
+/// `chars().take()`, not `String::truncate` — truncate panics unless the byte
+/// offset lands on a char boundary, and venue payloads carry non-ASCII (market
+/// titles, subject names). A diagnostic that can panic inside the feed loop is
+/// worse than the defect it reports. Same spelling as `gateway/pmus.rs`'s
+/// raw-body diagnostic.
+///
+/// Split out of `warn_composite` so a test can reach it AT ALL. `warn_composite`
+/// fires once per process, so an assertion driven through it would silently
+/// evaporate whenever any other test in the binary hit a composite first — a
+/// test that proves nothing depending on thread order is worse than none.
+fn shape_preview(v: &serde_json::Value) -> String {
+    v.to_string().chars().take(300).collect()
 }
 
 /// One side of a book from a venue's raw level array: drop non-positive sizes,
@@ -671,6 +710,59 @@ mod tests {
         assert_eq!(dec_string(&json!({"currency": "USD", "value": "5.0000"})), None);
         assert_eq!(dec_string(&json!(["5.0000"])), None);
         assert_eq!(dec_string(&json!(true)), None);
+    }
+
+    /// The drop has to leave a TRACE, or this whole change trades visible
+    /// garbage on the tape for an invisible absence. `warn_composite` speaks
+    /// once per process and is therefore already spent by the second incident;
+    /// the count is what the heartbeat can still read afterwards.
+    ///
+    /// Asserted as a LOWER BOUND on our own calls, not as an exact delta. The
+    /// counter is process-global and the test binary is multi-threaded, so any
+    /// `assert_eq!` on it races `dec_string_takes_scalars_and_refuses_composites`
+    /// above and would be a flake. The other direction — that a SCALAR never
+    /// counts — is structural rather than asserted here: the only increment
+    /// lives in `warn_composite`, which only the non-scalar match arm calls.
+    #[test]
+    fn a_refused_composite_is_counted_after_the_one_log_line_is_spent() {
+        use serde_json::json;
+        let before = dropped_composite();
+        assert_eq!(dec_string(&json!({"currency": "USD", "value": "5.0000"})), None);
+        assert_eq!(dec_string(&json!({"currency": "USD"})), None);
+        assert!(
+            dropped_composite() >= before + 2,
+            "two refused composites must both be counted: {before} -> {}",
+            dropped_composite()
+        );
+    }
+
+    /// The diagnostic's own bound — the one line in it that could take the
+    /// recorder down, and it fires exactly when things are already going wrong.
+    ///
+    /// `String::truncate(300)` panics unless byte 300 is a char boundary, and
+    /// venue payloads carry non-ASCII. The precondition below is asserted
+    /// rather than assumed: if `serde_json` ever escapes non-ASCII, byte 300
+    /// becomes a boundary, the old spelling would no longer panic and this test
+    /// would be quietly proving nothing — so it fails instead.
+    ///
+    /// Driven through `shape_preview` rather than `warn_composite` on purpose;
+    /// see there.
+    #[test]
+    fn the_shape_preview_bounds_a_payload_without_splitting_a_char() {
+        // 3-byte chars after a 10-byte prefix: byte 300 lands mid-sequence.
+        let v = serde_json::json!({ "title": "€".repeat(400) });
+        let raw = v.to_string();
+        assert!(
+            !raw.is_char_boundary(300),
+            "precondition: byte 300 must split a char or this test proves nothing"
+        );
+        assert!(
+            raw.chars().count() > 300,
+            "precondition: the payload must be longer than the bound or nothing is truncated"
+        );
+        let preview = shape_preview(&v);
+        assert_eq!(preview.chars().count(), 300, "bounded by CHARS, not bytes");
+        assert!(raw.starts_with(&preview), "the preview must be a prefix of the payload");
     }
 
     /// The mechanism both of the above rest on, deterministically and with no

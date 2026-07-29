@@ -70,9 +70,19 @@ fn parse_ws_message(msg: &Value, seq: &mut SeqCounter) -> Vec<TapeEvent> {
         // BOTH legs are money-wrapped, and `size` is a contract count despite
         // the wrapper's `"currency":"USD"` — see `money_value`. Resolved before
         // the sequence number is taken, so a frame we cannot read does not also
-        // spend a seq; and all-or-nothing, because a trade with an empty price
-        // (which is what `unwrap_or_default` used to write) is a lie in the
-        // same way a stringified object is.
+        // spend a seq.
+        //
+        // All-or-nothing on the COMPOSITE case, which is ticket #58's: an
+        // absent or unreadable leg costs the whole trade, where
+        // `unwrap_or_default` used to write `price: ""` — a lie of the same
+        // kind as a stringified object. It is NOT all-or-nothing on an explicit
+        // JSON `null`: `dec_string` maps null to `Some("")` (that arm is what
+        // keeps this change inert for the fields that legitimately arrive
+        // absent), so `{"currency":"USD","value":null}` still writes a trade
+        // with an empty price. Unchanged from before this fix, so not a
+        // regression, and no such payload has ever been seen on four full
+        // tapes — but it is a hole, not a guarantee, and saying otherwise here
+        // would claim more than the code does.
         let (Some(price), Some(size)) =
             (t.get("price").and_then(money_value), t.get("quantity").and_then(money_value))
         else {
@@ -297,23 +307,50 @@ mod tests {
         }
     }
 
-    /// The frame below is REAL, reconstructed field-for-field from a print on
-    /// the recorded tape.
+    /// PROVENANCE, because this test's whole subject is not claiming more than
+    /// you have. RECORDED, byte for byte, from the 2026-07-29 tape line for this
+    /// market: `marketSlug`, `tradeTime`, `price`'s value, and `quantity` —
+    /// the entire wrapper verbatim, since that stringified object is precisely
+    /// what the defect wrote into `size`. RECONSTRUCTED: `price`'s wrapper (the
+    /// recorder already unwrapped `price` before writing, so the tape holds
+    /// `"0.2800"` and the wrapper around it is known from the call site, not
+    /// from the recording), and `taker.intent`, which the tape NEVER stores —
+    /// it keeps only the derived `taker_side`. `BUY_SHORT` is DERIVED, not
+    /// observed: the tape says `taker_side: "buy"`, so the intent contained
+    /// "BUY" and was not `SELL_LONG`; the book below says the aggressor
+    /// consumed the resting BID; and hitting a resting YES bid is
+    /// `ORDER_INTENT_BUY_SHORT` (`docs/venue-quirks.md`,
+    /// `pmus-intent-buy-short`). Neither field is load-bearing for the
+    /// assertion, which is exactly why an invented value could sit here
+    /// unnoticed.
     ///
-    /// `quantity` arrives inside the venue's generic money wrapper —
+    /// UNITS. `quantity` arrives inside the venue's generic money wrapper —
     /// `{"currency":"USD","value":"5.0000"}` — and the `currency: USD` label is
-    /// the whole trap, because it reads as "these are dollars". They are not.
-    /// The BOOK settles it, in the same feed and across this very print: the
-    /// resting bid at 0.2800 goes 240.0000 -> 235.0000, so the level is
-    /// consumed by exactly the printed `value`. Book sizes are contracts, so
-    /// the printed value is contracts. USD notional would have had to take
-    /// 5.0000/0.28 = 17.86 off that level instead.
+    /// the whole trap, because it reads as "these are dollars". It is not: it
+    /// belongs to the WRAPPER, not to the meaning.
     ///
-    /// So the wrapper is an over-general money type reused for a quantity, and
-    /// `size` here means the same thing it means on every other tape event.
-    /// A non-integral value is NOT evidence against that reading — PM-US
-    /// positions are genuinely fractional and about half of all live prints
-    /// are too.
+    /// The book settles it by ATTRIBUTION, not by adjacency. PM-US stamps the
+    /// post-trade snapshot's `transactTime` byte-identically to the trade's
+    /// `tradeTime`, so the snapshot carrying this print's consequence is
+    /// IDENTIFIED rather than merely next to it:
+    /// `2026-07-29T01:56:27.328744187Z` appears on exactly one snapshot for
+    /// this market. The resting bid at 0.2800 holds 240.0000 across the five
+    /// snapshots before it, and reads 235.0000 on it and after — consumed by
+    /// EXACTLY the printed `value`. Nothing else can account for the move:
+    /// this is the ONLY trade on this market all day, so no interleaving is
+    /// possible. Book sizes are contracts (`qty` is the bare decimal the venue
+    /// also takes as a bare integer `quantity` on `POST /v1/orders`), so the
+    /// printed value is contracts. USD notional would have had to remove
+    /// 5.0000/0.28 = 17.86 from that level, and it did not.
+    ///
+    /// Not a one-off. Sweeping the same tape for every print whose post-trade
+    /// snapshot is identified this way: thousands match contracts and **zero**
+    /// match notional. The exact count moves with how you treat prints sharing
+    /// one snapshot (3,113 by the sweep in this PR's transcript); the zero does
+    /// not. A non-integral `value` is NOT evidence against contracts either —
+    /// PM-US positions are genuinely fractional, and 1,899 of those matches
+    /// carry a fractional size (`51.4800`, `1.0500`) agreeing to the cent with
+    /// an equally fractional level.
     #[test]
     fn trade_size_is_the_contract_count_inside_the_money_wrapper() {
         let mut seq = SeqCounter::default();
@@ -321,7 +358,7 @@ mod tests {
             "marketSlug": "ewc-pres-bra-2026-10-04-flabol",
             "price": {"currency": "USD", "value": "0.2800"},
             "quantity": {"currency": "USD", "value": "5.0000"},
-            "taker": {"intent": "ORDER_INTENT_BUY_LONG"},
+            "taker": {"intent": "ORDER_INTENT_BUY_SHORT"},
             "tradeTime": "2026-07-29T01:56:27.328744187Z"}});
         match &parse_ws_message(&t, &mut seq)[0] {
             TapeEvent::Trade { price, size, .. } => {
@@ -363,11 +400,24 @@ mod tests {
     /// `Dec::parse` over it and a stringified object does not parse, so the
     /// level is dropped. Nothing checks the PRICE. A composite there survived
     /// into `Level.price` verbatim, and the sort reads it back as `Dec::ZERO`
-    /// (`sorted_levels`' `unwrap_or`), so the bad level sorts to the far end of
-    /// the ladder and reads as an ordinary deep quote.
+    /// (`sorted_levels`' `unwrap_or`).
     ///
-    /// That accidental half-protection is exactly why this is fixed in
-    /// `dec_string` and not at the `quantity` call site.
+    /// Where that lands is NOT symmetric, and the benign-sounding half is the
+    /// bid half. Bids sort descending, so a `Dec::ZERO` price goes to the far
+    /// end and reads as a deep quote. Asks sort ASCENDING (`sorted_levels`'
+    /// other branch), so the same bad level sorts to `asks[0]` — the BEST
+    /// OFFER, the top of book the engine prices off.
+    ///
+    /// What actually saves us is downstream and is not the sort at all:
+    /// `book.rs`'s `px` parses that same price back to `Dec::ZERO`, so
+    /// `crossing()` sees bid >= ask and reports the book CROSSED, and every
+    /// consumer filters crossed books out (`scan.rs`, `hedge.rs`,
+    /// `quoter.rs`). The corrupt book is refused rather than priced. That is
+    /// the safe outcome, but it is safety by a corruption check catching a
+    /// poisoned top of book — not by the bad level being harmless.
+    ///
+    /// That accidental, ASYMMETRIC half-protection is exactly why this is fixed
+    /// in `dec_string` and not at the `quantity` call site.
     #[test]
     fn a_book_level_of_an_unknown_shape_is_dropped_not_stringified() {
         let md = json!({"marketSlug": "s-1",
