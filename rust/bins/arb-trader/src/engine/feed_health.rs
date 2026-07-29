@@ -32,6 +32,11 @@ use std::collections::HashMap;
 /// quote decision path and not a feed-health change. Those 6 also have a worse
 /// problem first: their hedge leg has no order path at all, so a fill on the
 /// Kalshi leg is naked by construction.
+///
+/// This exclusion is also what makes the counter-differencing in
+/// `feed_stale_reason` affordable. INTL logged 2,634 stale episodes in 9 days
+/// (~293/day) against 263 ever for PM-US; making INTL critical would fire that
+/// detector — and its sweep — roughly 290 times a day.
 const DATA_ONLY_VENUES: [Venue; 1] = [Venue::Polymarket];
 
 /// The health-file staleness keys the engine requires EVIDENCE for: one per
@@ -68,6 +73,13 @@ pub(super) fn required_feeds(by_market: &HashMap<(Venue, String), Vec<usize>>) -
     v
 }
 
+/// The publisher's `stale_after_s`: how long a connection must be silent before
+/// the recorder starts counting flagged seconds for it. Mirrored here for the
+/// REASON TEXT ONLY — no decision reads it, so drift makes a log line slightly
+/// wrong and changes nothing else. Without it "stale for 2s" reads as a 2-second
+/// blip when the socket was actually dead for at least twelve.
+const RECORDER_STALE_AFTER_S: f64 = 10.0;
+
 /// The recorder writes a health line per tick; the file is large, so read a
 /// tail window rather than the whole thing.
 fn last_line(path: &str, window: u64) -> Option<String> {
@@ -95,7 +107,33 @@ fn last_line(path: &str, window: u64) -> Option<String> {
 /// 2026-07-28 an absent key read as healthy (`unwrap_or(false)`), so the one
 /// venue the recorder happened not to report was the one venue the engine could
 /// never pull for.
-fn feed_stale_reason(path: &str, now_wall: f64, required: &[String]) -> Option<String> {
+///
+/// `seen` carries the previous tick's `stale_seconds_total` so that this is a
+/// DETECTOR rather than a sampler. `stale` is an INSTANTANEOUS predicate — "this
+/// feed has been silent for more than 10s" — recomputed once a second
+/// (`arb-recorder/src/health.rs`, `record/recorder.py`), and this reads it every
+/// five, so an outage of D seconds is flagged on `max(0, D-10)` lines and
+/// observed with probability `min(1, (D-10)/5)`, decided by nothing but tick
+/// phase: a 12s outage was caught 40% of the time. `stale_seconds_total` counts
+/// those SAME flagged seconds cumulatively in the SAME line, so differencing it
+/// catches every one of them at any phase. `data/health.jsonl` carried
+/// `polymarket_us-ws: 2.0` — a 2-line episode on the order-carrying feed with a
+/// ~60% chance of never being seen — and was watched ticking 2.0 -> 4.0 live on
+/// 2026-07-29. `feed_iv` is `MissedTickBehavior::Skip`, so a skipped tick loses
+/// the flag outright while the counter still covers the gap.
+///
+/// COST, because this is not free: differencing the whole live file finds 263
+/// `polymarket_us-ws` episodes (34 in the last 24h; 215 of them 2s, longest 7s)
+/// against ONE `kalshi-ws` episode ever. The sampler saw roughly 15 of
+/// yesterday's 34; this sees all 34, so ~19 extra `pull_quotes` + `SweepAndVerify`
+/// cycles a day, each costing maker queue position on every relationship and
+/// drawing on a shared venue API budget with a 429 history.
+fn feed_stale_reason(
+    path: &str,
+    now_wall: f64,
+    required: &[String],
+    seen: &mut HashMap<String, f64>,
+) -> Option<String> {
     let Some(line) = last_line(path, 4096) else {
         return Some(format!("health file {path} unreadable"));
     };
@@ -109,16 +147,64 @@ fn feed_stale_reason(path: &str, now_wall: f64, required: &[String]) -> Option<S
         // strictly worse condition than any single feed going quiet.
         return Some(format!("recorder silent for {age:.0}s"));
     }
+    // Both recorders emit this object on EVERY line — empty when nothing has
+    // ever been stale — so a line without it is a publisher whose semantics we
+    // cannot assume, and quietly falling back to the flag alone would restore
+    // the sampler this exists to replace. Missing evidence pulls, as everywhere
+    // else here.
+    let Some(totals) = v.get("stale_seconds_total").and_then(|t| t.as_object()) else {
+        return Some(format!("health file {path} reports no stale_seconds_total"));
+    };
     let stale = v.get("stale");
     let bad: Vec<String> = required
         .iter()
-        .filter_map(|f| match stale.and_then(|s| s.get(f)).and_then(|b| b.as_bool()) {
-            Some(true) => Some(format!("{f} stale")),
-            Some(false) => None,
-            // No entry is not a healthy entry. The recorder reporting nothing
-            // about a venue we trade is indistinguishable, from here, from that
-            // venue's socket being half-open — so it reads the same way.
-            None => Some(format!("{f} unreported by the recorder")),
+        .filter_map(|f| {
+            // Absent from the COUNTER means "never stale in this recorder
+            // process": the recorder inserts a key only once it has counted a
+            // stale second, and the live file names 2 of the 3 feeds it
+            // watches. That is the OPPOSITE of the rule for `stale` below, and
+            // it is only safe because the object's own presence was just
+            // required above.
+            let total = totals.get(f).and_then(|n| n.as_f64()).unwrap_or(0.0);
+            let missed = match seen.insert(f.clone(), total) {
+                // Backwards: the recorder restarted and began counting again
+                // from zero into the same append-only file, so a naive
+                // difference would go negative. Everything the NEW counter
+                // holds accumulated AFTER that restart, so it is all news and
+                // all of it is reported. Zero — a recorder that has counted
+                // nothing yet — is the ordinary case and reports nothing, which
+                // is why a restart is not a false alarm; `45 -> 3` is the case
+                // that must not be swallowed, and would be by any rule of the
+                // form "report only what exceeds the last reading".
+                Some(prev) if total < prev => total,
+                Some(prev) => total - prev,
+                // First reading: nothing to difference against. Whatever the
+                // counter already holds happened before this engine started.
+                None => 0.0,
+            };
+            match stale.and_then(|s| s.get(f)).and_then(|b| b.as_bool()) {
+                Some(true) => Some(format!("{f} stale")),
+                // Stale and recovered BETWEEN two ticks. This is NOT protection
+                // DURING the blackout and must not be read as such: the counter
+                // is differenced up to 5s after the episode ended, and it ended
+                // because messages resumed, which repairs the book in
+                // milliseconds. A 12s PM-US blackout gets zero seconds of cover
+                // while it is happening.
+                //
+                // What it buys is the SWEEP. `feed_tick` sweeps on the way in,
+                // so the quotes that were priced off a book we could not see get
+                // cancelled and the venue book re-proved — which is the half
+                // that matters in a system with this one's naked-fill history.
+                Some(false) if missed > 0.0 => Some(format!(
+                    "{f} stale for {missed:.0}s flagged (>={:.0}s silent) since the last check",
+                    missed + RECORDER_STALE_AFTER_S
+                )),
+                Some(false) => None,
+                // No entry is not a healthy entry. The recorder reporting nothing
+                // about a venue we trade is indistinguishable, from here, from that
+                // venue's socket being half-open — so it reads the same way.
+                None => Some(format!("{f} unreported by the recorder")),
+            }
         })
         .collect();
     (!bad.is_empty()).then(|| bad.join(", "))
@@ -229,10 +315,12 @@ impl Engine {
         let t = feed_tick(
             self.feed_reason.as_ref(),
             resync_reason(&self.link, std::time::Instant::now()),
-            self.cfg
-                .health_file
-                .as_deref()
-                .and_then(|p| feed_stale_reason(p, wall_now(), &self.required)),
+            match self.cfg.health_file.as_deref() {
+                Some(p) => {
+                    feed_stale_reason(p, wall_now(), &self.required, &mut self.stale_seen)
+                }
+                None => None,
+            },
         );
         if t.proven {
             self.link = Link::Fresh; // stop re-deriving it
@@ -269,12 +357,29 @@ mod feed_health_tests {
         (d, s)
     }
 
+    /// The recorder appends; so does this.
+    fn append(path: &str, line: &str) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        writeln!(f, "{line}").unwrap();
+    }
+
     const NOW: f64 = 1_000_000.0;
 
     fn line(ts: f64, kalshi: bool, pmus: bool) -> String {
+        counted(ts, kalshi, pmus, "{}")
+    }
+
+    /// `line`, plus an explicit `stale_seconds_total` object.
+    fn counted(ts: f64, kalshi: bool, pmus: bool, totals: &str) -> String {
         format!(
-            r#"{{"ts":{ts},"stale":{{"kalshi-ws":{kalshi},"polymarket_us-ws":{pmus},"polymarket-ws":true}}}}"#
+            r#"{{"ts":{ts},"stale":{{"kalshi-ws":{kalshi},"polymarket_us-ws":{pmus},"polymarket-ws":true}},"stale_seconds_total":{totals}}}"#
         )
+    }
+
+    /// `feed_stale_reason` with a throwaway counter baseline, for the cases
+    /// where only the newest line matters.
+    fn reason(path: &str, now: f64, required: &[String]) -> Option<String> {
+        feed_stale_reason(path, now, required, &mut HashMap::new())
     }
 
     /// The keys a registry over `venues` requires, through the real derivation.
@@ -292,7 +397,7 @@ mod feed_health_tests {
     #[test]
     fn healthy_feeds_do_not_pull() {
         let (_d, p) = health_file(&[&line(NOW - 1.0, false, false)]);
-        assert_eq!(feed_stale_reason(&p, NOW, &required(&QUOTED)), None);
+        assert_eq!(reason(&p, NOW, &required(&QUOTED)), None);
     }
 
     /// polymarket (INTL) is not a critical feed — the money path is Kalshi and
@@ -305,17 +410,17 @@ mod feed_health_tests {
     #[test]
     fn a_non_critical_feed_going_stale_does_not_pull() {
         let (_d, p) = health_file(&[&line(NOW - 1.0, false, false)]);
-        assert_eq!(feed_stale_reason(&p, NOW, &required(&QUOTED)), None);
+        assert_eq!(reason(&p, NOW, &required(&QUOTED)), None);
         let with_intl = required(&[Venue::Kalshi, Venue::PolymarketUs, Venue::Polymarket]);
         assert_eq!(with_intl, vec!["kalshi-ws", "polymarket_us-ws"], "INTL is data-only here");
-        assert_eq!(feed_stale_reason(&p, NOW, &with_intl), None);
+        assert_eq!(reason(&p, NOW, &with_intl), None);
     }
 
     #[test]
     fn either_critical_feed_pulls_all_quotes() {
         for (k, pm, want) in [(true, false, "kalshi-ws"), (false, true, "polymarket_us-ws")] {
             let (_d, p) = health_file(&[&line(NOW - 1.0, k, pm)]);
-            let why = feed_stale_reason(&p, NOW, &required(&QUOTED)).expect("must pull");
+            let why = reason(&p, NOW, &required(&QUOTED)).expect("must pull");
             assert!(why.contains(want), "{why}");
         }
     }
@@ -330,18 +435,17 @@ mod feed_health_tests {
     #[test]
     fn an_absent_staleness_key_reads_as_stale_not_healthy() {
         let l = format!(
-            r#"{{"ts":{},"stale":{{"polymarket_us-ws":false,"polymarket-ws":false}}}}"#,
+            r#"{{"ts":{},"stale":{{"polymarket_us-ws":false,"polymarket-ws":false}},"stale_seconds_total":{{}}}}"#,
             NOW - 1.0
         );
         let (_d, p) = health_file(&[&l]);
-        let why =
-            feed_stale_reason(&p, NOW, &required(&QUOTED)).expect("an unreported feed must pull");
+        let why = reason(&p, NOW, &required(&QUOTED)).expect("an unreported feed must pull");
         assert!(why.contains("kalshi-ws"), "{why}");
         assert!(why.contains("unreported"), "{why}");
         // ...and a `stale` object that is missing entirely is not a clean bill
-        // of health either.
-        let (_d2, p2) = health_file(&[&format!(r#"{{"ts":{}}}"#, NOW - 1.0)]);
-        assert!(feed_stale_reason(&p2, NOW, &required(&QUOTED)).is_some());
+        // of health either, counter or no counter.
+        append(&p, &format!(r#"{{"ts":{},"stale_seconds_total":{{}}}}"#, NOW - 1.0));
+        assert!(reason(&p, NOW, &required(&QUOTED)).is_some());
     }
 
     /// ...which is only safe because the required set is DERIVED: a venue this
@@ -355,16 +459,140 @@ mod feed_health_tests {
         // A Kalshi-only registry (`--rel-prefix` narrowing does exactly this)
         // must not need a PM-US entry it has no use for.
         assert_eq!(required(&[Venue::Kalshi]), vec!["kalshi-ws"]);
-        let l = format!(r#"{{"ts":{},"stale":{{"kalshi-ws":false}}}}"#, NOW - 1.0);
+        let l = format!(
+            r#"{{"ts":{},"stale":{{"kalshi-ws":false}},"stale_seconds_total":{{}}}}"#,
+            NOW - 1.0
+        );
         let (_d, p) = health_file(&[&l]);
         assert_eq!(
-            feed_stale_reason(&p, NOW, &required(&[Venue::Kalshi])),
+            reason(&p, NOW, &required(&[Venue::Kalshi])),
             None,
             "an absent PM-US entry cannot pull an engine that quotes no PM-US market"
         );
         // ...and the same file DOES pull once PM-US is quoted.
-        let why = feed_stale_reason(&p, NOW, &required(&QUOTED)).expect("must pull");
+        let why = reason(&p, NOW, &required(&QUOTED)).expect("must pull");
         assert!(why.contains("polymarket_us-ws"), "{why}");
+    }
+
+    /// THE POINT. `stale` is an INSTANTANEOUS predicate the recorder recomputes
+    /// every second and this check reads every five, which makes reading it
+    /// alone a SAMPLER: an outage of D seconds is flagged on `max(0, D-10)`
+    /// lines and observed with probability `min(1, (D-10)/5)`, decided by
+    /// nothing but tick phase. D <= 10s is never seen (recorder policy);
+    /// 10 < D < 15s is a coin flip — a 12s outage was caught 40% of the time;
+    /// D >= 15s is always seen, up to 5s late on top of the recorder's own 10s.
+    ///
+    /// LIVE: `data/health.jsonl` carried `polymarket_us-ws: 2.0` — two flagged
+    /// seconds on the order-carrying feed, an episode with roughly a 60% chance
+    /// of never being observed — and that counter was watched ticking
+    /// 2.0 -> 4.0 on 2026-07-29 while the flag was down at both ticks either
+    /// side of it.
+    ///
+    /// `stale_seconds_total` counts those same flagged seconds cumulatively in
+    /// the SAME line, so differencing it sees every one of them at any phase.
+    #[test]
+    fn a_stale_episode_shorter_than_the_tick_interval_is_still_seen() {
+        let req = required(&QUOTED);
+        let mut seen = HashMap::new();
+        let (_d, p) =
+            health_file(&[&counted(NOW - 1.0, false, false, r#"{"polymarket_us-ws":2.0}"#)]);
+        assert_eq!(
+            feed_stale_reason(&p, NOW, &req, &mut seen),
+            None,
+            "baseline tick, all flags down"
+        );
+        // Five seconds later the flag is down AGAIN: the whole two-second
+        // episode fell between the ticks and `stale` never showed it.
+        append(&p, &counted(NOW + 4.0, false, false, r#"{"polymarket_us-ws":4.0}"#));
+        let why = feed_stale_reason(&p, NOW + 5.0, &req, &mut seen).expect("the counter moved");
+        assert!(why.contains("polymarket_us-ws"), "{why}");
+        // Both numbers: 2 FLAGGED seconds is at least 12 seconds of dead
+        // socket, because the recorder counts nothing for the first 10.
+        assert!(why.contains("2s flagged"), "{why}");
+        assert!(why.contains(">=12s silent"), "{why}");
+        // ...and it clears on the next tick, once the counter stops advancing.
+        append(&p, &counted(NOW + 9.0, false, false, r#"{"polymarket_us-ws":4.0}"#));
+        assert_eq!(feed_stale_reason(&p, NOW + 10.0, &req, &mut seen), None);
+    }
+
+    /// The counter is monotone only WITHIN a recorder process: a restart begins
+    /// it again at zero in the same append-only file, and the live file holds 24
+    /// such resets (4 on `polymarket_us-ws`), so this path is exercised. A naive
+    /// difference goes negative there, and reading "not greater than last time"
+    /// as healthy would swallow every real stale second until the new counter
+    /// passed the old one — a false all-clear of the same shape as
+    /// `unwrap_or(false)`.
+    ///
+    /// So a backwards step reports the NEW total: everything it holds
+    /// accumulated after the restart. `45 -> 0` reports nothing, because a
+    /// recorder that has counted nothing has nothing to report — that is the
+    /// ordinary shape and it is not a false alarm. `45 -> 3` reports 3, and is
+    /// the shape a rebaseline-and-stay-quiet rule would have swallowed.
+    ///
+    /// Deliberately NOT relying on the belt-and-braces: today a restart also
+    /// takes the engine's subscription down (`Link::Down`, which outranks the
+    /// file) because ONE process both writes health.jsonl and serves the socket
+    /// the trader attaches to (`config/recorder.yaml`). Split those, or point
+    /// the trader at one recorder's socket and another's health file, and that
+    /// cover is gone — so the rule above has to stand on its own.
+    #[test]
+    fn a_recorder_restart_is_neither_a_false_alarm_nor_a_false_all_clear() {
+        let req = required(&QUOTED);
+        let mut seen = HashMap::new();
+        let (_d, p) =
+            health_file(&[&counted(NOW - 1.0, false, false, r#"{"polymarket_us-ws":45.0}"#)]);
+        assert_eq!(feed_stale_reason(&p, NOW, &req, &mut seen), None);
+        // Restarted: counters back to zero, both feeds reporting healthy.
+        append(&p, &counted(NOW + 4.0, false, false, "{}"));
+        assert_eq!(
+            feed_stale_reason(&p, NOW + 5.0, &req, &mut seen),
+            None,
+            "45 -> 0 is a restart, not 45 seconds of staleness"
+        );
+        // ...and the baseline moved with it, so ONE flagged second after the
+        // restart still pulls instead of being swallowed until the counter
+        // climbs back past 45.
+        append(&p, &counted(NOW + 9.0, false, false, r#"{"polymarket_us-ws":1.0}"#));
+        let why = feed_stale_reason(&p, NOW + 10.0, &req, &mut seen).expect("must pull");
+        assert!(why.contains("polymarket_us-ws"), "{why}");
+        // ...and the restart that lands on a tick ALREADY carrying flagged
+        // seconds — 45 -> 3, below the old baseline but not zero — reports all
+        // three rather than dropping them.
+        let mut seen2 = HashMap::new();
+        append(&p, &counted(NOW + 14.0, false, false, r#"{"polymarket_us-ws":45.0}"#));
+        assert_eq!(feed_stale_reason(&p, NOW + 15.0, &req, &mut seen2), None);
+        append(&p, &counted(NOW + 19.0, false, false, r#"{"polymarket_us-ws":3.0}"#));
+        let why = feed_stale_reason(&p, NOW + 20.0, &req, &mut seen2).expect("must pull");
+        assert!(why.contains("3s flagged"), "45 -> 3 must not be swallowed: {why}");
+    }
+
+    /// The counter's absent-KEY rule is the opposite of `stale`'s, and has to
+    /// be: `stale_seconds_total` omits every feed that has never been stale —
+    /// the live file names 2 of the 3 feeds it watches — so an absent key means
+    /// zero, not missing evidence.
+    ///
+    /// That inversion is only safe because the OBJECT's presence is required.
+    /// Both recorders write it on every line, empty when nothing has ever been
+    /// stale, so a line without it is a publisher whose semantics we cannot
+    /// assume — and degrading silently back to the flag alone would restore the
+    /// sampler above.
+    #[test]
+    fn an_absent_counter_key_means_never_stale_but_an_absent_counter_object_pulls() {
+        let req = required(&QUOTED);
+        let mut seen = HashMap::new();
+        // kalshi-ws is flagged healthy and simply not counted: never stale.
+        let (_d, p) =
+            health_file(&[&counted(NOW - 1.0, false, false, r#"{"polymarket_us-ws":2.0}"#)]);
+        assert_eq!(feed_stale_reason(&p, NOW, &req, &mut seen), None);
+        assert_eq!(seen.get("kalshi-ws"), Some(&0.0), "an absent key baselines at zero");
+        // The object missing entirely is missing evidence, not a clean bill.
+        let no_counter = format!(
+            r#"{{"ts":{},"stale":{{"kalshi-ws":false,"polymarket_us-ws":false}}}}"#,
+            NOW - 1.0
+        );
+        append(&p, &no_counter);
+        let why = feed_stale_reason(&p, NOW, &req, &mut seen).expect("must pull");
+        assert!(why.contains("stale_seconds_total"), "{why}");
     }
 
     /// The health writer going quiet means the recorder is down — worse than
@@ -372,7 +600,7 @@ mod feed_health_tests {
     #[test]
     fn a_silent_recorder_is_stale_even_when_the_last_line_looked_healthy() {
         let (_d, p) = health_file(&[&line(NOW - 120.0, false, false)]);
-        let why = feed_stale_reason(&p, NOW, &required(&QUOTED)).expect("must pull");
+        let why = reason(&p, NOW, &required(&QUOTED)).expect("must pull");
         assert!(why.contains("recorder silent"), "{why}");
     }
 
@@ -382,7 +610,7 @@ mod feed_health_tests {
     fn only_the_last_line_is_read() {
         let (_d, p) = health_file(&[&line(NOW - 5.0, false, false), &line(NOW - 1.0, true, false)]);
         assert!(
-            feed_stale_reason(&p, NOW, &required(&QUOTED)).is_some(),
+            reason(&p, NOW, &required(&QUOTED)).is_some(),
             "the newest line is stale"
         );
     }
@@ -393,18 +621,18 @@ mod feed_health_tests {
     #[test]
     fn an_unreadable_health_file_pulls_quotes() {
         let req = required(&QUOTED);
-        assert!(feed_stale_reason("/nonexistent/health.jsonl", NOW, &req).is_some());
+        assert!(reason("/nonexistent/health.jsonl", NOW, &req).is_some());
         let (_d, p) = health_file(&["not json at all"]);
-        assert!(feed_stale_reason(&p, NOW, &req).is_some());
+        assert!(reason(&p, NOW, &req).is_some());
         let (_d2, p2) = health_file(&[]);
-        assert!(feed_stale_reason(&p2, NOW, &req).is_some(), "an empty file proves nothing");
+        assert!(reason(&p2, NOW, &req).is_some(), "an empty file proves nothing");
     }
 
     /// A line with no `ts` is treated as infinitely old, not as ts=now.
     #[test]
     fn a_line_without_a_timestamp_is_stale() {
         let (_d, p) = health_file(&[r#"{"stale":{"kalshi-ws":false,"polymarket_us-ws":false}}"#]);
-        assert!(feed_stale_reason(&p, NOW, &required(&QUOTED)).is_some());
+        assert!(reason(&p, NOW, &required(&QUOTED)).is_some());
     }
 
     /// The tail window can start mid-codepoint; that must not panic or hide a
@@ -413,7 +641,7 @@ mod feed_health_tests {
     fn a_large_file_reads_only_its_tail() {
         let pad = format!(r#"{{"ts":1,"note":"{}"}}"#, "é".repeat(3000));
         let (_d, p) = health_file(&[&pad, &line(NOW - 1.0, false, false)]);
-        assert_eq!(feed_stale_reason(&p, NOW, &required(&QUOTED)), None);
+        assert_eq!(reason(&p, NOW, &required(&QUOTED)), None);
     }
 
     /// C4(b), the policy half. A disconnect must pull, and a RECONNECT is not
