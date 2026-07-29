@@ -1,0 +1,48 @@
+# Daily M1 recorder-cutover gate. Replaces the unit of the same name deleted in
+# c382ea5, which invoked `.claude/worktrees/rust-rewrite/scripts/shadow_gate.py`
+# — a worktree that no longer exists. Its last three runs produced a 153-byte
+# "can't open file" and the unit still exited 0 every time, because the old
+# ExecStart ended in `tail -3` and threw the gate's own status away. So the M1
+# evidence trail records three green service runs over three reports that had no
+# RESULT line in them at all.
+#
+# TWO CORRECTIONS TO THAT SHAPE, both deliberate:
+#
+#  1. THE EXIT STATUS IS THE GATE. `set -o pipefail` plus `tee` keeps the
+#     binary's status, so a red gate is a FAILED unit and shows up in
+#     `systemctl --user list-units --failed`. A gate whose result nothing reads
+#     is not a gate.
+#
+#  2. IT COMPARES TODAY, NOT YESTERDAY. The old unit ran at 07:40 UTC against
+#     the previous day — ten minutes after `archive_to_parquet` deletes exactly
+#     those Python JSONL files at 07:30. `data/raw` today holds no 2026-07-28
+#     tape for any venue while `data/parquet` holds all three, so a
+#     yesterday-shaped gate would now find nothing to compare on the Python
+#     side. The gate reads a trailing window of the CURRENT day's tapes, which
+#     are both live, both present, and never touched by the ETL.
+#
+# Install (manual, deployment-time):
+#   cp systemd/arbbot-shadow-gate.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now arbbot-shadow-gate.timer
+
+[Unit]
+Description=arbbot M1 recorder-cutover gate (tape comparison + live subscriber under load)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/claude/arbbot
+# Nice=19: the live stage deliberately generates CPU load, and the Python
+# recorder that the ARMED engine is subscribed to runs at Nice=0. This must lose
+# every contest with it. The binary refuses to start its workers at all if the
+# 1-minute load average plus the workers would cross its ceiling.
+Nice=19
+ExecStart=/bin/bash -c 'set -o pipefail; mkdir -p data/reports; \
+    day=$(date -u +%%Y-%%m-%%d); \
+    rust/target/release/arb-shadow-gate --day $day \
+        --py-dir data/raw --rs-dir data/raw-rs \
+        --socket data/arbbot-rs.sock \
+        --window-s 900 --live-s 120 --load 6 \
+        2>&1 | tee data/reports/shadow-gate-$day.txt'
+
+[Install]
+WantedBy=default.target

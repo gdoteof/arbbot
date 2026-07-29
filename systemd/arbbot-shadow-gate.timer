@@ -1,0 +1,12 @@
+# 12:00 UTC, not the old 07:40: the gate now reads the CURRENT day's tapes, so
+# it needs a window of the day to have happened, and 07:40 sat ten minutes
+# after the Parquet ETL deletes the previous day's Python JSONL.
+[Unit]
+Description=daily M1 recorder-cutover gate at 12:00 UTC
+
+[Timer]
+OnCalendar=*-*-* 12:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

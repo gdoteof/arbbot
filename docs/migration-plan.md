@@ -30,9 +30,15 @@ socket; tape consumers are already format-gated by `--parse-check`
 - Gate: 7 consecutive green shadow-gate days; gap counter <= Python's over
   the same window; subscriber stability post-broadcaster-fix (zero
   unexplained disconnects); parse-check PASS on every day in the window.
+  The gate is now `arb-shadow-gate` (`systemd/arbbot-shadow-gate.{service,
+  timer}`), which checks all four in one run — the last two by ATTACHING a
+  subscriber, because the recorder hang of 2026-07-29 only ever appeared
+  under CPU contention and a tape diff would have been green through it.
 - Risk: none to positions (read-only key; no order code path in binary).
-- Rollback: swap the two systemd units back; tapes from the shadow window
-  backfill any hole.
+- Rollback: **not a unit swap.** The flip is two flags on the armed engine
+  (`--socket`, `--health`) and both recorders keep running, so rollback is
+  the same two flags back and there is no hole to backfill — the Python
+  recorder never stopped. Full sequence: `docs/recorder-cutover-runbook.md`.
 - Approval: board card before the flip.
 
 ## M2 — venue-write hello world: the FIRST Rust to touch an order

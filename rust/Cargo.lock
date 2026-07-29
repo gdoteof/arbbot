@@ -149,6 +149,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "arb-shadow-gate"
+version = "0.1.0"
+dependencies = [
+ "arb-core",
+ "serde_json",
+]
+
+[[package]]
 name = "arb-tape"
 version = "0.1.0"
 dependencies = [
