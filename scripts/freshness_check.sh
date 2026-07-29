@@ -22,17 +22,27 @@ if [ -z "$TOPIC" ]; then
   done
 fi
 DAY=$(date -u +%F)
-STAMP=/tmp/arbbot-freshness-alerted            # paging channel (unchanged path)
-STAMP_ROUTINE=/tmp/arbbot-freshness-routine    # low-priority channel, own cooldown
+# All state lives in /tmp, as it always has. The override exists ONLY so
+# scripts/test_freshness_gauges.sh can exercise this file for real: a test that
+# had to touch /tmp/arbbot-freshness-alerted would reset the LIVE 30-minute
+# cooldown on every run, and one that wrote the LIVE gauge baseline would make
+# the next real poll compute its deltas from fiction. Never set in the unit.
+STATE_DIR=${ARBBOT_WATCHDOG_STATE_DIR:-/tmp}
+STAMP=$STATE_DIR/arbbot-freshness-alerted            # paging channel (unchanged path)
+STAMP_ROUTINE=$STATE_DIR/arbbot-freshness-routine    # low-priority channel, own cooldown
 now=$(date +%s)
+# Returns 0 ONLY if a POST actually went out. Both early returns used to be a
+# bare `return`, which yields the status of the preceding command — 0 in both
+# cases — so a caller could not tell a delivered alert from a suppressed one.
+# The gauge baseline below depends on that distinction.
 alert() {  # $1 = cooldown stamp, $2 = ntfy priority, $3 = body
-  [ -f "$1" ] && [ $(( now - $(stat -c %Y "$1") )) -lt 1800 ] && return
+  [ -f "$1" ] && [ $(( now - $(stat -c %Y "$1") )) -lt 1800 ] && return 1
   # Topic checked BEFORE the stamp is touched: an unresolvable topic must not
   # burn the cooldown, and must not be silent. The 7-day outage above happened
   # precisely because this function stamped and then discarded the POST. Print
   # only the ABSENCE of the topic — it is a capability secret, never log it.
   [ -n "$TOPIC" ] ||
-    { echo "watchdog: ntfy topic UNRESOLVED — alerts are disabled" >&2; return; }
+    { echo "watchdog: ntfy topic UNRESOLVED — alerts are disabled" >&2; return 1; }
   touch "$1"
   curl -s -m 10 -H "Title: arbbot watchdog" -H "Priority: $2" \
     -d "$3" "https://ntfy.sh/$TOPIC" >/dev/null
@@ -115,6 +125,51 @@ fi
 [ "$(systemctl --user show arbbot-trader-m3 -p LoadState --value)" = loaded ] ||
   page "ARMED trader-m3 unit NOT LOADED — it is no longer being watched"
 
+# --- ARMED engine safety gauges -------------------------------------------
+# Everything above this line watches whether processes are ALIVE. Nothing
+# watched what the armed one was SAYING. `engine/mod.rs::summary` prints a JSON
+# line of safety counters to stdout every 60s and, measured 2026-07-29, had zero
+# consumers outside rust/ — including the ones whose own doc comments call them
+# THE alarm for a specific money condition. See scripts/gauge_deltas.py for the
+# per-gauge page/note decision and the reasoning behind each threshold.
+#
+# Gated on is-active for the same reason the block above uses is-failed: this
+# unit is deliberately STOPPED between supervised sessions, and journalctl
+# happily serves the LAST session's stats line to a stopped unit. Evaluating
+# that would page about a process that no longer exists — and about counters
+# frozen at whatever they were when a human disarmed. Stopped means skip, and
+# skipping also leaves the baseline untouched, which is what makes the restart
+# rule in gauge_deltas.py work.
+GAUGE_STATE=$STATE_DIR/arbbot-gauge-last
+GAUGE_WINDOW=600   # 10x the unit's --stats-every 60
+gauge_fired=0
+if systemctl --user is-active --quiet arbbot-trader-m3; then
+  stats=$(journalctl --user -u arbbot-trader-m3 --since "-${GAUGE_WINDOW}s" \
+            -o cat --no-pager 2>/dev/null | grep '^{' | tail -1)
+  if [ -z "$stats" ]; then
+    # A check that cannot run must say so rather than pass. But a unit that
+    # started 30s ago has not printed its first stats line yet and is not a
+    # fault, so this is measured against how long the unit has actually been up
+    # — otherwise every restart pages.
+    started=$(date -d "$(systemctl --user show arbbot-trader-m3 \
+                -p ActiveEnterTimestamp --value)" +%s 2>/dev/null || echo "$now")
+    [ $(( now - started )) -gt "$GAUGE_WINDOW" ] &&
+      page "ARMED trader-m3 has printed NO stats line in ${GAUGE_WINDOW}s while ACTIVE — every safety gauge is unread, and that tick shares the engine's select loop with the kill switch and the hedge deadline"
+  else
+    gout=$(printf '%s\n' "$stats" | python3 scripts/gauge_deltas.py \
+             "$GAUGE_STATE" "$GAUGE_STATE.new")
+    grc=$?
+    if [ $grc -ne 0 ]; then
+      page "ARMED trader-m3 gauge check FAILED to run (gauge_deltas.py exited $grc) — the safety counters were NOT read this cycle; see the watchdog journal"
+    elif [ -n "$gout" ]; then
+      gauge_fired=1
+      while IFS='|' read -r sev msg; do
+        case "$sev" in PAGE) page "$msg" ;; NOTE) note "$msg" ;; esac
+      done <<< "$gout"
+    fi
+  fi
+fi
+
 disk_pct=$(df / --output=pcent | tail -1 | tr -dc 0-9)
 [ "$disk_pct" -ge 97 ] && page "disk ${disk_pct}% full"
 
@@ -123,9 +178,28 @@ disk_pct=$(df / --output=pcent | tail -1 | tr -dc 0-9)
 # never EVALUATED — a chronically down recorder did not delay the report of a
 # hung scanner or a full disk, it meant they were never reported at all. Still
 # one alert and one exit per channel: the cooldown mechanism is unchanged.
+delivered=1   # nothing to deliver counts as delivered
 if [ ${#paging[@]} -gt 0 ]; then
-  alert "$STAMP" high "$(printf '%s\n' "${paging[@]}" "${routine[@]}")"
+  delivered=0
+  alert "$STAMP" high "$(printf '%s\n' "${paging[@]}" "${routine[@]}")" && delivered=1
 elif [ ${#routine[@]} -gt 0 ]; then
-  alert "$STAMP_ROUTINE" low "$(printf '%s\n' "${routine[@]}")"
+  delivered=0
+  alert "$STAMP_ROUTINE" low "$(printf '%s\n' "${routine[@]}")" && delivered=1
+fi
+
+# The gauge baseline advances ONLY if this poll's verdicts actually reached a
+# phone. The 30-minute cooldown is shared with every other check in this file,
+# so a recorder outage at 12:00 suppresses the POST at 12:05 — and if the
+# baseline advanced anyway, a `fills_unattributed +1` in that window would be
+# retired unreported and never mentioned again. Not advancing it means the
+# delta re-accumulates and pages once the cooldown expires. Verdicts that never
+# fired are not affected: their baseline advances every poll, which is what
+# stops a standing value from paging for ever.
+if [ -f "$GAUGE_STATE.new" ]; then
+  if [ "$gauge_fired" = 0 ] || [ "$delivered" = 1 ]; then
+    mv -f "$GAUGE_STATE.new" "$GAUGE_STATE"
+  else
+    rm -f "$GAUGE_STATE.new"
+  fi
 fi
 exit 0
