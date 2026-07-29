@@ -770,6 +770,7 @@ mod hedge_deadline_tests {
                 dropped: std::sync::atomic::AtomicU64::new(0),
                 sent: std::sync::atomic::AtomicU64::new(0),
                 failed: std::sync::atomic::AtomicU64::new(0),
+                recovered: std::sync::atomic::AtomicU64::new(0),
             }),
             cfg,
         ));

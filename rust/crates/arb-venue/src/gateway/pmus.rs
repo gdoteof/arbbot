@@ -11,6 +11,7 @@ use crate::sign::PmusSigner;
 use crate::transport::{NotWired, Transport};
 use crate::wire;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 /// PM-US (QCX) paths. Unlike Kalshi there is no API prefix on the base
@@ -205,6 +206,63 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
             });
         }
         Ok(())
+    }
+
+    /// Find an order this process placed but could not read the answer for.
+    ///
+    /// PM-US HAS NO CLIENT ORDER ID ON THE WIRE. [`wire::pmus_order_body`] sends
+    /// no such field and the retired Python `_order_body` sent none either, so
+    /// unlike [`super::KalshiGateway::cancel_by_client_order_id`] there is no
+    /// tag of ours on the venue to look ourselves up by. The only handle left is
+    /// what the order LOOKS like on `/v1/orders/open`.
+    ///
+    /// That is a weak handle on a SHARED account, so the rule is deliberately
+    /// narrow — an adopted order gets CANCELLED later, and cancelling another
+    /// workstream's order is worse than the leak this recovers from
+    /// (docs/venue-quirks.md §xv-graceful-shutdown-cancels-orders: "scope any
+    /// sweep to orders this process owns"):
+    ///   * same market slug and same quantity. Those are the fields an open
+    ///     order carries that we also chose — there is no limit price on the row
+    ///     at all, and `side` has only ever been captured live in one direction
+    ///     (`ORDER_SIDE_SELL`), so matching on a guessed spelling would silently
+    ///     never fire;
+    ///   * NOT already `claimed` by this process. This is what stops the
+    ///     recovery adopting one of our OWN earlier orders: the resting list
+    ///     LAGS a write, so an order cancelled a moment ago is still on it, and
+    ///     mapping a new order to that id would cancel the wrong one;
+    ///   * and EXACTLY ONE candidate. Two indistinguishable orders is a refusal
+    ///     with a name, never a coin flip.
+    fn recover_place(
+        &self,
+        req: &PlaceRequest,
+        claimed: &HashSet<String>,
+    ) -> Result<Option<String>, VenueError> {
+        let mut hits: Vec<String> = self
+            .open_orders()?
+            .into_iter()
+            .filter(|o| {
+                o.market_slug.as_deref() == Some(req.market.as_str())
+                    && o.quantity == Some(req.qty)
+                    && !claimed.contains(&o.id)
+            })
+            .map(|o| o.id)
+            .collect();
+        if hits.len() > 1 {
+            return Err(VenueError::Status {
+                endpoint: "pmus recover_place",
+                status: 0,
+                body: format!(
+                    "{} unclaimed orders of {} contract(s) are resting on {} — none of them \
+                     is distinguishable from the place whose response was lost, and this \
+                     account is SHARED, so NONE is adopted: {}",
+                    hits.len(),
+                    req.qty,
+                    req.market,
+                    hits.join(" ")
+                ),
+            });
+        }
+        Ok(hits.pop())
     }
 
     /// GET /v1/order/{id} — authoritative. The create response omits fill data

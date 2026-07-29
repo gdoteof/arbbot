@@ -202,6 +202,16 @@ pub trait OrderSink: Send + Sync {
     /// Ids still resting. A 200 from `cancel_all_open` only says the venue
     /// accepted the request; this is the evidence that it worked.
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError>;
+    /// The venue's id for a place we could not read the answer for — see
+    /// [`VenueGateway::recover_place`]. `Ok(None)` means nothing matching it is
+    /// resting, and the default is no recovery at all.
+    fn recover_place(
+        &self,
+        _req: &PlaceRequest,
+        _claimed: &std::collections::HashSet<String>,
+    ) -> Result<Option<String>, VenueError> {
+        Ok(None)
+    }
 }
 
 /// Every gateway is a sink. The adapter is the same four delegations for both
@@ -227,6 +237,13 @@ where
     }
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
         VenueGateway::resting_order_ids(self)
+    }
+    fn recover_place(
+        &self,
+        req: &PlaceRequest,
+        claimed: &std::collections::HashSet<String>,
+    ) -> Result<Option<String>, VenueError> {
+        VenueGateway::recover_place(self, req, claimed)
     }
 }
 

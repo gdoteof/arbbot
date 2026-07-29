@@ -16,6 +16,7 @@ use arb_venue::ratelimit::RateLimiter;
 use arb_venue::transport::{Response, Transport};
 use arb_venue::{PmusSigner, VenueError};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::sync::Mutex;
 
 #[derive(Debug, Clone)]
@@ -93,6 +94,10 @@ const SLUG: &str = "will-x-happen";
 /// A create response: an id and `executions: []`, and NO fill data.
 const CREATED: &str = r#"{"id":"pm-1","marketSlug":"will-x-happen","state":"STATE_OPEN","executions":[]}"#;
 const OPEN_ORDER: &str = r#"{"id":"pm-1","marketSlug":"will-x-happen","state":"STATE_OPEN","cumQuantity":0}"#;
+/// A row from `/v1/orders/open` in the live-captured shape (`resp_parity.rs`):
+/// `quantity` is the ORIGINAL size, and there is no limit price on it at all.
+const OPEN_ORDER_5: &str =
+    r#"{"id":"pm-lost","marketSlug":"will-x-happen","side":"ORDER_SIDE_BUY","quantity":5,"cumQuantity":0,"leavesQuantity":5}"#;
 
 fn place_req() -> PlaceRequest {
     PlaceRequest {
@@ -283,6 +288,96 @@ fn open_orders_accepts_both_shapes() {
         assert_eq!(os.len(), 2);
         assert_eq!(os[0].id, "pm-1");
     }
+}
+
+// ------------------------------------------- a place whose answer was lost ---
+
+/// PM-US HAS NO CLIENT ORDER ID ON THE WIRE, so a create whose response is lost
+/// leaves an order that nothing can name. Kalshi recovers from this by its own
+/// `client_order_id` (`cancel_by_client_order_id`, added after the first live
+/// smoke left an order resting on 2026-07-27); the only handle PM-US offers is
+/// the open-orders row itself.
+///
+/// The transport maps a reqwest timeout to `Transport` after 15s, so this is not
+/// hypothetical: the order rests, no ack is emitted, `oid_venue` never learns
+/// the id, the cancel cannot be addressed and a fill on it arrives under an id
+/// the engine cannot attribute.
+#[test]
+fn a_place_whose_response_was_lost_is_found_by_its_market_and_size() {
+    let open = format!(
+        r#"[{{"id":"other-market","marketSlug":"different","quantity":5}},{OPEN_ORDER_5}]"#
+    );
+    let g = gw(vec![(200, &open)]);
+    let mut req = place_req();
+    req.qty = 5;
+    assert_eq!(
+        g.recover_place(&req, &HashSet::new()).unwrap(),
+        Some("pm-lost".to_string()),
+        "the order the venue took while we could not read the answer"
+    );
+    assert_eq!(g.transport.sent()[0].path, "/v1/orders/open", "one read, no guessing");
+}
+
+/// Nothing matching means nothing to adopt. A recovery that invents an order
+/// would be worse than the leak it recovers from.
+#[test]
+fn a_place_the_venue_really_refused_recovers_nothing() {
+    let g = gw(vec![(200, r#"[{"id":"someone-else","marketSlug":"different","quantity":5}]"#)]);
+    let mut req = place_req();
+    req.qty = 5;
+    assert_eq!(g.recover_place(&req, &HashSet::new()).unwrap(), None);
+}
+
+/// The size has to match too: an order of a different size on the same market is
+/// not the one we just placed.
+#[test]
+fn an_order_of_another_size_on_the_same_market_is_not_ours() {
+    let g = gw(vec![(200, &format!("[{OPEN_ORDER_5}]"))]);
+    let mut req = place_req();
+    req.qty = 25;
+    assert_eq!(g.recover_place(&req, &HashSet::new()).unwrap(), None);
+}
+
+/// THE scope rule. Both venues' resting lists LAG a write, so an order we placed
+/// (or even cancelled) a moment ago is still on them. Adopting one of those as
+/// the id of a DIFFERENT order would point the next cancel at the wrong order.
+#[test]
+fn an_order_this_process_already_claimed_is_never_adopted_again() {
+    let g = gw(vec![(200, &format!("[{OPEN_ORDER_5}]"))]);
+    let mut req = place_req();
+    req.qty = 5;
+    let claimed: HashSet<String> = ["pm-lost".to_string()].into_iter().collect();
+    assert_eq!(g.recover_place(&req, &claimed).unwrap(), None);
+}
+
+/// Two indistinguishable candidates is a REFUSAL with a name, never a coin
+/// flip. The account is SHARED (docs/venue-quirks.md
+/// §xv-graceful-shutdown-cancels-orders: "scope any sweep to orders this process
+/// owns"), and an adopted order gets cancelled later — cancelling another
+/// workstream's order is worse than the leak.
+#[test]
+fn two_indistinguishable_candidates_are_refused_not_guessed_between() {
+    let open = format!(
+        r#"[{OPEN_ORDER_5},{{"id":"pm-twin","marketSlug":"will-x-happen","quantity":5}}]"#
+    );
+    let g = gw(vec![(200, &open)]);
+    let mut req = place_req();
+    req.qty = 5;
+    match g.recover_place(&req, &HashSet::new()) {
+        Err(VenueError::Status { endpoint: "pmus recover_place", body, .. }) => {
+            assert!(body.contains("SHARED"), "{body}");
+            assert!(body.contains("pm-lost") && body.contains("pm-twin"), "names both: {body}");
+        }
+        other => panic!("an ambiguous match must be refused, got {other:?}"),
+    }
+}
+
+/// A read that fails is not an empty book: it must not read as "nothing to
+/// recover", because that is the answer that leaves the order resting.
+#[test]
+fn an_unreadable_open_orders_read_is_an_error_not_an_empty_answer() {
+    let g = gw(vec![(500, "boom")]);
+    assert!(g.recover_place(&place_req(), &HashSet::new()).is_err());
 }
 
 /// Positions are a dict KEYED BY SLUG with a string netPosition.

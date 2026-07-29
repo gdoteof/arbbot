@@ -216,6 +216,13 @@ double-entry books. Together they make the Kalshi account reconcile to
 - **Current handling:** `src/arbbot/exec/polymarket_us_gateway.py:101-106` (create, bare), `:69-77` (preview, wrapped).
 - **Port requirement:** Encode the two body shapes separately; do not share a serializer between create and preview.
 
+### `pmus-no-client-order-id`
+- **Venue:** polymarket_us
+- **What the API does:** The create body carries NO client-order-id field of any kind (`POST /v1/orders` takes marketSlug/type/price/quantity/tif/intent and nothing of ours), so the venue never learns a tag we could look ourselves up by. Kalshi's `client_order_id` has no counterpart here.
+- **Failure it caused:** a place whose RESPONSE is lost (the 15s HTTP timeout, or a body that will not parse) may still have REACHED the venue, and the order then rests under an id we never learned: no per-order cancel can address it, the client-id escalation is refused locally and forever, and a fill on it arrives under an id the engine cannot attribute (`fills_unattributed`, no hedge minted, the leg naked).
+- **Current handling:** `rust/crates/arb-venue/src/gateway/pmus.rs` (`recover_place`: one `GET /v1/orders/open`, matched on marketSlug + quantity, excluding ids this process has already claimed, and refusing outright when more than one candidate matches); `rust/bins/arb-trader/src/exec.rs` (the recovered order is adopted with a real `order_ack` and counted in `exec_recovered`). The Python this ports had no recovery at all.
+- **Port requirement:** Never send our id in a PM-US order body or cancel path (it will be answered <300 for an order the venue never issued). Recover a lost create ONLY from the open-orders row, scoped to orders this process owns and refused when ambiguous — the account is shared, and an adopted order gets cancelled later.
+
 ### `pmus-order-id-field-is-id`
 - **Venue:** polymarket_us
 - **What the API does:** The order id field is `id` (Kalshi uses `order_id`, sometimes nested under `order`).
