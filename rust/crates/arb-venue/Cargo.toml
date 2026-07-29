@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 # Venue-adapter layer: signing + request-shaping + response-parsing parity with
-# the Python gateways. NO network transport in this crate (no reqwest/hyper) —
-# real executors land later behind the arb-trader dry-run seam (docs/migration-plan.md).
+# the Python gateways, plus the transport that puts the signed bytes on the wire
+# (blocking reqwest, landed for M2 — see gateway/mod.rs for why a gateway built
+# with `new` still cannot reach a venue).
 
 [lints]
 workspace = true

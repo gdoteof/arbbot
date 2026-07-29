@@ -78,11 +78,11 @@ pub fn build_source(
     let mut state: HashMap<(String, String), MarketState> = HashMap::new();
     let mut st = Stats::default();
 
-    let mut on_event = |ev: TapeEvent,
-                        books: &mut BookBuilder,
-                        state: &mut HashMap<(String, String), MarketState>,
-                        st: &mut Stats,
-                        out: &mut dyn Write|
+    let on_event = |ev: TapeEvent,
+                    books: &mut BookBuilder,
+                    state: &mut HashMap<(String, String), MarketState>,
+                    st: &mut Stats,
+                    out: &mut dyn Write|
      -> Result<(), String> {
         st.events += 1;
         let venue = ev.venue();
@@ -174,6 +174,70 @@ fn event_ts(ev: &TapeEvent) -> i64 {
     }
 }
 
+/// Build every venue's ToB series for one day, in parallel, writing to
+/// `out_dir`. Shared by the CLI and the dashboard's on-demand trigger so the
+/// two cannot drift.
+///
+/// Writes go to `<name>.tmp` and are RENAMED into place. A reader must never
+/// see a half-built series, and rename is atomic on the same filesystem — this
+/// matters precisely because the dashboard reads these files while a rebuild
+/// may be running.
+///
+/// Cost, measured 2026-07-27 on real tape: ~30s wall, ~2 cores, under 40 MB
+/// RSS, ~10 MB output per day — for 16-20M events across 6.7 GB of JSONL. It
+/// streams, so memory does not scale with the tape.
+pub fn build_day(
+    raw_dir: &str,
+    parquet_dir: &str,
+    out_dir: &str,
+    day: &str,
+    interval_ns: i64,
+    venues: &[&str],
+) -> Result<Vec<(String, Stats)>, String> {
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("create {out_dir}: {e}"))?;
+    let results: Vec<(String, Result<Stats, String>)> = std::thread::scope(|s| {
+        let hs: Vec<_> = venues
+            .iter()
+            .map(|venue| {
+                s.spawn(move || {
+                    let Some(src) = arb_query::source_for(raw_dir, parquet_dir, venue, day) else {
+                        return (venue.to_string(), Err("no tape for this day".to_string()));
+                    };
+                    let final_path = format!("{out_dir}/tob-{venue}-{day}.jsonl");
+                    let tmp = format!("{final_path}.tmp");
+                    let r = (|| -> Result<Stats, String> {
+                        let f = std::fs::File::create(&tmp)
+                            .map_err(|e| format!("create {tmp}: {e}"))?;
+                        let mut w = std::io::BufWriter::new(f);
+                        let st = build_source(&src, interval_ns, &mut w)?;
+                        w.flush().map_err(|e| e.to_string())?;
+                        drop(w);
+                        std::fs::rename(&tmp, &final_path)
+                            .map_err(|e| format!("rename {tmp}: {e}"))?;
+                        Ok(st)
+                    })();
+                    if r.is_err() {
+                        let _ = std::fs::remove_file(&tmp);
+                    }
+                    (venue.to_string(), r)
+                })
+            })
+            .collect();
+        hs.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+
+    let mut out = Vec::new();
+    for (venue, r) in results {
+        match r {
+            Ok(st) => out.push((venue, st)),
+            // A venue with no tape for the day is normal, not fatal.
+            Err(e) if e.starts_with("no tape") => {}
+            Err(e) => return Err(format!("{venue}: {e}")),
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,68 +313,4 @@ mod tests {
         assert_eq!(samples(&out).len(), 1);
         let _ = std::fs::remove_file(p);
     }
-}
-
-/// Build every venue's ToB series for one day, in parallel, writing to
-/// `out_dir`. Shared by the CLI and the dashboard's on-demand trigger so the
-/// two cannot drift.
-///
-/// Writes go to `<name>.tmp` and are RENAMED into place. A reader must never
-/// see a half-built series, and rename is atomic on the same filesystem — this
-/// matters precisely because the dashboard reads these files while a rebuild
-/// may be running.
-///
-/// Cost, measured 2026-07-27 on real tape: ~30s wall, ~2 cores, under 40 MB
-/// RSS, ~10 MB output per day — for 16-20M events across 6.7 GB of JSONL. It
-/// streams, so memory does not scale with the tape.
-pub fn build_day(
-    raw_dir: &str,
-    parquet_dir: &str,
-    out_dir: &str,
-    day: &str,
-    interval_ns: i64,
-    venues: &[&str],
-) -> Result<Vec<(String, Stats)>, String> {
-    std::fs::create_dir_all(out_dir).map_err(|e| format!("create {out_dir}: {e}"))?;
-    let results: Vec<(String, Result<Stats, String>)> = std::thread::scope(|s| {
-        let hs: Vec<_> = venues
-            .iter()
-            .map(|venue| {
-                s.spawn(move || {
-                    let Some(src) = arb_query::source_for(raw_dir, parquet_dir, venue, day) else {
-                        return (venue.to_string(), Err("no tape for this day".to_string()));
-                    };
-                    let final_path = format!("{out_dir}/tob-{venue}-{day}.jsonl");
-                    let tmp = format!("{final_path}.tmp");
-                    let r = (|| -> Result<Stats, String> {
-                        let f = std::fs::File::create(&tmp)
-                            .map_err(|e| format!("create {tmp}: {e}"))?;
-                        let mut w = std::io::BufWriter::new(f);
-                        let st = build_source(&src, interval_ns, &mut w)?;
-                        w.flush().map_err(|e| e.to_string())?;
-                        drop(w);
-                        std::fs::rename(&tmp, &final_path)
-                            .map_err(|e| format!("rename {tmp}: {e}"))?;
-                        Ok(st)
-                    })();
-                    if r.is_err() {
-                        let _ = std::fs::remove_file(&tmp);
-                    }
-                    (venue.to_string(), r)
-                })
-            })
-            .collect();
-        hs.into_iter().filter_map(|h| h.join().ok()).collect()
-    });
-
-    let mut out = Vec::new();
-    for (venue, r) in results {
-        match r {
-            Ok(st) => out.push((venue, st)),
-            // A venue with no tape for the day is normal, not fatal.
-            Err(e) if e.starts_with("no tape") => {}
-            Err(e) => return Err(format!("{venue}: {e}")),
-        }
-    }
-    Ok(out)
 }

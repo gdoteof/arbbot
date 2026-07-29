@@ -115,6 +115,10 @@ impl BookBuilder {
         self.books.remove(&(venue, market_id.to_owned()));
     }
 
+    // The arguments ARE the wire event, field for field. `apply_event` below is
+    // the struct-shaped door; this one exists for callers holding the fields
+    // already destructured, and a parameter struct would just be `TapeEvent`.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_snapshot(
         &mut self,
         venue: Venue,
@@ -134,6 +138,8 @@ impl BookBuilder {
     }
 
     /// Ok(true) = applied; Ok(false) = stale/duplicate dropped.
+    // Same as `apply_snapshot`: the arguments are the wire event's fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_delta(
         &mut self,
         venue: Venue,

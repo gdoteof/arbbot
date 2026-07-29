@@ -125,7 +125,7 @@ fn main() {
         .filter_map(|r| {
             Some(Quoter::new(Rel {
                 id: r.id,
-                rtype: RelType::from_str(&r.rtype)?,
+                rtype: RelType::parse(&r.rtype)?,
                 tranche: r.tranche,
                 legs: r
                     .legs

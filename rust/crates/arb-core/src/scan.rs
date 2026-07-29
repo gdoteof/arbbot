@@ -196,7 +196,7 @@ pub enum RelType {
 impl RelType {
     /// The registry spelling. This is the `by_class` key the risk manager
     /// aggregates exposure under (Python `rel.type.value`), so it must stay
-    /// the exact inverse of `from_str`.
+    /// the exact inverse of `parse`.
     pub fn as_str(self) -> &'static str {
         match self {
             RelType::CrossVenueEquivalent => "cross-venue-equivalent",
@@ -210,7 +210,13 @@ impl RelType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<RelType> {
+    /// Inverse of [`RelType::as_str`]. Named `parse` and not `from_str`
+    /// deliberately: an inherent `from_str` shadows `std::str::FromStr` at
+    /// every call site, and `FromStr` would force a named error type that all
+    /// three callers immediately discard — each one is inside a `filter_map`
+    /// where an unrecognised registry `kind` means "skip this relationship".
+    /// `Venue::parse` and `Dec::parse` already spell this shape `parse`.
+    pub fn parse(s: &str) -> Option<RelType> {
         Some(match s {
             "cross-venue-equivalent" => RelType::CrossVenueEquivalent,
             "equivalent-pair" => RelType::EquivalentPair,
@@ -620,113 +626,6 @@ pub fn scan_relationship(
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::model::Level;
-
-    fn lvl(p: &str, s: &str) -> Level {
-        Level { price: p.into(), size: s.into() }
-    }
-
-    /// Pinned against tests/test_golden.py _decision_stream() output
-    /// (Python-generated 2026-07-23): the byte-for-byte parity contract.
-    const PY_LINE: &str = r#"{"basket":[{"buy_side":"yes","fee":"0.840000","market_id":"K","role":"taker","venue":"kalshi","vwap":"0.400000"},{"buy_side":"no","fee":"0.495000","market_id":"P","role":"taker","venue":"polymarket","vwap":"0.450000"}],"bucket":"primary","fees":"1.335000","gross_cost":"42.500000","max_hold_close_time":"2026-08-01T00:00:00Z","min_payoff":"1.000000","net_edge_per_contract":"0.123300","net_edge_total":"6.165000","relationship_id":"eq1","signature":"eq1:YN","size":"50","tranche":"head","ts_local_ns":7}"#;
-
-    #[test]
-    fn matches_python_reference_line() {
-        let mut cx = Cx::default();
-        let fees = FeeSchedule::new(&mut cx);
-        let mut bb = BookBuilder::new();
-        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.38", "50")],
-                          vec![lvl("0.40", "50")], 1, 1, None);
-        bb.apply_snapshot(Venue::Polymarket, "P", vec![lvl("0.55", "50")],
-                          vec![lvl("0.60", "50")], 1, 1, None);
-        let rel = Rel {
-            id: "eq1".into(),
-            rtype: RelType::CrossVenueEquivalent,
-            tranche: "head".into(),
-            legs: vec![
-                RelLeg { venue: Venue::Kalshi, market_id: "K".into() },
-                RelLeg { venue: Venue::Polymarket, market_id: "P".into() },
-            ],
-        };
-        // test fixture markets: min_order 1, close_time set (test_scanner.market)
-        let metas = |_leg: &RelLeg| MarketMeta {
-            category: "default".into(),
-            min_order_size: Cx::default().one,
-            close_time: Some("2026-08-01T00:00:00Z".into()),
-            taker_coef_override: None,
-        };
-        let mut cx2 = Cx::default();
-        let opps = scan_relationship(&mut cx2, &fees, &rel, &bb, &metas, 7);
-        assert_eq!(opps.len(), 1);
-        assert_eq!(opps[0].canonical_line(&mut cx2), PY_LINE);
-    }
-
-    fn fedcut_rel() -> Rel {
-        Rel {
-            id: "xvus-fedcut-26-usfed-2026-cut".into(),
-            rtype: RelType::CrossVenueEquivalent,
-            tranche: "head".into(),
-            legs: vec![
-                RelLeg { venue: Venue::Kalshi, market_id: "KXRATECUT-26DEC31".into() },
-                RelLeg { venue: Venue::PolymarketUs, market_id: "cbpac-usfed-2026-cut".into() },
-            ],
-        }
-    }
-
-    /// audit C5: both maker pricing functions price entirely off the HEDGE
-    /// book, so a crossed hedge book makes the quote fiction. Same rule and
-    /// same position (before any arithmetic) as the take-take detector's guard
-    /// from 4542e5f.
-    ///
-    /// Numbers are the real KXRATECUT-26DEC31 book of 2026-07-28: a phantom ask
-    /// at 0.0730 under a 0.1770 bid. The control moves ONLY the bid, below the
-    /// same ask, so the single variable under test is the crossing itself.
-    #[test]
-    fn no_maker_quote_off_a_crossed_hedge_book() {
-        let rel = fedcut_rel();
-        let metas = |_l: &RelLeg| MarketMeta::default_for_golden(&mut Cx::default());
-        let quote = |bids: Vec<Level>, asks: Vec<Level>| {
-            let mut cx = Cx::default();
-            let fees = FeeSchedule::new(&mut cx);
-            let mut bb = BookBuilder::new();
-            bb.apply_snapshot(Venue::Kalshi, "KXRATECUT-26DEC31", bids, asks, 1, 1, None);
-            let clip = cx.from_i64(5);
-            // maker leg 1 (PM-US), hedge leg 0 (Kalshi)
-            let bid_q = maker_quote(&mut cx, &fees, &rel, 1, &bb, &metas, clip);
-            let ask_q = maker_ask_quote(&mut cx, &fees, &rel, 1, &bb, &metas, clip);
-            (bid_q.is_some(), ask_q.is_some())
-        };
-
-        let crossed = vec![lvl("0.1770", "305")];
-        let locked = vec![lvl("0.0730", "305")];
-        let sane = vec![lvl("0.0720", "305")];
-        let asks = vec![lvl("0.0730", "26")];
-
-        assert_eq!(quote(crossed, asks.clone()), (false, false), "crossed book priced a quote");
-        assert_eq!(quote(locked, asks.clone()), (false, false), "locked book priced a quote");
-        // the control: same ask, bid one tick BELOW it. Both sides must still
-        // price, or the guard has switched the maker off rather than gated it.
-        assert_eq!(quote(sane, asks), (true, true), "the guard silenced a sane book");
-    }
-
-    #[test]
-    fn feasible_states_match_python() {
-        assert_eq!(feasible_states(RelType::CrossVenueEquivalent, 2),
-                   vec![vec![0, 0], vec![1, 1]]);
-        assert_eq!(feasible_states(RelType::Bundle, 2),
-                   vec![vec![0, 1], vec![1, 0]]);
-        assert_eq!(feasible_states(RelType::DateLadder, 2),
-                   vec![vec![0, 0], vec![0, 1], vec![1, 1]]);
-        assert_eq!(feasible_states(RelType::Exclusive, 2),
-                   vec![vec![0, 0], vec![1, 0], vec![0, 1]]);
-        assert_eq!(feasible_states(RelType::Rollup, 3),
-                   vec![vec![0, 0, 0], vec![1, 1, 0], vec![1, 0, 1], vec![1, 1, 1]]);
-    }
-}
-
 // ---------- maker quotes (quoter targets; intent-parity surface) ----------
 
 /// maker_quote — max YES-bid to rest on leg `i` such that hedging on fill
@@ -847,4 +746,111 @@ pub fn maker_ask_quote(
     let ticks = cx.quantize_int_ceil(ticks);
     let p = cx.mul(ticks, tick);
     if cx.cmp(p, one) == std::cmp::Ordering::Less { Some(p) } else { None }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Level;
+
+    fn lvl(p: &str, s: &str) -> Level {
+        Level { price: p.into(), size: s.into() }
+    }
+
+    /// Pinned against tests/test_golden.py _decision_stream() output
+    /// (Python-generated 2026-07-23): the byte-for-byte parity contract.
+    const PY_LINE: &str = r#"{"basket":[{"buy_side":"yes","fee":"0.840000","market_id":"K","role":"taker","venue":"kalshi","vwap":"0.400000"},{"buy_side":"no","fee":"0.495000","market_id":"P","role":"taker","venue":"polymarket","vwap":"0.450000"}],"bucket":"primary","fees":"1.335000","gross_cost":"42.500000","max_hold_close_time":"2026-08-01T00:00:00Z","min_payoff":"1.000000","net_edge_per_contract":"0.123300","net_edge_total":"6.165000","relationship_id":"eq1","signature":"eq1:YN","size":"50","tranche":"head","ts_local_ns":7}"#;
+
+    #[test]
+    fn matches_python_reference_line() {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let mut bb = BookBuilder::new();
+        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.38", "50")],
+                          vec![lvl("0.40", "50")], 1, 1, None);
+        bb.apply_snapshot(Venue::Polymarket, "P", vec![lvl("0.55", "50")],
+                          vec![lvl("0.60", "50")], 1, 1, None);
+        let rel = Rel {
+            id: "eq1".into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: "K".into() },
+                RelLeg { venue: Venue::Polymarket, market_id: "P".into() },
+            ],
+        };
+        // test fixture markets: min_order 1, close_time set (test_scanner.market)
+        let metas = |_leg: &RelLeg| MarketMeta {
+            category: "default".into(),
+            min_order_size: Cx::default().one,
+            close_time: Some("2026-08-01T00:00:00Z".into()),
+            taker_coef_override: None,
+        };
+        let mut cx2 = Cx::default();
+        let opps = scan_relationship(&mut cx2, &fees, &rel, &bb, &metas, 7);
+        assert_eq!(opps.len(), 1);
+        assert_eq!(opps[0].canonical_line(&mut cx2), PY_LINE);
+    }
+
+    fn fedcut_rel() -> Rel {
+        Rel {
+            id: "xvus-fedcut-26-usfed-2026-cut".into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: "KXRATECUT-26DEC31".into() },
+                RelLeg { venue: Venue::PolymarketUs, market_id: "cbpac-usfed-2026-cut".into() },
+            ],
+        }
+    }
+
+    /// audit C5: both maker pricing functions price entirely off the HEDGE
+    /// book, so a crossed hedge book makes the quote fiction. Same rule and
+    /// same position (before any arithmetic) as the take-take detector's guard
+    /// from 4542e5f.
+    ///
+    /// Numbers are the real KXRATECUT-26DEC31 book of 2026-07-28: a phantom ask
+    /// at 0.0730 under a 0.1770 bid. The control moves ONLY the bid, below the
+    /// same ask, so the single variable under test is the crossing itself.
+    #[test]
+    fn no_maker_quote_off_a_crossed_hedge_book() {
+        let rel = fedcut_rel();
+        let metas = |_l: &RelLeg| MarketMeta::default_for_golden(&mut Cx::default());
+        let quote = |bids: Vec<Level>, asks: Vec<Level>| {
+            let mut cx = Cx::default();
+            let fees = FeeSchedule::new(&mut cx);
+            let mut bb = BookBuilder::new();
+            bb.apply_snapshot(Venue::Kalshi, "KXRATECUT-26DEC31", bids, asks, 1, 1, None);
+            let clip = cx.from_i64(5);
+            // maker leg 1 (PM-US), hedge leg 0 (Kalshi)
+            let bid_q = maker_quote(&mut cx, &fees, &rel, 1, &bb, &metas, clip);
+            let ask_q = maker_ask_quote(&mut cx, &fees, &rel, 1, &bb, &metas, clip);
+            (bid_q.is_some(), ask_q.is_some())
+        };
+
+        let crossed = vec![lvl("0.1770", "305")];
+        let locked = vec![lvl("0.0730", "305")];
+        let sane = vec![lvl("0.0720", "305")];
+        let asks = vec![lvl("0.0730", "26")];
+
+        assert_eq!(quote(crossed, asks.clone()), (false, false), "crossed book priced a quote");
+        assert_eq!(quote(locked, asks.clone()), (false, false), "locked book priced a quote");
+        // the control: same ask, bid one tick BELOW it. Both sides must still
+        // price, or the guard has switched the maker off rather than gated it.
+        assert_eq!(quote(sane, asks), (true, true), "the guard silenced a sane book");
+    }
+
+    #[test]
+    fn feasible_states_match_python() {
+        assert_eq!(feasible_states(RelType::CrossVenueEquivalent, 2),
+                   vec![vec![0, 0], vec![1, 1]]);
+        assert_eq!(feasible_states(RelType::Bundle, 2),
+                   vec![vec![0, 1], vec![1, 0]]);
+        assert_eq!(feasible_states(RelType::DateLadder, 2),
+                   vec![vec![0, 0], vec![0, 1], vec![1, 1]]);
+        assert_eq!(feasible_states(RelType::Exclusive, 2),
+                   vec![vec![0, 0], vec![1, 0], vec![0, 1]]);
+        assert_eq!(feasible_states(RelType::Rollup, 3),
+                   vec![vec![0, 0, 0], vec![1, 1, 0], vec![1, 0, 1], vec![1, 1, 1]]);
+    }
 }

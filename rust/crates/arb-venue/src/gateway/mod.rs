@@ -1,8 +1,17 @@
-//! The `VenueGateway` trait — the typed executor seam. Signatures only: the
-//! stub implementations here return [`VenueError::NotWired`] because this crate
-//! has NO transport (no reqwest/hyper). Real executors land later behind
-//! arb-trader's dry-run seam (docs/migration-plan.md M2/M3), reusing the
-//! signers/wire/resp types in this crate.
+//! The `VenueGateway` trait — the typed executor seam. The implementations are
+//! real: they compose the signed request (where every venue quirk lives) and
+//! hand it to a [`crate::transport::Transport`], which is the only thing that
+//! touches the network.
+//!
+//! This header said "signatures only, no transport (no reqwest/hyper)" until
+//! [`crate::transport::HttpTransport`] landed for M2, and it is worth knowing
+//! why that claim was ever safe to make. The inertness did not go away with it;
+//! it moved into the type. Both gateways are generic over their transport with
+//! [`crate::transport::NotWired`] as the DEFAULT, so `KalshiGateway::new` and
+//! `PmusGateway::new` still cannot reach a venue and still answer
+//! [`VenueError::NotWired`] to everything. Reaching one is an explicit act with
+//! a name: `with_transport`. arb-trader's sink builders and arb-order are the
+//! only callers that perform it.
 //!
 //! One venue per file: the trait, the request types and the two helpers both
 //! gateways share live here; `kalshi` and `pmus` hold nothing but their own
@@ -83,8 +92,9 @@ pub struct CancelRequest {
     pub market_slug: Option<String>,
 }
 
-/// The venue-adapter interface. Every method is fallible; the only outcome in
-/// this build is [`VenueError::NotWired`].
+/// The venue-adapter interface. Every method is fallible. On a gateway built
+/// with `new` the only outcome is [`VenueError::NotWired`]; on one built with
+/// `with_transport` these reach the venue.
 pub trait VenueGateway {
     /// Order-shaped response of a place / single-order status call.
     type Order;

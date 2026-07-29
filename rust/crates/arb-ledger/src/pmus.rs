@@ -30,7 +30,7 @@ fn money(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Object(o) => o
             .get("value")
-            .map(|x| money(x))
+            .map(money)
             .unwrap_or_else(|| "0".into()),
         serde_json::Value::String(s) => s.clone(),
         serde_json::Value::Number(n) => n.to_string(),

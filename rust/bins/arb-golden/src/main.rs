@@ -57,7 +57,7 @@ fn load_rels(path: &str) -> Vec<Rel> {
         .filter_map(|r| {
             Some(Rel {
                 id: r.id,
-                rtype: RelType::from_str(&r.rtype)?,
+                rtype: RelType::parse(&r.rtype)?,
                 tranche: r.tranche,
                 legs: r
                     .legs

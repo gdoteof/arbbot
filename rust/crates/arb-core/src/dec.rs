@@ -95,7 +95,7 @@ impl PartialEq for Dec {
 impl Eq for Dec {}
 impl PartialOrd for Dec {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp_num(other))
+        Some(self.cmp(other))
     }
 }
 impl Ord for Dec {

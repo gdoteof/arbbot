@@ -326,7 +326,7 @@ fn verify_all<G: VenueGateway>(gw: &G, market: &str, venue: &str) -> Result<(), 
     let gone = (|| -> Result<bool, String> {
         for _ in 0..10 {
             let resting = gw.resting_order_ids().map_err(|e| format!("resting list: {e}"))?;
-            if !resting.iter().any(|r| *r == oid) {
+            if !resting.contains(&oid) {
                 return Ok(true);
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
