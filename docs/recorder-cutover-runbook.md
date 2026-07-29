@@ -67,10 +67,18 @@ without edits. Do not do this at M1; it removes the rollback target.
 recorder that was tested.** On 2026-07-29 it was not — the live shadow
 recorder, up since 01:53, was serving an image that does not contain the string
 `DROPPED subscriber` anywhere in it, while the binary on disk (rebuilt 14:02)
-does. PR #19's eviction notice, PR #27's register-exactly-once welcome, and the
-book-eviction logging were all in the tree and none of them were in the
-process. `cargo build` replaces the file without restarting the unit, and
+does. The eviction notice, the register-exactly-once welcome and the
+book-eviction logging all arrived together in PR #27 (`47e3c9b`) at 04:29 —
+**two hours and thirty-six minutes after that process started.** So nothing was
+broken; the fixes were simply not in the running image. `git log -S 'DROPPED
+subscriber' -- rust/` returns that one commit and no other, which is the whole
+proof. `cargo build` replaces the file without restarting the unit, and
 `Restart=always` only fires on exit, so this can persist for days.
+
+> Numbers in `(#N)` commit subjects in this repo are LOCAL TICKET numbers, not
+> PR numbers, and the two do not line up: ticket #19 is the socket eviction
+> while PR #19 (`f0f5593`) is a trader bankroll fix. `gh issue view N` will
+> resolve to an unrelated PR because this repo has zero issues. Cite the SHA.
 
 ```bash
 # the check, and the gate now does it for you:
@@ -85,14 +93,38 @@ running when the evidence was gathered.
 ```bash
 cd ~/claude/arbbot
 # 1. the gate must be GREEN. Not "green apart from"; green.
-rust/target/release/arb-shadow-gate \
+#    `nice -n 19` is NOT optional and is not what the binary does for you: the
+#    unit sets Nice=19, a hand-run inherits your shell's priority, and `--load 6`
+#    is six CPU burners on the box carrying the armed engine's feed — above even
+#    the Rust recorder (NI 10). Doing this unniced degraded the live feed on
+#    2026-07-29. The gate prints its own nice value and warns if you forget.
+nice -n 19 rust/target/release/arb-shadow-gate \
     --py-dir data/raw --rs-dir data/raw-rs --socket data/arbbot-rs.sock \
     --window-s 900 --live-s 120 --load 6
 # last line must read: SHADOW GATE: PASS
 
-# 2. seven consecutive green days of it (migration-plan.md M1)
-grep -h 'SHADOW GATE' data/reports/shadow-gate-2026-*.txt | tail -10
+# 2. seven consecutive green days of it (migration-plan.md M1).
+#    THIS GREP IS THE ONLY THING THAT CHECKS THAT CLAUSE. The binary judges one
+#    day and knows nothing about any other run, so consecutiveness is checked
+#    here or nowhere. Read the FILENAMES, not just the verdicts: seven PASS
+#    lines can be seven runs in one afternoon.
+for f in data/reports/shadow-gate-*.txt; do
+    printf '%s ' "$f"; grep 'SHADOW GATE' "$f" | tail -1
+done | tail -10
+```
 
+Each report may hold several runs (the unit appends), so the LAST `SHADOW GATE:`
+line in a file is that file's verdict — which is what the loop prints. Three
+outcomes, and they are deliberately distinguishable from one another:
+
+| last line | meaning |
+|---|---|
+| `SHADOW GATE: PASS` | that day is green |
+| `SHADOW GATE: FAIL` | the gate ran and decided against you; the reasons are listed just above it |
+| `SHADOW GATE: NO VERDICT` | the run was KILLED before it decided — a start timeout, an OOM kill, a Ctrl-C. **Not a green day and not a missing day.** Re-run it |
+| no file at all | the gate did not run that day |
+
+```bash
 # 3. nothing in flight. An unhedged leg across a feed change is the one thing
 #    that turns a clean restart into a position problem.
 journalctl --user -u arbbot-trader-m3.service -n 200 --no-pager | grep -i undischarged
@@ -102,6 +134,13 @@ systemctl --user list-timers arbbot-hedge.timer
 systemctl --user status arbbot-recorder-rs.service --no-pager | head -5
 journalctl --user -u arbbot-recorder-rs.service -n 5 --no-pager   # [hb] gaps= subscribers=
 ```
+
+`[hb] gaps=N` is the recorder's OWN ingest-side counter (`NotSynced` +
+`GapDetected` at the venue boundary, cumulative since process start — it read
+107 eleven minutes after a restart). **The gate does not read it**: it lives only
+in the journal, not in `health-rs.jsonl`, and reading it would couple the gate to
+a unit name. Judge it by hand and judge the SLOPE, not the value — it should be
+flat between two heartbeats, and a climbing one is a venue feed resubscribing.
 
 Do it during a quiet window. The engine holds no quotes while it is down.
 
@@ -226,21 +265,31 @@ afterwards.
 
 ## 5. Known-open at the time of writing (2026-07-29)
 
-* **The running shadow recorder predates PR #27 and PR #19.** See §1. Two
-  consequences beyond the missing eviction notice: the welcome burst in the
-  running image still enqueues before it registers (the LOSS window PR #27
-  closed), and every piece of shadow evidence quoted for M1 — the tape volume
-  comparison, the dedup rates, the subscriber proof in this document — was
-  gathered against that image. **Nothing here is evidence about the binary that
-  would be cut over to until the recorder has been restarted and the window
-  re-run.**
-* **A slow subscriber is shed SILENTLY on the running image.** Measured twice:
-  a subscriber that connects and never reads is dropped after 70-155s with zero
-  `DROPPED subscriber` lines in the recorder's journal. The cap itself works —
-  draining that socket afterwards yielded **16,127,981 bytes** against
-  `MAX_BUFFER = 16_000_000` — so this is the running image having no notice in
-  it, not a broken eviction. It is still what the armed engine would hit today,
-  and the only trace would be on the engine's side as
+* **THE GATE CANNOT GO GREEN TODAY, AND DAY 1 OF THE SEVEN CANNOT START.**
+  `bad_field > 0` is a gating check and PM-US `trade.size` is corrupt on every
+  such line, so the gate is structurally red until `pmus.rs:55` is fixed (see
+  below; a separate change owns it). This is stated here rather than left to be
+  discovered because a gate that cannot go green is how the last one came to be
+  ignored — three months of `RESULT: FAIL`, then three months of a 153-byte
+  error nobody read. If the first seven runs of this one are red for a reason
+  everybody already knows about, it will train the same reflex. Fix `pmus.rs`
+  FIRST, then start counting days.
+* **The shadow recorder that gathered this evidence predated PR #27
+  (`47e3c9b`); it has since been RESTARTED and the new process carries it.**
+  See §1. Two consequences of the old image, both now historical: its welcome
+  burst still enqueued before it registered (the LOSS window PR #27 closed), and
+  every piece of shadow evidence quoted for M1 — the tape volume comparison, the
+  dedup census, the subscriber proof in this document — was gathered against it.
+  **None of that is evidence about the binary that would be cut over to.** The
+  soak clock starts at the restart, not at the date on this document, and the
+  gate's `running_image_verdict` is what stops the same thing happening again.
+* **A slow subscriber was shed SILENTLY on the pre-restart image.** Measured
+  twice: a subscriber that connects and never reads was dropped after 70-155s
+  with zero `DROPPED subscriber` lines in the recorder's journal. The cap itself
+  worked — draining that socket afterwards yielded **16,127,981 bytes** against
+  `MAX_BUFFER = 16_000_000` — so this was an image with no notice in it, not a
+  broken eviction, and the restarted process has the notice. Re-verify it on the
+  running image before the flip: the trace on the engine's side is
   `subscription ended (EOF)`, followed by every resting quote being pulled.
 * **PM-US `trade.size` is not a number.** `pmus.rs:55` reads `quantity`
   straight through `dec_string`, and the venue sends it as
@@ -250,9 +299,14 @@ afterwards.
   `size` does not. Compare `pmus.rs:54` and `:55`. This is why the gate is red;
   it is a cutover blocker for the tape, and it needs the `quantity` units
   question settled (USD notional, not contracts) before it is fixed.
-* The Rust recorder dedups consecutive-identical snapshots, so any window-shaped
+* The Rust recorder drops consecutive-identical snapshots, so any window-shaped
   view of its tape covers fewer markets than Python's — 66 fewer on PM-US over
-  900s on 2026-07-29, every one of which was present elsewhere in the same day's
-  Rust tape. Nothing is lost and the welcome burst carries all of them, but a
-  backtest that slices the Rust tape by a short window will see a smaller
-  universe than the same slice of the Python tape.
+  900s on 2026-07-29. Censused, not sampled: **all 66** appear in the same day's
+  Rust tape, between 15 and 8,558 times each. Nothing is lost and the welcome
+  burst carries all of them, but a backtest that slices the Rust tape by a short
+  window will see a smaller universe than the same slice of the Python tape.
+* **The welcome-coverage check cannot see a book that is tracked but stale.** It
+  asks whether the recorder HAS a market, not whether it is still refreshing it.
+  `[pm-ws] resnapshot sweep: 3/111 books did NOT refresh — their age is now
+  unbounded`, on the live recorder eleven minutes after a restart: those three
+  books are in the welcome burst and pass the check.

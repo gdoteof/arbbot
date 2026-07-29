@@ -12,11 +12,24 @@
 //! exercised by anything. Both are the same gap, and one subscriber under load
 //! closes both.
 //!
-//! WHAT IS CHECKED, and each is a line from `docs/migration-plan.md`'s M1 gate:
+//! WHAT IS CHECKED. The first three are lines from `docs/migration-plan.md`'s
+//! M1 gate; the fourth and the welcome-coverage check below are additions.
 //!  * the stream survives the window with no disconnect ("zero unexplained
 //!    disconnects") — an EOF here IS the broadcaster's eviction, which is
-//!    silent on the client and only says so on the recorder's stderr (PR #19);
-//!  * no `GapDetected` ("gap counter"), i.e. nothing was lost mid-stream;
+//!    silent on the client and only says so on the recorder's stderr (PR #27,
+//!    `47e3c9b`);
+//!  * no `GapDetected` ("gap counter"), i.e. nothing was lost mid-stream. This
+//!    is SHARP here in a way it is not on the tape, and the reason is the same
+//!    property that makes it useless there: the recorder numbers each market's
+//!    events +1 itself (`SeqCounter::next`) at the moment it publishes them, so
+//!    the sequence a subscriber receives is contiguous BY CONSTRUCTION. A hole
+//!    in it is not a venue renumbering or a resubscribe — it is a frame the
+//!    fan-out numbered and this subscriber never got. Nothing else can produce
+//!    one. See the long comment in `main.rs`'s tape gating for the other half.
+//!    The same property bounds what it can see: loss UPSTREAM of the numbering
+//!    — a message the venue sent and the recorder never received — is invisible
+//!    here, because the +1 counter closes over it. That direction is the
+//!    recorder's own `[hb] gaps=` counter, read by hand in §1 of the runbook;
 //!  * no `NotSynced` — a delta for a market whose snapshot never arrived is a
 //!    HOLE IN THE WELCOME BURST, which is exactly the loss PR #27 fixed and the
 //!    only way to see it from outside is to be a subscriber;
@@ -44,6 +57,27 @@ use std::time::{Duration, Instant};
 pub const MAX_WORKERS: usize = 8;
 /// 1-minute load average this gate will not push the box past.
 pub const DEFAULT_LOAD_CEILING: f64 = 40.0;
+
+/// This process's nice value, parsed out of a `/proc/<pid>/stat` line.
+///
+/// `Nice=19` is a property of the systemd UNIT and of nothing else. The binary
+/// sets no priority of its own, and the runbook's pre-flight tells an operator
+/// to invoke it by hand with `--load 6` — six unniced burners on the box
+/// carrying the armed engine's feed, outranking even the Rust recorder (NI 10).
+/// That is not a hypothetical: it was done on 2026-07-29 and it degraded the
+/// live feed. So the gate reads its own priority and says so.
+///
+/// The parse is fiddly for one reason: field 2 is the executable name in
+/// parentheses and may itself contain spaces and parentheses, so the only safe
+/// split point is the LAST `)`. Fields after it start at 3, and nice is 19.
+pub fn nice_from_stat(stat: &str) -> Option<i64> {
+    let after = stat.rsplit_once(')')?.1;
+    after.split_whitespace().nth(19 - 3)?.parse().ok()
+}
+
+pub fn own_nice() -> Option<i64> {
+    nice_from_stat(&std::fs::read_to_string("/proc/self/stat").ok()?)
+}
 
 pub fn load1() -> f64 {
     std::fs::read_to_string("/proc/loadavg")
@@ -97,17 +131,24 @@ pub struct StreamCheck {
 ///
 /// This is the universe check, and it lives here rather than on the tape side
 /// on purpose. Comparing the two TAPES over a window answers the wrong
-/// question: the Rust recorder dedups consecutive-identical snapshots (5.9% vs
-/// Python's 29.8%), so a market whose book has not moved for half an hour is
-/// simply absent from its recent tape and present in Python's — measured
-/// 2026-07-29, 54 PM-US markets over 1800s, every one of which turned out to be
-/// in the Rust tape thousands of lines earlier. That difference is the dedup
-/// working, and gating on it would make this gate cry wolf every single day.
+/// question: the Rust recorder drops consecutive-identical snapshots, so a
+/// market whose book has not moved for the length of the window is simply
+/// absent from its recent tape and present in Python's. Censused rather than
+/// sampled on 2026-07-29 — all 66 PM-US markets missing from a 900s Rust window
+/// appear in the SAME DAY's Rust tape, between 15 and 8,558 times each. Every
+/// one. That difference is the dedup working, and gating on it would make this
+/// gate cry wolf every single day.
 ///
-/// The welcome burst has no such ambiguity: it is one snapshot per book the
+/// The welcome burst has far less ambiguity: it is one snapshot per book the
 /// recorder is CURRENTLY TRACKING, so a market missing from it is a market the
 /// Rust recorder does not have — which is the only version of this that a
 /// subscriber would ever feel.
+///
+/// WHAT IT STILL DOES NOT SEE: a book the recorder is tracking but no longer
+/// refreshing. `[pm-ws] resnapshot sweep: 3/111 books did NOT refresh — their
+/// age is now unbounded` (live, eleven minutes after a restart) describes three
+/// books that are in the welcome burst, pass this check, and are stale. Being
+/// present is not being fresh, and this check only asks the first question.
 pub fn welcome_coverage_gap(welcome: &HashSet<String>, python_window: &HashSet<String>) -> Vec<String> {
     let mut v: Vec<String> = python_window.difference(welcome).cloned().collect();
     v.sort();
@@ -209,9 +250,11 @@ impl StreamCheck {
 /// FOUND 2026-07-29, and it is the reason this check exists at all. The live
 /// shadow recorder (started 01:53) was running an image that does not contain
 /// the string `DROPPED subscriber` at all, while the binary on disk — rebuilt
-/// at 14:02 — does. So PR #19's eviction notice, PR #27's
-/// register-exactly-once welcome, and the book-eviction logging were all in the
-/// tree and NONE of them were in the process producing the shadow evidence. A
+/// at 14:02 — does. PR #27 (`47e3c9b`, 04:29) carries both the eviction notice
+/// and the register-exactly-once welcome, and it landed two and a half hours
+/// AFTER that process started, so the fix was never broken: it was not running.
+/// It, and the book-eviction logging, were in the tree and NONE of them were in
+/// the process producing the shadow evidence. A
 /// subscriber attached to it was silently shed after ~95-155s with nothing in
 /// the journal, exactly as an image with no notice in it would behave.
 ///
@@ -404,7 +447,7 @@ mod tests {
         assert!(e.contains("sequence gap"), "{e}");
     }
 
-    /// PR #19's territory. Eviction is SILENT on this side — the only thing the
+    /// PR #27's territory. Eviction is SILENT on this side — the only thing the
     /// subscriber ever sees is the stream ending — so "ended early" has to be a
     /// failure in its own right or the gate cannot see an eviction at all.
     #[test]
@@ -429,6 +472,21 @@ mod tests {
         let me = std::env::current_exe().expect("current exe");
         assert!(!running_images(&me).is_empty(), "did not find our own image at {me:?}");
         assert!(running_images(Path::new("/no/such/binary")).is_empty());
+    }
+
+    /// The gate is only niced when systemd nices it. A hand-run from the
+    /// runbook is not, and six unniced burners next to the armed engine's feed
+    /// is a thing that has already happened once.
+    #[test]
+    fn the_gate_can_read_its_own_priority() {
+        // field 2 is allowed to contain spaces AND parentheses, which is why
+        // the split is on the LAST `)` and not on the first.
+        let stat = "42 (arb shadow (gate)) S 1 42 42 0 -1 4194304 100 0 0 0 5 6 0 0 20 19 4 0 \
+                    900 0 0";
+        assert_eq!(nice_from_stat(stat), Some(19));
+        assert_eq!(nice_from_stat("nonsense with no paren"), None);
+        // and it reads the real thing, or the parse describes nothing
+        assert!(own_nice().is_some(), "could not read this process's own nice value");
     }
 
     #[test]

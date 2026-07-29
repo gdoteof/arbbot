@@ -3,9 +3,22 @@
 //! The Python gate's RESULT line failed on exactly ONE condition: a Rust line
 //! its `parse_event` could not read. Volume and TOB were printed and judged by
 //! eye ("poll-mode lags are expected"). This port keeps that judgement split
-//! but makes the gating side match what `docs/migration-plan.md` actually asks
-//! of M1 — parse-compat, gap counter <= Python's, and the market universe —
 //! and leaves volume/TOB advisory.
+//!
+//! Of the two things gated on THIS side, one is a clause of M1's gate in
+//! `docs/migration-plan.md` (parse-compat) and one is a repair of a clause that
+//! could not be checked as written: "gap counter <= Python's" compares two
+//! numbers that do not measure the same thing, so what is gated is `rust == 0`.
+//! The reasoning is in `main.rs`, at the check. The MARKET UNIVERSE is not
+//! gated here at all — the plan does not ask for it, and asking it of a deduped
+//! tape is how this gate cried wolf on 66 markets that were never missing. The
+//! welcome burst answers it in `live.rs`.
+//!
+//! `undecodable` and `bad_field` are both counted over the WHOLE TAIL SLICE and
+//! not over the time window. They have to be: an undecodable line has no
+//! readable timestamp, so it cannot be placed in a window at all, and counting
+//! its partner after the window filter meant the two numbers on the report
+//! covered different spans while the gate ORed them together.
 //!
 //! ONE CHECK IS NEW, and it is the check that matters. Python's `parse_event`
 //! rejected the Rust PM-US `trade` lines because pydantic could not coerce
@@ -37,9 +50,10 @@ pub struct TapeStats {
     pub snapshot: u64,
     pub delta: u64,
     pub trade: u64,
-    /// Did not deserialize into a `TapeEvent` at all.
+    /// Did not deserialize into a `TapeEvent` at all. Over the whole slice.
     pub undecodable: u64,
-    /// Deserialized, but a price/size field is not a decimal number.
+    /// Deserialized, but a price/size field is not a decimal number. Over the
+    /// whole slice, like `undecodable` and unlike everything else here.
     pub bad_field: u64,
     /// `GapDetected` — a sequence hole. The counter `migration-plan.md` names.
     pub gaps: u64,
@@ -150,6 +164,13 @@ pub fn replay(
                 continue;
             }
         };
+        // BEFORE the window filter, so that this counter and `undecodable`
+        // cover the same span — the gate ORs them into one parse-compat
+        // verdict, and two counters over two different spans is not one
+        // verdict.
+        if !decimal_fields_ok(&ev) {
+            stats.bad_field += 1;
+        }
         let ts = ts_of(&ev);
         if ts < window.0 || ts > window.1 {
             continue;
@@ -159,9 +180,6 @@ pub fn replay(
             stats.first_ts_ns = ts;
         }
         stats.last_ts_ns = ts;
-        if !decimal_fields_ok(&ev) {
-            stats.bad_field += 1;
-        }
         match &ev {
             TapeEvent::Snapshot { .. } => stats.snapshot += 1,
             TapeEvent::Delta { .. } => stats.delta += 1,
@@ -289,6 +307,13 @@ mod tests {
         assert_eq!(st.trade, 2);
         assert_eq!(st.undecodable, 0, "both lines are valid JSON — decode alone sees nothing");
         assert_eq!(st.bad_field, 1);
+        // Both parse-compat counters cover the SLICE, not the window. A corrupt
+        // line outside the window is still a corrupt line, and the gate ORs
+        // these two together — counting them over different spans made one
+        // verdict out of two measurements of different things.
+        let (out, _) = replay(&p, (0, 1), u64::MAX, 1_000_000_000).expect("replay");
+        assert_eq!(out.in_window, 0, "the window excludes both lines");
+        assert_eq!(out.bad_field, 1, "and the corrupt one is still counted");
         std::fs::remove_dir_all(dir).ok();
     }
 
