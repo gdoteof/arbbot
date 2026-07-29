@@ -162,6 +162,38 @@ impl<T: Transport> KalshiGateway<T> {
     }
 }
 
+/// Whose resting order this row is, as far as a SHARED account can tell.
+///
+/// Three states, not two, for the same reason [`Ours`] below has three: a
+/// sweep's two jobs — cancel what is ours, prove nothing of ours is left —
+/// answer differently for each, and collapsing them is how one of the two goes
+/// silently wrong.
+enum Owner {
+    /// Minted by this stack ([`super::is_ours`]). Cancel it, and it must be
+    /// gone before the book is proven.
+    Ours,
+    /// Carries somebody else's tag. Leave it alone AND leave it out of the
+    /// proof: `arbbot-hedge.timer` runs on this key every 5 minutes, and a
+    /// sweep that counted its orders could never come back clean.
+    Theirs,
+    /// No `client_order_id` on the row at all. Kalshi's create body REQUIRES
+    /// one ([`crate::wire::kalshi_place_body`]) so no live order can produce
+    /// this — it means the LIST has stopped reporting the tag the whole scope
+    /// rests on. Not cancelled, because nothing claims it; NOT proven clean
+    /// either, because an unattributable row is the ownership-level form of the
+    /// unreadable list `bins/arb-trader/src/sink.rs` already refuses to accept
+    /// as proof. Scoping the sweep must not re-open that door one layer down.
+    Untagged,
+}
+
+fn owner(o: &resp::KalshiOrder) -> Owner {
+    match o.client_order_id.as_deref() {
+        Some(c) if super::is_ours(c) => Owner::Ours,
+        Some(_) => Owner::Theirs,
+        None => Owner::Untagged,
+    }
+}
+
 /// The state of an order we tagged with a `client_order_id`, as the venue's own
 /// order list reports it.
 enum Ours {
@@ -277,15 +309,40 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
         Ok(resp::kalshi_order_envelope(&r.body)?.order)
     }
 
+    /// The evidence half of the sweep, scoped to match the cancel half:
+    /// [`Owner::Theirs`] is excluded, [`Owner::Untagged`] is NOT.
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
-        Ok(self.all_orders()?.into_iter().filter(|o| o.is_resting()).map(|o| o.order_id).collect())
+        Ok(self
+            .all_orders()?
+            .into_iter()
+            .filter(|o| o.is_resting() && !matches!(owner(o), Owner::Theirs))
+            .map(|o| o.order_id)
+            .collect())
     }
 
     /// Kill-switch sweep. `/portfolio/orders` returns history (canceled and
     /// executed too), so filter to `resting` — never try to cancel a dead order.
+    ///
+    /// And filter to OURS. This looped every resting order on the account
+    /// regardless of `client_order_id`, against the port requirement in
+    /// `docs/venue-quirks.md` §`xv-graceful-shutdown-cancels-orders`, on the
+    /// key `arbbot-hedge.timer` also trades under. The material was already
+    /// here — [`Self::find_ours`] matches on exactly this field — and the sweep
+    /// was the one caller not using it.
+    ///
+    /// SCOPING DOES NOT COST THE UNACKED-ORDER CATCH, which is the reason an
+    /// unscoped sweep was worth keeping. The `client_order_id` goes out IN THE
+    /// CREATE BODY, so an order whose ack we never read is already carrying our
+    /// tag when it starts resting: it is `Owner::Ours` on the very next list
+    /// read, with no ack, no venue id and no local record needed. That is a
+    /// STRONGER handle than the sweep had before — the old blanket cancel could
+    /// only catch it by catching everything — and it is the same handle
+    /// [`Self::cancel_by_client_order_id`] recovers a lost create with. Orders a
+    /// PREVIOUS run left behind are caught for the same reason: `is_ours` is a
+    /// property of this codebase's ids, not of one process's seed.
     fn cancel_all_open(&self) -> Result<(), VenueError> {
         for o in self.all_orders()? {
-            if o.is_resting() {
+            if o.is_resting() && matches!(owner(&o), Owner::Ours) {
                 self.cancel(&CancelRequest {
                     by: CancelBy::VenueId(o.order_id),
                     market_slug: None,

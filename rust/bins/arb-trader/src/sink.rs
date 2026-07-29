@@ -608,6 +608,43 @@ mod tests {
         assert_eq!(sent[0].1, "/trade-api/v2/portfolio/events/orders/srv-1");
     }
 
+    /// The whole chain, end to end: a venue answering 200 with a body that has
+    /// no `orders` key must come out of the sweep as UNPROVEN.
+    ///
+    /// `sweep_tests` above proves the loop refuses to let a read ERROR stand in
+    /// for a confirmation. This proves the venue layer actually hands it one —
+    /// which, until `KalshiOrdersPage::orders` became required, it did not: the
+    /// body deserialized to an empty page, `cancel_all_open` cancelled nothing
+    /// and returned `Ok(())`, both confirming reads came back empty, and this
+    /// call returned `Ok(())`. That `Ok` is what `exec::ShutdownOutcome` prints
+    /// as "book PROVEN clean at exit" before exiting 0.
+    #[test]
+    fn a_book_the_venue_never_showed_us_is_not_proven_clean() {
+        let mock = Mock {
+            // one cancel-all round + one confirming poll, both list reads
+            replies: Mutex::new(vec![
+                (200, r#"{"error":"internal"}"#.to_string()),
+                (200, r#"{"error":"internal"}"#.to_string()),
+            ]),
+            sent: Mutex::new(Vec::new()),
+        };
+        let gw = KalshiGateway::with_transport(
+            signer(),
+            RateLimiter::from_per_minute(600.0, 0),
+            mock,
+        );
+        let pol = SweepPolicy {
+            rounds: 1,
+            polls_per_round: 1,
+            poll_delay: std::time::Duration::ZERO,
+            ..SweepPolicy::default()
+        };
+        let err = cancel_all_and_verify_blocking(&gw, &pol)
+            .expect_err("a book we never read is not a clean book");
+        assert!(err.contains("could NOT be proven clean"), "{err}");
+        assert!(err.contains("missing required field `orders`"), "names the cause: {err}");
+    }
+
     /// A venue rejection surfaces as an error rather than being counted as a
     /// successful place.
     #[test]

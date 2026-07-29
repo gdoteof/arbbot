@@ -81,9 +81,30 @@ pub struct KalshiOrderEnvelope {
 }
 
 /// GET /portfolio/orders — HISTORY, paginated. `cursor` absent on the last page.
+///
+/// `orders` is REQUIRED, which is this module's own header contract and not a
+/// style preference. It carried `#[serde(default)]`, so EVERY json object
+/// deserialized: a 200 whose body has no top-level `orders` — an error envelope
+/// served with 200, a venue-side re-nesting — became `Ok(vec![])`. That is the
+/// one place a wrong default is an AFFIRMATIVE CLAIM. `all_orders` answered
+/// "nothing", `cancel_all_open` cancelled nothing and returned `Ok(())`,
+/// `resting_order_ids` answered "empty", two of those satisfied
+/// `confirm_empty_reads`, and the process printed "book PROVEN clean at exit"
+/// over a book it had never read. `bins/arb-trader/src/sink.rs` is explicit
+/// that an UNREADABLE list must be UNPROVEN and refuses to let a read error
+/// stand in for proof; defaulting laundered one class of unreadable list into
+/// "empty" upstream of that refusal, where it could no longer be told apart.
+///
+/// A required field rather than a custom deserializer or a post-parse presence
+/// check because serde's own `missing field` error is already what
+/// [`crate::error::from_serde`] turns into [`VenueError::MissingField`] — the
+/// mechanism the header promises exists; this struct just was not using it.
+///
+/// NEITHER VENUE HAS BEEN OBSERVED SERVING SUCH A BODY. This closes a contract,
+/// it does not record an incident. `cursor` keeps its default: it is genuinely
+/// absent on the last page.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KalshiOrdersPage {
-    #[serde(default)]
     pub orders: Vec<KalshiOrder>,
     #[serde(default)]
     pub cursor: Option<String>,

@@ -85,6 +85,48 @@ pub enum CancelBy {
 // target (a log line, a test record) should print the variant — `{:?}` gives
 // `VenueId("BH9…")` / `ClientId("m1")`, which says which id space it was in.
 
+/// Does this `client_order_id` belong to THIS STACK?
+///
+/// `docs/venue-quirks.md` §`xv-graceful-shutdown-cancels-orders` requires it:
+/// *"scope any sweep to orders this process owns (shared-account contract)"* —
+/// and names the failure it prevents, *"a blanket cancel-all from one
+/// workstream kills another workstream's orders on the SHARED Kalshi
+/// account"*. `arbbot-hedge.timer` fires every 5 minutes under the same primary
+/// Kalshi key.
+///
+/// OURS MEANS "MINTED BY THIS CODEBASE", NOT "MINTED BY THIS PROCESS". The
+/// distinction is the whole design. `Engine::id_base` seeds the counters from
+/// the wall clock, so this process's ids ARE distinguishable from the last
+/// run's — and scoping to them would have broken the startup sweep, whose ONLY
+/// job is to clean up what a previous run left behind when it could not clean
+/// up after itself (SIGKILL, an OOM kill, an abort). The quirk's own unit is
+/// the workstream, not the process instance, because the order it protects is
+/// another workstream's.
+///
+/// Every prefix below is minted somewhere in this tree and nowhere else:
+///   * `m`, `h`, `t` + a decimal counter — the maker (`arb_core::quoter`),
+///     hedge (`engine::hedge`/`engine::fill`) and take-take (`engine`) ids the
+///     trader sends as its `client_order_id` verbatim (`engine::cancel`);
+///   * `rehearse-` + millis — [`KalshiGateway::rehearse`];
+///   * `sweep-` + pid — `arb-order verify`, whose whole purpose is to watch the
+///     kill sweep cancel a REAL resting order, so it has to be inside the
+///     scope the sweep now applies.
+///
+/// Nothing else on this account can collide with them. The retired Python
+/// gateway tags every order `uuid.uuid4().hex` (`exec/kalshi_gateway.py:51`) —
+/// 32 characters drawn from `[0-9a-f]`, and `m`/`h`/`t`/`r`/`s` are not hex
+/// digits, so no id it ever minted can match. The trailing run is required to be
+/// digits for the same reason: it is what the counters actually emit, and it
+/// keeps a bare word that happens to start with `t` from reading as ours.
+pub fn is_ours(client_order_id: &str) -> bool {
+    for p in ["m", "h", "t", "rehearse-", "sweep-"] {
+        if let Some(n) = client_order_id.strip_prefix(p) {
+            return !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+        }
+    }
+    false
+}
+
 /// A cancel request. PM-US requires the `market_slug` in the body; Kalshi
 /// cancels by id alone (`market_slug` ignored there).
 #[derive(Debug, Clone)]
@@ -133,12 +175,23 @@ pub trait VenueGateway {
     /// spells it `id`; callers that work across venues need one name.
     fn order_id(order: &Self::Order) -> String;
     fn order_status(&self, order_id: &str) -> Result<Self::Order, VenueError>;
-    /// Cancel every RESTING order owned by this account (kill-switch sweep).
+    /// Cancel every RESTING order THIS STACK owns (kill-switch sweep) — see
+    /// [`is_ours`] for what that means and why it is not "this process".
+    ///
+    /// Kalshi scopes by `client_order_id`. PM-US CANNOT: its create body
+    /// carries no tag of ours at all (`docs/venue-quirks.md`
+    /// §`pmus-no-client-order-id`), so its one-call cancel-all stays
+    /// account-wide and says so at the implementation.
     fn cancel_all_open(&self) -> Result<(), VenueError>;
-    /// Ids of every order still RESTING on this account. This is how a caller
+    /// Ids still RESTING that this sweep is answerable for. This is how a caller
     /// proves a sweep actually worked — an empty list is the only real
     /// evidence, since a 200 from cancel_all_open only says the venue accepted
     /// the request.
+    ///
+    /// It must report exactly what [`Self::cancel_all_open`] is able to cancel,
+    /// or the two disagree in one of two bad directions: wider, and a sweep can
+    /// never come back clean while another workstream is quoting; narrower, and
+    /// it proves less than it claims.
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError>;
     /// Place one far-off-touch contract, confirm it rests, cancel it. Live
     /// auth rehearsal — returns the order id on success.

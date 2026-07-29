@@ -577,10 +577,13 @@ fn sweep_only_blast_radius(cred_suffix: &[(String, String)]) -> Vec<String> {
             .unwrap_or_else(|| "PRIMARY key — SHARED WITH THE PYTHON STACK".into())
     };
     vec![
-        "[exec] --sweep-only CANCELS EVERY RESTING ORDER ON THE WHOLE ACCOUNT,".into(),
-        "[exec]   not just the ones this process placed. Keys in use:".into(),
+        "[exec] --sweep-only DESTROYS REAL RESTING ORDERS. Keys in use:".into(),
         format!("[exec]   kalshi        -> {}", ident(&["kalshi"])),
+        "[exec]     scoped to ids THIS STACK minted (m…/h…/t…/rehearse-…/sweep-…);".into(),
+        "[exec]     another workstream's orders under this key are LEFT RESTING.".into(),
         format!("[exec]   polymarket_us -> {}", ident(&["pmus", "polymarket_us"])),
+        "[exec]     THE WHOLE ACCOUNT — PM-US carries no id of ours to scope by,".into(),
+        "[exec]     so this cancels orders this stack never placed.".into(),
     ]
 }
 
@@ -1749,6 +1752,11 @@ mod precondition_tests {
             "both venues warn when no suffix is given: {none}"
         );
         assert!(none.contains("SHARED WITH THE PYTHON STACK"), "{none}");
+        // ...and WHICH venue is the wide one, now that Kalshi's sweep is scoped
+        // to ids this stack minted and PM-US's still cannot be.
+        let (k, p) = none.split_once("polymarket_us").expect("{none}");
+        assert!(!k.contains("WHOLE ACCOUNT"), "kalshi is scoped now: {k}");
+        assert!(p.contains("WHOLE ACCOUNT"), "PM-US has no id of ours to scope by: {p}");
 
         let both = sweep_only_blast_radius(&[
             ("kalshi".into(), "rs_trader".into()),
