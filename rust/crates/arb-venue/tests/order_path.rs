@@ -1058,6 +1058,68 @@ fn a_recovery_that_has_its_answer_does_not_page_the_rest_of_the_account() {
     assert_eq!(g.transport.sent().len(), 1, "page 2 cannot change the answer");
 }
 
+/// ...and it fires ONLY on a resting row, so the executed case — the one that
+/// costs money — pays the FULL walk. Pinned rather than left implicit: a later
+/// page could still hold a resting row for the same tag and that answer has to
+/// win, so this cost is deliberate and must not be optimised away by accident.
+#[test]
+fn an_executed_order_still_costs_the_whole_walk() {
+    let p1 = format!(r#"{{"orders":[{}],"cursor":"CUR"}}"#, tagged("ours", "executed", "c-1"));
+    let p2 = page(&[tagged("later", "resting", "m2")]);
+    let g = gw(vec![(200, &p1), (200, &p2)]);
+    assert_eq!(
+        g.recover_place(&place_req(), &HashSet::new()).unwrap().as_deref(),
+        Some("ours")
+    );
+    assert_eq!(
+        g.transport.sent().len(),
+        2,
+        "a resting row for the same tag on a later page would have to beat it"
+    );
+}
+
+/// THE PREMISE, on the arm that had no check. `resting_order_ids` and
+/// `cancel_all_open` both refuse over a list that echoes no `client_order_id` at
+/// all; the recovery read the same list and did not, so on a non-echoing list it
+/// would report the LAG — "the order list has not caught up" — about a lookup
+/// that is structurally blind and will answer the same way for ever.
+#[test]
+fn a_recovery_over_a_list_that_echoes_no_tags_says_so_instead_of_blaming_the_lag() {
+    let p = r#"{"orders":[
+        {"order_id":"a","status":"resting","ticker":"KXTEST"},
+        {"order_id":"b","status":"executed","ticker":"KXTEST"}
+    ],"cursor":null}"#;
+    let g = gw(vec![(200, p)]);
+    match g.recover_place(&place_req(), &HashSet::new()) {
+        Err(VenueError::Status { endpoint: "kalshi orders", body, .. }) => {
+            assert!(body.contains("not one of 2 order(s)"), "{body}");
+            assert!(body.contains("--sweep-unscoped"), "names the way out: {body}");
+            assert!(
+                !body.contains("LAGS a write"),
+                "a blind lookup must not be reported as a lagging one: {body}"
+            );
+        }
+        other => panic!("expected the premise refusal, got {other:?}"),
+    }
+}
+
+/// The cursor walk is BOUNDED. It is the one read with no cap and no deadline,
+/// its longest run is the recovery's own not-found path, and it holds the
+/// executor's serial blocking hop while it runs. The Python this ports capped at
+/// 50 pages; the port dropped it.
+#[test]
+fn a_cursor_that_never_terminates_is_an_error_not_an_endless_walk() {
+    let forever = format!(r#"{{"orders":[{}],"cursor":"CUR"}}"#, tagged("o", "resting", "m1"));
+    let g = gw(vec![(200, &forever); 60]);
+    match g.resting_order_ids() {
+        Err(VenueError::Status { endpoint: "kalshi orders", body, .. }) => {
+            assert!(body.contains("still has a cursor after 50 pages"), "{body}");
+        }
+        other => panic!("an unbounded walk is not an answer, got {other:?}"),
+    }
+    assert_eq!(g.transport.sent().len(), 50, "it stops AT the cap, not past it");
+}
+
 /// ...and the early stop is scoped to the caller that has its answer. The sweep
 /// asks a different question — is this account CLEAN — which no prefix can
 /// answer, so it still walks to the cursor's end.

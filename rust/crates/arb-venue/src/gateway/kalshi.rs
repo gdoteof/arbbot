@@ -33,6 +33,21 @@ const K_BALANCE: &str = "/trade-api/v2/portfolio/balance";
 /// reconciliation forever on a background budget. Exceeding it is an ERROR, not
 /// a truncated list: see [`KalshiGateway::fills_since`].
 const K_FILLS_MAX_PAGES: usize = 5;
+/// Pages of ORDER history one cursor walk will read before it gives up.
+///
+/// The Python this ports capped at 50 (`kalshi_gateway.py:85-104`, quirk
+/// `kalshi-orders-list-history-paginated`) and the port dropped the cap. It is
+/// worth restoring now that [`KalshiGateway::recover_place`] puts this walk on a
+/// new trigger: the LONGEST walk is the one that finds nothing, which is exactly
+/// the recovery's `Ours::Absent` path, it runs inside the executor's serial
+/// blocking hop, and each page can cost the transport's own 15s timeout.
+///
+/// An ERROR, not a truncated list, for the same reason as
+/// [`K_FILLS_MAX_PAGES`]: a caller cannot tell a prefix from the whole account,
+/// and `resting_order_ids` answering `Ok(vec![])` over a prefix is "PROVEN
+/// clean" over a book nobody read. 50 pages is 5,000 rows against a history in
+/// the hundreds, so reaching it means the cursor is not terminating.
+const K_ORDERS_MAX_PAGES: usize = 50;
 const K_POSITIONS: &str = "/trade-api/v2/portfolio/positions";
 
 /// Kalshi gateway. Generic over its [`Transport`]; the default is
@@ -173,11 +188,33 @@ impl<T: Transport> KalshiGateway<T> {
     /// It is not a claim about sort order. A venue that lists oldest-first puts
     /// a just-placed order on the LAST page and this saves nothing; the worst
     /// case is exactly the walk we did before.
+    ///
+    /// TWO ANSWERS STILL COST THE FULL WALK, and both are on the recovery's
+    /// hot path, so do not read this as a bound:
+    ///   * `Ours::Gone` — an order that already EXECUTED is not `is_resting()`,
+    ///     so it never stops the walk. A later page could still hold a RESTING
+    ///     row for the same tag, and that answer has to win;
+    ///   * `Ours::Absent` — "not on the account" is only sound over the whole
+    ///     account, which is the point of [`Self::find_ours`]'s not-found arm.
+    ///
+    /// [`K_ORDERS_MAX_PAGES`] is what actually bounds those.
     fn listing_for(&self, stop_at: Option<&str>) -> Result<Listing, VenueError> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
         let mut cut_short: Option<String> = None;
+        let mut pages = 0usize;
         loop {
+            if pages >= K_ORDERS_MAX_PAGES {
+                return Err(VenueError::Status {
+                    endpoint: "kalshi orders",
+                    status: 0,
+                    body: format!(
+                        "the order list still has a cursor after {K_ORDERS_MAX_PAGES} pages; \
+                         refusing to return a truncated list, which the caller cannot tell \
+                         from a complete one"
+                    ),
+                });
+            }
             let q = cursor.as_ref().map(|c| format!("limit=100&cursor={c}"));
             let r = self.call(
                 Priority::Critical,
@@ -186,6 +223,7 @@ impl<T: Transport> KalshiGateway<T> {
                 q.as_deref().or(Some("limit=100")),
                 None,
             )?;
+            pages += 1;
             if r.status != 200 {
                 return Err(VenueError::Status {
                     endpoint: "kalshi orders",
@@ -341,25 +379,41 @@ impl<T: Transport> KalshiGateway<T> {
     /// Finding it despite the truncation is still an answer — a prefix that
     /// contains the order tells the truth about it — so only the not-found arm
     /// has to care.
+    ///
+    /// AND NEITHER CAN A LIST THAT DOES NOT ECHO THE TAG. `Absent` is a claim
+    /// about the venue; over a list that carries no `client_order_id` on ANY row
+    /// it is a claim about this lookup being structurally blind, and the two
+    /// read identically. `Book::echoes_tags` is the check the sweep already
+    /// makes for exactly this reason and it is checked here over the SAME bytes
+    /// — the premise a scope rests on cannot be verified against a different
+    /// read than the one it is applied to.
+    ///
+    /// It belongs on the not-found arm ONLY. A row that matched carried the tag,
+    /// which demonstrates the echo outright: the walk may have stopped early, so
+    /// there is no complete list to check, and there is nothing left to check
+    /// FOR.
     fn find_ours(&self, coid: &str) -> Result<Ours, VenueError> {
         let listing = self.listing_for(Some(coid))?;
         let mut gone: Option<String> = None;
-        for o in listing.orders {
+        for o in &listing.orders {
             if o.client_order_id.as_deref() != Some(coid) {
                 continue;
             }
             if o.is_resting() {
-                return Ok(Ours::Resting(o.order_id));
+                return Ok(Ours::Resting(o.order_id.clone()));
             }
             // First finished row wins, and only if no resting one turns up:
             // the walk keeps going precisely so a resting row on a later page
             // still beats it.
-            gone.get_or_insert(o.order_id);
+            gone.get_or_insert(o.order_id.clone());
         }
         if let Some(id) = gone {
             return Ok(Ours::Gone(id));
         }
         truncated(listing.cut_short)?;
+        if let Some(e) = Book::read(listing.orders).premise_broken() {
+            return Err(e);
+        }
         Ok(Ours::Absent)
     }
 
@@ -420,10 +474,13 @@ struct Book {
     /// below is worthless if the list does not echo the tag, and NOTHING in this
     /// repo has ever demonstrated that it does: the only live-provenance list
     /// row on record (`tests/test_venue_contracts.py`, 2026-07-21) does not
-    /// carry the field, and the one production path that reads it —
-    /// [`Self::find_ours`] — has never fired on the armed unit, so its
+    /// carry the field, and the production path that reads it —
+    /// [`KalshiGateway::find_ours`] — has never fired on the armed unit, so its
     /// deliberately quiet "nothing cancelled" would have hidden a non-echoing
-    /// list indefinitely.
+    /// list indefinitely. That quiet is why `find_ours` consults this check on
+    /// its own not-found arm rather than leaving it to the sweep: it is now
+    /// reached by the lost-place recovery too, which would otherwise report the
+    /// LAG about a lookup that is structurally blind.
     ///
     /// History is the right place to look and costs nothing extra: this account
     /// has hundreds of finished rows, both stacks have always sent a
@@ -488,14 +545,20 @@ impl Book {
         }
     }
 
+    /// Read by BOTH sweep halves and by [`KalshiGateway::find_ours`], so the
+    /// wording names the shared premise rather than the sweep alone: a lookup by
+    /// our own id — a client-id cancel, a lost-place recovery — is exactly as
+    /// blind as a scoped sweep when the tag does not come back.
     fn premise_broken(&self) -> Option<VenueError> {
         (!self.echoes_tags && self.rows > 0).then(|| VenueError::Status {
             endpoint: "kalshi orders",
             status: 0,
             body: format!(
                 "not one of {} order(s) in this account's history carries a \
-                 `client_order_id`, so the order list is not echoing the tag a scoped \
-                 sweep needs and NOTHING here can be attributed to this process. \
+                 `client_order_id`, so the order list is not echoing the tag EVERY \
+                 lookup by our own id depends on — the scoped sweep, the client-id \
+                 cancel, and the recovery of a place whose answer was lost — and \
+                 NOTHING here can be attributed to this process. \
                  Refusing to cancel blind on a SHARED key, and refusing to call the \
                  book clean. Re-run with --sweep-unscoped to cancel EVERY resting \
                  order on the account instead (the pre-2026-07-29 behaviour)",
@@ -620,9 +683,10 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
     /// THE PRODUCTION CALLER for the handle this gateway has always had.
     /// `client_order_id` goes out IN THE CREATE BODY (Kalshi requires it —
     /// [`wire::kalshi_place_body`]), so an order the venue took is carrying our
-    /// tag before any ack exists; [`Self::cancel_by_client_order_id`] has
-    /// recovered a lost create with it since 2026-07-27 and
-    /// [`Self::cancel_all_open`] scopes itself with it. What had no caller was
+    /// tag before any ack exists; [`Self::cancel_by_client_order_id`] was
+    /// written for a lost create on 2026-07-27 — that is the incident, not
+    /// evidence the path has ever fired — and [`Self::cancel_all_open`] scopes
+    /// itself with the same tag. What had no caller was
     /// this hook — `arb-trader`'s executor asks every sink for a lost place and
     /// Kalshi answered with the trait DEFAULT, `Ok(None)`: "the venue never saw
     /// it", asserted about an order that may well be resting. PM-US got its
@@ -633,18 +697,23 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
     /// orders need the id back and only one of them is resting:
     ///   * a resting maker, so it can be CANCELLED. Nothing else can address it
     ///     — a fill on it would arrive under an id the engine never learned;
-    ///   * an IOC hedge that already EXECUTED, so it is not bought TWICE.
-    ///     `engine::fill::on_order_ack` is the join: the ack maps venue id to
-    ///     ours and REPLAYS a fill that beat it, which is what credits the
-    ///     obligation. Without it the fill stays held, the obligation reads
-    ///     zero, and `hedge_tick`'s retry places the hedge again — 10 Kalshi
-    ///     long against 5 PM-US short, observed 2026-07-28 with an ack that was
-    ///     merely 48 ms late. A lost response is that same race with no ack
-    ///     coming at all.
+    ///   * an IOC hedge that already EXECUTED, so its fill has something to be
+    ///     attributed TO. `engine::fill::on_order_ack` is the join: the ack maps
+    ///     venue id to ours and REPLAYS a fill that beat it. The incident
+    ///     recorded there — an ack merely 48 ms late, the fill dropped, the
+    ///     obligation credited 0, the retry buying the hedge a second time — is
+    ///     that same race, and a lost response is it with no ack coming at all.
     ///
     /// So both arms hand the id back. Adopting a finished order costs nothing:
     /// the ack only teaches the engine an id, and a cancel later sent to a dead
     /// order is the 404 quirk K4 already calls success.
+    ///
+    /// IT DOES NOT ON ITS OWN CLOSE THE DOUBLE HEDGE, and must not be read as if
+    /// it does. `HOLD_FOR_ACK` and the transport's own timeout are both 15s, so
+    /// on a TIMED-OUT hedge the hold expires at the instant this read begins and
+    /// the retry is already dispatched; once dispatched nothing re-examines it.
+    /// This restores the id — which is what makes the duplicate visible and
+    /// attributable — and `engine::hedge` is where the race itself is fixed.
     ///
     /// ABSENT IS AN ERROR, NOT `Ok(None)`. The order list LAGS a write (see
     /// [`Settle`]), so "not on the account" and "not on the account YET" are
