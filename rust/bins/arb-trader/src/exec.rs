@@ -62,6 +62,19 @@ pub enum Action {
 /// booked against that attempt (`HedgeOrder::cum_filled`), and without it the
 /// executor would have to compare the venue's total against ZERO — which
 /// refuses every retry that follows an ordinary partial fill, for ever.
+///
+/// `credited` IS A SNAPSHOT, AND IT CAN ONLY BE STALE IN THE SAFE DIRECTION.
+/// It is read when the command is queued and used when the executor gets to it,
+/// so a fill frame landing in between makes it too LOW. That matters, and the
+/// direction is what makes it safe: `HedgeOrder::cum_filled` is monotone — the
+/// only write in the process is `+= c.delta` with a non-negative delta, and it
+/// is never reset or decremented — so a snapshot can never read HIGHER than the
+/// truth. Too low means the venue's total more easily exceeds it, which
+/// WITHHOLDS a place. The cost of the race is at most one retry interval of
+/// extra naked time, and the fill it withheld for is reported and credited on
+/// the way past, so the next retry is `Accounted` and goes out. The opposite
+/// error — a snapshot reading high, and so waving through a fill nobody saw —
+/// is not reachable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Superseded {
     pub venue_order_id: String,

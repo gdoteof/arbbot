@@ -438,6 +438,17 @@ pub enum PriorAttempt {
 /// can address the order directly precisely because case 2 above did not
 /// happen: its ack landed, so the venue gave us its id.
 ///
+/// AN INTERLOCK, NOT A DURATION. Nothing here waits out a window and then
+/// assumes: the read and the place it gates are the same executor command, so
+/// the place cannot be dispatched until this has answered. The one duration on
+/// the path is `Settle::retry_404`'s not-yet-visible poll, and it fails to the
+/// SAFE side — running out returns the 404, which is `Unreadable`, which
+/// withholds. It also removes a duration that WAS standing in for an interlock:
+/// `HedgePlan::HoldForAck` gives up after `HOLD_FOR_ACK` and re-places anyway,
+/// and for any attempt the venue has issued an id for that expiry no longer
+/// means placing blind — this asks instead. What is left is the attempt with no
+/// venue id at all, which is `recover_place`'s to repair.
+///
 /// WHAT IT COSTS IN TIME, stated at the tail and not the median: one venue
 /// round trip added to a hedge retry, and in the worst case the transport's 15s
 /// timeout followed by a refusal. It is also inline in the executor's serial
