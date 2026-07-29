@@ -32,7 +32,7 @@
 
 use arb_core::book::BookBuilder;
 use arb_core::fees::{FeeSchedule, Role};
-use arb_core::model::Venue;
+use arb_core::model::{BookSide, Venue};
 use arb_core::scan::{Cx, Rel, D};
 
 /// Policy FLOOR on the both-leg taker fee per contract — no longer the fee
@@ -273,10 +273,10 @@ impl Gate {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
     pub rel_id: String,
-    /// Leg 1 — the CONSTRAINED leg, sold first (PM-US YES at its bid).
+    /// The PM-US leg: sell YES at this bid, which is how a NO is opened.
     pub pmus_market: String,
     pub pmus_bid: String,
-    /// Leg 2 — bought for exactly what leg 1 fills (Kalshi YES at its ask).
+    /// The Kalshi leg: buy YES at this ask.
     pub kalshi_market: String,
     pub kalshi_ask: String,
     pub size: i64,
@@ -287,6 +287,56 @@ pub struct Candidate {
     pub fee: String,
     pub net: String,
     pub apr: f64,
+    /// Which venue LEG 1 goes to: the touch likeliest to VANISH before we
+    /// reach it. Only leg 1 is placed — its fill mints the other leg through
+    /// `hedge_anchor` — so a leg-1 miss costs nothing, while a leg-2 miss is a
+    /// naked leg.
+    ///
+    /// Leg 1 was PM-US for as long as take-take has existed, described as "the
+    /// CONSTRAINED leg". That phrase comes from `scripts/execute_xv.py`, and
+    /// there it meant DEPTH and nothing else: "fill the CONSTRAINED leg (PM US
+    /// bid, thinner) FIRST via IOC; then buy EXACTLY the filled quantity on
+    /// Kalshi (deep, stable) -> bounds leg risk". It was an observation about
+    /// which book was thin in July 2026, not a venue rule — there is no order
+    /// semantics, fee, settlement or geoblock reason PM-US must lead, and the
+    /// hedge pipeline derives either direction from `rel.legs` alone.
+    ///
+    /// 2026-07-29 00:53:50 is that observation failing. Kalshi's ask on
+    /// KXRATECUT-26DEC31 had been 0.1300 x 4 for seventeen seconds when a ONE
+    /// lot appeared at 0.1080. `detect` fired on it (edge 0.062, net 0.042,
+    /// 11%/yr against a 10.06% bar), leg 1 sold instantly into a PM-US bid
+    /// **476** deep, and 159 ms later the 0.1080 was gone — PULLED, not taken:
+    /// no trade printed there and the ask was back at 0.1300 two hundred
+    /// seconds later. We had taken the ROBUST leg first and were left chasing
+    /// the fragile one, 1 contract short on PM-US and unhedged, the hedge
+    /// correctly refusing to chase 1.2c past its 1c slip budget.
+    ///
+    /// Speed cannot fix that — `exec_hop_latency` is p50 100.7ms / p90
+    /// 805.3ms before a packet reaches a venue — so ORDER is the fix.
+    pub lead: Venue,
+}
+
+impl Candidate {
+    /// Leg 1 as an order: venue, market, price, and the ORDER side to send.
+    ///
+    /// A Kalshi lead BUYS YES at the ask, which is a BID-side order; a PM-US
+    /// lead SELLS YES at the bid, which is an ASK-side order (`arb_venue::wire`
+    /// turns that into `ORDER_INTENT_BUY_SHORT`, i.e. opens NO). Pairing a
+    /// price with the wrong side buys the leg it meant to sell at a price
+    /// chosen for the other side of the book, which is the exact failure
+    /// `intent_actions` records — so the pairing is written once, here, and
+    /// tested, rather than inlined at a fire site no unarmed run can reach.
+    ///
+    /// The `else` is PM-US because `detect` mints no other lead; it is also
+    /// today's behaviour, so an unreachable third venue degrades to what leg 1
+    /// has always been.
+    pub fn leg1(&self) -> (Venue, &str, &str, BookSide) {
+        if self.lead == Venue::Kalshi {
+            (Venue::Kalshi, &self.kalshi_market, &self.kalshi_ask, BookSide::Bid)
+        } else {
+            (Venue::PolymarketUs, &self.pmus_market, &self.pmus_bid, BookSide::Ask)
+        }
+    }
 }
 
 /// Why a relationship did not fire. Reported, not silently dropped: a
@@ -397,6 +447,14 @@ pub fn detect(
     if size < 1 {
         return Err(Skip::NoDepth);
     }
+    // WHICH LEG LEADS (see `Candidate::lead`). The thinner cushion behind
+    // `size` is the leg likeliest to be gone when we get there, and it is the
+    // one to risk on. Both coverage ratios are over the SAME `size`, so
+    // comparing `depth_k / size` against `depth_p / size` is comparing the two
+    // depths: one comparison of two integers already in hand, no clock read
+    // and no lookup on the decision path. Ties keep PM-US, which is what leg 1
+    // has always been.
+    let lead = if depth_k < depth_p { Venue::Kalshi } else { Venue::PolymarketUs };
 
     let fee = both_leg_taker_fee(cx, ka, pb, size);
     let net = cx.sub(edge_kpm, fee);
@@ -427,6 +485,7 @@ pub fn detect(
         fee: cx.emit_6dp(fee),
         net: cx.emit_6dp(net),
         apr,
+        lead,
     })
 }
 
@@ -756,6 +815,76 @@ mod tests {
             detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20),
             Err(Skip::NoResolveDate)
         );
+    }
+
+    /// THE INCIDENT, 2026-07-29 00:53:50, reconstructed from
+    /// `data/raw/kalshi-2026-07-29.jsonl` and
+    /// `data/raw/polymarket_us-2026-07-29.jsonl`.
+    ///
+    /// KXRATECUT-26DEC31 sat bid 0.0830 x 143.75 / ask 0.1300 x 4 for
+    /// seventeen seconds. At 00:53:50.535 a ONE lot appeared at 0.1080 and
+    /// this detector fired on it — edge 0.062, net 0.042, 10.55%/yr against
+    /// the session's 10.0585%/yr bar — while PM-US `cbpac-usfed-2026-cut` was
+    /// bid 0.1700 x **476**.
+    ///
+    /// Leg 1 went to PM-US and sold into that 476-deep bid instantly. At
+    /// 00:53:50.694, 159 ms later, the 0.1080 was gone: PULLED, not taken —
+    /// no trade printed at 0.1080 and the ask was back at 0.1300 x 4. One
+    /// contract short on PM-US, unhedged.
+    ///
+    /// The 1-lot covers `size` exactly and nothing else, so it is the leg to
+    /// risk: leg 1 goes to KALSHI, and a miss there leaves no position at all.
+    #[test]
+    fn the_pulled_one_lot_makes_kalshi_the_leading_leg() {
+        let mut cx = Cx::default();
+        let r = rel("xvus-fedcut-26-usfed-2026-cut");
+        let b = books("0.0830", "0.1080", "1", "0.1700", "476", "0.1800");
+        // the bar the armed session was really running against
+        let got = detect(&mut cx, &r, &b, "2026-07-29", 10.058485370878834, 50, 0, 20)
+            .expect("the crossing that fired must still fire");
+        assert_eq!(got.size, 1, "the 1-lot ask is what bounds it");
+        assert_eq!(got.edge, "0.062000");
+        assert_eq!(got.fee, "0.020000", "real fee 0.018466/ct — the floor binds");
+        assert_eq!(got.net, "0.042000");
+        assert!((got.apr - 10.5497).abs() < 0.01, "got {}", got.apr);
+
+        assert_eq!(got.lead, Venue::Kalshi, "the 1-lot is the leg that vanishes");
+        assert_eq!(
+            got.leg1(),
+            (Venue::Kalshi, "K", "0.1080", BookSide::Bid),
+            "leg 1 BUYS Kalshi YES at the ask, which is a bid-side order"
+        );
+    }
+
+    /// ...and the rule is a comparison, not a new hardcoded venue. When PM-US
+    /// is the thin side — which is what `scripts/execute_xv.py` observed when
+    /// it called PM-US "the CONSTRAINED leg (PM US bid, thinner)" — leg 1 is
+    /// PM-US exactly as before, and so is a tie.
+    #[test]
+    fn the_thinner_touch_leads_and_a_tie_keeps_pm_us() {
+        let mut cx = Cx::default();
+        let r = rel("xvus-fedcut-26-usfed-2026-cut");
+
+        // PM-US thin, Kalshi deep: the July-2026 shape.
+        let pm_thin = books("0.0830", "0.1080", "476", "0.1700", "1", "0.1800");
+        let got = detect(&mut cx, &r, &pm_thin, "2026-07-29", 10.0, 50, 0, 20).expect("fires");
+        assert_eq!(got.lead, Venue::PolymarketUs);
+        assert_eq!(
+            got.leg1(),
+            (Venue::PolymarketUs, "P", "0.1700", BookSide::Ask),
+            "leg 1 SELLS PM-US YES at the bid, which is an ask-side order"
+        );
+
+        // Equally covered: no reason to move, so nothing moves.
+        let tie = books("0.0830", "0.1080", "20", "0.1700", "20", "0.1800");
+        let got = detect(&mut cx, &r, &tie, "2026-07-29", 10.0, 50, 0, 20).expect("fires");
+        assert_eq!(got.lead, Venue::PolymarketUs, "a tie keeps today's behaviour");
+
+        // Coverage, not raw depth, is the question — but both ratios divide by
+        // the same `size`, so the clip that binds both cannot reorder them.
+        let clipped = detect(&mut cx, &r, &pm_thin, "2026-07-29", 10.0, 50, 0, 1).expect("fires");
+        assert_eq!(clipped.size, 1);
+        assert_eq!(clipped.lead, Venue::PolymarketUs, "still the thinner touch");
     }
 
     /// Size is bounded by the THINNEST of the two levels we cross, the clip,

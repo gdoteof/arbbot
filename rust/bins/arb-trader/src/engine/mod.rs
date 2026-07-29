@@ -828,7 +828,14 @@ impl Engine {
             // caps, and not taking that allowance is the
             // conservative direction.
             if let Some(rv) = self.cfg.risk.as_ref() {
-                let v = rv.check(&quoters[qi].rel, Venue::PolymarketUs, c.size);
+                // The venue named here is the one being QUOTED,
+                // which is now leg 1's rather than always PM-US.
+                // Behaviour is unchanged either way — `venue_costs`
+                // charges every venue the basket spends on, so a
+                // two-venue relationship reserves both whichever leg
+                // leads (risk.rs) — but the refusal reason should
+                // name the leg we were about to send first.
+                let v = rv.check(&quoters[qi].rel, c.lead, c.size);
                 if !v.allowed {
                     eprintln!(
                         "[take-take] REFUSED {} x{} apr={:.0}%/yr — {}",
@@ -840,41 +847,49 @@ impl Engine {
                     continue;
                 }
             }
-            // Leg 1 ONLY. It is the constrained leg, and
-            // its fill mints the Kalshi hedge through the
-            // same anchor path a maker fill uses — so leg 2
-            // inherits retry, escalation, the naked alarm
-            // and ledger booking rather than duplicating
-            // them. `taker` makes it a marketable IOC.
+            // Leg 1 ONLY, and it is `Candidate::lead` — the
+            // leg whose touch is likeliest to vanish before we
+            // reach it — rather than always PM-US. Its fill
+            // mints the OTHER leg through the same anchor path
+            // a maker fill uses, so leg 2 inherits retry,
+            // escalation, the naked alarm and ledger booking
+            // rather than duplicating them; `hedge_anchor`
+            // derives that leg from `rel.legs` and is symmetric
+            // in the direction, so both leads reach it.
+            // `taker` makes it a marketable IOC.
+            let (leg1_venue, leg1_market, leg1_price, leg1_side) = c.leg1();
+            let (leg1_market, leg1_price) = (leg1_market.to_string(), leg1_price.to_string());
             self.next_tt_oid += 1;
             self.n_tt_fired += 1;
+            let (first, second) = if c.lead == Venue::Kalshi {
+                (
+                    format!("buy {} @{}", c.kalshi_market, c.kalshi_ask),
+                    format!("sell {} @{}", c.pmus_market, c.pmus_bid),
+                )
+            } else {
+                (
+                    format!("sell {} @{}", c.pmus_market, c.pmus_bid),
+                    format!("buy {} @{}", c.kalshi_market, c.kalshi_ask),
+                )
+            };
             eprintln!(
                 "[take-take] FIRE {} x{} edge={} net={} apr={:.0}%/yr \
-                 (bar {:.0}%) — sell {} @{} then buy {} @{}",
-                c.rel_id,
-                c.size,
-                c.edge,
-                c.net,
-                c.apr,
-                tt_bar,
-                c.pmus_market,
-                c.pmus_bid,
-                c.kalshi_market,
-                c.kalshi_ask,
+                 (bar {:.0}%) — leg 1 {first} then leg 2 {second}",
+                c.rel_id, c.size, c.edge, c.net, c.apr, tt_bar,
             );
             self.intents.push(Intent::Place(intent::Place {
                 count: c.size,
                 old_price: None,
                 order_id: format!("t{}", self.next_tt_oid),
-                place: c.pmus_market,
-                price: c.pmus_bid,
+                place: leg1_market,
+                price: leg1_price,
                 replaces: None,
                 retry: None,
-                side: BookSide::Ask,
+                side: leg1_side,
                 tag: Some(Tag::TakeTake),
                 taker: true,
                 ts: now,
-                venue: Venue::PolymarketUs,
+                venue: leg1_venue,
             }));
             self.drain_intents(Some(&quoters[qi].rel));
         }
@@ -1093,15 +1108,11 @@ mod take_take_wiring_tests {
     use super::*;
     use arb_core::scan::{RelLeg, RelType};
 
-    /// The whole take-take execution design rests on ONE assumption: that a
-    /// leg-1 sell on PM-US derives a hedge anchor pointing at the Kalshi leg's
-    /// ASK — i.e. leg 2 BUYS Kalshi, completing the K->PM basket.
-    ///
-    /// `detect_only` is forced on whenever the order path is unarmed, so the
-    /// fire path cannot be exercised end-to-end without real money. This pins
-    /// the assumption directly instead.
-    #[test]
-    fn leg1_sell_on_pmus_anchors_a_kalshi_buy() {
+    /// One vetted cross-venue relationship and a sane book on each leg:
+    /// Kalshi 0.03/0.04, PM-US 0.08/0.09. Shared by both directions below,
+    /// because what they must prove is that the SAME books anchor either lead
+    /// at the other leg's touch.
+    fn fixture() -> (Rel, BookBuilder) {
         let rel = Rel {
             id: "xvus-nobel-peace-26-elonmusk".into(),
             rtype: RelType::CrossVenueEquivalent,
@@ -1130,6 +1141,19 @@ mod take_take_wiring_tests {
             0,
             None,
         );
+        (rel, books)
+    }
+
+    /// The whole take-take execution design rests on ONE assumption: that a
+    /// leg-1 sell on PM-US derives a hedge anchor pointing at the Kalshi leg's
+    /// ASK — i.e. leg 2 BUYS Kalshi, completing the K->PM basket.
+    ///
+    /// `detect_only` is forced on whenever the order path is unarmed, so the
+    /// fire path cannot be exercised end-to-end without real money. This pins
+    /// the assumption directly instead.
+    #[test]
+    fn leg1_sell_on_pmus_anchors_a_kalshi_buy() {
+        let (rel, books) = fixture();
         // leg 1 is an ASK-side order on the PM-US market (we sell PM YES)
         let a = hedge_anchor(&rel, "P", BookSide::Ask, &books).expect("anchor on the other leg");
         assert_eq!(a.venue, Venue::Kalshi, "hedge must be the OTHER leg");
@@ -1141,6 +1165,32 @@ mod take_take_wiring_tests {
         // written out here — a copy is exactly how the mint path and the retry
         // path could come to disagree about which way a hedge trades.
         assert_eq!(super::hedge::taking_side(a.side), BookSide::Bid, "leg 2 must BUY Kalshi");
+    }
+
+    /// The MIRROR, which nothing pinned until leg 1 could lead on either
+    /// venue (`Candidate::lead`, the 2026-07-29 pulled-1-lot incident): a
+    /// leg-1 BUY on Kalshi must derive a hedge anchor pointing at the PM-US
+    /// leg's BID — i.e. leg 2 SELLS PM-US YES, which opens the NO, completing
+    /// the same K->PM basket from the other end.
+    ///
+    /// It holds because `hedge_anchor` is symmetric by construction: it finds
+    /// the placed leg's index, takes `1 - i`, and reads the SAME side of that
+    /// leg's book. Nothing in it names a venue. This test is what keeps that
+    /// true — an anchor that pointed at PM-US's ASK would make leg 2 buy the
+    /// leg it was meant to sell, doubling the position instead of hedging it.
+    #[test]
+    fn leg1_buy_on_kalshi_anchors_a_pmus_sell() {
+        let (rel, books) = fixture();
+        // leg 1 is a BID-side order on the Kalshi market (we buy Kalshi YES
+        // at its ask, marketable) — `Candidate::leg1`'s other arm.
+        let a = hedge_anchor(&rel, "K", BookSide::Bid, &books).expect("anchor on the other leg");
+        assert_eq!(a.venue, Venue::PolymarketUs, "hedge must be the OTHER leg");
+        assert_eq!(a.market_id, "P");
+        assert_eq!(a.side, BookSide::Bid, "we take PM-US's bid, i.e. we SELL");
+        assert_eq!(a.price, "0.08", "at the PM-US bid the crossing was priced against");
+        // and a 'bid' anchor becomes an ask-side (sell) order, which is what
+        // `arb_venue::wire` sends PM-US as ORDER_INTENT_BUY_SHORT.
+        assert_eq!(super::hedge::taking_side(a.side), BookSide::Ask, "leg 2 must SELL PM-US");
     }
 }
 
