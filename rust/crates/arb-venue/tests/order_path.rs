@@ -449,6 +449,54 @@ fn a_list_that_echoes_no_tags_at_all_is_a_named_refusal_not_a_silent_no_op() {
     assert_eq!(g.transport.sent().len(), 1, "the list read and nothing else");
 }
 
+/// THE TRAILING-PAGE CASE. `orders` is required so a FIRST page without it
+/// cannot read as "the book is empty". A CONTINUATION page is a different
+/// question — page 1 already proved the list readable and already carries real
+/// rows — so a final `{"cursor":""}` with `orders` omitted ends the walk
+/// instead of hard-failing the whole sweep on a shape nobody has captured.
+///
+/// But a truncated walk must never read as a complete one: the page we did not
+/// see could hold a resting order of ours. So the cancel proceeds over what was
+/// read, and the PROOF refuses.
+#[test]
+fn a_continuation_page_that_cannot_be_read_ends_the_walk_without_proving_anything() {
+    let p1 = format!(
+        r#"{{"orders":[{}],"cursor":"CUR"}}"#,
+        tagged("ours", "resting", "m1785257819045")
+    );
+    // the trailing page, with `orders` omitted entirely
+    let p2 = r#"{"cursor":""}"#;
+
+    // the cancel still happens for everything page 1 showed
+    let g = gw(vec![(200, &p1), (200, p2), (200, "{}")]);
+    g.cancel_all_open().expect("a truncated walk must not withhold the cancel");
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 3, "two page reads and the cancel: {sent:?}");
+    assert_eq!(sent[2].path, "/trade-api/v2/portfolio/events/orders/ours");
+
+    // ...but nothing is proven over a list that was cut short
+    let g = gw(vec![(200, &p1), (200, p2)]);
+    match g.resting_order_ids() {
+        Err(VenueError::Parse { endpoint: "kalshi:orders", detail }) => {
+            assert!(detail.contains("cursor walk stopped"), "{detail}");
+            assert!(detail.contains(r#"{"cursor":""}"#), "carries the raw body: {detail}");
+        }
+        other => panic!("a truncated walk cannot prove a book clean, got {other:?}"),
+    }
+}
+
+/// ...and the FIRST page keeps the hard error, or the whole of defect A is back:
+/// with nothing read at all, "no orders key" would be indistinguishable from an
+/// empty book.
+#[test]
+fn the_first_page_still_hard_errors_when_it_carries_no_orders_key() {
+    let g = gw(vec![(200, r#"{"cursor":""}"#)]);
+    assert!(matches!(
+        g.resting_order_ids(),
+        Err(VenueError::MissingField { endpoint: "kalshi:orders", .. })
+    ));
+}
+
 /// ONE tag anywhere in the history — even on a finished row, even somebody
 /// else's — proves the field survives the round trip, and that is all the
 /// premise needs. History is where to look because it is never empty on this

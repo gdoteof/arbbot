@@ -310,6 +310,17 @@ fn claim_halt() -> bool {
 pub struct ShutdownOutcome {
     pub clean: Vec<Venue>,
     pub unclean: Vec<(Venue, String)>,
+    /// Swept, cancel-all ACCEPTED, and nothing ever observed resting — but the
+    /// confirmation could not be READ. Absence of evidence, not evidence of a
+    /// leak, and deliberately NOT part of `exit_code`.
+    ///
+    /// It is its own bucket because the alternative is a self-inflicted outage:
+    /// nobody has captured what PM-US sends on an EMPTY book, so if that shape
+    /// is one `open_orders` cannot parse, counting it as unclean would make
+    /// every shutdown exit 17 and every start refuse, for ever, over an empty
+    /// book. The line is unmissable and carries the raw body, which is how the
+    /// observation finally gets made.
+    pub unconfirmed: Vec<(Venue, String)>,
     /// Places the latch refused after shutdown began. Each one is an order that
     /// would otherwise have been placed by a process on its way out. Makers
     /// among these are pure safety.
@@ -371,6 +382,17 @@ impl ShutdownOutcome {
                     "[exec] {v:?}: resting list read EMPTY — but see below, this is not proof"
                 ));
             }
+        }
+        for (v, e) in &self.unconfirmed {
+            out.push(format!(
+                "[exec] {v:?}: cancel-all ACCEPTED and nothing was ever seen resting, \
+                 but the book could NOT be confirmed — {e}"
+            ));
+            out.push(format!(
+                "[exec] {v:?}: ^ this is an UNREAD list, not a proven-empty one. If this \
+                 line is routine, the body above is the response shape this repo has \
+                 never captured — pin it and tighten the check"
+            ));
         }
         let makers = self.discarded_places.saturating_sub(self.discarded_takers);
         if makers > 0 {
@@ -469,7 +491,11 @@ pub async fn shutdown_sweep(
             }
             Ok(Some(Ok((v, Err(e))))) => {
                 pending.remove(&v);
-                out.unclean.push((v, e));
+                if e.is_only_unconfirmed() {
+                    out.unconfirmed.push((v, e.msg));
+                } else {
+                    out.unclean.push((v, e.msg));
+                }
             }
             // A panicked sweep proves nothing; its venue stays `pending` and is
             // reported below rather than quietly counted clean.

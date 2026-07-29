@@ -117,8 +117,29 @@ impl<T: Transport> KalshiGateway<T> {
     /// a halt that a token bucket can turn into "NOT CLEAN at exit" is the same
     /// hazard as the hedge this priority exists to protect.
     pub fn all_orders(&self) -> Result<Vec<resp::KalshiOrder>, VenueError> {
+        Ok(self.listing()?.orders)
+    }
+
+    /// [`Self::all_orders`], keeping whether the walk actually FINISHED.
+    ///
+    /// The trailing page of a cursor walk is the one place the required-`orders`
+    /// rule could bite a legitimate response. `orders` is required so that a
+    /// FIRST page without it cannot read as "the book is empty" — that is the
+    /// whole of defect A. A CONTINUATION page is a different question: page 1
+    /// already proved the list is readable and already carries real rows, so a
+    /// final `{"cursor":""}` with `orders` omitted cannot make us conclude
+    /// anything about emptiness. Hard-erroring the entire sweep on it would be
+    /// fail-closed on a shape nobody has captured.
+    ///
+    /// So the walk ENDS there instead — and says it was cut short, because the
+    /// one thing it must not do is let a truncated walk read as a complete one.
+    /// A page we never saw could hold a resting order of ours, and
+    /// `resting_order_ids` returning early would be "PROVEN clean" over exactly
+    /// that. Incomplete means: cancel what we did find, prove nothing.
+    fn listing(&self) -> Result<Listing, VenueError> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut cut_short: Option<String> = None;
         loop {
             let q = cursor.as_ref().map(|c| format!("limit=100&cursor={c}"));
             let r = self.call(
@@ -135,14 +156,26 @@ impl<T: Transport> KalshiGateway<T> {
                     body: r.body,
                 });
             }
-            let page = resp::kalshi_orders_page(&r.body)?;
+            let page = match resp::kalshi_orders_page(&r.body) {
+                Ok(p) => p,
+                // Only AFTER a good page. The first page keeps the hard error.
+                Err(e) if cursor.is_some() => {
+                    cut_short = Some(format!(
+                        "the cursor walk stopped at a page that could not be read ({e}); \
+                         body was: {}",
+                        r.body.chars().take(300).collect::<String>()
+                    ));
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
             out.extend(page.orders);
             match page.cursor {
                 Some(c) if !c.is_empty() => cursor = Some(c),
                 _ => break,
             }
         }
-        Ok(out)
+        Ok(Listing { orders: out, cut_short })
     }
 
     /// Where an order carrying OUR `client_order_id` stands on this account.
@@ -181,6 +214,14 @@ impl<T: Transport> KalshiGateway<T> {
             Ours::Gone | Ours::Absent => Ok(None),
         }
     }
+}
+
+/// One cursor walk, and whether it reached the end.
+struct Listing {
+    orders: Vec<resp::KalshiOrder>,
+    /// `Some(why)` when a CONTINUATION page could not be read, so the rows below
+    /// are a prefix of the account, not the account.
+    cut_short: Option<String>,
 }
 
 /// The account history, partitioned the way a scoped sweep needs it.
@@ -379,15 +420,22 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
 
     /// The evidence half of the sweep, scoped to match the cancel half.
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
-        let orders = self.all_orders()?;
+        let listing = self.listing()?;
+        // A walk that was cut short cannot prove anything: the page we never
+        // read could hold a resting order of ours, and answering "empty" here is
+        // precisely the "PROVEN clean over a book nobody read" defect.
+        if let Some(why) = listing.cut_short {
+            return Err(VenueError::Parse { endpoint: "kalshi:orders", detail: why });
+        }
         if self.unscoped_sweep {
-            return Ok(orders
+            return Ok(listing
+                .orders
                 .into_iter()
                 .filter(|o| o.is_resting())
                 .map(|o| o.order_id)
                 .collect());
         }
-        let book = Book::read(orders);
+        let book = Book::read(listing.orders);
         match book.premise_broken() {
             Some(e) => Err(e),
             None => Ok(book.ours),
@@ -420,7 +468,12 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
     /// does — so [`Book`] checks that against the same read, and refuses rather
     /// than quietly cancelling nothing. See [`Book::echoes_tags`].
     fn cancel_all_open(&self) -> Result<(), VenueError> {
-        let orders = self.all_orders()?;
+        // Cancelling proceeds on a cut-short walk — every row we DID read is
+        // still worth cancelling, and withholding the cancel because the list
+        // was truncated would leave orders resting to protect a proof we were
+        // never going to be able to give. `resting_order_ids` is where the
+        // truncation refuses.
+        let orders = self.listing()?.orders;
         if self.unscoped_sweep {
             for o in orders {
                 if o.is_resting() {

@@ -641,10 +641,30 @@ async fn startup_sweep(
                                      sweeping blind, the sweep is the authority"),
             Err(e) => eprintln!("[exec] {venue:?}: list task panicked ({e}) — sweeping anyway"),
         }
-        sink::cancel_all_and_verify_with(sink.clone(), pol.clone())
-            .await
-            .map_err(|e| format!("{venue:?}: {e}"))?;
-        eprintln!("[exec] {venue:?}: book is clean");
+        match sink::cancel_all_and_verify_with(sink.clone(), pol.clone()).await {
+            Ok(()) => eprintln!("[exec] {venue:?}: book is clean"),
+            // The cancel-all went in and NOTHING was ever observed resting — we
+            // just could not read the confirmation. Arm, loudly.
+            //
+            // Refusing here would be fail-closed on a premise nobody has
+            // verified: no capture in this repo shows what PM-US returns for an
+            // EMPTY book, so if that shape is one `open_orders` cannot parse,
+            // this refusal would be permanent and the engine could never start
+            // again — an outage manufactured out of an empty book. Fail-closed
+            // is earned where the premise is checked (Kalshi's tag echo is, and
+            // its failure comes back through `cancel_all_open`, so it still
+            // refuses below); it is not earned here.
+            Err(e) if e.is_only_unconfirmed() => {
+                eprintln!("[exec] {venue:?}: ARMING ON AN UNCONFIRMED BOOK — {e}");
+                eprintln!(
+                    "[exec] {venue:?}: cancel-all was accepted and nothing was seen resting, \
+                     but the resting list could not be READ. The body is in the line above: \
+                     it is the response shape this repo has never captured. Pin it and \
+                     tighten the check."
+                );
+            }
+            Err(e) => return Err(format!("{venue:?}: {e}")),
+        }
     }
     Ok(())
 }
@@ -1717,6 +1737,74 @@ mod sweep_tests {
         let err = startup_sweep(&h, &fast()).await.unwrap_err();
         assert!(err.contains("SURVIVED"), "{err}");
         assert!(err.contains('b'), "names what is left: {err}");
+    }
+
+    /// A resting list this process cannot READ must not be able to stop it
+    /// starting, when the cancel-all itself was accepted and nothing was ever
+    /// seen resting.
+    ///
+    /// This is the second blocking review finding. Nobody has captured what
+    /// PM-US returns for an EMPTY book; if that shape is one `open_orders`
+    /// cannot parse, a fail-closed proof would refuse to arm on every start and
+    /// exit 17 on every shutdown, permanently, over an empty book. Absence of
+    /// evidence is not evidence of a leak — so it arms, and the raw body goes
+    /// in the log so the shape finally gets captured.
+    #[tokio::test]
+    async fn an_unreadable_resting_list_arms_loudly_instead_of_refusing() {
+        struct Unreadable {
+            cancelled: std::sync::Mutex<bool>,
+        }
+        impl sink::OrderSink for Unreadable {
+            fn place(&self, _r: &PlaceRequest) -> Result<String, VenueError> {
+                unreachable!("a sweep never places")
+            }
+            fn cancel(&self, _r: &CancelRequest) -> Result<(), VenueError> {
+                unreachable!("a sweep uses cancel_all_open")
+            }
+            fn cancel_all_open(&self) -> Result<(), VenueError> {
+                *self.cancelled.lock().unwrap() = true;
+                Ok(()) // the venue ACCEPTED the cancel
+            }
+            fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+                Err(VenueError::Parse {
+                    endpoint: "pmus:open_orders",
+                    detail: "missing field `orders` — body was: {}".into(),
+                })
+            }
+        }
+        let m = std::sync::Arc::new(Unreadable { cancelled: std::sync::Mutex::new(false) });
+        let mut h: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> = HashMap::new();
+        h.insert(Venue::PolymarketUs, m.clone());
+        startup_sweep(&h, &fast())
+            .await
+            .expect("an unread list is not a leak, and must not manufacture an outage");
+        assert!(*m.cancelled.lock().unwrap(), "the cancel-all still went in");
+    }
+
+    /// ...but the leniency is exactly that narrow. A cancel-all the venue never
+    /// ACCEPTED means the sweep never got its instruction in, so there is no
+    /// basis to proceed — that stays fail-closed whatever the list said.
+    #[tokio::test]
+    async fn a_cancel_all_the_venue_refused_still_refuses_to_arm() {
+        struct RefusesBoth;
+        impl sink::OrderSink for RefusesBoth {
+            fn place(&self, _r: &PlaceRequest) -> Result<String, VenueError> {
+                unreachable!()
+            }
+            fn cancel(&self, _r: &CancelRequest) -> Result<(), VenueError> {
+                unreachable!()
+            }
+            fn cancel_all_open(&self) -> Result<(), VenueError> {
+                Err(VenueError::Transport("429".into()))
+            }
+            fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+                Err(VenueError::Transport("503".into()))
+            }
+        }
+        let mut h: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> = HashMap::new();
+        h.insert(Venue::Kalshi, std::sync::Arc::new(RefusesBoth));
+        let err = startup_sweep(&h, &fast()).await.unwrap_err();
+        assert!(err.contains("could NOT be proven clean"), "{err}");
     }
 }
 
