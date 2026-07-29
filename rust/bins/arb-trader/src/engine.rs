@@ -1116,6 +1116,1510 @@ fn intent_actions(
     out
 }
 
+/// The quoter index a book event is looked up in: (venue, market) -> the
+/// quoters that quote it.
+type ByMarket = HashMap<(Venue, String), Vec<usize>>;
+
+/// What ONE hedge deadline tick decides, for every outstanding obligation.
+///
+/// `hedge_plan` was the first half of the seam this arm needed; this is the
+/// rest of it. Which side of which book the touch is read from, whether an
+/// unattributed fill can plausibly be this obligation's own, and what the naked
+/// alarm says were all still reachable only through a `tokio::select!` arm over
+/// live channels until they moved here.
+///
+/// Returns `(chain id, plan, alarm line)`, sorted by chain id: the dispatch
+/// that follows must not depend on `HashMap` iteration order.
+fn hedge_tick_plans(
+    cx: &mut Cx,
+    pol: &HedgeRetry,
+    pending: &HashMap<String, PendingHedge>,
+    books: &BookBuilder,
+    oid_venue: &HashMap<String, String>,
+    unclaimed: &HashMap<String, UnclaimedFill>,
+    mono: std::time::Instant,
+) -> Vec<(String, HedgePlan, Option<String>)> {
+    let mut plans: Vec<(String, HedgePlan, Option<String>)> = Vec::new();
+    for (chain, p) in pending.iter() {
+        // The side of the hedge leg's book we TAKE. Read off the
+        // OBLIGATION's anchor, not off the last attempt: the anchor
+        // is the one thing about this obligation that never moves.
+        let book_side = p.anchor.side;
+        let hedge_book =
+            Venue::parse(p.anchor.venue).and_then(|vn| books.get(vn, &p.anchor.market_id));
+        // The touch is read even off a CROSSED book, unlike
+        // `hedge_anchor`, and the asymmetry is deliberate. Refusing to
+        // OPEN an obligation on corrupt data costs nothing; refusing to
+        // DISCHARGE one already owed strands real directional exposure
+        // to resolution. And a phantom touch cannot make this trade
+        // badly: the hedge is an IOC LIMIT, so the phantom is a ceiling
+        // on what we pay and a floor on what we receive — the worst it
+        // can do is not fill. That rests on the hedge really reaching
+        // the wire as an IOC: it does, but via `post_only: false`, not
+        // via `PlaceRequest::tif`, which BOTH wire builders ignore
+        // (`wire.rs` inlines the TIF from `post_only`, and
+        // `Tif::is_maker` documents itself as unused). The two agree at
+        // the one call site that builds a hedge (`intent_actions`:
+        // `taker` sets `tif: Ioc` AND `post_only: false`). If that ever
+        // drifts, this reasoning drifts with it.
+        //
+        // What the phantom is judged against is the obligation's anchor,
+        // which was itself minted off a book proven un-crossed. A
+        // crossed hedge book is instead reported in the naked alarm, so
+        // an operator learns WHY it will not clear.
+        let touch = hedge_book
+            .and_then(|b| if book_side == "bid" { b.bids.first() } else { b.asks.first() })
+            .map(|l| l.price.clone());
+        // Does THIS obligation have an attempt at the venue whose
+        // `order_ack` has not landed? Only then can an unattributed
+        // fill on its market plausibly be its own. An obligation whose
+        // first attempt the slip gate refused has nothing at the venue,
+        // so holding it would be added naked time bought for nothing.
+        let ack_outstanding = p.latest_attempt.as_ref().is_some_and(|a| !oid_venue.contains_key(a))
+            && unclaimed.values().any(|u| {
+                u.market_id == p.anchor.market_id && Venue::parse(p.anchor.venue) == Some(u.venue)
+            });
+        let plan = hedge_plan(
+            cx,
+            pol,
+            p.owed,
+            p.filled,
+            &p.anchor.price,
+            book_side,
+            touch.as_deref(),
+            p.last_try_at,
+            mono,
+            ack_outstanding,
+        );
+        // The alarm is independent of the plan: waiting is the policy
+        // (Geoff 2026-07-22, "hedge only if profitable; otherwise find
+        // a profitable hedge in the future"), and waiting must never be
+        // silent. It survives a PARTIAL fill now — the remainder used
+        // to lose both its retry and this alarm.
+        let alarm = (!matches!(plan, HedgePlan::Retire)
+            && naked_alarm_due(p.first_at, mono, pol, p.alarmed))
+        .then(|| {
+            let crossed = hedge_book
+                .and_then(|b| b.crossing())
+                .map(|(bid, ask)| {
+                    format!(
+                        " — and the hedge leg's book is CROSSED (bid {bid} >= ask \
+                         {ask}), so its touch is a phantom"
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "[hedge] NAKED {}x {} on {} for {:.0}s after {} tries — the book has \
+                 not offered a price that keeps the basket profitable (anchor {} on \
+                 the {} side, budget {}){crossed}",
+                p.owed - p.filled,
+                p.anchor.market_id,
+                p.anchor.venue,
+                mono.saturating_duration_since(p.first_at).as_secs_f64(),
+                p.tries,
+                p.anchor.price,
+                book_side,
+                pol.max_slip,
+            )
+        });
+        plans.push((chain.clone(), plan, alarm));
+    }
+    plans.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic dispatch order
+    plans
+}
+
+/// Everything the engine knows: the books, the id counters, the order and fill
+/// maps, the outstanding hedge obligations, the parked cancels, the gauges.
+///
+/// This used to be ~30 free-standing `let mut` locals at the top of `run()`,
+/// and that is exactly why this file carried five `macro_rules!` where it
+/// should have carried five methods. A closure cannot borrow a set of locals
+/// mutably, so every piece of logic two arms shared had to be textually
+/// substituted back into the one function that owned them — and nothing that is
+/// substituted can be called from a test. The hedge arm's own comment records
+/// the price: it "had no seam that made it testable at all, which is why all
+/// four of its defects survived".
+///
+/// `quoters` and `by_market` are deliberately NOT fields. They are passed
+/// alongside `&mut self` to the arms that need both, because the quote loop
+/// holds `&quoters[qi].rel` across a call that drains that quoter's intents —
+/// legal only while the quoters and the engine state live in different objects.
+/// Making them fields would force a clone of a `Rel` (or of the whole quoter
+/// vector) on the hottest path in the process.
+struct Engine {
+    cfg: RunCfg,
+    exec_txs: HashMap<Venue, mpsc::Sender<ExecCmd>>,
+    exec_stats: Arc<ExecStats>,
+    cx: Cx,
+    fees: FeeSchedule,
+    books: BookBuilder,
+    digest: Sha256,
+    decision: Hist,
+    /// Intent lines the current decision produced, awaiting `drain_intents`.
+    intents: Vec<String>,
+    out: Option<std::io::BufWriter<std::fs::File>>,
+    wal: Option<Wal>,
+    t_start: std::time::Instant,
+    /// The health-file keys we require evidence for — the venues we quote.
+    required: Vec<String>,
+    n_ev: u64,
+    n_book: u64,
+    n_int: u64,
+    /// Crossings the detector found above the bar. In detect_only these are
+    /// opportunities we DECLINED to take, which is the number worth watching
+    /// before arming the taker path.
+    n_tt: u64,
+    /// Crossings the gate below refused to re-fire. A large number here is
+    /// normal and healthy — it is the same standing crossing seen again.
+    n_tt_gated: u64,
+    n_tt_fired: u64,
+    tt_gate: crate::taketake::Gate,
+    /// The bar is re-derived from marks on the stats tick: it moves as the book
+    /// turns over, and a stale bar is a wrong bar in both directions.
+    ///
+    /// `None` is a REFUSAL to run take-take, not a missing number (see
+    /// `taketake::Bar`). It used to be `unwrap_or(DEFAULT_BAR_APR)` over a plain
+    /// read, so when marks.json froze at 12:46:12 on 2026-07-28 the armed
+    /// session spent four hours firing against that frozen 10.0088%/yr bar and
+    /// said nothing about it.
+    tt_bar: Option<f64>,
+    next_oid: u64,
+    next_hedge_oid: u64,
+    next_tt_oid: u64,
+    killed: bool,
+    /// Feed-health pull (card 0a7e5478). Holds the REASON, not just a flag, so
+    /// a pulled engine can always say why it is silent. Starts pulled when the
+    /// check is on: we have not yet proven the feeds are healthy, and the first
+    /// tick either clears it or names the problem.
+    feed_reason: Option<String>,
+    /// The engine's own subscription to the recorder, tracked separately from
+    /// what the recorder says about the venues: a bench tape cannot disconnect,
+    /// a socket can and did (ten times on 2026-07-28).
+    link: Link,
+    last_now: f64,
+    chan_hw: usize,
+    fills: FillLedger,
+    /// order id -> (relationship id, class). A fill arrives with our order id
+    /// only, but exposure is booked per relationship, so the mapping is captured
+    /// at place time when the rel is in hand.
+    order_rel: HashMap<String, MakerOrder>,
+    /// venue's order id -> ours, learned from order_ack. Read by the FILL path:
+    /// a venue reports a fill under its own id.
+    venue_oid: HashMap<String, String>,
+    /// ...and ours -> the venue's, learned from the same ack. Read by the CANCEL
+    /// path: both venues' cancel endpoints accept only their own id, and until
+    /// 2026-07-28 this map did not exist, so every per-order cancel the engine
+    /// ever sent was addressed to an id the venue had never issued.
+    oid_venue: HashMap<String, String>,
+    /// Cancels waiting on the ack that will make them addressable, by OUR id.
+    parked_cancels: HashMap<String, ParkedCancel>,
+    n_cancel_escalated: u64,
+    /// Every hedge ATTEMPT we placed, by OUR id — superseded ones included, so a
+    /// late frame on one is still recognisable. Deliberately separate from the
+    /// FillLedger: a hedge in the ledger would hedge its own fill.
+    hedge_orders: HashMap<String, HedgeOrder>,
+    /// Outstanding hedge OBLIGATIONS, keyed by the id of the first attempt made
+    /// for each (see `PendingHedge` for the invariant it maintains). Populated
+    /// for every obligation, retry policy or not: it is the accounting unit, and
+    /// `hedged_by_maker` — one credit shared by every obligation of a maker
+    /// order — is what it replaces.
+    pending_hedges: HashMap<String, PendingHedge>,
+    /// Fills we cannot attribute yet, by the id the venue reported. See
+    /// `UnclaimedFill`: held for their ack, alarmed if it never comes.
+    unclaimed_fills: HashMap<String, UnclaimedFill>,
+    n_retry: u64,
+    n_naked: u64,
+    /// Fills that expired unclaimed (money we cannot explain) and hedge fills
+    /// beyond what an obligation owed. Both must stay 0.
+    n_unattributed: u64,
+    n_overhedge: u64,
+    n_ack: u64,
+    n_fill: u64,
+    n_hedge: u64,
+}
+
+impl Engine {
+    fn new(
+        cfg: RunCfg,
+        exec_txs: HashMap<Venue, mpsc::Sender<ExecCmd>>,
+        exec_stats: Arc<ExecStats>,
+        by_market: &ByMarket,
+    ) -> Engine {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        // Order-id counters (m = maker, t = take-take, h = hedge). They must not
+        // restart at 0 on a LIVE run: the id is sent as the venue's
+        // client_order_id, and Kalshi rejects one it has seen before with
+        // `409 order_already_exists`. Observed 2026-07-28 right after a restart —
+        // 4 places rejected. The rejection is the small half: the engine registers
+        // an order at INTENT time, before the place result, so it believed those
+        // quotes were resting when the venue had never accepted them. Those
+        // markets then go quietly dark, because the engine sees no reason to
+        // re-quote something it thinks is already working.
+        //
+        // Seeding from the wall clock keeps ids monotonic across restarts without
+        // changing the id FORMAT, which the golden digest tests pin. bench/replay
+        // still start at 0, so those digests stay byte-exact.
+        let id_base: u64 = if cfg.bench { 0 } else { wall_now() as u64 * 1000 };
+        let mut tt_bar: Option<f64> = None;
+        if let Some(tt) = cfg.take_take.as_ref() {
+            let bar = read_bar(&tt.marks_path);
+            tt_bar = bar.tradable();
+            eprintln!(
+                "[take-take] {} — {}, cap {}ct/rel, clip {}",
+                if tt.detect_only { "DETECT ONLY (places nothing)" } else { "ARMED" },
+                bar.describe(),
+                tt.max_ct_per_rel,
+                tt.max_clip
+            );
+        }
+        let feed_reason: Option<String> =
+            cfg.health_file.is_some().then(|| "startup — feeds not yet proven healthy".to_string());
+        let link = if cfg.bench { Link::Fresh } else { Link::Down };
+        let required = required_feeds(by_market);
+        let t_start = std::time::Instant::now();
+        let wal = cfg.wal_path.as_deref().map(Wal::spawn);
+        let out = cfg.out_path.as_ref().map(|p| {
+            if let Some(dir) = std::path::Path::new(p).parent() {
+                std::fs::create_dir_all(dir).expect("out dir");
+            }
+            std::io::BufWriter::new(
+                std::fs::OpenOptions::new().create(true).append(true).open(p).expect("out"),
+            )
+        });
+        Engine {
+            cfg,
+            exec_txs,
+            exec_stats,
+            cx,
+            fees,
+            books: BookBuilder::new(),
+            digest: Sha256::new(),
+            decision: Hist::new(),
+            intents: Vec::new(),
+            out,
+            wal,
+            t_start,
+            required,
+            n_ev: 0,
+            n_book: 0,
+            n_int: 0,
+            n_tt: 0,
+            n_tt_gated: 0,
+            n_tt_fired: 0,
+            tt_gate: crate::taketake::Gate::default(),
+            tt_bar,
+            next_oid: id_base,
+            next_hedge_oid: id_base,
+            next_tt_oid: id_base,
+            killed: false,
+            feed_reason,
+            link,
+            last_now: 0.0,
+            chan_hw: 0,
+            fills: FillLedger::new(),
+            order_rel: HashMap::new(),
+            venue_oid: HashMap::new(),
+            oid_venue: HashMap::new(),
+            parked_cancels: HashMap::new(),
+            n_cancel_escalated: 0,
+            hedge_orders: HashMap::new(),
+            pending_hedges: HashMap::new(),
+            unclaimed_fills: HashMap::new(),
+            n_retry: 0,
+            n_naked: 0,
+            n_unattributed: 0,
+            n_overhedge: 0,
+            n_ack: 0,
+            n_fill: 0,
+            n_hedge: 0,
+        }
+    }
+
+    /// Queue one effect command on its venue's executor. Returns false when the
+    /// channel is full — the command is LOST and only the counter moves, which
+    /// is why callers with an ordered sequence must stop on a false.
+    fn dispatch(&self, venue: Venue, action: Action) -> bool {
+        match self.exec_txs.get(&venue) {
+            Some(tx) => {
+                let queued =
+                    tx.try_send(ExecCmd { t_read: std::time::Instant::now(), action }).is_ok();
+                if !queued {
+                    self.exec_stats.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                queued
+            }
+            None => false,
+        }
+    }
+
+    /// Emit every pending intent line and route its effect to a venue executor.
+    ///
+    /// `rel`: the relationship whose quoter emitted these intents (for the
+    /// hedge-anchor lookup at place time), or None for intents that rest
+    /// nothing (hedge obligations).
+    fn drain_intents(&mut self, rel: Option<&Rel>) {
+        // Swapped out of `self` rather than drained in place: the body below
+        // needs `&mut self`, and swapped BACK rather than reallocated because
+        // this runs on every book event. Nothing in the body pushes an intent.
+        let mut pending = std::mem::take(&mut self.intents);
+        for l in pending.drain(..) {
+            self.digest.update(l.as_bytes());
+            self.digest.update(b"\n");
+            self.n_int += 1;
+            if let Some(o) = self.out.as_mut() {
+                writeln!(o, "{l}").expect("write out");
+                if !self.cfg.bench {
+                    o.flush().expect("flush out"); // tail -f visibility; ~80/day live
+                }
+            }
+            // route the effect to its venue executor (dry-run gateway seam)
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
+                // fill-ledger bookkeeping: orders enter the ledger at place
+                // time carrying their quote-time hedge anchor, so a later
+                // fill knows where to hedge without re-reading the book.
+                let ts_ev = v.get("ts").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                if let (Some(mkt), Some(oid), Some(count)) = (
+                    v.get("place").and_then(|x| x.as_str()),
+                    v.get("order_id").and_then(|x| x.as_str()),
+                    v.get("count").and_then(|x| x.as_i64()),
+                ) {
+                    let side = v.get("side").and_then(|x| x.as_str()).unwrap_or("");
+                    // A hedge is never registered: it has no hedge of its
+                    // own, and registering it would make its fill mint one.
+                    if v.get("tag").and_then(|x| x.as_str()) != Some("hedge") {
+                        let anchor =
+                            rel.and_then(|r| hedge_anchor(r, mkt, side, &self.books, ts_ev));
+                        self.fills.register_order(oid, mkt, count, anchor);
+                    }
+                    if let Some(r) = rel {
+                        self.order_rel.insert(
+                            oid.to_string(),
+                            MakerOrder {
+                                rel_id: r.id.clone(),
+                                class: r.rtype.as_str(),
+                                venue: v
+                                    .get("venue")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                market_id: mkt.to_string(),
+                                side: side.to_string(),
+                                price: v
+                                    .get("price")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                // The intent already carries who emitted
+                                // it; the ledger just has to stop
+                                // discarding that.
+                                strategy: match v.get("tag").and_then(|x| x.as_str()) {
+                                    Some("take-take") => "take-take",
+                                    _ => "maker-hedge",
+                                },
+                            },
+                        );
+                    }
+                    // an amend retires the old id, but a fill can still
+                    // race it — observe_cancel KEEPS the record.
+                    if let Some(roid) = v.get("replaces").and_then(|x| x.as_str()) {
+                        self.fills.observe_cancel(roid);
+                    }
+                } else if let Some(oid) =
+                    v.get("cancel").and(v.get("order_id")).and_then(|x| x.as_str())
+                {
+                    self.fills.observe_cancel(oid);
+                }
+                // Build the REAL requests from the intent (see
+                // `intent_actions`: an amend is a cancel AND a place, in
+                // that order).
+                if let Some(venue) = v.get("venue").and_then(|x| x.as_str()).and_then(Venue::parse)
+                {
+                    // Only the park reads this clock, and only an armed engine
+                    // parks, so a replay's determinism cannot depend on it.
+                    let now = std::time::Instant::now();
+                    for action in intent_actions(
+                        &v,
+                        venue,
+                        self.cfg.armed,
+                        &self.oid_venue,
+                        &mut self.parked_cancels,
+                        now,
+                    ) {
+                        if !self.dispatch(venue, action) {
+                            // The commands of ONE intent are a sequence: an
+                            // amend's place must never go out without the
+                            // cancel that precedes it, or the amend doubles
+                            // the exposure it was meant to move.
+                            eprintln!(
+                                "[engine] executor {venue:?} backlogged — dropped the \
+                                 remaining command(s) of this intent"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.intents = pending;
+    }
+
+    /// Stop quoting AND leave nothing resting — the same standard the KILL path
+    /// was held to on 2026-07-28, for the same reason.
+    ///
+    /// `cancel_all` alone is not enough: it reaches only orders the engine still
+    /// holds ids for, and NONE of its cancels is verified. The feed-stale pull
+    /// did exactly that and no more, so `feed_pulled: true` could sit over real
+    /// quotes resting on a book the engine could no longer see — the one state
+    /// this pull exists to prevent. The venue sweep is the part that cannot be
+    /// fooled: it reaches orders we hold no id for at all, and it PROVES the
+    /// outcome.
+    fn pull_quotes(&mut self, quoters: &mut [Quoter], why: &str) {
+        for q in quoters.iter_mut() {
+            q.cancel_all(&mut self.cx, self.last_now, &mut self.intents);
+            self.drain_intents(Some(&q.rel));
+        }
+        // Empty unarmed — an unarmed engine has no executor and nothing at
+        // a venue to sweep.
+        for (venue, tx) in self.exec_txs.iter() {
+            if tx
+                .try_send(ExecCmd {
+                    t_read: std::time::Instant::now(),
+                    action: Action::SweepAndVerify,
+                })
+                .is_err()
+            {
+                eprintln!(
+                    "[engine] {why}: could not queue sweep for {venue:?} — executor \
+                     backlogged; book NOT proven clean"
+                );
+            }
+        }
+    }
+
+    /// Attribute ONE fill frame to the order it belongs to, and act on it.
+    ///
+    /// Returns which arm it took (`FillArm`), because the caller's two gauges ask
+    /// different questions: `fills` counts maker frames only, and tape time
+    /// advances for anything that is not a hedge frame.
+    ///
+    /// Called from the `fill` arm and from the `order_ack` arm, which replays a
+    /// held fill the moment its ack makes it addressable. `since` is the
+    /// MONOTONIC time the frame was first seen, so a frame going back on the
+    /// hold keeps its original deadline rather than restarting it.
+    ///
+    /// This is one function rather than two copies because the two callers must
+    /// never disagree about what a fill means.
+    fn attribute_fill(
+        &mut self,
+        oid: &str,
+        cum: i64,
+        venue: Venue,
+        market: &str,
+        now: f64,
+        since: std::time::Instant,
+    ) -> FillArm {
+        // A hedge fill discharges (part of) an obligation. Hedges are never
+        // in the FillLedger — registering one would let its own fill mint
+        // another hedge, forever — so they are recognised here.
+        match self.hedge_orders.get(oid).cloned() {
+            Some(h) => {
+                let ob = self.pending_hedges.get(&h.chain_id).map(|p| (p.owed, p.filled));
+                let c = hedge_credit(cum, h.qty, h.cum_filled, ob);
+                if c.delta > 0 {
+                    // I1/I2: credit the ATTEMPT (so its own later frames are
+                    // deltas) and the OBLIGATION (so the retry knows what is
+                    // left). Retiring the attempt on its first frame is what
+                    // booked a 10-lot as a 4-lot and lost the rest.
+                    if let Some(o) = self.hedge_orders.get_mut(oid) {
+                        o.cum_filled += c.delta;
+                    }
+                    if let Some(p) = self.pending_hedges.get_mut(&h.chain_id) {
+                        p.filled += c.delta;
+                    }
+                    if c.book > 0 {
+                        match self.order_rel.get(&h.maker_order_id) {
+                            Some(mo) => {
+                                if let Some(lp) = self.cfg.ledger_path.as_deref() {
+                                    book_basket(lp, mo, &h, c.book, now);
+                                }
+                                eprintln!(
+                                    "[ledger] booked {} x{} ({} maker / {} hedge)",
+                                    mo.rel_id, c.book, mo.market_id, h.market_id
+                                );
+                            }
+                            // Without the maker order there is no relationship
+                            // id, so there is no honest ledger record to write
+                            // — and an unbooked basket is exposure no restart
+                            // can see. `order_rel` is never pruned, so this is
+                            // a bug in the engine rather than a venue event.
+                            None => eprintln!(
+                                "[ledger] CANNOT BOOK {}x {} ({} hedge {oid}): maker order \
+                                 {} is unknown to this engine — RECOVER BY HAND.",
+                                c.book, h.market_id, h.venue, h.maker_order_id
+                            ),
+                        }
+                    }
+                    if c.over > 0 {
+                        // Contracts with no maker leg to pair them with:
+                        // the obligation was already covered (a superseded
+                        // IOC filled late). Booking them as a basket would
+                        // invent a maker fill that never happened, so they
+                        // are alarmed instead.
+                        self.n_overhedge += 1;
+                        eprintln!(
+                            "[hedge] OVER-HEDGED: {} extra contract(s) filled on {} \
+                             ({} {}) beyond what obligation {} owed. This is directional \
+                             exposure the OPPOSITE way and it is NOT booked as a basket \
+                             — RECONCILE BY HAND.",
+                            c.over, oid, h.venue, h.market_id, h.chain_id
+                        );
+                    }
+                    if c.done {
+                        // I3: retired only now that it is really covered.
+                        // Its attempts stay in `hedge_orders` so a further
+                        // frame on one is recognised as an over-fill rather
+                        // than as money we cannot explain.
+                        self.pending_hedges.remove(&h.chain_id);
+                    }
+                }
+                FillArm::Hedge
+            }
+            None => match self.fills.observe_cum_fill(oid, cum) {
+                arb_core::fill::FillOutcome::Minted(ob) => {
+                    // Book the new exposure BEFORE the hedge intent, so
+                    // the next quote sees capital this fill just spent.
+                    if let (Some(rv), Some(mo)) = (self.cfg.risk.as_ref(), self.order_rel.get(oid))
+                    {
+                        rv.record_open(&mo.rel_id, mo.class, ob.qty() as f64);
+                    }
+                    // No anchor => no hedge target. The obligation is
+                    // deliberately left unconsumed so the ledger's
+                    // dropped_unconsumed() alarm surfaces it instead of
+                    // an exposed leg vanishing silently. A crossed hedge
+                    // book lands here too (see `hedge_anchor`).
+                    if let Some(a) = ob.anchor().cloned() {
+                        let (f_oid, _order_market, qty, _) = ob.into_parts();
+                        self.n_hedge += 1;
+                        self.intents.push(
+                            json!({"hedge_needed": a.market_id, "order_id": f_oid.clone(),
+                                   "qty": qty, "anchor_price": a.price.clone(), "ts": now})
+                            .to_string(),
+                        );
+                        // The obligation says WHAT to hedge; the order
+                        // below is the one that does it. Marketable IOC,
+                        // not a resting quote: an unhedged leg is unbounded
+                        // directional risk until resolution, so the hedge
+                        // crosses rather than waits.
+                        //
+                        // `a.side` is the hedge-leg BOOK side we take.
+                        let order_side = taking_side(a.side);
+                        // Price at the CURRENT touch so it actually fills.
+                        // The anchor is the fallback: it was captured at
+                        // place time precisely because the burst that fills
+                        // you is the burst that gaps your book, so a missing
+                        // level here is exactly when it is needed.
+                        let px = Venue::parse(a.venue)
+                            .and_then(|vn| self.books.get(vn, &a.market_id))
+                            .and_then(|b| {
+                                if a.side == "bid" { b.bids.first() } else { b.asks.first() }
+                            })
+                            .map(|l| l.price.clone())
+                            .unwrap_or_else(|| a.price.clone());
+                        self.next_hedge_oid += 1;
+                        let hoid = format!("h{}", self.next_hedge_oid);
+                        // The obligation, named by its FIRST attempt. It is
+                        // recorded BEFORE the placement decision, so a
+                        // refusal below still leaves a tracked, alarmed
+                        // obligation rather than a leg nobody owns.
+                        // MONOTONIC, not the fill's tape time: the fill feed
+                        // is a separate socket from the market feed, so tape
+                        // time can be frozen at this very moment (see
+                        // `PendingHedge::first_at`).
+                        let at = std::time::Instant::now();
+                        self.pending_hedges.insert(
+                            hoid.clone(),
+                            PendingHedge {
+                                maker_order_id: f_oid.clone(),
+                                owed: qty,
+                                filled: 0,
+                                anchor: a.clone(),
+                                first_at: at,
+                                last_try_at: at,
+                                latest_attempt: None,
+                                tries: 0,
+                                alarmed: false,
+                                hold_logged: false,
+                            },
+                        );
+                        // I5, first attempt included — see
+                        // `first_attempt_acceptable` for why it is gated at
+                        // all and why bench/replay is the one exception.
+                        let acceptable = first_attempt_acceptable(
+                            &mut self.cx,
+                            self.cfg.hedge_retry.as_ref(),
+                            a.side,
+                            &px,
+                            &a.price,
+                        );
+                        if acceptable {
+                            if let Some(p) = self.pending_hedges.get_mut(&hoid) {
+                                p.tries = 1;
+                                p.latest_attempt = Some(hoid.clone());
+                            }
+                            self.hedge_orders.insert(
+                                hoid.clone(),
+                                HedgeOrder {
+                                    maker_order_id: f_oid,
+                                    chain_id: hoid.clone(),
+                                    market_id: a.market_id.clone(),
+                                    venue: a.venue,
+                                    side: order_side,
+                                    price: px.clone(),
+                                    qty,
+                                    cum_filled: 0,
+                                },
+                            );
+                            self.intents.push(
+                                json!({"ts": now, "place": a.market_id, "venue": a.venue,
+                                       "side": order_side, "price": px, "count": qty,
+                                       "order_id": hoid, "tag": "hedge", "taker": true})
+                                .to_string(),
+                            );
+                        } else {
+                            let (slip, alarm_s) = self
+                                .cfg
+                                .hedge_retry
+                                .as_ref()
+                                .map(|p| (p.max_slip.as_str(), p.alarm_after_s))
+                                .unwrap_or(("0", 0.0));
+                            eprintln!(
+                                "[hedge] WAIT {qty}x {} on {} — the touch {px} is worse \
+                                 than the anchor {} by more than {slip} ({} side). \
+                                 Obligation {hoid} is live and retrying; NOTHING is hedged \
+                                 yet, and it alarms as NAKED if it is still open in \
+                                 {alarm_s:.0}s.",
+                                a.market_id, a.venue, a.price, a.side
+                            );
+                        }
+                        self.drain_intents(Option::<&Rel>::None);
+                    }
+                    FillArm::Maker
+                }
+                // Duplicate / stale / replayed report for an order we know:
+                // idempotent by construction, nothing to do.
+                arb_core::fill::FillOutcome::Seen => FillArm::Maker,
+                arb_core::fill::FillOutcome::Unknown => {
+                    // HELD, not dropped. See `UnclaimedFill` — this is the
+                    // fill the engine used to count in `fills` and then
+                    // throw away with no alarm at all.
+                    if !self.unclaimed_fills.contains_key(oid) {
+                        eprintln!(
+                            "[fill] UNATTRIBUTED {cum}x on {} {} reported as order {oid} \
+                             — no order of ours maps to that id. Holding it for its \
+                             order_ack; it alarms in {}s if none comes.",
+                            venue.as_str(),
+                            market,
+                            FILL_ACK_GRACE.as_secs()
+                        );
+                    }
+                    let e = self.unclaimed_fills.entry(oid.to_string()).or_insert(UnclaimedFill {
+                        venue,
+                        market_id: market.to_string(),
+                        cum,
+                        since,
+                    });
+                    e.cum = e.cum.max(cum);
+                    // NOT a maker frame. It was counted as one, so the `fills`
+                    // gauge over-reported by every foreign fill on the account —
+                    // and a frame replayed out of the hold would have been
+                    // counted a second time. `fills_unclaimed` and
+                    // `fills_unattributed` are where this frame is visible.
+                    FillArm::Unattributed
+                }
+            },
+        }
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        let elapsed = self.t_start.elapsed().as_secs_f64();
+        serde_json::json!({
+            "mode": if self.cfg.bench { "bench" } else if self.cfg.armed { "live" } else { "shadow" },
+            "events": self.n_ev, "book_events": self.n_book, "intents": self.n_int,
+            "take_take_found": self.n_tt, "take_take_bar_apr": self.tt_bar,
+            "take_take_gated": self.n_tt_gated, "take_take_fired": self.n_tt_fired,
+            "killed": self.killed,
+            "feed_pulled": self.feed_reason.is_some(),
+            "risk_allowed": self.cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
+            "risk_rejected": self.cfg.risk.as_ref().map(|r| r.stats().1).unwrap_or(0),
+            // Cancels the engine decided on but has not been able to queue a
+            // venue-addressed command for. Healthy is 0, or a transient 1
+            // while an ack is in flight.
+            "cancels_unresolved": self.parked_cancels.len(),
+            // ...of which these have already had their one client-id
+            // escalation and are still unaddressable. This is the subset a
+            // human has to reason about, and it is separated out precisely so
+            // the gauge above stays a real signal: the commonest member is a
+            // place the venue REJECTED, where nothing rests and nothing is
+            // wrong (see the escalation log line).
+            "cancels_unaddressable":
+                self.parked_cancels.values().filter(|p| p.escalated).count(),
+            "cancels_escalated": self.n_cancel_escalated,
+            "hedges_pending": self.pending_hedges.len(),
+            "hedges_retried": self.n_retry,
+            "hedges_naked": self.n_naked,
+            // Hedge contracts filled beyond what an obligation owed — a
+            // position with no maker leg to pair it with. Must stay 0.
+            "hedges_overfilled": self.n_overhedge,
+            "order_acks": self.n_ack, "fills": self.n_fill, "hedge_obligations": self.n_hedge,
+            // Fills held for the `order_ack` that would name them. A
+            // transient 1 is the ack race; a persistent count is a broken
+            // ack path.
+            "fills_unclaimed": self.unclaimed_fills.len(),
+            // ...and fills that gave up waiting: money that moved in our
+            // account that we cannot explain. Must stay 0.
+            "fills_unattributed": self.n_unattributed,
+            // programming-bug alarm: an obligation that was minted and
+            // never hedged (arb_core::fill) — must stay 0.
+            "dropped_unconsumed": dropped_unconsumed(),
+            "would_place": self.exec_stats.placed.load(std::sync::atomic::Ordering::Relaxed),
+            "would_cancel": self.exec_stats.cancelled.load(std::sync::atomic::Ordering::Relaxed),
+            "exec_dropped": self.exec_stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
+            "exec_sent": self.exec_stats.sent.load(std::sync::atomic::Ordering::Relaxed),
+            "exec_failed": self.exec_stats.failed.load(std::sync::atomic::Ordering::Relaxed),
+            "chan_high_water": self.chan_hw,
+            "decision_latency": self.decision.summary(),
+            "exec_hop_latency": self.exec_stats.hop.summary(),
+            "elapsed_s": (elapsed * 10.0).round() / 10.0,
+            "eps": if elapsed > 0.0 { (self.n_ev as f64 / elapsed) as u64 } else { 0 },
+        })
+    }
+
+    /// One line off the feed channel. `queued` is the channel depth behind it.
+    fn on_feed(
+        &mut self,
+        m: FeedMsg,
+        queued: usize,
+        quoters: &mut [Quoter],
+        by_market: &ByMarket,
+    ) {
+        self.n_ev += 1;
+        self.chan_hw = self.chan_hw.max(queued);
+        // THE merge point: everything that reaches the engine passes
+        // here exactly once, so this is where the WAL sequence is
+        // assigned — before any parsing, so lines the engine skips are
+        // still in the incident record verbatim.
+        if let Some(w) = self.wal.as_mut() {
+            w.append(&m.line);
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&m.line) else { return };
+        let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+        // Feed-CONNECTION control lines (crate::feed). They ride the
+        // same ordered channel as book events precisely so the pull
+        // lands where the outage did, and they carry no venue/market so
+        // they would otherwise fall out of the parse below.
+        //
+        // LIVE ONLY. A bench tape and a WAL replay must stay
+        // byte-deterministic, and re-enacting a recorded outage would
+        // make their decisions depend on `Instant::now()`; a replay
+        // reads these lines as the incident record they are.
+        if !self.cfg.bench && (kind == crate::feed::FEED_UP || kind == crate::feed::FEED_DOWN) {
+            self.on_link_line(&v, kind, quoters);
+            return;
+        }
+        let Some(venue) = v.get("venue").and_then(|x| x.as_str()).and_then(Venue::parse) else {
+            return;
+        };
+        let Some(market_id) = v.get("market_id").and_then(|x| x.as_str()).map(str::to_owned) else {
+            return;
+        };
+        let seq = v.get("seq").and_then(|x| x.as_u64()).unwrap_or(0);
+        let ts_local_ns = v.get("ts_local_ns").and_then(|x| x.as_i64()).unwrap_or(0);
+        let ts_venue = v.get("ts_venue").and_then(|x| x.as_str()).map(str::to_owned);
+        match kind {
+            "snapshot" => {
+                let (Some(bids), Some(asks)) = (levels_of(v.get("bids")), levels_of(v.get("asks")))
+                else {
+                    return;
+                };
+                self.books.apply_snapshot(
+                    venue,
+                    &market_id,
+                    bids,
+                    asks,
+                    seq,
+                    ts_local_ns,
+                    ts_venue,
+                );
+                // Evidence that a reconnect's welcome burst is really
+                // arriving — the only thing that clears the pull a
+                // disconnect set (see `Link`).
+                if let Link::Resyncing { snapshots, .. } = &mut self.link {
+                    *snapshots += 1;
+                }
+            }
+            "delta" => {
+                let side = match v.get("side").and_then(|x| x.as_str()) {
+                    Some("bid") => BookSide::Bid,
+                    Some("ask") => BookSide::Ask,
+                    _ => return,
+                };
+                let (Some(price), Some(size)) = (
+                    v.get("price").and_then(|x| x.as_str()),
+                    v.get("size").and_then(|x| x.as_str()),
+                ) else {
+                    return;
+                };
+                match self.books.apply_delta(
+                    venue,
+                    &market_id,
+                    side,
+                    price,
+                    size,
+                    seq,
+                    ts_local_ns,
+                    ts_venue,
+                ) {
+                    Ok(_) => {}
+                    Err(ApplyError::GapDetected { .. }) | Err(ApplyError::NotSynced) => return,
+                }
+            }
+            // Own-order lifecycle events (P4 item 1). Schema, both
+            // kinds, on the SAME ordered channel as book events:
+            //   {"kind":"order_ack","venue":<kalshi|polymarket|
+            //    polymarket_us>,"market_id":str,"order_id":str,
+            //    "ts_local_ns":int}
+            //   {"kind":"fill","venue":...,"market_id":str,
+            //    "order_id":str,"cum":int,"ts_local_ns":int}
+            // `cum` is the venue's CUMULATIVE filled count for that
+            // order — not a delta — which is what makes the private-WS
+            // and poll paths idempotent against each other
+            // (arb_core::fill). `order_id` is ours (the id in the place
+            // intent). Unknown kinds keep being skipped.
+            "order_ack" => {
+                self.on_order_ack(&v, ts_local_ns, m.t_read);
+                return;
+            }
+            "fill" => {
+                self.on_fill(&v, venue, &market_id, ts_local_ns, m.t_read);
+                return;
+            }
+            _ => return,
+        }
+        self.n_book += 1;
+        let now = ts_local_ns as f64 / 1e9;
+        self.last_now = now;
+        if !self.killed && self.feed_reason.is_none() {
+            if let Some(idxs) = by_market.get(&(venue, market_id)) {
+                self.quote(quoters, idxs, now);
+                // Take-take on the SAME event that moved the book: the
+                // crossing exists for as long as the slower side takes
+                // to react, which is not minutes.
+                self.take_take_scan(quoters, idxs, now);
+            }
+        }
+        self.decision.record(m.t_read.elapsed().as_nanos() as u64);
+    }
+
+    /// A feed-connection control line: our own subscription came up or went
+    /// away.
+    fn on_link_line(&mut self, v: &serde_json::Value, kind: &str, quoters: &mut [Quoter]) {
+        if kind == crate::feed::FEED_UP {
+            // NOT a clear. `resync_reason` decides when the welcome
+            // burst has actually made the books current again; this
+            // only starts the clock for it.
+            self.link = Link::Resyncing { since: std::time::Instant::now(), snapshots: 0 };
+            eprintln!(
+                "[engine] feed reconnected — quotes stay pulled until the welcome \
+                 snapshot burst has landed"
+            );
+            return;
+        }
+        // Act on the DOWN EDGE only: `socket_feed` re-emits
+        // FEED_DOWN every 2s for as long as the recorder is
+        // unreachable.
+        let edge = !matches!(self.link, Link::Down);
+        self.link = Link::Down;
+        if !edge {
+            return;
+        }
+        // ...and sweep only on the way IN, the same rule the
+        // health tick follows. Nothing can have started
+        // resting while the engine was already pulled, and a
+        // flapping subscriber would otherwise sweep every
+        // reconnect against the rate budget the order path
+        // needs.
+        let entering = self.feed_reason.is_none();
+        self.feed_reason = resync_reason(&self.link, std::time::Instant::now());
+        eprintln!(
+            "[engine] FEED DOWN ({}) — quotes pulled",
+            v.get("note").and_then(|x| x.as_str()).unwrap_or("no reason given")
+        );
+        if entering {
+            self.pull_quotes(quoters, "FEED DOWN");
+        }
+    }
+
+    /// The venue's own id for an order of ours.
+    ///
+    /// The ledger already registered the order at place time (ids are ours), so
+    /// an ack changes no decision state and emits no intent: digest-invisible.
+    ///
+    /// It carries ONE thing the engine cannot know otherwise: the venue's id for
+    /// our order. Fills arrive under that id, so without this mapping a fill on
+    /// a live order would match nothing and the hedge would never fire — and a
+    /// CANCEL cannot be addressed at all, because both venues accept only their
+    /// own id.
+    fn on_order_ack(
+        &mut self,
+        v: &serde_json::Value,
+        ts_local_ns: i64,
+        t_read: std::time::Instant,
+    ) {
+        if let (Some(ours), Some(theirs)) = (
+            v.get("order_id").and_then(|x| x.as_str()),
+            v.get("venue_order_id").and_then(|x| x.as_str()),
+        ) {
+            self.venue_oid.insert(theirs.to_string(), ours.to_string());
+            self.oid_venue.insert(ours.to_string(), theirs.to_string());
+            // ...and THE moment a fill that beat this ack becomes
+            // attributable. A hedge is an IOC, so it fills in the
+            // instant it is accepted and its fill frame can
+            // overtake the ack that names it (observed margin
+            // 48 ms). Dropping that frame left the basket
+            // unbooked, the obligation credited 0, and the
+            // 5-second retry bought the hedge a second time —
+            // 10 Kalshi long against 5 PM short. Replay it here,
+            // before any deadline can act on the wrong state.
+            if let Some(u) = self.unclaimed_fills.remove(theirs) {
+                eprintln!(
+                    "[fill] {theirs} is {ours} — replaying the held fill of {} \
+                     that arrived before its ack",
+                    u.cum
+                );
+                let ts = ts_local_ns as f64 / 1e9;
+                let _ = self.attribute_fill(ours, u.cum, u.venue, &u.market_id, ts, u.since);
+            }
+            // THE moment a cancel decided before this ack became
+            // addressable. It was parked rather than sent with
+            // our id (a no-op both venues report as success), so
+            // this is where it actually goes out.
+            //
+            // The park entry is retired by `settle` only if the
+            // command was actually QUEUED — never before the
+            // dispatch. A full channel loses the command, and
+            // logging a send that never happened while the gauge
+            // dropped to 0 was how an unaddressable quote could
+            // rest with every number reading healthy.
+            let w = self.parked_cancels.get(ours).map(|p| CancelWork::Send {
+                oid: ours.to_string(),
+                venue: p.venue,
+                market: p.market.clone(),
+                venue_order_id: theirs.to_string(),
+            });
+            if let Some(w) = w {
+                let queued = self.dispatch(w.venue(), w.action());
+                settle(&mut self.parked_cancels, &w, queued);
+                if queued {
+                    eprintln!(
+                        "[engine] cancel {ours} was waiting on its ack — sent to \
+                         {} as {theirs}",
+                        w.venue().as_str()
+                    );
+                } else {
+                    eprintln!(
+                        "[engine] cancel {ours} is addressable now ({theirs}) but \
+                         the {} executor is FULL — NOT sent; the order is still \
+                         resting and the cancel stays owed",
+                        w.venue().as_str()
+                    );
+                }
+            }
+        }
+        self.n_ack += 1;
+        self.last_now = ts_local_ns as f64 / 1e9;
+        self.decision.record(t_read.elapsed().as_nanos() as u64);
+    }
+
+    /// One fill frame off the private feed.
+    fn on_fill(
+        &mut self,
+        v: &serde_json::Value,
+        venue: Venue,
+        market_id: &str,
+        ts_local_ns: i64,
+        t_read: std::time::Instant,
+    ) {
+        let (Some(reported), Some(cum)) = (
+            v.get("order_id").and_then(|x| x.as_str()),
+            v.get("cum").and_then(|x| x.as_i64()),
+        ) else {
+            return;
+        };
+        // A venue reports its own id; the ledger knows ours.
+        // Fall through to the reported id when it is already
+        // ours (the dry-run/replay case, and the poll path
+        // which looks orders up by our id).
+        let oid: String =
+            self.venue_oid.get(reported).cloned().unwrap_or_else(|| reported.to_string());
+        let now = ts_local_ns as f64 / 1e9;
+        let arm =
+            self.attribute_fill(&oid, cum, venue, market_id, now, std::time::Instant::now());
+        if matches!(arm, FillArm::Maker) {
+            self.n_fill += 1;
+        }
+        if !matches!(arm, FillArm::Hedge) {
+            self.last_now = now;
+        }
+        self.decision.record(t_read.elapsed().as_nanos() as u64);
+    }
+
+    /// Re-quote every relationship this book event touches.
+    fn quote(&mut self, quoters: &mut [Quoter], idxs: &[usize], now: f64) {
+        for &qi in idxs {
+            quoters[qi].on_book(
+                &mut self.cx,
+                &self.fees,
+                &self.books,
+                now,
+                &mut self.next_oid,
+                &mut self.intents,
+            );
+            self.drain_intents(Some(&quoters[qi].rel));
+        }
+    }
+
+    /// Immediately-executable crossings on this book event.
+    ///
+    /// No trustworthy bar, no take-take. `tt_bar` is `None` exactly when
+    /// `marks.json` is present but stale or corrupt, and the bar IS the
+    /// profitability test — a frozen one is wrong in both directions, so there
+    /// is no substitute to fall back to.
+    fn take_take_scan(&mut self, quoters: &mut [Quoter], idxs: &[usize], now: f64) {
+        let (Some(tt), Some(tt_bar)) = (self.cfg.take_take.as_ref(), self.tt_bar) else { return };
+        // Copied out of the policy rather than held as a borrow of `self.cfg`:
+        // the loop below drains intents, which needs `&mut self`. `marks_path`
+        // is not read here — only the stats tick re-derives the bar.
+        let (max_ct_per_rel, max_clip, detect_only, cooldown_s) =
+            (tt.max_ct_per_rel, tt.max_clip, tt.detect_only, tt.cooldown_s);
+        let today = crate::taketake::today_iso(now);
+        for &qi in idxs {
+            let open =
+                self.cfg.risk.as_ref().map(|r| r.open_ct(&quoters[qi].rel.id)).unwrap_or(0.0) as i64;
+            let found = crate::taketake::detect(
+                &mut self.cx,
+                &quoters[qi].rel,
+                &self.books,
+                &today,
+                tt_bar,
+                max_ct_per_rel,
+                open,
+                max_clip,
+            );
+            let c = match found {
+                // A venue offering below its own bid means
+                // OUR book is corrupt, and every price
+                // derived from it is fiction. The detector
+                // has refused it since 4542e5f, but the
+                // engine DISCARDED the reason, so six hours
+                // of live book corruption on
+                // KXRATECUT-26DEC31 (2026-07-28) logged
+                // nothing at all.
+                Err(crate::taketake::Skip::CrossedBook { venue }) => {
+                    self.intents.push(
+                        json!({"ts": now,
+                               "skip": [format!("crossed book {venue} take-take {}",
+                                                quoters[qi].rel.id)]})
+                        .to_string(),
+                    );
+                    self.drain_intents(Some(&quoters[qi].rel));
+                    continue;
+                }
+                Err(_) => continue,
+                Ok(c) => c,
+            };
+            self.n_tt += 1;
+            // The SAME crossing is present on every event
+            // until someone takes it, and exposure does not
+            // move until a fill books. Without this the
+            // armed path would re-place it every tick.
+            if !self.tt_gate.take(&c.rel_id, now, cooldown_s) {
+                self.n_tt_gated += 1;
+                continue;
+            }
+            if detect_only {
+                eprintln!(
+                    "[take-take] FOUND {} x{} edge={} net={} apr={:.0}%/yr \
+                     (bar {:.0}%) — buy {} @{} / sell {} @{} \
+                     [DETECT ONLY — nothing sent]",
+                    c.rel_id,
+                    c.size,
+                    c.edge,
+                    c.net,
+                    c.apr,
+                    tt_bar,
+                    c.kalshi_market,
+                    c.kalshi_ask,
+                    c.pmus_market,
+                    c.pmus_bid,
+                );
+                continue;
+            }
+            // Capital caps, balances and topic budgets are
+            // the maker path's gate too — take-take is a
+            // different reason to trade, not a licence to
+            // ignore how much is already committed.
+            //
+            // The risk gate's `opportunity_apr` overflow
+            // (risk.rs:208) is deliberately NOT supplied:
+            // it would let a great crossing exceed normal
+            // caps, and not taking that allowance is the
+            // conservative direction.
+            if let Some(rv) = self.cfg.risk.as_ref() {
+                let v = rv.check(&quoters[qi].rel, Venue::PolymarketUs, c.size);
+                if !v.allowed {
+                    eprintln!(
+                        "[take-take] REFUSED {} x{} apr={:.0}%/yr — {}",
+                        c.rel_id,
+                        c.size,
+                        c.apr,
+                        v.reasons.join("; ")
+                    );
+                    continue;
+                }
+            }
+            // Leg 1 ONLY. It is the constrained leg, and
+            // its fill mints the Kalshi hedge through the
+            // same anchor path a maker fill uses — so leg 2
+            // inherits retry, escalation, the naked alarm
+            // and ledger booking rather than duplicating
+            // them. `taker` makes it a marketable IOC.
+            self.next_tt_oid += 1;
+            self.n_tt_fired += 1;
+            eprintln!(
+                "[take-take] FIRE {} x{} edge={} net={} apr={:.0}%/yr \
+                 (bar {:.0}%) — sell {} @{} then buy {} @{}",
+                c.rel_id,
+                c.size,
+                c.edge,
+                c.net,
+                c.apr,
+                tt_bar,
+                c.pmus_market,
+                c.pmus_bid,
+                c.kalshi_market,
+                c.kalshi_ask,
+            );
+            self.intents.push(
+                json!({"place": c.pmus_market,
+                       "order_id": format!("t{}", self.next_tt_oid),
+                       "count": c.size, "side": "ask",
+                       "price": c.pmus_bid, "venue": "polymarket_us",
+                       "tag": "take-take", "taker": true, "ts": now})
+                .to_string(),
+            );
+            self.drain_intents(Some(&quoters[qi].rel));
+        }
+    }
+
+    /// The kill-switch watch.
+    fn kill_tick(&mut self, quoters: &mut [Quoter]) {
+        let kill_now = std::path::Path::new(&self.cfg.kill_file).exists();
+        if kill_now && !self.killed {
+            self.killed = true;
+            eprintln!(
+                "[engine] KILL switch on ({}) — cancelling all resting quotes",
+                self.cfg.kill_file
+            );
+            for q in quoters.iter_mut() {
+                q.cancel_all(&mut self.cx, self.last_now, &mut self.intents);
+                self.drain_intents(Some(&q.rel));
+            }
+            // Those cancels reach only orders we still hold ids for,
+            // and NONE of them is verified. On 2026-07-28 that path
+            // logged "cancelled" for a PM-US order that was still
+            // resting 35 minutes later, which is how the engine can
+            // report itself halted while it is still exposed.
+            //
+            // Follow with a real venue sweep that proves the book is
+            // empty. Halting is the one moment where "probably
+            // cancelled" is not good enough.
+            for (venue, tx) in self.exec_txs.iter() {
+                if tx
+                    .try_send(ExecCmd {
+                        t_read: std::time::Instant::now(),
+                        action: Action::SweepAndVerify,
+                    })
+                    .is_err()
+                {
+                    eprintln!(
+                        "[engine] KILL: could not queue sweep for {venue:?} — \
+                         executor backlogged; book NOT proven clean"
+                    );
+                }
+            }
+        } else if !kill_now && self.killed {
+            self.killed = false;
+            eprintln!("[engine] KILL switch cleared — quoting resumes");
+        }
+    }
+
+    /// The hedge deadline.
+    fn hedge_tick(&mut self) {
+        let pol = self.cfg.hedge_retry.as_ref().expect("guarded above");
+        // ONE monotonic reading for the whole tick, so every obligation is
+        // judged against the same clock and the decide/act phases cannot
+        // disagree. Monotonic and not tape time: tape time freezes exactly
+        // when the market feed dies while the fill feed keeps delivering,
+        // which pinned both the retry interval and the naked alarm at 0
+        // for as long as the feed stayed down (see `PendingHedge::first_at`).
+        let mono = std::time::Instant::now();
+        // DECIDE first, ACT second. The decision for one obligation is a
+        // pure function of the obligation, the book and the clock
+        // (`hedge_plan`) — the seam that makes this arm testable at all.
+        // It had none, which is why all four of its defects survived.
+        let plans = hedge_tick_plans(
+            &mut self.cx,
+            pol,
+            &self.pending_hedges,
+            &self.books,
+            &self.oid_venue,
+            &self.unclaimed_fills,
+            mono,
+        );
+        self.apply_hedge_plans(plans, mono);
+    }
+
+    /// The ACT half of the hedge deadline: everything `hedge_tick_plans`
+    /// decided, in the order it decided it.
+    fn apply_hedge_plans(
+        &mut self,
+        plans: Vec<(String, HedgePlan, Option<String>)>,
+        mono: std::time::Instant,
+    ) {
+        for (chain, plan, alarm) in plans {
+            if let Some(msg) = alarm {
+                if let Some(p) = self.pending_hedges.get_mut(&chain) {
+                    p.alarmed = true;
+                }
+                self.n_naked += 1;
+                eprintln!("{msg}");
+            }
+            match plan {
+                // Not due, or the book will not offer a profitable price.
+                // `last_try_at` is NOT bumped on a wait: it gates
+                // PLACEMENTS, and looking at the book again next tick is
+                // free, so a naked leg hedges the moment the price comes
+                // back instead of up to `interval_s` later.
+                HedgePlan::Hold | HedgePlan::Wait => {}
+                // Deferring to a fill we cannot attribute. Said out loud
+                // once per obligation: `HedgePlan::Hold` used to swallow
+                // this, so added naked time had no signal at all.
+                HedgePlan::HoldForAck => {
+                    let Some(p) = self.pending_hedges.get_mut(&chain) else { continue };
+                    if !p.hold_logged {
+                        p.hold_logged = true;
+                        eprintln!(
+                            "[hedge] HOLD {}x {} on {} — a fill on that market is not \
+                             attributable yet and may be this hedge's own (attempt {}, \
+                             no order_ack). Not re-placing for up to {}s; if \
+                             fills_unattributed rises, CHECK FOR A DUPLICATE HEDGE.",
+                            p.owed - p.filled,
+                            p.anchor.market_id,
+                            p.anchor.venue,
+                            p.latest_attempt.as_deref().unwrap_or("?"),
+                            HOLD_FOR_ACK.as_secs()
+                        );
+                    }
+                }
+                HedgePlan::Retire => {
+                    // Covered after all — a late fill landed. The attempts
+                    // stay in `hedge_orders`, so a further frame on one is
+                    // recognised as an over-fill rather than as money we
+                    // cannot explain.
+                    self.pending_hedges.remove(&chain);
+                }
+                HedgePlan::Retry { qty, price } => {
+                    self.next_hedge_oid += 1;
+                    let hoid = format!("h{}", self.next_hedge_oid);
+                    let Some(p) = self.pending_hedges.get_mut(&chain) else { continue };
+                    p.tries += 1;
+                    p.last_try_at = mono;
+                    // This attempt becomes the one whose `order_ack` the
+                    // ack-hold waits for, and it gets its own hold line:
+                    // a new attempt is a new ack that can go missing.
+                    p.latest_attempt = Some(hoid.clone());
+                    p.hold_logged = false;
+                    let (tries, owed, filled) = (p.tries, p.owed, p.filled);
+                    let ho = HedgeOrder {
+                        maker_order_id: p.maker_order_id.clone(),
+                        chain_id: chain.clone(),
+                        market_id: p.anchor.market_id.clone(),
+                        venue: p.anchor.venue,
+                        side: taking_side(p.anchor.side),
+                        price: price.clone(),
+                        qty,
+                        cum_filled: 0,
+                    };
+                    self.n_retry += 1;
+                    eprintln!(
+                        "[hedge] retry {hoid} {qty}x {} @ {price} (try {tries}; \
+                         obligation {chain} owed {owed}, {filled} hedged)",
+                        ho.market_id
+                    );
+                    self.intents.push(
+                        json!({"ts": self.last_now, "place": ho.market_id,
+                               "venue": ho.venue, "side": ho.side,
+                               "price": ho.price, "count": ho.qty,
+                               "order_id": hoid, "tag": "hedge", "taker": true,
+                               "retry": tries})
+                        .to_string(),
+                    );
+                    // EVERY attempt stays in `hedge_orders`, superseded
+                    // ones included: an IOC that filled late still has to
+                    // credit its obligation, and the obligation's key does
+                    // not move, so the credit lands on the right one.
+                    self.hedge_orders.insert(hoid, ho);
+                    self.drain_intents(Option::<&Rel>::None);
+                }
+            }
+        }
+    }
+
+    /// Fills held for an `order_ack` that has not come.
+    fn unclaimed_tick(&mut self) {
+        for id in unclaimed_expired(&self.unclaimed_fills, std::time::Instant::now()) {
+            let Some(u) = self.unclaimed_fills.remove(&id) else { continue };
+            self.n_unattributed += 1;
+            eprintln!(
+                "[fill] UNEXPLAINED {}x on {} {} reported as order {id} — no order_ack \
+                 claimed it within {}s. Either a fill on an order of ours whose ack was \
+                 lost (a place can return a parse error and still rest) or a fill from \
+                 outside this engine — the Kalshi fill channel is account-wide by \
+                 design. It is NOT credited to any hedge: attributing money by guess is \
+                 worse than saying we cannot. RECONCILE BY HAND.",
+                u.cum,
+                u.venue.as_str(),
+                u.market_id,
+                FILL_ACK_GRACE.as_secs()
+            );
+        }
+    }
+
+    /// Dispatch one tick's worth of parked-cancel work.
+    fn cancel_tick(&mut self) {
+        for w in cancel_work(
+            &self.parked_cancels,
+            &self.oid_venue,
+            std::time::Instant::now(),
+            self.killed,
+        ) {
+            let queued = self.dispatch(w.venue(), w.action());
+            settle(&mut self.parked_cancels, &w, queued);
+            if let (CancelWork::Escalate { oid, venue, market }, true) = (&w, queued) {
+                self.n_cancel_escalated += 1;
+                // Deliberately not shouted. The commonest cause is a
+                // place the venue REJECTED (post-only would cross, rate
+                // limited, 409 duplicate id): the quoter still believes
+                // it rests, so its next reprice parks a cancel for an
+                // order that never existed and nothing is wrong at the
+                // venue. A replay of one 3.7-day shadow produced ~150 of
+                // those on PM-US alone, and a line that cries wolf 150
+                // times is a line operators stop reading.
+                eprintln!(
+                    "[engine] cancel {oid} ({market} on {}) has had no order_ack for \
+                     {}s — escalating to a client-id cancel (Kalshi resolves it against \
+                     its order list; PM-US cannot and will refuse). A place the venue \
+                     rejected looks exactly like this.",
+                    venue.as_str(),
+                    CANCEL_ACK_GRACE.as_secs()
+                );
+            }
+        }
+    }
+
+    /// One feed-health tick: decide with `feed_tick`, then act on it.
+    fn health_tick(&mut self, quoters: &mut [Quoter]) {
+        let t = feed_tick(
+            self.feed_reason.as_ref(),
+            resync_reason(&self.link, std::time::Instant::now()),
+            self.cfg
+                .health_file
+                .as_deref()
+                .and_then(|p| feed_stale_reason(p, wall_now(), &self.required)),
+        );
+        if t.proven {
+            self.link = Link::Fresh; // stop re-deriving it
+        }
+        // Log on any CHANGE of reason, not just healthy<->stale: an
+        // engine that is silent must always be able to say why, and
+        // "unreadable path" vs "recorder silent" are different bugs.
+        if t.log {
+            match &t.reason {
+                Some(why) => eprintln!("[engine] FEED STALE ({why}) — quotes pulled"),
+                None => eprintln!("[engine] feeds healthy — quoting resumes"),
+            }
+        }
+        if t.sweep {
+            self.pull_quotes(quoters, "FEED STALE");
+        }
+        self.feed_reason = t.reason;
+    }
+
+    /// The stats line, and the take-take bar it re-derives.
+    fn stats_tick(&mut self) {
+        println!("{}", self.summary());
+        if let Some(o) = self.out.as_mut() {
+            o.flush().expect("flush");
+        }
+        // Re-derive the bar: marks are rewritten by arbbot-marks.timer
+        // as the book turns over, and holding the startup value would
+        // let the engine trade against a stale definition of "good".
+        if let Some(tt) = self.cfg.take_take.as_ref() {
+            let bar = read_bar(&tt.marks_path);
+            let now_bar = bar.tradable();
+            // Edge-triggered, like `feed_reason`: the four hours the
+            // armed session spent firing against a frozen bar produced
+            // not one line saying so, and a line every stats tick is a
+            // line nobody reads. `take_take_bar_apr` in the summary
+            // above renders `None` as null, which is the standing
+            // signal.
+            if now_bar.is_some() != self.tt_bar.is_some() {
+                eprintln!("[take-take] {}", bar.describe());
+            }
+            self.tt_bar = now_bar;
+        }
+    }
+
+    /// The feed has closed: flush, alarm on anything still held, and report.
+    fn finish(&mut self) -> serde_json::Value {
+        if let Some(o) = self.out.as_mut() {
+            o.flush().expect("final flush");
+        }
+        // Anything still HELD has run out of chances to be explained: the loop is
+        // over, so no `order_ack` is coming for it. Say so once per fill rather than
+        // letting the process exit with the count buried in a gauge — and count it,
+        // so a bench/replay (which never runs the deadline above) still reports it.
+        for (id, u) in std::mem::take(&mut self.unclaimed_fills) {
+            self.n_unattributed += 1;
+            eprintln!(
+                "[fill] UNEXPLAINED at exit: {}x on {} {} reported as order {id}, never claimed by \
+                 an order_ack. Money moved in this account that the engine cannot attribute — \
+                 RECONCILE BY HAND.",
+                u.cum,
+                u.venue.as_str(),
+                u.market_id
+            );
+        }
+        let mut s = self.summary();
+        if self.cfg.bench {
+            let digest = std::mem::take(&mut self.digest);
+            s["sha256"] = serde_json::json!(format!("{:x}", digest.finalize()));
+        }
+        s
+    }
+}
+
 pub async fn run(
     mut quoters: Vec<Quoter>,
     by_market: HashMap<(Venue, String), Vec<usize>>,
@@ -1124,124 +2628,15 @@ pub async fn run(
     exec_stats: Arc<ExecStats>,
     cfg: RunCfg,
 ) -> serde_json::Value {
-    let mut cx = Cx::default();
-    let fees = FeeSchedule::new(&mut cx);
-    let mut books = BookBuilder::new();
-    let mut digest = Sha256::new();
-    let decision = Hist::new();
-    let (mut n_ev, mut n_book, mut n_int) = (0u64, 0u64, 0u64);
-    // Crossings the detector found above the bar. In detect_only these are
-    // opportunities we DECLINED to take, which is the number worth watching
-    // before arming the taker path.
-    let mut n_tt: u64 = 0;
-    // Crossings the gate below refused to re-fire. A large number here is
-    // normal and healthy — it is the same standing crossing seen again.
-    let mut n_tt_gated: u64 = 0;
-    let mut n_tt_fired: u64 = 0;
-    let mut tt_gate = crate::taketake::Gate::default();
-    // Order-id counters (m = maker, t = take-take, h = hedge). They must not
-    // restart at 0 on a LIVE run: the id is sent as the venue's
-    // client_order_id, and Kalshi rejects one it has seen before with
-    // `409 order_already_exists`. Observed 2026-07-28 right after a restart —
-    // 4 places rejected. The rejection is the small half: the engine registers
-    // an order at INTENT time, before the place result, so it believed those
-    // quotes were resting when the venue had never accepted them. Those
-    // markets then go quietly dark, because the engine sees no reason to
-    // re-quote something it thinks is already working.
-    //
-    // Seeding from the wall clock keeps ids monotonic across restarts without
-    // changing the id FORMAT, which the golden digest tests pin. bench/replay
-    // still start at 0, so those digests stay byte-exact.
-    let id_base: u64 = if cfg.bench { 0 } else { wall_now() as u64 * 1000 };
-    let mut next_tt_oid: u64 = id_base;
-    // The bar is re-derived from marks on the stats tick: it moves as the book
-    // turns over, and a stale bar is a wrong bar in both directions.
-    //
-    // `None` is a REFUSAL to run take-take, not a missing number (see
-    // `taketake::Bar`). It used to be `unwrap_or(DEFAULT_BAR_APR)` over a plain
-    // read, so when marks.json froze at 12:46:12 on 2026-07-28 the armed
-    // session spent four hours firing against that frozen 10.0088%/yr bar and
-    // said nothing about it.
-    let mut tt_bar: Option<f64> = None;
-    if let Some(tt) = cfg.take_take.as_ref() {
-        let bar = read_bar(&tt.marks_path);
-        tt_bar = bar.tradable();
-        eprintln!(
-            "[take-take] {} — {}, cap {}ct/rel, clip {}",
-            if tt.detect_only { "DETECT ONLY (places nothing)" } else { "ARMED" },
-            bar.describe(),
-            tt.max_ct_per_rel,
-            tt.max_clip
-        );
-    }
-    let mut next_oid: u64 = id_base;
-    let mut intents: Vec<String> = Vec::new();
-    let mut killed = false;
-    // Feed-health pull (card 0a7e5478). Holds the REASON, not just a flag, so
-    // a pulled engine can always say why it is silent. Starts pulled when the
-    // check is on: we have not yet proven the feeds are healthy, and the first
-    // tick either clears it or names the problem.
-    let mut feed_reason: Option<String> =
-        cfg.health_file.is_some().then(|| "startup — feeds not yet proven healthy".to_string());
-    // The engine's own subscription to the recorder, tracked separately from
-    // what the recorder says about the venues: a bench tape cannot disconnect,
-    // a socket can and did (ten times on 2026-07-28).
-    let mut link = if cfg.bench { Link::Fresh } else { Link::Down };
-    // The health-file keys we require evidence for — the venues we quote.
-    let required = required_feeds(&by_market);
-    let mut last_now: f64 = 0.0;
-    let mut chan_hw: usize = 0;
-    let mut fills = FillLedger::new();
-    // order id -> (relationship id, class). A fill arrives with our order id
-    // only, but exposure is booked per relationship, so the mapping is captured
-    // at place time when the rel is in hand.
-    let mut order_rel: HashMap<String, MakerOrder> = HashMap::new();
-    // venue's order id -> ours, learned from order_ack. Read by the FILL path:
-    // a venue reports a fill under its own id.
-    let mut venue_oid: HashMap<String, String> = HashMap::new();
-    // ...and ours -> the venue's, learned from the same ack. Read by the CANCEL
-    // path: both venues' cancel endpoints accept only their own id, and until
-    // 2026-07-28 this map did not exist, so every per-order cancel the engine
-    // ever sent was addressed to an id the venue had never issued.
-    let mut oid_venue: HashMap<String, String> = HashMap::new();
-    // Cancels waiting on the ack that will make them addressable, by OUR id.
-    let mut parked_cancels: HashMap<String, ParkedCancel> = HashMap::new();
-    let mut n_cancel_escalated: u64 = 0;
-    // Every hedge ATTEMPT we placed, by OUR id — superseded ones included, so a
-    // late frame on one is still recognisable. Deliberately separate from the
-    // FillLedger: a hedge in the ledger would hedge its own fill.
-    let mut hedge_orders: HashMap<String, HedgeOrder> = HashMap::new();
-    let mut next_hedge_oid: u64 = id_base;
-    // Outstanding hedge OBLIGATIONS, keyed by the id of the first attempt made
-    // for each (see `PendingHedge` for the invariant it maintains). Populated
-    // for every obligation, retry policy or not: it is the accounting unit, and
-    // `hedged_by_maker` — one credit shared by every obligation of a maker
-    // order — is what it replaces.
-    let mut pending_hedges: HashMap<String, PendingHedge> = HashMap::new();
-    // Fills we cannot attribute yet, by the id the venue reported. See
-    // `UnclaimedFill`: held for their ack, alarmed if it never comes.
-    let mut unclaimed_fills: HashMap<String, UnclaimedFill> = HashMap::new();
-    let (mut n_retry, mut n_naked) = (0u64, 0u64);
-    // Fills that expired unclaimed (money we cannot explain) and hedge fills
-    // beyond what an obligation owed. Both must stay 0.
-    let (mut n_unattributed, mut n_overhedge) = (0u64, 0u64);
-    let (mut n_ack, mut n_fill, mut n_hedge) = (0u64, 0u64, 0u64);
-    let t_start = std::time::Instant::now();
-    let mut wal = cfg.wal_path.as_deref().map(Wal::spawn);
-
-    let mut out = cfg.out_path.as_ref().map(|p| {
-        if let Some(dir) = std::path::Path::new(p).parent() {
-            std::fs::create_dir_all(dir).expect("out dir");
-        }
-        std::io::BufWriter::new(
-            std::fs::OpenOptions::new().create(true).append(true).open(p).expect("out"),
-        )
-    });
+    let bench = cfg.bench;
+    let armed = cfg.armed;
+    let hedge_retry = cfg.hedge_retry.is_some();
+    let stats_every_s = cfg.stats_every_s;
+    let mut eng = Engine::new(cfg, exec_txs, exec_stats, &by_market);
 
     let mut kill_iv = tokio::time::interval(std::time::Duration::from_secs(1));
     kill_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut stats_iv =
-        tokio::time::interval(std::time::Duration::from_secs(cfg.stats_every_s.max(1)));
+    let mut stats_iv = tokio::time::interval(std::time::Duration::from_secs(stats_every_s.max(1)));
     stats_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut feed_iv = tokio::time::interval(std::time::Duration::from_secs(5));
     feed_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1252,1169 +2647,38 @@ pub async fn run(
     let mut fill_iv = tokio::time::interval(std::time::Duration::from_secs(1));
     fill_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    /// Queue one effect command on its venue's executor. Returns false when the
-    /// channel is full — the command is LOST and only the counter moves, which
-    /// is why callers with an ordered sequence must stop on a false.
-    macro_rules! dispatch {
-        ($venue:expr, $action:expr) => {{
-            match exec_txs.get(&$venue) {
-                Some(tx) => {
-                    let queued = tx
-                        .try_send(ExecCmd { t_read: std::time::Instant::now(), action: $action })
-                        .is_ok();
-                    if !queued {
-                        exec_stats.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    queued
-                }
-                None => false,
-            }
-        }};
-    }
-
-    // $rel: the relationship whose quoter emitted these intents (for the
-    // hedge-anchor lookup at place time), or None for intents that rest
-    // nothing (hedge obligations).
-    macro_rules! drain_intents {
-        ($rel:expr) => {
-            for l in intents.drain(..) {
-                digest.update(l.as_bytes());
-                digest.update(b"\n");
-                n_int += 1;
-                if let Some(o) = out.as_mut() {
-                    writeln!(o, "{l}").expect("write out");
-                    if !cfg.bench {
-                        o.flush().expect("flush out"); // tail -f visibility; ~80/day live
-                    }
-                }
-                // route the effect to its venue executor (dry-run gateway seam)
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
-                    // fill-ledger bookkeeping: orders enter the ledger at place
-                    // time carrying their quote-time hedge anchor, so a later
-                    // fill knows where to hedge without re-reading the book.
-                    let ts_ev = v.get("ts").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                    if let (Some(mkt), Some(oid), Some(count)) = (
-                        v.get("place").and_then(|x| x.as_str()),
-                        v.get("order_id").and_then(|x| x.as_str()),
-                        v.get("count").and_then(|x| x.as_i64()),
-                    ) {
-                        let side = v.get("side").and_then(|x| x.as_str()).unwrap_or("");
-                        // A hedge is never registered: it has no hedge of its
-                        // own, and registering it would make its fill mint one.
-                        if v.get("tag").and_then(|x| x.as_str()) != Some("hedge") {
-                            let anchor = $rel
-                                .and_then(|r| hedge_anchor(r, mkt, side, &books, ts_ev));
-                            fills.register_order(oid, mkt, count, anchor);
-                        }
-                        if let Some(r) = $rel {
-                            order_rel.insert(
-                                oid.to_string(),
-                                MakerOrder {
-                                    rel_id: r.id.clone(),
-                                    class: r.rtype.as_str(),
-                                    venue: v.get("venue").and_then(|x| x.as_str())
-                                        .unwrap_or("").to_string(),
-                                    market_id: mkt.to_string(),
-                                    side: side.to_string(),
-                                    price: v.get("price").and_then(|x| x.as_str())
-                                        .unwrap_or("").to_string(),
-                                    // The intent already carries who emitted
-                                    // it; the ledger just has to stop
-                                    // discarding that.
-                                    strategy: match v.get("tag").and_then(|x| x.as_str()) {
-                                        Some("take-take") => "take-take",
-                                        _ => "maker-hedge",
-                                    },
-                                },
-                            );
-                        }
-                        // an amend retires the old id, but a fill can still
-                        // race it — observe_cancel KEEPS the record.
-                        if let Some(roid) = v.get("replaces").and_then(|x| x.as_str()) {
-                            fills.observe_cancel(roid);
-                        }
-                    } else if let Some(oid) =
-                        v.get("cancel").and(v.get("order_id")).and_then(|x| x.as_str())
-                    {
-                        fills.observe_cancel(oid);
-                    }
-                    // Build the REAL requests from the intent (see
-                    // `intent_actions`: an amend is a cancel AND a place, in
-                    // that order).
-                    if let Some(venue) =
-                        v.get("venue").and_then(|x| x.as_str()).and_then(Venue::parse)
-                    {
-                        // Only the park reads this clock, and only an armed engine
-                        // parks, so a replay's determinism cannot depend on it.
-                        let now = std::time::Instant::now();
-                        for action in intent_actions(
-                            &v,
-                            venue,
-                            cfg.armed,
-                            &oid_venue,
-                            &mut parked_cancels,
-                            now,
-                        ) {
-                            if !dispatch!(venue, action) {
-                                // The commands of ONE intent are a sequence: an
-                                // amend's place must never go out without the
-                                // cancel that precedes it, or the amend doubles
-                                // the exposure it was meant to move.
-                                eprintln!(
-                                    "[engine] executor {venue:?} backlogged — dropped the \
-                                     remaining command(s) of this intent"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        };
-    }
-
-    // Stop quoting AND leave nothing resting — the same standard the KILL path
-    // was held to on 2026-07-28, for the same reason.
-    //
-    // `cancel_all` alone is not enough: it reaches only orders the engine still
-    // holds ids for, and NONE of its cancels is verified. The feed-stale pull
-    // did exactly that and no more, so `feed_pulled: true` could sit over real
-    // quotes resting on a book the engine could no longer see — the one state
-    // this pull exists to prevent. The venue sweep is the part that cannot be
-    // fooled: it reaches orders we hold no id for at all, and it PROVES the
-    // outcome.
-    macro_rules! pull_quotes {
-        ($why:expr) => {{
-            for q in quoters.iter_mut() {
-                q.cancel_all(&mut cx, last_now, &mut intents);
-                drain_intents!(Some(&q.rel));
-            }
-            // Empty unarmed — an unarmed engine has no executor and nothing at
-            // a venue to sweep.
-            for (venue, tx) in exec_txs.iter() {
-                if tx
-                    .try_send(ExecCmd {
-                        t_read: std::time::Instant::now(),
-                        action: Action::SweepAndVerify,
-                    })
-                    .is_err()
-                {
-                    eprintln!(
-                        "[engine] {}: could not queue sweep for {venue:?} — executor \
-                         backlogged; book NOT proven clean",
-                        $why
-                    );
-                }
-            }
-        }};
-    }
-
-    // Attribute ONE fill frame to the order it belongs to, and act on it.
-    //
-    // Returns which arm it took (`FillArm`), because the caller's two gauges ask
-    // different questions: `fills` counts maker frames only, and tape time
-    // advances for anything that is not a hedge frame.
-    //
-    // Called from the `fill` arm and from the `order_ack` arm, which replays a
-    // held fill the moment its ack makes it addressable. `$since` is the
-    // MONOTONIC time the frame was first seen, so a frame going back on the
-    // hold keeps its original deadline rather than restarting it.
-    //
-    // This is one macro rather than two copies because the two callers must
-    // never disagree about what a fill means.
-    macro_rules! attribute_fill {
-        ($oid:expr, $cum:expr, $venue:expr, $market:expr, $now:expr, $since:expr) => {{
-            let oid: &str = $oid;
-            let cum: i64 = $cum;
-            let now: f64 = $now;
-            // A hedge fill discharges (part of) an obligation. Hedges are never
-            // in the FillLedger — registering one would let its own fill mint
-            // another hedge, forever — so they are recognised here.
-            match hedge_orders.get(oid).cloned() {
-                Some(h) => {
-                    let ob = pending_hedges.get(&h.chain_id).map(|p| (p.owed, p.filled));
-                    let c = hedge_credit(cum, h.qty, h.cum_filled, ob);
-                    if c.delta > 0 {
-                        // I1/I2: credit the ATTEMPT (so its own later frames are
-                        // deltas) and the OBLIGATION (so the retry knows what is
-                        // left). Retiring the attempt on its first frame is what
-                        // booked a 10-lot as a 4-lot and lost the rest.
-                        if let Some(o) = hedge_orders.get_mut(oid) {
-                            o.cum_filled += c.delta;
-                        }
-                        if let Some(p) = pending_hedges.get_mut(&h.chain_id) {
-                            p.filled += c.delta;
-                        }
-                        if c.book > 0 {
-                            match order_rel.get(&h.maker_order_id) {
-                                Some(mo) => {
-                                    if let Some(lp) = cfg.ledger_path.as_deref() {
-                                        book_basket(lp, mo, &h, c.book, now);
-                                    }
-                                    eprintln!(
-                                        "[ledger] booked {} x{} ({} maker / {} hedge)",
-                                        mo.rel_id, c.book, mo.market_id, h.market_id
-                                    );
-                                }
-                                // Without the maker order there is no relationship
-                                // id, so there is no honest ledger record to write
-                                // — and an unbooked basket is exposure no restart
-                                // can see. `order_rel` is never pruned, so this is
-                                // a bug in the engine rather than a venue event.
-                                None => eprintln!(
-                                    "[ledger] CANNOT BOOK {}x {} ({} hedge {oid}): maker order \
-                                     {} is unknown to this engine — RECOVER BY HAND.",
-                                    c.book, h.market_id, h.venue, h.maker_order_id
-                                ),
-                            }
-                        }
-                        if c.over > 0 {
-                            // Contracts with no maker leg to pair them with:
-                            // the obligation was already covered (a superseded
-                            // IOC filled late). Booking them as a basket would
-                            // invent a maker fill that never happened, so they
-                            // are alarmed instead.
-                            n_overhedge += 1;
-                            eprintln!(
-                                "[hedge] OVER-HEDGED: {} extra contract(s) filled on {} \
-                                 ({} {}) beyond what obligation {} owed. This is directional \
-                                 exposure the OPPOSITE way and it is NOT booked as a basket \
-                                 — RECONCILE BY HAND.",
-                                c.over, oid, h.venue, h.market_id, h.chain_id
-                            );
-                        }
-                        if c.done {
-                            // I3: retired only now that it is really covered.
-                            // Its attempts stay in `hedge_orders` so a further
-                            // frame on one is recognised as an over-fill rather
-                            // than as money we cannot explain.
-                            pending_hedges.remove(&h.chain_id);
-                        }
-                    }
-                    FillArm::Hedge
-                }
-                None => match fills.observe_cum_fill(oid, cum) {
-                    arb_core::fill::FillOutcome::Minted(ob) => {
-                        // Book the new exposure BEFORE the hedge intent, so
-                        // the next quote sees capital this fill just spent.
-                        if let (Some(rv), Some(mo)) = (cfg.risk.as_ref(), order_rel.get(oid)) {
-                            rv.record_open(&mo.rel_id, mo.class, ob.qty() as f64);
-                        }
-                        // No anchor => no hedge target. The obligation is
-                        // deliberately left unconsumed so the ledger's
-                        // dropped_unconsumed() alarm surfaces it instead of
-                        // an exposed leg vanishing silently. A crossed hedge
-                        // book lands here too (see `hedge_anchor`).
-                        if let Some(a) = ob.anchor().cloned() {
-                            let (f_oid, _order_market, qty, _) = ob.into_parts();
-                            n_hedge += 1;
-                            intents.push(
-                                json!({"hedge_needed": a.market_id, "order_id": f_oid.clone(),
-                                       "qty": qty, "anchor_price": a.price.clone(), "ts": now})
-                                .to_string(),
-                            );
-                            // The obligation says WHAT to hedge; the order
-                            // below is the one that does it. Marketable IOC,
-                            // not a resting quote: an unhedged leg is unbounded
-                            // directional risk until resolution, so the hedge
-                            // crosses rather than waits.
-                            //
-                            // `a.side` is the hedge-leg BOOK side we take.
-                            let order_side = taking_side(a.side);
-                            // Price at the CURRENT touch so it actually fills.
-                            // The anchor is the fallback: it was captured at
-                            // place time precisely because the burst that fills
-                            // you is the burst that gaps your book, so a missing
-                            // level here is exactly when it is needed.
-                            let px = Venue::parse(a.venue)
-                                .and_then(|vn| books.get(vn, &a.market_id))
-                                .and_then(|b| {
-                                    if a.side == "bid" { b.bids.first() } else { b.asks.first() }
-                                })
-                                .map(|l| l.price.clone())
-                                .unwrap_or_else(|| a.price.clone());
-                            next_hedge_oid += 1;
-                            let hoid = format!("h{next_hedge_oid}");
-                            // The obligation, named by its FIRST attempt. It is
-                            // recorded BEFORE the placement decision, so a
-                            // refusal below still leaves a tracked, alarmed
-                            // obligation rather than a leg nobody owns.
-                            // MONOTONIC, not the fill's tape time: the fill feed
-                            // is a separate socket from the market feed, so tape
-                            // time can be frozen at this very moment (see
-                            // `PendingHedge::first_at`).
-                            let at = std::time::Instant::now();
-                            pending_hedges.insert(
-                                hoid.clone(),
-                                PendingHedge {
-                                    maker_order_id: f_oid.clone(),
-                                    owed: qty,
-                                    filled: 0,
-                                    anchor: a.clone(),
-                                    first_at: at,
-                                    last_try_at: at,
-                                    latest_attempt: None,
-                                    tries: 0,
-                                    alarmed: false,
-                                    hold_logged: false,
-                                },
-                            );
-                            // I5, first attempt included — see
-                            // `first_attempt_acceptable` for why it is gated at
-                            // all and why bench/replay is the one exception.
-                            let acceptable = first_attempt_acceptable(
-                                &mut cx,
-                                cfg.hedge_retry.as_ref(),
-                                a.side,
-                                &px,
-                                &a.price,
-                            );
-                            if acceptable {
-                                if let Some(p) = pending_hedges.get_mut(&hoid) {
-                                    p.tries = 1;
-                                    p.latest_attempt = Some(hoid.clone());
-                                }
-                                hedge_orders.insert(
-                                    hoid.clone(),
-                                    HedgeOrder {
-                                        maker_order_id: f_oid,
-                                        chain_id: hoid.clone(),
-                                        market_id: a.market_id.clone(),
-                                        venue: a.venue,
-                                        side: order_side,
-                                        price: px.clone(),
-                                        qty,
-                                        cum_filled: 0,
-                                    },
-                                );
-                                intents.push(
-                                    json!({"ts": now, "place": a.market_id, "venue": a.venue,
-                                           "side": order_side, "price": px, "count": qty,
-                                           "order_id": hoid, "tag": "hedge", "taker": true})
-                                    .to_string(),
-                                );
-                            } else {
-                                let (slip, alarm_s) = cfg
-                                    .hedge_retry
-                                    .as_ref()
-                                    .map(|p| (p.max_slip.as_str(), p.alarm_after_s))
-                                    .unwrap_or(("0", 0.0));
-                                eprintln!(
-                                    "[hedge] WAIT {qty}x {} on {} — the touch {px} is worse \
-                                     than the anchor {} by more than {slip} ({} side). \
-                                     Obligation {hoid} is live and retrying; NOTHING is hedged \
-                                     yet, and it alarms as NAKED if it is still open in \
-                                     {alarm_s:.0}s.",
-                                    a.market_id, a.venue, a.price, a.side
-                                );
-                            }
-                            drain_intents!(Option::<&Rel>::None);
-                        }
-                        FillArm::Maker
-                    }
-                    // Duplicate / stale / replayed report for an order we know:
-                    // idempotent by construction, nothing to do.
-                    arb_core::fill::FillOutcome::Seen => FillArm::Maker,
-                    arb_core::fill::FillOutcome::Unknown => {
-                        // HELD, not dropped. See `UnclaimedFill` — this is the
-                        // fill the engine used to count in `fills` and then
-                        // throw away with no alarm at all.
-                        if !unclaimed_fills.contains_key(oid) {
-                            eprintln!(
-                                "[fill] UNATTRIBUTED {cum}x on {} {} reported as order {oid} \
-                                 — no order of ours maps to that id. Holding it for its \
-                                 order_ack; it alarms in {}s if none comes.",
-                                $venue.as_str(),
-                                $market,
-                                FILL_ACK_GRACE.as_secs()
-                            );
-                        }
-                        let e = unclaimed_fills.entry(oid.to_string()).or_insert(UnclaimedFill {
-                            venue: $venue,
-                            market_id: $market.to_string(),
-                            cum,
-                            since: $since,
-                        });
-                        e.cum = e.cum.max(cum);
-                        // NOT a maker frame. It was counted as one, so the `fills`
-                        // gauge over-reported by every foreign fill on the account —
-                        // and a frame replayed out of the hold would have been
-                        // counted a second time. `fills_unclaimed` and
-                        // `fills_unattributed` are where this frame is visible.
-                        FillArm::Unattributed
-                    }
-                },
-            }
-        }};
-    }
-
-    macro_rules! summary {
-        () => {{
-            let elapsed = t_start.elapsed().as_secs_f64();
-            serde_json::json!({
-                "mode": if cfg.bench { "bench" } else if cfg.armed { "live" } else { "shadow" },
-                "events": n_ev, "book_events": n_book, "intents": n_int,
-                "take_take_found": n_tt, "take_take_bar_apr": tt_bar,
-                "take_take_gated": n_tt_gated, "take_take_fired": n_tt_fired,
-                "killed": killed,
-                "feed_pulled": feed_reason.is_some(),
-                "risk_allowed": cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
-                "risk_rejected": cfg.risk.as_ref().map(|r| r.stats().1).unwrap_or(0),
-                // Cancels the engine decided on but has not been able to queue a
-                // venue-addressed command for. Healthy is 0, or a transient 1
-                // while an ack is in flight.
-                "cancels_unresolved": parked_cancels.len(),
-                // ...of which these have already had their one client-id
-                // escalation and are still unaddressable. This is the subset a
-                // human has to reason about, and it is separated out precisely so
-                // the gauge above stays a real signal: the commonest member is a
-                // place the venue REJECTED, where nothing rests and nothing is
-                // wrong (see the escalation log line).
-                "cancels_unaddressable":
-                    parked_cancels.values().filter(|p| p.escalated).count(),
-                "cancels_escalated": n_cancel_escalated,
-                "hedges_pending": pending_hedges.len(),
-                "hedges_retried": n_retry,
-                "hedges_naked": n_naked,
-                // Hedge contracts filled beyond what an obligation owed — a
-                // position with no maker leg to pair it with. Must stay 0.
-                "hedges_overfilled": n_overhedge,
-                "order_acks": n_ack, "fills": n_fill, "hedge_obligations": n_hedge,
-                // Fills held for the `order_ack` that would name them. A
-                // transient 1 is the ack race; a persistent count is a broken
-                // ack path.
-                "fills_unclaimed": unclaimed_fills.len(),
-                // ...and fills that gave up waiting: money that moved in our
-                // account that we cannot explain. Must stay 0.
-                "fills_unattributed": n_unattributed,
-                // programming-bug alarm: an obligation that was minted and
-                // never hedged (arb_core::fill) — must stay 0.
-                "dropped_unconsumed": dropped_unconsumed(),
-                "would_place": exec_stats.placed.load(std::sync::atomic::Ordering::Relaxed),
-                "would_cancel": exec_stats.cancelled.load(std::sync::atomic::Ordering::Relaxed),
-                "exec_dropped": exec_stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
-                "exec_sent": exec_stats.sent.load(std::sync::atomic::Ordering::Relaxed),
-                "exec_failed": exec_stats.failed.load(std::sync::atomic::Ordering::Relaxed),
-                "chan_high_water": chan_hw,
-                "decision_latency": decision.summary(),
-                "exec_hop_latency": exec_stats.hop.summary(),
-                "elapsed_s": (elapsed * 10.0).round() / 10.0,
-                "eps": if elapsed > 0.0 { (n_ev as f64 / elapsed) as u64 } else { 0 },
-            })
-        }};
-    }
-
     loop {
         tokio::select! {
             biased;
             msg = rx.recv() => {
                 let Some(m) = msg else { break }; // feed closed (bench EOF)
-                n_ev += 1;
-                chan_hw = chan_hw.max(rx.len());
-                // THE merge point: everything that reaches the engine passes
-                // here exactly once, so this is where the WAL sequence is
-                // assigned — before any parsing, so lines the engine skips are
-                // still in the incident record verbatim.
-                if let Some(w) = wal.as_mut() {
-                    w.append(&m.line);
-                }
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&m.line) else { continue };
-                let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                // Feed-CONNECTION control lines (crate::feed). They ride the
-                // same ordered channel as book events precisely so the pull
-                // lands where the outage did, and they carry no venue/market so
-                // they would otherwise fall out of the parse below.
-                //
-                // LIVE ONLY. A bench tape and a WAL replay must stay
-                // byte-deterministic, and re-enacting a recorded outage would
-                // make their decisions depend on `Instant::now()`; a replay
-                // reads these lines as the incident record they are.
-                if !cfg.bench && (kind == crate::feed::FEED_UP || kind == crate::feed::FEED_DOWN) {
-                    if kind == crate::feed::FEED_UP {
-                        // NOT a clear. `resync_reason` decides when the welcome
-                        // burst has actually made the books current again; this
-                        // only starts the clock for it.
-                        link = Link::Resyncing {
-                            since: std::time::Instant::now(),
-                            snapshots: 0,
-                        };
-                        eprintln!(
-                            "[engine] feed reconnected — quotes stay pulled until the welcome \
-                             snapshot burst has landed"
-                        );
-                    } else {
-                        // Act on the DOWN EDGE only: `socket_feed` re-emits
-                        // FEED_DOWN every 2s for as long as the recorder is
-                        // unreachable.
-                        let edge = !matches!(link, Link::Down);
-                        link = Link::Down;
-                        if edge {
-                            // ...and sweep only on the way IN, the same rule the
-                            // health tick follows. Nothing can have started
-                            // resting while the engine was already pulled, and a
-                            // flapping subscriber would otherwise sweep every
-                            // reconnect against the rate budget the order path
-                            // needs.
-                            let entering = feed_reason.is_none();
-                            feed_reason = resync_reason(&link, std::time::Instant::now());
-                            eprintln!(
-                                "[engine] FEED DOWN ({}) — quotes pulled",
-                                v.get("note").and_then(|x| x.as_str()).unwrap_or("no reason given")
-                            );
-                            if entering {
-                                pull_quotes!("FEED DOWN");
-                            }
-                        }
-                    }
-                    continue;
-                }
-                let Some(venue) = v.get("venue").and_then(|x| x.as_str()).and_then(Venue::parse)
-                else { continue };
-                let Some(market_id) = v.get("market_id").and_then(|x| x.as_str()).map(str::to_owned)
-                else { continue };
-                let seq = v.get("seq").and_then(|x| x.as_u64()).unwrap_or(0);
-                let ts_local_ns = v.get("ts_local_ns").and_then(|x| x.as_i64()).unwrap_or(0);
-                let ts_venue = v.get("ts_venue").and_then(|x| x.as_str()).map(str::to_owned);
-                match kind {
-                    "snapshot" => {
-                        let (Some(bids), Some(asks)) =
-                            (levels_of(v.get("bids")), levels_of(v.get("asks")))
-                        else { continue };
-                        books.apply_snapshot(venue, &market_id, bids, asks, seq, ts_local_ns, ts_venue);
-                        // Evidence that a reconnect's welcome burst is really
-                        // arriving — the only thing that clears the pull a
-                        // disconnect set (see `Link`).
-                        if let Link::Resyncing { snapshots, .. } = &mut link {
-                            *snapshots += 1;
-                        }
-                    }
-                    "delta" => {
-                        let side = match v.get("side").and_then(|x| x.as_str()) {
-                            Some("bid") => BookSide::Bid,
-                            Some("ask") => BookSide::Ask,
-                            _ => continue,
-                        };
-                        let (Some(price), Some(size)) = (
-                            v.get("price").and_then(|x| x.as_str()),
-                            v.get("size").and_then(|x| x.as_str()),
-                        ) else { continue };
-                        match books.apply_delta(venue, &market_id, side, price, size, seq,
-                                                ts_local_ns, ts_venue) {
-                            Ok(_) => {}
-                            Err(ApplyError::GapDetected { .. }) | Err(ApplyError::NotSynced) => continue,
-                        }
-                    }
-                    // Own-order lifecycle events (P4 item 1). Schema, both
-                    // kinds, on the SAME ordered channel as book events:
-                    //   {"kind":"order_ack","venue":<kalshi|polymarket|
-                    //    polymarket_us>,"market_id":str,"order_id":str,
-                    //    "ts_local_ns":int}
-                    //   {"kind":"fill","venue":...,"market_id":str,
-                    //    "order_id":str,"cum":int,"ts_local_ns":int}
-                    // `cum` is the venue's CUMULATIVE filled count for that
-                    // order — not a delta — which is what makes the private-WS
-                    // and poll paths idempotent against each other
-                    // (arb_core::fill). `order_id` is ours (the id in the place
-                    // intent). Unknown kinds keep being skipped.
-                    "order_ack" => {
-                        // The ledger already registered the order at place
-                        // time (ids are ours), so an ack changes no decision
-                        // state and emits no intent: digest-invisible.
-                        //
-                        // It carries ONE thing the engine cannot know
-                        // otherwise: the venue's id for our order. Fills arrive
-                        // under that id, so without this mapping a fill on a
-                        // live order would match nothing and the hedge would
-                        // never fire — and a CANCEL cannot be addressed at all,
-                        // because both venues accept only their own id.
-                        if let (Some(ours), Some(theirs)) = (
-                            v.get("order_id").and_then(|x| x.as_str()),
-                            v.get("venue_order_id").and_then(|x| x.as_str()),
-                        ) {
-                            venue_oid.insert(theirs.to_string(), ours.to_string());
-                            oid_venue.insert(ours.to_string(), theirs.to_string());
-                            // ...and THE moment a fill that beat this ack becomes
-                            // attributable. A hedge is an IOC, so it fills in the
-                            // instant it is accepted and its fill frame can
-                            // overtake the ack that names it (observed margin
-                            // 48 ms). Dropping that frame left the basket
-                            // unbooked, the obligation credited 0, and the
-                            // 5-second retry bought the hedge a second time —
-                            // 10 Kalshi long against 5 PM short. Replay it here,
-                            // before any deadline can act on the wrong state.
-                            if let Some(u) = unclaimed_fills.remove(theirs) {
-                                eprintln!(
-                                    "[fill] {theirs} is {ours} — replaying the held fill of {} \
-                                     that arrived before its ack",
-                                    u.cum
-                                );
-                                let ts = ts_local_ns as f64 / 1e9;
-                                let _ = attribute_fill!(
-                                    ours, u.cum, u.venue, &u.market_id, ts, u.since
-                                );
-                            }
-                            // THE moment a cancel decided before this ack became
-                            // addressable. It was parked rather than sent with
-                            // our id (a no-op both venues report as success), so
-                            // this is where it actually goes out.
-                            //
-                            // The park entry is retired by `settle` only if the
-                            // command was actually QUEUED — never before the
-                            // dispatch. A full channel loses the command, and
-                            // logging a send that never happened while the gauge
-                            // dropped to 0 was how an unaddressable quote could
-                            // rest with every number reading healthy.
-                            let w = parked_cancels.get(ours).map(|p| CancelWork::Send {
-                                oid: ours.to_string(),
-                                venue: p.venue,
-                                market: p.market.clone(),
-                                venue_order_id: theirs.to_string(),
-                            });
-                            if let Some(w) = w {
-                                let queued = dispatch!(w.venue(), w.action());
-                                settle(&mut parked_cancels, &w, queued);
-                                if queued {
-                                    eprintln!(
-                                        "[engine] cancel {ours} was waiting on its ack — sent to \
-                                         {} as {theirs}",
-                                        w.venue().as_str()
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "[engine] cancel {ours} is addressable now ({theirs}) but \
-                                         the {} executor is FULL — NOT sent; the order is still \
-                                         resting and the cancel stays owed",
-                                        w.venue().as_str()
-                                    );
-                                }
-                            }
-                        }
-                        n_ack += 1;
-                        last_now = ts_local_ns as f64 / 1e9;
-                        decision.record(m.t_read.elapsed().as_nanos() as u64);
-                        continue;
-                    }
-                    "fill" => {
-                        let (Some(reported), Some(cum)) = (
-                            v.get("order_id").and_then(|x| x.as_str()),
-                            v.get("cum").and_then(|x| x.as_i64()),
-                        ) else { continue };
-                        // A venue reports its own id; the ledger knows ours.
-                        // Fall through to the reported id when it is already
-                        // ours (the dry-run/replay case, and the poll path
-                        // which looks orders up by our id).
-                        let oid: String = venue_oid
-                            .get(reported)
-                            .cloned()
-                            .unwrap_or_else(|| reported.to_string());
-                        let now = ts_local_ns as f64 / 1e9;
-                        let arm = attribute_fill!(
-                            &oid,
-                            cum,
-                            venue,
-                            &market_id,
-                            now,
-                            std::time::Instant::now()
-                        );
-                        if matches!(arm, FillArm::Maker) {
-                            n_fill += 1;
-                        }
-                        if !matches!(arm, FillArm::Hedge) {
-                            last_now = now;
-                        }
-                        decision.record(m.t_read.elapsed().as_nanos() as u64);
-                        continue;
-                    }
-                    _ => continue,
-                }
-                n_book += 1;
-                let now = ts_local_ns as f64 / 1e9;
-                last_now = now;
-                if !killed && feed_reason.is_none() {
-                    if let Some(idxs) = by_market.get(&(venue, market_id)) {
-                        for &qi in idxs {
-                            quoters[qi].on_book(&mut cx, &fees, &books, now, &mut next_oid, &mut intents);
-                            drain_intents!(Some(&quoters[qi].rel));
-                        }
-                        // Take-take on the SAME event that moved the book: the
-                        // crossing exists for as long as the slower side takes
-                        // to react, which is not minutes.
-                        //
-                        // No trustworthy bar, no take-take. `tt_bar` is `None`
-                        // exactly when `marks.json` is present but stale or
-                        // corrupt, and the bar IS the profitability test — a
-                        // frozen one is wrong in both directions, so there is no
-                        // substitute to fall back to.
-                        if let (Some(tt), Some(tt_bar)) = (cfg.take_take.as_ref(), tt_bar) {
-                            let today = crate::taketake::today_iso(now);
-                            for &qi in idxs {
-                                let open = cfg
-                                    .risk
-                                    .as_ref()
-                                    .map(|r| r.open_ct(&quoters[qi].rel.id))
-                                    .unwrap_or(0.0) as i64;
-                                let found = crate::taketake::detect(
-                                    &mut cx,
-                                    &quoters[qi].rel,
-                                    &books,
-                                    &today,
-                                    tt_bar,
-                                    tt.max_ct_per_rel,
-                                    open,
-                                    tt.max_clip,
-                                );
-                                let c = match found {
-                                    // A venue offering below its own bid means
-                                    // OUR book is corrupt, and every price
-                                    // derived from it is fiction. The detector
-                                    // has refused it since 4542e5f, but the
-                                    // engine DISCARDED the reason, so six hours
-                                    // of live book corruption on
-                                    // KXRATECUT-26DEC31 (2026-07-28) logged
-                                    // nothing at all.
-                                    Err(crate::taketake::Skip::CrossedBook { venue }) => {
-                                        intents.push(json!({"ts": now,
-                                            "skip": [format!("crossed book {venue} take-take {}",
-                                                             quoters[qi].rel.id)]})
-                                            .to_string());
-                                        drain_intents!(Some(&quoters[qi].rel));
-                                        continue;
-                                    }
-                                    Err(_) => continue,
-                                    Ok(c) => c,
-                                };
-                                n_tt += 1;
-                                // The SAME crossing is present on every event
-                                // until someone takes it, and exposure does not
-                                // move until a fill books. Without this the
-                                // armed path would re-place it every tick.
-                                if !tt_gate.take(&c.rel_id, now, tt.cooldown_s) {
-                                    n_tt_gated += 1;
-                                    continue;
-                                }
-                                if tt.detect_only {
-                                    eprintln!(
-                                        "[take-take] FOUND {} x{} edge={} net={} apr={:.0}%/yr \
-                                         (bar {:.0}%) — buy {} @{} / sell {} @{} \
-                                         [DETECT ONLY — nothing sent]",
-                                        c.rel_id, c.size, c.edge, c.net, c.apr, tt_bar,
-                                        c.kalshi_market, c.kalshi_ask, c.pmus_market, c.pmus_bid,
-                                    );
-                                    continue;
-                                }
-                                // Capital caps, balances and topic budgets are
-                                // the maker path's gate too — take-take is a
-                                // different reason to trade, not a licence to
-                                // ignore how much is already committed.
-                                //
-                                // The risk gate's `opportunity_apr` overflow
-                                // (risk.rs:208) is deliberately NOT supplied:
-                                // it would let a great crossing exceed normal
-                                // caps, and not taking that allowance is the
-                                // conservative direction.
-                                if let Some(rv) = cfg.risk.as_ref() {
-                                    let v = rv.check(
-                                        &quoters[qi].rel,
-                                        Venue::PolymarketUs,
-                                        c.size,
-                                    );
-                                    if !v.allowed {
-                                        eprintln!(
-                                            "[take-take] REFUSED {} x{} apr={:.0}%/yr — {}",
-                                            c.rel_id, c.size, c.apr, v.reasons.join("; ")
-                                        );
-                                        continue;
-                                    }
-                                }
-                                // Leg 1 ONLY. It is the constrained leg, and
-                                // its fill mints the Kalshi hedge through the
-                                // same anchor path a maker fill uses — so leg 2
-                                // inherits retry, escalation, the naked alarm
-                                // and ledger booking rather than duplicating
-                                // them. `taker` makes it a marketable IOC.
-                                next_tt_oid += 1;
-                                n_tt_fired += 1;
-                                eprintln!(
-                                    "[take-take] FIRE {} x{} edge={} net={} apr={:.0}%/yr \
-                                     (bar {:.0}%) — sell {} @{} then buy {} @{}",
-                                    c.rel_id, c.size, c.edge, c.net, c.apr, tt_bar,
-                                    c.pmus_market, c.pmus_bid, c.kalshi_market, c.kalshi_ask,
-                                );
-                                intents.push(
-                                    json!({"place": c.pmus_market,
-                                           "order_id": format!("t{next_tt_oid}"),
-                                           "count": c.size, "side": "ask",
-                                           "price": c.pmus_bid, "venue": "polymarket_us",
-                                           "tag": "take-take", "taker": true, "ts": now})
-                                    .to_string(),
-                                );
-                                drain_intents!(Some(&quoters[qi].rel));
-                            }
-                        }
-                    }
-                }
-                decision.record(m.t_read.elapsed().as_nanos() as u64);
+                let queued = rx.len();
+                eng.on_feed(m, queued, &mut quoters, &by_market);
             }
-            _ = kill_iv.tick() => {
-                let kill_now = std::path::Path::new(&cfg.kill_file).exists();
-                if kill_now && !killed {
-                    killed = true;
-                    eprintln!("[engine] KILL switch on ({}) — cancelling all resting quotes", cfg.kill_file);
-                    for q in quoters.iter_mut() {
-                        q.cancel_all(&mut cx, last_now, &mut intents);
-                        drain_intents!(Some(&q.rel));
-                    }
-                    // Those cancels reach only orders we still hold ids for,
-                    // and NONE of them is verified. On 2026-07-28 that path
-                    // logged "cancelled" for a PM-US order that was still
-                    // resting 35 minutes later, which is how the engine can
-                    // report itself halted while it is still exposed.
-                    //
-                    // Follow with a real venue sweep that proves the book is
-                    // empty. Halting is the one moment where "probably
-                    // cancelled" is not good enough.
-                    for (venue, tx) in exec_txs.iter() {
-                        if tx
-                            .try_send(ExecCmd {
-                                t_read: std::time::Instant::now(),
-                                action: Action::SweepAndVerify,
-                            })
-                            .is_err()
-                        {
-                            eprintln!(
-                                "[engine] KILL: could not queue sweep for {venue:?} — \
-                                 executor backlogged; book NOT proven clean"
-                            );
-                        }
-                    }
-                } else if !kill_now && killed {
-                    killed = false;
-                    eprintln!("[engine] KILL switch cleared — quoting resumes");
-                }
-            }
-            _ = hedge_iv.tick(), if cfg.hedge_retry.is_some() && !cfg.bench => {
-                let pol = cfg.hedge_retry.as_ref().expect("guarded above");
-                // ONE monotonic reading for the whole tick, so every obligation is
-                // judged against the same clock and the decide/act phases cannot
-                // disagree. Monotonic and not tape time: tape time freezes exactly
-                // when the market feed dies while the fill feed keeps delivering,
-                // which pinned both the retry interval and the naked alarm at 0
-                // for as long as the feed stayed down (see `PendingHedge::first_at`).
-                let mono = std::time::Instant::now();
-                // DECIDE first, ACT second. The decision for one obligation is a
-                // pure function of the obligation, the book and the clock
-                // (`hedge_plan`) — the seam that makes this arm testable at all.
-                // It had none, which is why all four of its defects survived.
-                let mut plans: Vec<(String, HedgePlan, Option<String>)> = Vec::new();
-                for (chain, p) in pending_hedges.iter() {
-                    // The side of the hedge leg's book we TAKE. Read off the
-                    // OBLIGATION's anchor, not off the last attempt: the anchor
-                    // is the one thing about this obligation that never moves.
-                    let book_side = p.anchor.side;
-                    let hedge_book = Venue::parse(p.anchor.venue)
-                        .and_then(|vn| books.get(vn, &p.anchor.market_id));
-                    // The touch is read even off a CROSSED book, unlike
-                    // `hedge_anchor`, and the asymmetry is deliberate. Refusing to
-                    // OPEN an obligation on corrupt data costs nothing; refusing to
-                    // DISCHARGE one already owed strands real directional exposure
-                    // to resolution. And a phantom touch cannot make this trade
-                    // badly: the hedge is an IOC LIMIT, so the phantom is a ceiling
-                    // on what we pay and a floor on what we receive — the worst it
-                    // can do is not fill. That rests on the hedge really reaching
-                    // the wire as an IOC: it does, but via `post_only: false`, not
-                    // via `PlaceRequest::tif`, which BOTH wire builders ignore
-                    // (`wire.rs` inlines the TIF from `post_only`, and
-                    // `Tif::is_maker` documents itself as unused). The two agree at
-                    // the one call site that builds a hedge (`intent_actions`:
-                    // `taker` sets `tif: Ioc` AND `post_only: false`). If that ever
-                    // drifts, this reasoning drifts with it.
-                    //
-                    // What the phantom is judged against is the obligation's anchor,
-                    // which was itself minted off a book proven un-crossed. A
-                    // crossed hedge book is instead reported in the naked alarm, so
-                    // an operator learns WHY it will not clear.
-                    let touch = hedge_book
-                        .and_then(|b| {
-                            if book_side == "bid" { b.bids.first() } else { b.asks.first() }
-                        })
-                        .map(|l| l.price.clone());
-                    // Does THIS obligation have an attempt at the venue whose
-                    // `order_ack` has not landed? Only then can an unattributed
-                    // fill on its market plausibly be its own. An obligation whose
-                    // first attempt the slip gate refused has nothing at the venue,
-                    // so holding it would be added naked time bought for nothing.
-                    let ack_outstanding = p
-                        .latest_attempt
-                        .as_ref()
-                        .is_some_and(|a| !oid_venue.contains_key(a))
-                        && unclaimed_fills.values().any(|u| {
-                            u.market_id == p.anchor.market_id
-                                && Venue::parse(p.anchor.venue) == Some(u.venue)
-                        });
-                    let plan = hedge_plan(
-                        &mut cx,
-                        pol,
-                        p.owed,
-                        p.filled,
-                        &p.anchor.price,
-                        book_side,
-                        touch.as_deref(),
-                        p.last_try_at,
-                        mono,
-                        ack_outstanding,
-                    );
-                    // The alarm is independent of the plan: waiting is the policy
-                    // (Geoff 2026-07-22, "hedge only if profitable; otherwise find
-                    // a profitable hedge in the future"), and waiting must never be
-                    // silent. It survives a PARTIAL fill now — the remainder used
-                    // to lose both its retry and this alarm.
-                    let alarm = (!matches!(plan, HedgePlan::Retire)
-                        && naked_alarm_due(p.first_at, mono, pol, p.alarmed))
-                    .then(|| {
-                        let crossed = hedge_book
-                            .and_then(|b| b.crossing())
-                            .map(|(bid, ask)| {
-                                format!(
-                                    " — and the hedge leg's book is CROSSED (bid {bid} >= ask \
-                                     {ask}), so its touch is a phantom"
-                                )
-                            })
-                            .unwrap_or_default();
-                        format!(
-                            "[hedge] NAKED {}x {} on {} for {:.0}s after {} tries — the book has \
-                             not offered a price that keeps the basket profitable (anchor {} on \
-                             the {} side, budget {}){crossed}",
-                            p.owed - p.filled,
-                            p.anchor.market_id,
-                            p.anchor.venue,
-                            mono.saturating_duration_since(p.first_at).as_secs_f64(),
-                            p.tries,
-                            p.anchor.price,
-                            book_side,
-                            pol.max_slip,
-                        )
-                    });
-                    plans.push((chain.clone(), plan, alarm));
-                }
-                plans.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic dispatch order
-                for (chain, plan, alarm) in plans {
-                    if let Some(msg) = alarm {
-                        if let Some(p) = pending_hedges.get_mut(&chain) {
-                            p.alarmed = true;
-                        }
-                        n_naked += 1;
-                        eprintln!("{msg}");
-                    }
-                    match plan {
-                        // Not due, or the book will not offer a profitable price.
-                        // `last_try_at` is NOT bumped on a wait: it gates
-                        // PLACEMENTS, and looking at the book again next tick is
-                        // free, so a naked leg hedges the moment the price comes
-                        // back instead of up to `interval_s` later.
-                        HedgePlan::Hold | HedgePlan::Wait => {}
-                        // Deferring to a fill we cannot attribute. Said out loud
-                        // once per obligation: `HedgePlan::Hold` used to swallow
-                        // this, so added naked time had no signal at all.
-                        HedgePlan::HoldForAck => {
-                            let Some(p) = pending_hedges.get_mut(&chain) else { continue };
-                            if !p.hold_logged {
-                                p.hold_logged = true;
-                                eprintln!(
-                                    "[hedge] HOLD {}x {} on {} — a fill on that market is not \
-                                     attributable yet and may be this hedge's own (attempt {}, \
-                                     no order_ack). Not re-placing for up to {}s; if \
-                                     fills_unattributed rises, CHECK FOR A DUPLICATE HEDGE.",
-                                    p.owed - p.filled,
-                                    p.anchor.market_id,
-                                    p.anchor.venue,
-                                    p.latest_attempt.as_deref().unwrap_or("?"),
-                                    HOLD_FOR_ACK.as_secs()
-                                );
-                            }
-                        }
-                        HedgePlan::Retire => {
-                            // Covered after all — a late fill landed. The attempts
-                            // stay in `hedge_orders`, so a further frame on one is
-                            // recognised as an over-fill rather than as money we
-                            // cannot explain.
-                            pending_hedges.remove(&chain);
-                        }
-                        HedgePlan::Retry { qty, price } => {
-                            next_hedge_oid += 1;
-                            let hoid = format!("h{next_hedge_oid}");
-                            let Some(p) = pending_hedges.get_mut(&chain) else { continue };
-                            p.tries += 1;
-                            p.last_try_at = mono;
-                            // This attempt becomes the one whose `order_ack` the
-                            // ack-hold waits for, and it gets its own hold line:
-                            // a new attempt is a new ack that can go missing.
-                            p.latest_attempt = Some(hoid.clone());
-                            p.hold_logged = false;
-                            let (tries, owed, filled) = (p.tries, p.owed, p.filled);
-                            let ho = HedgeOrder {
-                                maker_order_id: p.maker_order_id.clone(),
-                                chain_id: chain.clone(),
-                                market_id: p.anchor.market_id.clone(),
-                                venue: p.anchor.venue,
-                                side: taking_side(p.anchor.side),
-                                price: price.clone(),
-                                qty,
-                                cum_filled: 0,
-                            };
-                            n_retry += 1;
-                            eprintln!(
-                                "[hedge] retry {hoid} {qty}x {} @ {price} (try {tries}; \
-                                 obligation {chain} owed {owed}, {filled} hedged)",
-                                ho.market_id
-                            );
-                            intents.push(
-                                json!({"ts": last_now, "place": ho.market_id,
-                                       "venue": ho.venue, "side": ho.side,
-                                       "price": ho.price, "count": ho.qty,
-                                       "order_id": hoid, "tag": "hedge", "taker": true,
-                                       "retry": tries})
-                                .to_string(),
-                            );
-                            // EVERY attempt stays in `hedge_orders`, superseded
-                            // ones included: an IOC that filled late still has to
-                            // credit its obligation, and the obligation's key does
-                            // not move, so the credit lands on the right one.
-                            hedge_orders.insert(hoid, ho);
-                            drain_intents!(Option::<&Rel>::None);
-                        }
-                    }
-                }
-            }
+            _ = kill_iv.tick() => eng.kill_tick(&mut quoters),
+            _ = hedge_iv.tick(), if hedge_retry && !bench => eng.hedge_tick(),
             // Fills held for an `order_ack` that has not come. Bench has no live
             // ack path at all and must stay byte-deterministic, so it relies on
             // the flush after the loop instead of this deadline.
-            _ = fill_iv.tick(), if !cfg.bench => {
-                for id in unclaimed_expired(&unclaimed_fills, std::time::Instant::now()) {
-                    let Some(u) = unclaimed_fills.remove(&id) else { continue };
-                    n_unattributed += 1;
-                    eprintln!(
-                        "[fill] UNEXPLAINED {}x on {} {} reported as order {id} — no order_ack \
-                         claimed it within {}s. Either a fill on an order of ours whose ack was \
-                         lost (a place can return a parse error and still rest) or a fill from \
-                         outside this engine — the Kalshi fill channel is account-wide by \
-                         design. It is NOT credited to any hedge: attributing money by guess is \
-                         worse than saying we cannot. RECONCILE BY HAND.",
-                        u.cum,
-                        u.venue.as_str(),
-                        u.market_id,
-                        FILL_ACK_GRACE.as_secs()
-                    );
-                }
-            }
+            _ = fill_iv.tick(), if !bench => eng.unclaimed_tick(),
             // Cancels the engine owes but could not address when it decided on
             // them. Only an armed engine can ever learn a venue id, so only an
             // armed engine parks (see `resolve_cancel`) and only it has anything
             // to do here. `cancel_work` owns the policy — including the one
             // escalation per tick and none at all while killed.
-            _ = cancel_iv.tick(), if cfg.armed => {
-                for w in cancel_work(&parked_cancels, &oid_venue, std::time::Instant::now(), killed)
-                {
-                    let queued = dispatch!(w.venue(), w.action());
-                    settle(&mut parked_cancels, &w, queued);
-                    if let (CancelWork::Escalate { oid, venue, market }, true) = (&w, queued) {
-                        n_cancel_escalated += 1;
-                        // Deliberately not shouted. The commonest cause is a
-                        // place the venue REJECTED (post-only would cross, rate
-                        // limited, 409 duplicate id): the quoter still believes
-                        // it rests, so its next reprice parks a cancel for an
-                        // order that never existed and nothing is wrong at the
-                        // venue. A replay of one 3.7-day shadow produced ~150 of
-                        // those on PM-US alone, and a line that cries wolf 150
-                        // times is a line operators stop reading.
-                        eprintln!(
-                            "[engine] cancel {oid} ({market} on {}) has had no order_ack for \
-                             {}s — escalating to a client-id cancel (Kalshi resolves it against \
-                             its order list; PM-US cannot and will refuse). A place the venue \
-                             rejected looks exactly like this.",
-                            venue.as_str(),
-                            CANCEL_ACK_GRACE.as_secs()
-                        );
-                    }
-                }
-            }
+            _ = cancel_iv.tick(), if armed => eng.cancel_tick(),
             // Two independent facts, in order of locality: whether the engine's
             // own subscription can be trusted, then whether the recorder says
             // the venue sockets can be. Ungated by `--health` (only by bench)
             // because the FIRST of those is the engine's own business — a run
             // without a health file must still be able to notice, and clear, a
             // disconnect of its own feed.
-            _ = feed_iv.tick(), if !cfg.bench => {
-                let t = feed_tick(
-                    feed_reason.as_ref(),
-                    resync_reason(&link, std::time::Instant::now()),
-                    cfg.health_file
-                        .as_deref()
-                        .and_then(|p| feed_stale_reason(p, wall_now(), &required)),
-                );
-                if t.proven {
-                    link = Link::Fresh; // stop re-deriving it
-                }
-                // Log on any CHANGE of reason, not just healthy<->stale: an
-                // engine that is silent must always be able to say why, and
-                // "unreadable path" vs "recorder silent" are different bugs.
-                if t.log {
-                    match &t.reason {
-                        Some(why) => eprintln!("[engine] FEED STALE ({why}) — quotes pulled"),
-                        None => eprintln!("[engine] feeds healthy — quoting resumes"),
-                    }
-                }
-                if t.sweep {
-                    pull_quotes!("FEED STALE");
-                }
-                feed_reason = t.reason;
-            }
-            _ = stats_iv.tick(), if !cfg.bench => {
-                println!("{}", summary!());
-                if let Some(o) = out.as_mut() { o.flush().expect("flush"); }
-                // Re-derive the bar: marks are rewritten by arbbot-marks.timer
-                // as the book turns over, and holding the startup value would
-                // let the engine trade against a stale definition of "good".
-                if let Some(tt) = cfg.take_take.as_ref() {
-                    let bar = read_bar(&tt.marks_path);
-                    let now_bar = bar.tradable();
-                    // Edge-triggered, like `feed_reason`: the four hours the
-                    // armed session spent firing against a frozen bar produced
-                    // not one line saying so, and a line every stats tick is a
-                    // line nobody reads. `take_take_bar_apr` in the summary
-                    // above renders `None` as null, which is the standing
-                    // signal.
-                    if now_bar.is_some() != tt_bar.is_some() {
-                        eprintln!("[take-take] {}", bar.describe());
-                    }
-                    tt_bar = now_bar;
-                }
-            }
+            _ = feed_iv.tick(), if !bench => eng.health_tick(&mut quoters),
+            _ = stats_iv.tick(), if !bench => eng.stats_tick(),
         }
     }
 
-    if let Some(o) = out.as_mut() {
-        o.flush().expect("final flush");
-    }
-    // Anything still HELD has run out of chances to be explained: the loop is
-    // over, so no `order_ack` is coming for it. Say so once per fill rather than
-    // letting the process exit with the count buried in a gauge — and count it,
-    // so a bench/replay (which never runs the deadline above) still reports it.
-    for (id, u) in std::mem::take(&mut unclaimed_fills) {
-        n_unattributed += 1;
-        eprintln!(
-            "[fill] UNEXPLAINED at exit: {}x on {} {} reported as order {id}, never claimed by \
-             an order_ack. Money moved in this account that the engine cannot attribute — \
-             RECONCILE BY HAND.",
-            u.cum,
-            u.venue.as_str(),
-            u.market_id
-        );
-    }
-    let mut s = summary!();
-    if cfg.bench {
-        s["sha256"] = serde_json::json!(format!("{:x}", digest.finalize()));
-    }
-    s
+    eng.finish()
 }
 
 #[cfg(test)]
