@@ -40,7 +40,7 @@ fn status_of(r: &Value) -> &str {
 /// A correction is appended when a recorded value proves wrong (a hedge
 /// response lost to a 429 that recorded avg_price=0). `fields` are
 /// shallow-merged — a `legs` value replaces the whole list.
-fn apply_corrections(records: Vec<Value>) -> Vec<Value> {
+pub(crate) fn apply_corrections(records: Vec<Value>) -> Vec<Value> {
     let mut fixes: HashMap<Key, serde_json::Map<String, Value>> = HashMap::new();
     for r in &records {
         if status_of(r) == "correction" {

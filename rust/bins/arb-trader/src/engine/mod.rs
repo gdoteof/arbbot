@@ -75,6 +75,13 @@ pub struct RunCfg {
     /// every armed run still reported `mode: "shadow"` — the dashboard and any
     /// log-based monitor would say NOT TRADING while it placed real orders.
     pub armed: bool,
+    /// Contracts this unit's PREVIOUS run owed a hedge for and never booked,
+    /// counted at startup by `orphan::undischarged`. Carried only to be
+    /// reported: the standing gauge is the half of that census a monitor sees,
+    /// and it is what makes `hedges_pending: 0` honest after a restart that
+    /// forgot an obligation (2026-07-29 01:34). The engine never acts on it —
+    /// `orphan` documents why the second hedger would be a double hedge.
+    pub hedges_undischarged: u64,
 }
 
 /// Immediately-executable crossings, tested on the book event that creates
@@ -529,6 +536,13 @@ impl Engine {
                 self.parked_cancels.values().filter(|p| p.escalated).count(),
             "cancels_escalated": self.n_cancel_escalated,
             "hedges_pending": self.pending_hedges.len(),
+            // ...of which THIS process knows nothing: contracts a previous run
+            // owed a hedge for and never booked. `hedges_pending` counts only
+            // what is live in memory, so it read 0 after the 01:34 restart on
+            // 2026-07-29 while a PM-US short was still real at the venue. This
+            // is the standing signal that it is not the whole story;
+            // arbbot-hedge.timer is what completes them (see `orphan`).
+            "hedges_undischarged": self.cfg.hedges_undischarged,
             "hedges_retried": self.n_retry,
             "hedges_naked": self.n_naked,
             // Hedge contracts filled beyond what an obligation owed — a
@@ -1074,6 +1088,7 @@ fn test_cfg() -> RunCfg {
         hedge_retry: None,
         take_take: None,
         armed: false,
+        hedges_undischarged: 0,
     }
 }
 
@@ -1251,6 +1266,7 @@ mod feed_wiring_tests {
             hedge_retry: None,
             take_take,
             armed: false,
+            hedges_undischarged: 0,
         }
     }
 
