@@ -13,6 +13,18 @@ serde = { version = "1", features = ["derive"] }
 # alone. Nothing on the hot path parses one (feed timestamps are integer
 # nanoseconds and prices are strings all the way to `dec`), and the golden
 # digest is unchanged by it.
+#
+# It is NOT confined to the intent round-trip that found it, so be clear about
+# what it does move. The periodic readers that DO parse a float are the ones
+# that decide with it: `taketake::blended_apr` reads `cost_usd` /
+# `locked_profit_usd` out of marks.json to compute the take-take bar, `risk`
+# reads `bankroll_usd` / `per_class_cap`, and `ledger` reads a booked `qty`.
+# A correctly-rounded parse moves any of those by at most one ULP — ~2e-15 on a
+# 10%/yr bar — and moves it TOWARD the value the writer intended, so the only
+# decision it can flip is one already sitting within 2e-15 of a threshold. That
+# is the safe direction and the accurate one; it is recorded here because
+# "nothing on the hot path" is true and would still be the wrong thing to
+# reassure yourself with.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # Lint policy. All 16 members opt in with `[lints] workspace = true`.
