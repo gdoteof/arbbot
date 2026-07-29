@@ -380,6 +380,29 @@ mod tests {
         tokio::io::BufReader::new(UnixStream::connect(dir.join("t.sock")).await.expect("connect"))
     }
 
+    /// Connected AND REGISTERED — which are not the same instant, and the gap
+    /// between them is what hung this file.
+    ///
+    /// `UnixStream::connect` returns as soon as the kernel queues the connection
+    /// on the listener's backlog. The welcome burst and the push into `subs`
+    /// happen later, on the accept task, and only once it has won the CORE lock
+    /// — which `std::sync::Mutex` hands to nobody in particular, so a feed
+    /// thread re-locking in a tight loop can barge past it for the whole run.
+    /// Everything published in that window goes to an EMPTY subscriber list,
+    /// including the `END` sentinel `wire` blocks on, and then the read never
+    /// returns.
+    ///
+    /// That is the whole of the 2026-07-29 "deadlock": no lock was ever held by
+    /// anyone. Waiting on the registration is the difference between a test that
+    /// hangs at 0% CPU and one that cannot.
+    async fn subscribed(dir: &Path, core: &Core) -> tokio::io::BufReader<UnixStream> {
+        let reader = subscribe(dir).await;
+        while core.broadcaster.subscriber_count() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        reader
+    }
+
     /// Everything the subscriber saw, in wire order, up to the sentinel.
     async fn wire(reader: &mut tokio::io::BufReader<UnixStream>) -> Vec<(String, String, u64)> {
         let mut out = Vec::new();
@@ -433,7 +456,9 @@ mod tests {
     async fn a_rebroadcast_never_trails_a_newer_delta_with_an_older_snapshot() {
         let dir = tmpdir("rebroadcast");
         let core = seeded(&dir).await;
-        let mut reader = subscribe(&dir).await;
+        // registered, not merely connected — see `subscribed`. Nothing is
+        // publishing yet, so the accept task takes the core lock uncontended.
+        let mut reader = subscribed(&dir, &core).await;
         let collect = tokio::spawn(async move { wire(&mut reader).await });
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -488,9 +513,14 @@ mod tests {
     /// Cannot spuriously PASS, for the same reason: after the fix the welcome
     /// is built and registered under the core lock, so `on_event` cannot
     /// publish inside that window at all and the delta run is contiguous by
-    /// construction. It CAN fail RED if the accept loop loses a race and the
-    /// subscriber lands after the feed is done — the `connected too late`
-    /// assertion says so rather than passing on an empty proof.
+    /// construction.
+    ///
+    /// It used to be able to HANG rather than fail, which is strictly worse than
+    /// either colour: the feed was a fixed 5000 events and the accept task only
+    /// had to lose the core lock for all of them, after which the sentinel was
+    /// published to nobody and the read blocked forever at 0% CPU. The feed now
+    /// runs until the subscriber is registered, so the subscriber cannot land
+    /// after the feed is done and there is no race left to lose.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_subscriber_connecting_mid_feed_loses_nothing() {
         let dir = tmpdir("welcome");
@@ -501,8 +531,26 @@ mod tests {
             let core = core.clone();
             tokio::task::spawn_blocking(move || {
                 started.send(()).expect("feed start");
-                for seq in 2..=DELTAS + 1 {
+                // Deltas UNTIL the subscriber is registered, then a fixed run
+                // after it. The fixed `2..=DELTAS+1` this replaces could run out
+                // first — the accept task only has to lose the core lock for
+                // ~5000 iterations, which is what CPU contention makes it do —
+                // and then `publish(END)` below went to an empty subscriber list
+                // and `wire` waited forever for a sentinel already dropped on
+                // the floor.
+                //
+                // Gating the feed on the registration makes "connected mid-feed"
+                // true BY CONSTRUCTION rather than by winning a race, and it
+                // cannot deadlock: the accept task needs only the core lock,
+                // which this loop releases between every event.
+                let mut seq = 2;
+                while core.broadcaster.subscriber_count() == 0 {
                     core.on_event(&delta(seq));
+                    seq += 1;
+                }
+                for _ in 0..DELTAS {
+                    core.on_event(&delta(seq));
+                    seq += 1;
                 }
             })
         };
@@ -517,9 +565,17 @@ mod tests {
             .filter(|(_, m, _)| m == HOT)
             .map(|(k, _, s)| (k, s))
             .collect();
+        // Guaranteed by the feed gate above rather than hoped for: the connect
+        // lands mid-feed, so AT LEAST DELTAS events follow the welcome (exactly
+        // DELTAS, plus however many the feed emitted between the registration
+        // and its next check of it). The two "connected too late" assertions
+        // this replaces were the same race, checked for after the fact.
+        assert!(
+            hot.len() > DELTAS as usize,
+            "the feed ran out before the connect: {} {HOT} lines, want > {DELTAS}",
+            hot.len()
+        );
         assert_eq!(hot[0].0, "snapshot", "first {HOT} line is the welcome snapshot");
-        assert!(hot.len() > 1, "connected too late to see any delta");
-        assert!(hot[0].1 < DELTAS, "connected too late for this to prove anything");
         for (i, (kind, seq)) in hot.iter().enumerate() {
             let want = hot[0].1 + i as u64;
             // abs_diff, not `seq - want`: format args are evaluated only on

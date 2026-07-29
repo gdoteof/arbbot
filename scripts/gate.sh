@@ -86,6 +86,72 @@ T_DIGEST=300      # observed ~4-5s of replay per run (`elapsed_s` in the summary
 # status regardless, so a code nobody anticipated cannot become a pass.
 is_timeout() { [ "$1" = 124 ] || [ "$1" = 125 ]; }
 
+# Run a cargo stage bounded by `timeout`, in a process group of its own, and
+# REAP whatever is left in that group afterwards. Output lands in $STAGE_OUT.
+#
+# Measured 2026-07-29 against a genuinely hung `cargo test` (arb-recorder's
+# core::tests, registration delayed past the sentinel): `timeout` DOES signal the
+# whole process group here, rc=124 at the bound with zero surviving
+# `arb_recorder-*` binaries. So the group kill below is not what stops the
+# orphaning today — it is what NOTICES if that ever stops being true, which is
+# the same reason every other check in this file exists.
+#
+# The hole it DOES close is the one shaped like cargo: the direct child dies on
+# TERM, a GRANDCHILD survives, and the survivor still holds the stdout it
+# inherited. `timeout` returns 124 at the bound, but `out=$(...)` then blocks on
+# the capture pipe until that survivor exits. Measured 2026-07-29 with a
+# grandchild ignoring TERM for 40s:
+#
+#   out=$(timeout 3 victim)   -> rc=124, but 40s elapsed   (13x past its bound)
+#   run_stage 3 victim        -> rc=124, 3s elapsed, leftover group reported+reaped
+#
+# The gate sitting there in silence is the exact failure the budgets above were
+# added to remove, so a bound that a survivor can extend is not a bound. Two
+# deadlocked test binaries accumulated in one session on 2026-07-29, one of them
+# parked in futex_do_wait for 63 minutes at 0% CPU, and nothing reaped them.
+#
+# Hence both halves: a FILE instead of a pipe, so no survivor can hold the
+# capture open, and a group kill after `wait` returns, so no survivor outlives
+# the stage. `setsid` does not fork when the caller is not already a process
+# group leader (a script's background job is not), so `$!` is the group leader —
+# but the pgid is read back from `ps` rather than assumed, because if that ever
+# changed, `kill -- -$!` would signal the WRONG GROUP.
+#
+# What it does NOT do is bound a DIRECT child that ignores TERM: `timeout` waits
+# for that child, so `wait` here does too, and the reap only runs afterwards.
+# Nothing short of a watchdog fixes that, and it is not worth one — cargo, rustc
+# and libtest binaries all die on TERM, which is why the real stages are bounded.
+# Measured against a genuinely hung `cargo test`: rc=124 at the bound, zero
+# surviving `arb_recorder-*`.
+#
+# No `-k`. See the note above: every spelling of it turns a normal timeout's 124
+# into 125 on this implementation, and still does not bound a TERM-ignoring
+# child. The reaping below is what -k is usually reached for, and it works.
+#
+# The two digest stages deliberately keep their inline `timeout`: `arb-trader` is
+# timeout's DIRECT child and spawns nothing, so there is no group to leak, and
+# their `| tail -1` needs the pipeline this helper replaces with a file.
+STAGE_OUT=
+run_stage() {
+  local secs="$1"; shift
+  local f pid pgid rc
+  f=$(mktemp)
+  setsid timeout "$secs" "$@" > "$f" 2>&1 &
+  pid=$!
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  wait "$pid"; rc=$?
+  STAGE_OUT=$(cat "$f")
+  rm -f "$f"
+  # A non-empty group after the stage has exited is a leak. Say so — silently
+  # cleaning it up would hide the regression this exists to catch.
+  if [ -n "$pgid" ] && kill -0 -- "-$pgid" 2>/dev/null; then
+    echo "      NOTE: process group $pgid outlived the stage; killing it. \`timeout\`"
+    echo "            no longer reaps the group, so a stage can leak a wedged binary."
+    kill -9 -- "-$pgid" 2>/dev/null
+  fi
+  return $rc
+}
+
 for a in "$@"; do
   case "$a" in
     --skip-digest) skip_digest=1 ;;
@@ -137,8 +203,8 @@ fi
 echo "BASE: up to date with origin/main"
 
 echo "--- 1/6 build (workspace, release) ---"
-bout=$(timeout $T_BUILD nice -n 19 cargo build --workspace --release --manifest-path "$ROOT/rust/Cargo.toml" 2>&1)
-brc=$?
+run_stage $T_BUILD nice -n 19 cargo build --workspace --release --manifest-path "$ROOT/rust/Cargo.toml"
+brc=$?; bout=$STAGE_OUT
 echo "$bout" | tail -3
 if is_timeout $brc; then
   echo "BUILD: FAIL — TIMED OUT after ${T_BUILD}s (suspect a hang, not slowness)"; fail=1
@@ -149,8 +215,8 @@ else
 fi
 
 echo "--- 2/6 test (workspace) ---"
-tout=$(timeout $T_TEST nice -n 19 cargo test --workspace --manifest-path "$ROOT/rust/Cargo.toml" 2>&1)
-trc=$?
+run_stage $T_TEST nice -n 19 cargo test --workspace --manifest-path "$ROOT/rust/Cargo.toml"
+trc=$?; tout=$STAGE_OUT
 if is_timeout $trc; then
   echo "TEST: FAIL — TIMED OUT after ${T_TEST}s (suspect deadlock, not slowness)"
   echo "      2026-07-29: arb-recorder core::tests hung here with 1.16s of CPU"
@@ -187,8 +253,8 @@ else
 fi
 
 echo "--- 3/6 clippy (all targets, workspace) ---"
-cout=$(timeout $T_CLIPPY nice -n 19 cargo clippy --all-targets --workspace --manifest-path "$ROOT/rust/Cargo.toml" 2>&1)
-crc=$?
+run_stage $T_CLIPPY nice -n 19 cargo clippy --all-targets --workspace --manifest-path "$ROOT/rust/Cargo.toml"
+crc=$?; cout=$STAGE_OUT
 nw=$(echo "$cout" | grep -cE '^(warning|error)')
 if is_timeout $crc; then
   echo "CLIPPY: FAIL — TIMED OUT after ${T_CLIPPY}s (suspect a hang, not slowness)"; fail=1
@@ -206,8 +272,8 @@ else
 fi
 
 echo "--- 4/6 determinism (synthetic tape) ---"
-dout=$(timeout $T_DETERMINISM nice -n 19 cargo test -p arb-trader --test determinism --manifest-path "$ROOT/rust/Cargo.toml" 2>&1)
-drc=$?
+run_stage $T_DETERMINISM nice -n 19 cargo test -p arb-trader --test determinism --manifest-path "$ROOT/rust/Cargo.toml"
+drc=$?; dout=$STAGE_OUT
 if is_timeout $drc; then
   echo "DETERMINISM: FAIL — TIMED OUT after ${T_DETERMINISM}s (suspect a hang)"; fail=1
 elif [ $drc -ne 0 ]; then
