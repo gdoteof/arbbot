@@ -108,21 +108,35 @@ nice -n 19 rust/target/release/arb-shadow-gate \
 #    day and knows nothing about any other run, so consecutiveness is checked
 #    here or nowhere. Read the FILENAMES, not just the verdicts: seven PASS
 #    lines can be seven runs in one afternoon.
+#    `shopt -s nullglob` so that a run before any report exists prints nothing
+#    instead of handing grep the literal string `data/reports/shadow-gate-*.txt`
+#    — which reads as "no such file", not as "no gate has ever run".
+shopt -s nullglob
 for f in data/reports/shadow-gate-*.txt; do
     printf '%s ' "$f"; grep 'SHADOW GATE' "$f" | tail -1
 done | tail -10
+shopt -u nullglob
 ```
 
 Each report may hold several runs (the unit appends), so the LAST `SHADOW GATE:`
-line in a file is that file's verdict — which is what the loop prints. Three
+line in a file is that file's verdict — which is what the loop prints. Four
 outcomes, and they are deliberately distinguishable from one another:
 
 | last line | meaning |
 |---|---|
 | `SHADOW GATE: PASS` | that day is green |
 | `SHADOW GATE: FAIL` | the gate ran and decided against you; the reasons are listed just above it |
-| `SHADOW GATE: NO VERDICT` | the run was KILLED before it decided — a start timeout, an OOM kill, a Ctrl-C. **Not a green day and not a missing day.** Re-run it |
+| `SHADOW GATE: NO VERDICT` | the run was KILLED before it decided — a start timeout, an OOM kill, a Ctrl-C, or a bad flag on a hand-run. **Not a green day and not a missing day.** See below before re-running |
 | no file at all | the gate did not run that day |
+
+`NO VERDICT` is not automatically "re-run it". Check `systemctl --user status
+arbbot-shadow-gate.service` first: an OOM kill or a `TimeoutStartSec=600`
+timeout means something took four times longer than a full run, and re-running
+into the same wedge just burns another ten minutes. The one hang this stage was
+built to find — a recorder that has stopped calling `accept()` — no longer
+lands here: `connect()` is bounded and reports `SHADOW GATE: FAIL` naming the
+socket, because a wedged recorder answering as "killed, re-run me" is an
+instruction to loop.
 
 ```bash
 # 3. nothing in flight. An unhedged leg across a feed change is the one thing
@@ -279,7 +293,7 @@ afterwards.
   See §1. Two consequences of the old image, both now historical: its welcome
   burst still enqueued before it registered (the LOSS window PR #27 closed), and
   every piece of shadow evidence quoted for M1 — the tape volume comparison, the
-  dedup census, the subscriber proof in this document — was gathered against it.
+  universe census, the subscriber proof in this document — was gathered against it.
   **None of that is evidence about the binary that would be cut over to.** The
   soak clock starts at the restart, not at the date on this document, and the
   gate's `running_image_verdict` is what stops the same thing happening again.
@@ -299,12 +313,17 @@ afterwards.
   `size` does not. Compare `pmus.rs:54` and `:55`. This is why the gate is red;
   it is a cutover blocker for the tape, and it needs the `quantity` units
   question settled (USD notional, not contracts) before it is fixed.
-* The Rust recorder drops consecutive-identical snapshots, so any window-shaped
-  view of its tape covers fewer markets than Python's — 66 fewer on PM-US over
+* **Rust PM-US is WS-event-driven; Python polls.** So any window-shaped view of
+  the Rust tape covers fewer markets than Python's — 66 fewer on PM-US over
   900s on 2026-07-29. Censused, not sampled: **all 66** appear in the same day's
   Rust tape, between 15 and 8,558 times each. Nothing is lost and the welcome
   burst carries all of them, but a backtest that slices the Rust tape by a short
   window will see a smaller universe than the same slice of the Python tape.
+  (This was previously written up as the Rust recorder "deduping
+  consecutive-identical snapshots". **There is no dedup in the recorder** —
+  `Core::on_event` writes every event it is handed. The measured difference is
+  19.4% consecutive-identical lines on Python PM-US against 2.2% on Rust, which
+  is polling versus event-driven, and the practical consequence is unchanged.)
 * **The welcome-coverage check cannot see a book that is tracked but stale.** It
   asks whether the recorder HAS a market, not whether it is still refreshing it.
   `[pm-ws] resnapshot sweep: 3/111 books did NOT refresh — their age is now

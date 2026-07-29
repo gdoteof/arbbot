@@ -18,18 +18,20 @@
 //!    disconnects") — an EOF here IS the broadcaster's eviction, which is
 //!    silent on the client and only says so on the recorder's stderr (PR #27,
 //!    `47e3c9b`);
-//!  * no `GapDetected` ("gap counter"), i.e. nothing was lost mid-stream. This
-//!    is SHARP here in a way it is not on the tape, and the reason is the same
-//!    property that makes it useless there: the recorder numbers each market's
-//!    events +1 itself (`SeqCounter::next`) at the moment it publishes them, so
-//!    the sequence a subscriber receives is contiguous BY CONSTRUCTION. A hole
-//!    in it is not a venue renumbering or a resubscribe — it is a frame the
-//!    fan-out numbered and this subscriber never got. Nothing else can produce
-//!    one. See the long comment in `main.rs`'s tape gating for the other half.
-//!    The same property bounds what it can see: loss UPSTREAM of the numbering
-//!    — a message the venue sent and the recorder never received — is invisible
-//!    here, because the +1 counter closes over it. That direction is the
-//!    recorder's own `[hb] gaps=` counter, read by hand in §1 of the runbook;
+//!  * no `GapDetected` ("gap counter"). The sequence a subscriber receives is
+//!    the recorder's own per-market +1 (`SeqCounter::next`), not the venue's,
+//!    so a hole is never a venue renumbering or a resubscribe. It is ONE of two
+//!    things, and the claim that it could only be the first was retracted from
+//!    here: either a frame the fan-out numbered and this subscriber never got,
+//!    or a number the recorder SPENT on a call that then failed —
+//!    `pmintl.rs:344`, `kalshi.rs:304`, `pmus.rs:218` all bump the counter
+//!    before a fallible `.await` and drop it on `Err`. That second reading is
+//!    the recorder defect filed separately; the long comment in `main.rs`'s
+//!    tape gating carries the measurement and the way to tell the two apart.
+//!    What no reading of it can see is loss UPSTREAM of the numbering — a
+//!    message the venue sent and the recorder never received — because the +1
+//!    counter closes over it. That direction is the recorder's own `[hb] gaps=`
+//!    counter, read by hand in §1 of the runbook;
 //!  * no `NotSynced` — a delta for a market whose snapshot never arrived is a
 //!    HOLE IN THE WELCOME BURST, which is exactly the loss PR #27 fixed and the
 //!    only way to see it from outside is to be a subscriber;
@@ -131,13 +133,17 @@ pub struct StreamCheck {
 ///
 /// This is the universe check, and it lives here rather than on the tape side
 /// on purpose. Comparing the two TAPES over a window answers the wrong
-/// question: the Rust recorder drops consecutive-identical snapshots, so a
-/// market whose book has not moved for the length of the window is simply
-/// absent from its recent tape and present in Python's. Censused rather than
-/// sampled on 2026-07-29 — all 66 PM-US markets missing from a 900s Rust window
-/// appear in the SAME DAY's Rust tape, between 15 and 8,558 times each. Every
-/// one. That difference is the dedup working, and gating on it would make this
-/// gate cry wolf every single day.
+/// question. This used to say the reason was that "the Rust recorder drops
+/// consecutive-identical snapshots"; it does not, and there is no dedup in the
+/// recorder at all — `Core::on_event` writes every event it is handed. The
+/// reason is that Rust PM-US is WS-EVENT-DRIVEN while Python POLLS, so a market
+/// nothing happened to inside the window produces Rust lines only if the venue
+/// pushed a frame, and Python lines regardless. Measured: 19.4% of consecutive
+/// Python PM-US lines repeat their predecessor against 2.2% of Rust's. Censused
+/// rather than sampled on 2026-07-29 — all 66 PM-US markets missing from a 900s
+/// Rust window appear in the SAME DAY's Rust tape, between 15 and 8,558 times
+/// each. Every one. Gating on that difference would make this gate cry wolf
+/// every single day.
 ///
 /// The welcome burst has far less ambiguity: it is one snapshot per book the
 /// recorder is CURRENTLY TRACKING, so a market missing from it is a market the
@@ -230,7 +236,12 @@ impl StreamCheck {
             ));
         }
         if self.gaps > 0 {
-            return Err(format!("{} sequence gap(s) on the wire — events were lost", self.gaps));
+            return Err(format!(
+                "{} sequence gap(s) on the wire: either a frame this subscriber never got, or a \
+                 number the recorder spent on a call that failed (pmintl.rs:344, kalshi.rs:304). \
+                 Check the venue's resnapshot-failure line before reading it as loss",
+                self.gaps
+            ));
         }
         if self.undecodable > 0 {
             return Err(format!("{} line(s) the subscriber could not decode", self.undecodable));
@@ -501,7 +512,7 @@ mod tests {
     }
 
     /// The universe check, in the only place it can be answered without
-    /// confusing a deduped feed for a lossy one.
+    /// confusing an event-driven feed for a lossy one.
     #[test]
     fn the_welcome_burst_is_where_a_coverage_hole_is_visible() {
         let mut c = StreamCheck::new();

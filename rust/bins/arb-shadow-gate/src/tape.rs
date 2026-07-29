@@ -9,9 +9,15 @@
 //! `docs/migration-plan.md` (parse-compat) and one is a repair of a clause that
 //! could not be checked as written: "gap counter <= Python's" compares two
 //! numbers that do not measure the same thing, so what is gated is `rust == 0`.
-//! The reasoning is in `main.rs`, at the check. The MARKET UNIVERSE is not
-//! gated here at all — the plan does not ask for it, and asking it of a deduped
-//! tape is how this gate cried wolf on 66 markets that were never missing. The
+//! The reasoning, the measurement and the two ways to read a hole are in
+//! `main.rs`, at the check. NOTE THAT `rust == 0` CANNOT FIRE ON
+//! `polymarket_us`: that venue's tape carries snapshots and trades and no
+//! deltas at all, and `GapDetected` only comes from `apply_delta`. Parse-compat
+//! is the whole of the tape stage there.
+//!
+//! The MARKET UNIVERSE is not gated here at all — the plan does not ask for it,
+//! and asking it of a tape whose recorder is event-driven while Python's polls
+//! is how this gate cried wolf on 66 markets that were never missing. The
 //! welcome burst answers it in `live.rs`.
 //!
 //! `undecodable` and `bad_field` are both counted over the WHOLE TAIL SLICE and

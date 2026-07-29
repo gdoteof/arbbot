@@ -32,11 +32,31 @@
 //!    `data/reports/`, in §1 of `docs/recorder-cutover-runbook.md`, and that
 //!    grep is the only thing standing behind that clause.
 //!  * **"parse-check PASS on every day in the window"** is under-covered. This
-//!    gate decodes a byte-bounded TRAILING SLICE of the CURRENT day — roughly
-//!    1% of a 6 GB tape — and never invokes `arb-recorder --parse-check`, which
-//!    is the thing that reads a whole file. Each venue's line prints the slice
-//!    size against the file size so the shortfall is on the report rather than
-//!    in a reader's head.
+//!    gate decodes a byte-bounded TRAILING SLICE of the CURRENT day — 256 MiB,
+//!    which is 4-6% of the 3.8-6.6 GB these tapes reach — and never invokes
+//!    `arb-recorder --parse-check`, which is the thing that reads a whole file.
+//!    Measure that shortfall in BYTES, not in the 900s window: `tape.rs` counts
+//!    `undecodable` and `bad_field` over the whole slice on purpose, so the
+//!    SLICE is what parse-compat covers, and 900s/86400s = 1% understates it by
+//!    4-6x. Each venue's line prints slice against file size so the number is
+//!    on the report rather than in a reader's head.
+//!  * **On `polymarket_us` the gap check cannot fire at all**, so the tape
+//!    stage on that venue is parse-compat and nothing else.
+//!    `pmus::parse_ws_message` emits only `Snapshot` and `Trade`;
+//!    `BookBuilder::apply_event` inserts snapshots unconditionally and returns
+//!    `Ok(())` for trades, so `GapDetected` has no reachable call path.
+//!    Measured on the 2026-07-29 Rust tape: 6,582,352 snapshots, 0 deltas, and
+//!    the same 0 deltas over the 256 MiB slice the gate actually reads. That is
+//!    the venue carrying the most bytes of the three, and the one this PR names
+//!    as corrupt.
+//!  * **"Compared" here means BOTH TAPES HAD EVENTS, not that the two tapes
+//!    were diffed.** Every GATING check in the tape stage reads the RUST tape
+//!    only — `undecodable`, `bad_field`, `gaps`. The Python side gates on
+//!    exactly one thing, that its window is non-empty; its market set is then
+//!    handed to the live stage, where the only two-sided GATE in this binary
+//!    lives (welcome coverage). Volume and TOB agreement are two-sided and
+//!    advisory, as they were in the Python gate. Widening that is a design
+//!    question, not a wording one.
 //!  * Three of the checks here — welcome coverage, `bad_field`, and the
 //!    running-image verdict — are ADDITIONS with no clause behind them. That is
 //!    deliberate; what would be wrong is claiming every check is a clause.
@@ -85,8 +105,13 @@ fn parse_args() -> Args {
         py_dir: "data/raw".into(),
         rs_dir: "data/raw-rs".into(),
         window_s: 900,
-        // 256 MiB covers 900s of the busiest venue with room to spare
-        // (PM-US ran ~72 KB/s on 2026-07-29) and bounds a 6 GB tape.
+        // 256 MiB covers 900s of the busiest venue with room to spare and
+        // bounds a multi-GB tape. Measured on PM-US's own Rust tape: 48 KB/s
+        // over the whole of 2026-07-28 (4,180,061,342 B / 86,400 s), 58 KB/s
+        // over the trailing slice. 256 MiB at the trailing rate reaches back
+        // 4,616 s = 77 min against a 900 s window — the same measurement as the
+        // "~75 minutes" quoted at the empty-window check below, and the two
+        // must move together.
         tail_bytes: 268_435_456,
         sample_s: 60,
         tolerance: 0.01,
@@ -289,13 +314,69 @@ fn tape_stage(a: &Args, fails: &mut Vec<String>) -> HashMap<&'static str, HashSe
         // like thousands of holes when replayed per-market. The two sides were
         // not measuring the same quantity, so `rust > python` was `0 > N`.
         //
-        // What `rust > 0` means is sharp precisely BECAUSE the sequence is
-        // synthetic: every event the recorder numbered n+1 was numbered while
-        // holding the same lock it writes under, so a hole between two applied
-        // events in the file means a line the recorder numbered never reached
-        // the tape — a failed write, a truncation, or an undecodable line in
-        // the middle of the slice. That is a real, reachable loss, and it is
-        // the only gap question a tape can answer.
+        // RETRACTED, and this is the second time this check's justification has
+        // been wrong. It used to read: "every event the recorder numbered n+1
+        // was numbered while holding the same lock it writes under, so a hole
+        // means a line the recorder numbered never reached the tape". THAT IS
+        // FALSE. `SeqCounter::next` (`arb-recorder/src/core.rs:92`) is a plain
+        // `HashMap` bump in the VENUE TASK; the core mutex is taken later, in
+        // `Core::on_event` (`core.rs:115`). Nothing ties the two together, and
+        // there are call sites that SPEND a number and then drop it:
+        //
+        //   pmintl.rs:344  `let s = seq.next(tid);` then `clob.book(tid, s)`,
+        //                  `Err(_) => resnap.failed += 1` — number gone
+        //   pmintl.rs:309  the same shape on the gap-recovery resnapshot
+        //   kalshi.rs:304  the same shape around `catalog.orderbook_fp(t)`
+        //   kalshi.rs:405  `on_delta` returns None on a missing field, seq spent
+        //   pmus.rs:218    `catalog.book(slug, seq.next(slug)).await`
+        //
+        // A spent-and-dropped number leaves the NEXT delta one ahead of what
+        // `apply_delta` expects, which is read as a gap and DELETES the book
+        // (`arb-core/src/book.rs:159`). The repo already documents that exact
+        // consequence at `pmintl.rs:89`. So a hole here is "a numbered event
+        // that is not in the file", which is a WEAKER claim than "a line was
+        // lost" — the wording of the failure below says so.
+        //
+        // The check still GATES, and the reason is measurement rather than
+        // argument. Replaying the Rust tapes under this rule, in independent
+        // 900s windows the way `tape::replay` sees them (book state starts
+        // empty at the window edge, because the window filter runs before
+        // `apply_event`):
+        //
+        //   kalshi   2026-07-28   0 holes    0 of 95 windows red
+        //   kalshi   2026-07-29   0 holes    0 of 88 windows red
+        //   pm-us    2026-07-29   0 holes    0 of 88 windows red (see above:
+        //                                    it has no deltas, so it cannot)
+        //   pm-intl  2026-07-28   4,747      92 of 95 windows red
+        //   pm-intl  2026-07-29     800      18 of 88 windows red
+        //
+        // and the pm-intl reds are not spread across either day. On 07-29 they
+        // are windows 0..18 and nothing after: the last red window ends 04:30
+        // UTC, and `b1f990a` ("an INTL trade deleted its own market's book",
+        // ticket #13) landed at 00:42 local with a recorder restart behind it.
+        // The 69 windows after it — 17.25 consecutive hours, all three venues —
+        // hold ZERO holes. 07-28 is that same bug over a whole day before the
+        // fix. It burned a book sequence number on every trade, which is the
+        // spend-and-drop shape above, and this check is what would have caught
+        // it: 92 red windows against a real P1 that was deleting books.
+        //
+        // A resnapshot failure has NOT been observed to redden it, and the
+        // arithmetic that says it should (`[pm-ws] resnapshot sweep: 3/111
+        // books did NOT refresh` on most cycles, ~276 cycles/day, ~828 burns)
+        // does not survive the clustering: 828 burns spread over a day cannot
+        // produce 800 holes confined to its first four and a half hours. The
+        // three tokens that fail the sweep are evidently tokens the CLOB will
+        // not serve, and a token the CLOB will not serve sends no deltas to
+        // trip over the hole.
+        //
+        // WHEN IT DOES GO RED, READ IT LIKE THIS, because a gate that goes red
+        // for a benign reason nobody can diagnose is how the last one came to
+        // be ignored: 98.8% of the holes above are exactly ONE missing number,
+        // which is the signature of a single spend-and-drop. Check the venue's
+        // resnapshot-failure line and `[hb] gaps=` FIRST. A hole wider than one
+        // number, or one on a venue whose sweep is clean, is the tape-loss
+        // reading. The recorder defect itself is filed separately; fixing it
+        // means assigning the number after the `Ok`, and it is not this PR.
         //
         // The recorder's own `[hb] gaps=` counter is a DIFFERENT number again
         // (ingest-side `NotSynced` + `GapDetected` at the venue boundary, e.g.
@@ -308,8 +389,11 @@ fn tape_stage(a: &Args, fails: &mut Vec<String>) -> HashMap<&'static str, HashSe
                 fails,
                 format!(
                     "{} sequence hole(s) in the RUST tape slice: the recorder numbers its own \
-                     events +1 per market, so a hole is a numbered event that never reached the \
-                     file",
+                     events +1 per market, so a hole is a numbered event that is NOT in the file. \
+                     Two readings — a line was lost, or the recorder SPENT a number on a call that \
+                     then failed (pmintl.rs:344, kalshi.rs:304, pmus.rs:218). Check the venue's \
+                     resnapshot-failure line first; a hole wider than one number is the lost-line \
+                     reading",
                     rss.gaps
                 ),
             );
@@ -322,17 +406,32 @@ fn tape_stage(a: &Args, fails: &mut Vec<String>) -> HashMap<&'static str, HashSe
         );
 
         // --- ADVISORY. The universe difference between the two TAPES is one of
-        // these and not a gate: the Rust recorder dedups consecutive-identical
-        // snapshots, so a market whose book has not moved inside the window is
-        // absent from its tape and present in Python's, with nothing lost. The
-        // gating version of this question is asked of the WELCOME BURST in the
-        // live stage, where a missing market means the recorder does not have
-        // the book at all.
+        // these and not a gate, but NOT for the reason this comment used to
+        // give. It said "the Rust recorder dedups consecutive-identical
+        // snapshots". There is no dedup anywhere in the recorder:
+        // `Core::on_event` (`core.rs:114`) writes every event it is handed, and
+        // `JsonlWriter::write` appends unconditionally. Every emitter always
+        // emits.
+        //
+        // The real asymmetry is POLLED vs EVENT-DRIVEN. Rust PM-US runs
+        // `pmus::ws_task` when credentials exist (it does), so it emits only
+        // when the venue pushes a frame; Python polls on an interval and emits
+        // whether or not anything moved. Measured today: 19.4% of consecutive
+        // Python PM-US lines are identical to their predecessor against 2.2% of
+        // Rust's. So a market that has not traded inside the window is absent
+        // from the Rust tape because nothing happened to it, not because a
+        // duplicate was suppressed — same conclusion, different mechanism, and
+        // gating on it would still cry wolf.
+        //
+        // The gating version of this question is asked of the WELCOME BURST in
+        // the live stage, where a missing market means the recorder does not
+        // have the book at all.
         let missing = tape::missing_from_rs(&pys, &rss);
         if !missing.is_empty() {
             println!(
-                "  note: {} market(s) in the python window and not the rust one (dedup, or a \
-                 hole — the live stage decides), e.g. {:?}",
+                "  note: {} market(s) in the python window and not the rust one (python POLLS and \
+                 rust is event-driven, so a quiet market is absent from rust — or it is a real \
+                 hole; the live stage decides), e.g. {:?}",
                 missing.len(),
                 &missing[..missing.len().min(5)]
             );
