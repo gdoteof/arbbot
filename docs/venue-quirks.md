@@ -160,7 +160,7 @@ double-entry books. Together they make the Kalshi account reconcile to
 - **Venue:** kalshi
 - **What the API does:** WS sends `orderbook_snapshot` only on subscribe and on explicit `get_snapshot` request — and in practice the WS `get_snapshot` path produced ZERO snapshots (adversarial review, 2026-07-20). The auth-free REST orderbook endpoint works.
 - **Failure it caused:** a late/regapped subscriber waits forever for a snapshot (scanner-stuck-book bug, 2026-07-20).
-- **Current handling:** `src/arbbot/record/recorder.py:82-85` (welcome snapshots on connect), `:113-121` (30s rebroadcast heal), `:266-271` (periodic 300s re-snapshot request), `:298-305` (gap -> REST snapshot resync, not WS).
+- **Current handling:** `src/arbbot/record/recorder.py:82-85` (welcome snapshots on connect), `:113-121` (30s rebroadcast heal), `:266-271` (periodic 300s re-snapshot request), `:298-305` (gap -> REST snapshot resync, not WS). The Rust recorder — the production stack since 2026-07-28 — sends NO `get_snapshot` at any point: `rust/bins/arb-recorder/src/kalshi.rs` sweeps every book by REST on a 300s cycle (`resnap_slice`) and rebuilds a market whose snapshot was lost by REST from `on_ws_message`. The request was deleted in #32; a call the venue never answers was the only thing the gap branch did, which made a no-op look like a recovery.
 - **Port requirement:** On gap, resync via REST snapshot; push synthetic snapshots to (re)connecting subscribers; do not rely on the venue re-sending snapshots.
 
 ### `kalshi-market-data-auth-split`

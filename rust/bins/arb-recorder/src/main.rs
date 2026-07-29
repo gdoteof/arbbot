@@ -345,14 +345,33 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
                 if let Ok(statuses) = kalshi_catalog.statuses(&kalshi_tickers).await {
                     for (ticker, status) in statuses {
-                        if !matches!(status.as_str(), "active" | "open" | "") {
-                            core.evict_book(Venue::Kalshi, &ticker);
+                        // Symmetric, and the symmetry is the point. This is a
+                        // WHITELIST of live spellings, so anything the venue
+                        // invents evicts — which is the right way to fail, but
+                        // eviction now also removes the market from the 300s
+                        // integrity sweep. Kalshi's vocabulary is wider than
+                        // the terminal states (`inactive` appears in this
+                        // repo's captured catalog on markets whose close time
+                        // is years away), and the whitelist needing BOTH
+                        // "active" and "open" is evidence it has drifted
+                        // before. One-way, a single poll returning a spelling
+                        // this list has not learned would cost that market its
+                        // heal cadence for the life of the process. The else
+                        // branch costs one line and bounds that at one cycle.
+                        if matches!(status.as_str(), "active" | "open" | "") {
+                            core.restore_book(Venue::Kalshi, &ticker);
+                        } else {
+                            core.evict_book(Venue::Kalshi, &ticker, &format!("status {status:?}"));
                         }
                     }
                 }
+                // No symmetry available here: `closed_tokens` reports only the
+                // closed ones, so a token's absence is not a statement that it
+                // is live. Polymarket eviction stays one-way — and pmintl's
+                // sweep does not consult it yet either.
                 if let Ok(closed) = clob.closed_tokens(&pm_tokens).await {
                     for tok in closed {
-                        core.evict_book(Venue::Polymarket, &tok);
+                        core.evict_book(Venue::Polymarket, &tok, "gamma: closed");
                     }
                 }
             }
