@@ -1005,6 +1005,27 @@ impl Engine {
     }
 }
 
+/// How many feed events `run` may process before the deadline arms below are
+/// owed a turn.
+///
+/// `biased` polls the select's arms in declaration order and takes the first
+/// READY one, and `rx.recv()` on a non-empty channel is always ready — so with
+/// no cap the kill switch, the hedge retry and the naked alarm are not
+/// deadlines at all, they are when-idle callbacks. Backlogs are structural, not
+/// hypothetical: the recorder rebroadcasts a snapshot for every book it holds
+/// every 30s and sends a ~1.4MB burst on connect, and `socket_feed` pushes all
+/// of it into the 65536-deep channel unpaced. The armed engine reported
+/// `chan_high_water: 1036` and a `decision_latency` max of 6_496_952_349 ns on
+/// 2026-07-29 — 6.5 seconds in which `data/KILL` was never stat'ed,
+/// `health_tick` did not run, and no hedge retry or naked alarm could fire. The
+/// thing that stopped the naked alarm was the market feed misbehaving, which is
+/// the one condition it exists to survive (see `engine::hedge`).
+///
+/// 64 is small enough to bound the halt at well under its 1s interval even at
+/// the drain rate that 6.5s window implies, and costs one extra loop iteration
+/// and six timer polls per 64 events — noise against a JSON parse per event.
+const FEED_BUDGET: usize = 64;
+
 pub async fn run(
     mut quoters: Vec<Quoter>,
     by_market: HashMap<(Venue, String), Vec<usize>>,
@@ -1032,11 +1053,18 @@ pub async fn run(
     let mut fill_iv = tokio::time::interval(std::time::Duration::from_secs(1));
     fill_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Unbounded in bench/replay: the budget never reaches zero, so both guards
+    // below are constant, the select polls exactly the arms it polled before in
+    // exactly the same order, and the digest is unchanged by construction. A
+    // cap that reordered replay would be a worse defect than the one it fixes.
+    let mut budget = if bench { usize::MAX } else { FEED_BUDGET };
+
     loop {
         tokio::select! {
             biased;
-            msg = rx.recv() => {
+            msg = rx.recv(), if budget > 0 => {
                 let Some(m) = msg else { break }; // feed closed (bench EOF)
+                budget -= 1;
                 let queued = rx.len();
                 eng.on_feed(m, queued, &mut quoters, &by_market);
             }
@@ -1060,6 +1088,14 @@ pub async fn run(
             // disconnect of its own feed.
             _ = feed_iv.tick(), if !bench => eng.health_tick(&mut quoters),
             _ = stats_iv.tick(), if !bench => eng.stats_tick(),
+            // The budget is spent and every deadline that was DUE has now had
+            // its turn: the arms above are polled first and this one is always
+            // ready, so it is reached only once none of them will fire. Refill
+            // and go back to the feed. It is `ready` rather than another timer
+            // because a deadline that is not due must not stall the feed —
+            // trading a 6.5s halt latency for a 1s decision latency is not a
+            // fix, it is the same defect pointing the other way.
+            _ = std::future::ready(()), if budget == 0 => budget = FEED_BUDGET,
         }
     }
 
@@ -1358,7 +1394,9 @@ mod feed_wiring_tests {
 
     /// Feed `lines`, then close the feed and let `run` return its summary. No
     /// timer arm can fire: `biased` polls the feed first and it is always ready
-    /// (message, then closed), which is what makes this deterministic.
+    /// (message, then closed), which is what makes this deterministic — and
+    /// every caller stays well under `FEED_BUDGET`, which is what keeps that
+    /// true now that a long enough backlog deliberately does yield to them.
     #[allow(clippy::type_complexity)]
     async fn drive(
         cfg: RunCfg,
@@ -1491,6 +1529,56 @@ mod feed_wiring_tests {
         );
         assert_eq!(sum_s["take_take_bar_apr"], serde_json::Value::Null, "{sum_s}");
         assert_eq!(sum_s["take_take_found"], serde_json::json!(0), "{sum_s}");
+    }
+
+    /// THE deadline-starvation regression, and the reason `drive` above can
+    /// promise no timer arm fires: a pre-filled channel whose sender is dropped
+    /// is ready at EVERY poll — message, then closed — so under `biased` alone
+    /// the kill switch is never even looked at. That is not a test artifact.
+    /// Live on 2026-07-29 the armed engine reported `chan_high_water: 1036` and
+    /// a `decision_latency` max of 6_496_952_349 ns: 6.5 seconds of backlog in
+    /// which `data/KILL` — documented as a 1-second watch — was never stat'ed.
+    ///
+    /// The kill file is in place before the first event, so the ONLY question
+    /// the assert asks is whether the arm is ever polled. The backlog is many
+    /// times `FEED_BUDGET` because a `tokio` interval's first tick is not ready
+    /// the instant it is created — it becomes ready once the time driver has
+    /// run, which is a few hundred events and a few milliseconds in — so a
+    /// backlog of exactly one budget would prove nothing either way.
+    #[tokio::test]
+    async fn a_feed_backlog_cannot_starve_the_kill_switch() {
+        const BACKLOG: usize = 128 * FEED_BUDGET;
+        let kill = scratch("starving-KILL");
+        std::fs::write(&kill, "halt").unwrap();
+        let out = scratch("starving-intents.jsonl");
+        let mut cfg = cfg(&out, None, None);
+        cfg.kill_file = kill.to_string_lossy().into_owned();
+
+        let (quoters, by_market) = fixture();
+        let (tx, rx) = mpsc::channel(BACKLOG);
+        for _ in 0..BACKLOG {
+            tx.try_send(FeedMsg {
+                line: snapshot("kalshi", "K", "0.03", "0.04", 1_785_211_200.0),
+                t_read: std::time::Instant::now(),
+            })
+            .expect("test channel");
+        }
+        drop(tx);
+        let (txs, _rxs) = executors();
+        let summary = run(quoters, by_market, rx, txs, stats(), cfg).await;
+
+        assert_eq!(summary["events"], json!(BACKLOG), "the whole backlog drained");
+        assert_eq!(
+            summary["chan_high_water"],
+            json!(BACKLOG - 1),
+            "the depth behind the FIRST event: the feed arm was ready at every \
+             poll from here to the close, which is the starving shape: {summary}"
+        );
+        assert_eq!(
+            summary["killed"],
+            json!(true),
+            "a feed backlog must not be able to hide the halt: {summary}"
+        );
     }
 
     /// C5's logging half. The detector has refused crossed books since 4542e5f,
