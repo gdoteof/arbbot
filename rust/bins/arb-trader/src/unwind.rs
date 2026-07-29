@@ -33,6 +33,25 @@
 //! says which side of it a candidate falls on. `scripts/unwind_positions.py:282`
 //! refuses by the same kind of ownership contract and has since it was written.
 //!
+//! THE MISSING COST BASIS HAS A THIRD OPTION, and an arming author should not
+//! be left believing the only two are "guess one" and "build a Rust-side mark".
+//! `ledger::apply_corrections` (`ledger.py:26-52`) shallow-merges
+//! `{"status":"correction","corrects_ts":<the open record's ts>,"fields":{…}}`
+//! onto its target, and `open_baskets` folds corrections BEFORE
+//! `mark_positions.py:280-282` ever sees the record. The mechanism is in
+//! production for this class of defect — corrections carrying
+//! `cost_usd`/`profit_usd`/`legs` already sit in the ledger, though none has
+//! yet targeted an engine record — and the raw material is already written:
+//! `fill::book_basket` emits `qty` and `legs[].yes_price` for both legs, and
+//! `mark_positions.py` already imports `FeeSchedule`/`leg_fee`.
+//!
+//! It is still not free, and the DEPENDENCY is the real obstacle: a basis that
+//! is not merely an upper bound needs the venue FILL reports the engine does
+//! not read — which is what `fees_pending: true` is naming — and both cheap
+//! variants of this are Python edits, which the freeze forbids. So this is a
+//! route rather than a plan. But it is a cheaper route than a Rust-side mark,
+//! and the arming PR should cost it out before assuming otherwise.
+//!
 //! # 2. The signal FLAPS. A placer needs hysteresis
 //!
 //! RETRACTION. This file's first draft said the loop "cannot oscillate" because
@@ -50,15 +69,23 @@
 //!     shrinks the position — which pushes `apr_bar` up and the candidate set
 //!     out. That is a runaway, not a ratchet.
 //!   * "Only a fill moves exposure" is false at the ledger level too: the
-//!     ledger carries `correction`, `settlement` and `realized` records, and
-//!     `arbbot-settle.timer` and `arbbot-hedge.timer` both mutate the fold with
-//!     no engine fill involved.
+//!     ledger carries `correction` and `realized` records alongside `open` and
+//!     `unwound`, and `arbbot-settle.timer` and `arbbot-hedge.timer` both
+//!     mutate the fold with no engine fill involved. (An earlier draft listed
+//!     `settlement` among the statuses. It is not one — NO ledger record
+//!     carries `status: "settlement"`. `settlement` is a STRATEGY, and it
+//!     appears on `unwound` records: it is how a basket that ran to resolution
+//!     is closed out, not a fourth kind of record. Statuses and strategies are
+//!     different fields and this file conflated them.)
 //!   * And the INPUT oscillates on its own, with nothing of ours touching it.
-//!     Over 3435 marks samples spanning 127.5 h, one basket's `maker_exit_ct`
-//!     crossed the old half-cent floor 93 times — about every 82 minutes — and
-//!     just under half of all tracked baskets crossed it at least once. One
-//!     candidate went from clearing the floor to pricing a per-contract loss
-//!     in six minutes, untouched by any exit of ours.
+//!     Over 3464 marks samples spanning 128.5 h, one basket's `maker_exit_ct`
+//!     crossed the old half-cent floor 93 times — about every 83 minutes — and
+//!     just under half of all tracked baskets crossed it at least once.
+//!     **THE NEW FLOOR RELOCATES THAT FLAP; IT DOES NOT REDUCE IT.** Re-run the
+//!     same tape against two ticks and the worst basket crosses 91 times
+//!     instead of 93, and one fewer basket crosses at all. A placer's debounce
+//!     must be sized against ~90 crossings over five days, NOT budgeted down on
+//!     the theory that a higher floor bought quiet.
 //!
 //! What [`select`] is actually monotone in is the HURDLE: it is a threshold on
 //! a per-basket value the hurdle does not touch, so a lower hurdle always
@@ -69,13 +96,25 @@
 //! debounce is the arming PR's job; this module deliberately does not pretend
 //! the question is settled.
 //!
-//! # 3. The floor is sized in TICKS, because the input moves in ticks
+//! # 3. The floor is a STALENESS SCREEN. It is not a guarantee about the exit
 //!
-//! RETRACTION. The first draft inherited `mark_positions.py`'s `0.005`
-//! eligibility floor. Both legs price in one-cent ticks and `maker_exit_ct`
-//! carries unit coefficients on both touches (`∂mx/∂k_ask = +1`,
-//! `∂mx/∂p_ask = −1`), so ONE adverse tick on EITHER leg moves the number by a
-//! full cent — twice the old floor. See [`MIN_EXIT_CT`] for the derivation.
+//! RETRACTED TWICE. The first draft inherited `mark_positions.py`'s `0.005`
+//! eligibility floor, which is half of one tick on a one-tick grid. The second
+//! draft raised it to two ticks and argued the marks "move more than a tick
+//! inside" a writer period, "so" a candidate must clear "break-even after a
+//! single tick". The premise is right; the conclusion does not follow from it,
+//! and the tape refutes it by an order of magnitude. The very basket this
+//! file's own test calls "over the floor by more than a tick, so a tick of
+//! movement does not unmake it" went `+0.0312` → `−0.0721` across ONE writer
+//! period on 2026-07-29: **−10.3 ticks**. See [`MIN_EXIT_CT`], which now says
+//! what the floor does and, at more length, what it does not.
+//!
+//! AND THE QUANTITY IT SCREENS IS NOT THE PAYOFF. `maker_exit_ct` is a snapshot
+//! price of a LEGGED trade — rest a Kalshi ask, close the PM NO *when it fills*
+//! — and a resting ask fills preferentially when the book is moving against it.
+//! No static floor can fix that, and raising this one to ten ticks would select
+//! nothing with a different number. What fixes it is a check at FILL time,
+//! which is §5's fourth bullet and which nothing here does.
 //!
 //! # 4. The hurdle is an opportunity cost that may be unearnable
 //!
@@ -120,7 +159,19 @@
 //!     — card ed6a5910, 14 soft unwinds blocked. That is what
 //!     [`Exit::suppress_key`] is for, and it is computed and NOT installed here
 //!     because pulling the entry quote off a side and resting nothing in its
-//!     place is strictly worse than the status quo.
+//!     place is strictly worse than the status quo;
+//!   * RE-PRICE AT FILL TIME, against the book WITHOUT our own quotes, AND
+//!     ABANDON THE CLOSE IF IT NO LONGER PAYS. Nothing above does this, and
+//!     nothing in this module does either: [`MIN_EXIT_CT`] is checked once, at
+//!     SCAN time, against a snapshot that is up to one writer period old, and
+//!     the PM leg is then taken at whatever exists when the Kalshi ask fills —
+//!     preferentially the moment the book has moved against it. The frozen
+//!     Python ALREADY implements the missing half; `unwind_positions.py:80-83`
+//!     is the whole requirement in three lines: "RE-PRICE against the book
+//!     WITHOUT our own quotes … Only unwind if it is still profitable against
+//!     the real residual book." An arming author who reads §5 as a complete
+//!     list rests an ask, takes the PM leg at fill, and has performed no floor
+//!     check anywhere near the trade.
 //!
 //! # The rule itself
 //!
@@ -179,35 +230,65 @@ use arb_core::model::BookSide;
 /// not a modelling choice.
 const TICK_CT: f64 = 0.01;
 
-/// Minimum per-contract profit a maker exit must lock before it is worth
-/// resting: TWO TICKS, and the two are for different things.
+/// Minimum per-contract profit a maker exit must SHOW before it is worth
+/// reporting: TWO TICKS.
 ///
-/// `maker_exit_ct` is `k_exit + (1 - p_close) - basis - fees` with unit
-/// coefficients on both touches, so `∂mx/∂k_ask = +1` and `∂mx/∂p_ask = −1`:
-/// one adverse tick on EITHER leg costs a full [`TICK_CT`]. The old floor —
-/// inherited from `mark_positions.py`'s `mx >= Decimal("0.005")` eligibility
-/// test — was half of one tick on a one-tick grid, so half the candidates it
-/// admitted did not survive a single tick, and one of them did not survive six
-/// real minutes.
+/// THIS IS A SCREEN AGAINST A STALE SNAPSHOT. IT IS NOT A GUARANTEE ABOUT
+/// REALIZED EXIT VALUE, and the quantity it screens is not the payoff. Both
+/// halves of that sentence are corrections to the previous draft, which claimed
+/// two ticks bought "break-even after a single adverse tick".
 ///
-///   * ONE TICK for a KNOWN, DIRECTIONAL OVERSTATEMENT. `mark_positions.py:227`
+/// WHAT THE TWO TICKS ARE FOR. `maker_exit_ct` is
+/// `k_exit + (1 - p_close) - basis - fees` with unit coefficients on both
+/// touches, so `∂mx/∂k_ask = +1` and `∂mx/∂p_ask = −1`: one adverse tick on
+/// EITHER leg costs a full [`TICK_CT`]. The old floor — inherited from
+/// `mark_positions.py`'s `mx >= Decimal("0.005")` eligibility test — was half
+/// of one tick, i.e. finer than the grid its own input is quoted on, so it
+/// admitted candidates that were inside their input's resolution before they
+/// were ever read. Two ticks buys exactly two things:
+///
+///   * ONE TICK FOR A KNOWN, DIRECTIONAL OVERSTATEMENT. `mark_positions.py:227`
 ///     prices `k_exit_px`/`p_close_px` from `kalshi_books`/`pmus_topbook` with
 ///     NO self-exclusion, while the entry side explicitly excludes our own
 ///     resting size (`quoter.rs:310`, "our resting subtracted"). On the PM leg
 ///     that bias only ever flatters: `p_close_px = p_ask + tick` takes THROUGH
-///     an ask our own resting size may be the touch of, so the real close costs
-///     at least a tick more and `mx` is overstated by at least a tick.
-///     `unwind_positions.py:80-83` already paid for this — "on thin books our
-///     maker quotes ARE the touch … flattered by ourselves". The Python is
-///     frozen, so the bias cannot be fixed here; a systematic bias with a known
-///     sign is subtracted, not hedged.
-///   * ONE TICK so that what remains is still a profit-take after one adverse
-///     move. The marks are up to one writer period (two minutes) old and move
-///     more than a tick inside that window, so a candidate must be at or above
-///     break-even after a single tick to be a decision rather than a coin flip.
+///     an ask our own resting size may be the touch of. ONE TICK IS A LOWER
+///     BOUND ON THAT BIAS, NOT A BOUND ON IT — on a book where our resting size
+///     is the only ask, excluding it may leave no ask at all, which is the
+///     thin-book case `unwind_positions.py:80-83` exists for ("on thin books
+///     our maker quotes ARE the touch … flattered by ourselves"). So this tick
+///     does not neutralise the bias; it pays the smallest instalment the grid
+///     can express, on a debt whose size the frozen Python cannot tell us.
+///   * ONE TICK so the candidate is not inside the resolution of its own input.
 ///
-/// A candidate that clears this by less than a tick is inside the resolution of
-/// its own input and is reported as [`Exit::near_floor`] — noise, not signal.
+/// WHAT THE TWO TICKS ARE NOT FOR, AND THE TAPE SAYS SO. They do not make a
+/// candidate break-even after an adverse move. Over 128.5 h of
+/// `marks_history.jsonl` (3464 samples, ~92k adjacent-period deltas) an adverse
+/// move of a tick or more is rare — 0.9% of deltas — and LARGE when it happens:
+/// 55% of those are two ticks or worse, 41% are three or worse, and the worst
+/// single writer period in the tape is −35 ticks. The 2026-07-29 candidate this
+/// file's [`tests::a_candidate_within_one_tick_of_the_floor_is_flagged_as_noise`]
+/// uses as its example of a basket WITH room went `+0.0312` → `−0.0721` in one
+/// 121-second period: −10.3 ticks, from a level a tick clear of this floor. A
+/// floor sized to survive that would select nothing at all.
+///
+/// AND THE NUMBER IT SCREENS IS NOT THE PAYOFF. `maker_exit_ct` prices a LEGGED
+/// trade at one instant: the Kalshi ask RESTS, and the PM NO is taken WHEN IT
+/// FILLS. A resting ask fills preferentially when the book is coming to meet
+/// it, i.e. when the PM close has already moved against us, so the realized
+/// exit is adversely selected relative to this number by construction. The
+/// floor guards a snapshot at SCAN time; what would guard the trade is a
+/// re-price at FILL time, and that is §5's fourth bullet, and it does not exist
+/// here.
+///
+/// THE FEE TERM IS NOT SMOOTH, either. `curves.py` applies `ceil_cents` to the
+/// Kalshi MAKER leg's TOTAL, so per contract the fee steps by `$0.01/qty` — a
+/// full tick at `qty=1`. The unit-coefficient derivation above is exact between
+/// steps and off by one step across one; it is a good guide to the size of this
+/// floor, not an identity.
+///
+/// A candidate that clears this by less than a tick is reported as
+/// [`Exit::near_floor`]: noise even by the weak reading above.
 const MIN_EXIT_CT: f64 = 2.0 * TICK_CT;
 
 /// A basket that should be quoted out of: holding it is worse than redeploying
@@ -242,10 +323,17 @@ pub struct Exit {
     /// (`resolve_dates.py`: "event date not officially fixed"). Both halves of
     /// the decision rest on it — `forward_hold_apr` is annualised to that date,
     /// and [`Skip::Settled`] compares against it — so a candidate carrying it
-    /// is a candidate whose APR is speculative. It is surfaced rather than
-    /// refused because every long-dated family in `_RULES` is estimated;
-    /// refusing on it would select nothing, ever. The guard that does NOT rest
-    /// on the guess is [`Skip::NotPriceable`]: a resolved market has no book.
+    /// is a candidate whose APR is speculative.
+    ///
+    /// THE EXPOSURE IS THE WHOLE BOOK, NOT PART OF IT. On the 2026-07-29 marks
+    /// EVERY priced position carries this flag. It is surfaced rather than
+    /// refused on for exactly that reason — refusing would select nothing,
+    /// ever — but "surfaced" must not be read as "bounded".
+    ///
+    /// AND THERE IS NO GUARD BEHIND IT. An earlier draft said "the guard that
+    /// does NOT rest on the guess is [`Skip::NotPriceable`]: a resolved market
+    /// has no book". That is false on the Kalshi leg, for a reason that is in
+    /// the frozen Python and cannot be fixed here — see [`Skip::NotPriceable`].
     pub resolves_estimated: bool,
 }
 
@@ -270,18 +358,39 @@ impl Exit {
 /// five very different causes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Skip {
-    /// No live book behind it, so no exit price and no forward APR. THIS IS
-    /// ALSO WHAT A SETTLED MARKET LOOKS LIKE: `mark_positions.py` prices a
-    /// position from top-of-book, and a market that has resolved has none, so
-    /// its row carries nulls (or the position never reaches the file at all).
-    /// A settled market is therefore unquotable-into by construction, not by a
-    /// rule that has to remember to fire.
+    /// No live book behind it, so no exit price and no forward APR.
+    ///
+    /// THIS HOLDS ON THE PM LEG ONLY, AND AN EARLIER DRAFT CLAIMED IT HELD ON
+    /// BOTH. `pmus_topbook` returns `None` for a missing quote, so a dark PM
+    /// leg does produce a null row and does land here. The Kalshi leg does not:
+    /// `mark_positions.py:70-71` reads
+    /// `Decimal(str(m.get("yes_bid_dollars") or 0))`, and that `or 0` turns a
+    /// MISSING quote into `Decimal("0")` — which is not `None`. So the row
+    /// passes `mark_positions.py:222`'s `k_ask is not None` test, enters the
+    /// maker-exit branch, computes `k_exit_px = k_ask - 0.01 = -0.01`, and
+    /// hands that to `leg_fee`. `FeeSchedule.fee` (`curves.py:85`) rejects any
+    /// price outside `[0, 1]` with `ValueError("bad fill: …")`, which
+    /// propagates out of an unguarded loop in `main()` and kills the run BEFORE
+    /// the file is written.
+    ///
+    /// SO WHAT PROTECTS THIS MODULE IS THE CLOCK, AND FOR FIFTEEN MINUTES IT
+    /// DOES NOT. The writer dies, `marks.json` FREEZES at its last good version
+    /// — which still carries the now-resolved market as a live, fully-priced
+    /// candidate — and the scan runs against that frozen file until
+    /// `taketake::MAX_MARKS_AGE_S` (900 s) ages it out and [`select`] refuses.
+    /// Inside that window the only thing that can catch it is [`Skip::Settled`],
+    /// which compares against a date that is a guess for every priced position
+    /// in the book. The Python is frozen and this cannot be fixed here; what
+    /// follows for a placer is that a priced row is not evidence of a live
+    /// book, and the venue must be asked before an order is rested.
     NotPriceable,
-    /// At or past its resolve date — settling or settled. The belt to
-    /// `NotPriceable`'s braces, and only as good as the date: when
-    /// `resolves_estimated` is set that date is a curated guess, and a guess
-    /// that runs LATE would let this pass a market that has already resolved.
-    /// `NotPriceable` is what actually holds in that case.
+    /// At or past its resolve date — settling or settled.
+    ///
+    /// Inside the fifteen-minute window above this is not a belt to
+    /// `NotPriceable`'s braces, it is the ONLY strap — and it is only as good
+    /// as the date. When `resolves_estimated` is set that date is a curated
+    /// guess, and a guess that runs LATE lets this pass a market that has
+    /// already resolved. On the live book every priced position sets that flag.
     Settled { resolves_by: String },
     /// A family whose exits this engine does not own. Sports baskets resolve in
     /// hours and `mark_positions.py` keeps every unwind signal dark for them
@@ -332,6 +441,23 @@ impl SkipTally {
             }
         }
         t
+    }
+
+    /// The tally's INTEGER shape, for edge-triggering a report on.
+    ///
+    /// EXCLUDES `exit_unprofitable_usd` deliberately: that is a price, it moves
+    /// on every book tick, and triggering on it would make every scan "new" and
+    /// the report a paragraph a minute that nobody reads. The counts move only
+    /// when a basket changes CAUSE — which is precisely the change
+    /// [`Self::describe`] exists to announce.
+    pub fn counts(&self) -> (usize, usize, usize, usize, usize) {
+        (
+            self.not_priceable,
+            self.settled,
+            self.held_to_settlement,
+            self.hold_is_better,
+            self.exit_unprofitable,
+        )
     }
 
     /// One line. Every cause, because four of the five render as
@@ -560,10 +686,15 @@ mod tests {
     /// legs' fees. Selecting on the APR test alone would quote out of it and
     /// PAY to free the capital.
     ///
-    /// The floor is [`MIN_EXIT_CT`] = two [`TICK_CT`]s and the numbers below
-    /// are the live ones that make the sizing non-theoretical: the TIME-AI
-    /// basket priced +1.44c/ct — clearing the OLD half-cent floor with room —
-    /// and was at −0.65c/ct six minutes later, one tick and change away.
+    /// The floor is [`MIN_EXIT_CT`] = two [`TICK_CT`]s. The numbers below are
+    /// live ones that show the OLD floor was finer than its own input: a
+    /// TIME-POTY basket priced +1.44c/ct, cleared the half-cent floor with
+    /// room, and was under water shortly after.
+    ///
+    /// THEY DO NOT SHOW THE NEW FLOOR SURVIVING ANYTHING. On the same tape a
+    /// basket at +3.12c/ct — a tick clear of this floor — lost 10.3 ticks in a
+    /// single writer period. What this test pins is that the floor is sized to
+    /// the grid, not that a candidate clearing it is safe; see [`MIN_EXIT_CT`].
     #[test]
     fn a_maker_exit_must_clear_two_ticks_because_one_adverse_tick_costs_one() {
         let m = marks(&pos("unconverged", 26, "2027-04-25", "11.0", "-0.033"));
@@ -574,16 +705,16 @@ mod tests {
             "and the near-miss carries its size, so the report can price it: {skips:?}"
         );
 
-        // the old floor: half a tick on a one-tick grid. 1.44c/ct cleared it
-        // and did not survive six minutes of book.
+        // the old floor: half a tick on a one-tick grid, i.e. finer than the
+        // resolution of the number it screened. 1.44c/ct cleared it.
         let old_floor = marks(&pos("timeai", 4, "2026-12-09", "15.6", "0.0144"));
         assert!(
             sel(&old_floor, 16.0).unwrap().0.is_empty(),
             "1.44c/ct is one adverse tick from a loss — not a decision"
         );
-        // ...and one tick is still not enough: break-even after a single
-        // adverse tick is not a profit-take once the PM self-pricing bias
-        // (also a tick, also always adverse) is paid.
+        // ...and one tick is still not enough: it is entirely spent on the PM
+        // self-pricing bias, which is always adverse and of which a tick is a
+        // LOWER BOUND, not a bound.
         let one_tick = marks(&pos("onetick", 10, "2027-04-25", "11.0", "0.0100"));
         assert!(sel(&one_tick, 16.0).unwrap().0.is_empty(), "one tick does not clear the floor");
 
@@ -593,17 +724,23 @@ mod tests {
 
     /// A CANDIDATE INSIDE ONE TICK OF THE FLOOR IS NOISE, AND SAYS SO.
     ///
-    /// The floor makes a candidate survivable; it does not make it a signal.
-    /// One tick of book movement puts a 2.0c/ct exit back under the floor, so
-    /// the report must distinguish it from the 3.12c/ct one that has room.
+    /// This pins the FLAG and nothing more. A 2.0c/ct exit is one tick from the
+    /// floor and a 3.12c/ct one is not, so the report can tell them apart —
+    /// which is all `near_floor` claims. It is NOT a claim that the unflagged
+    /// one is durable; see the second block.
     #[test]
     fn a_candidate_within_one_tick_of_the_floor_is_flagged_as_noise() {
         let thin = marks(&pos("thin", 10, "2027-04-25", "11.0", "0.0200"));
         let e = sel(&thin, 16.0).unwrap().0;
         assert!(e[0].near_floor, "2.0c/ct is one tick from the floor: {e:?}");
 
-        // the live selected candidate, +3.12c/ct: over the floor by more than
-        // a tick, so a tick of movement does not unmake it.
+        // The live selected candidate, +3.12c/ct: over the floor by more than a
+        // tick, so the flag is off. AN EARLIER DRAFT ADDED "so a tick of
+        // movement does not unmake it", and this exact basket refutes it: it
+        // went +0.0312 -> -0.0721 across one 121-second writer period on
+        // 2026-07-29, which is -10.3 ticks. `near_floor` being false means the
+        // candidate is outside its input's resolution, NOT that it survives the
+        // book. See MIN_EXIT_CT.
         let real = marks(&pos("melenchon", 26, "2027-04-25", "12.6", "0.0312"));
         let e = sel(&real, 16.0).unwrap().0;
         assert!(!e[0].near_floor, "3.12c/ct has a tick of room: {e:?}");
