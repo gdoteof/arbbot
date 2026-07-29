@@ -69,6 +69,34 @@ async def test_unix_broadcaster_fanout_and_slow_client_drop(tmp_path):
     await b.stop()
 
 
+async def test_a_dropped_subscriber_is_announced_not_discarded_in_silence(tmp_path, capsys):
+    """The eviction in `publish` used to be a bare `discard` + `close`.
+
+    The subscriber it drops is the armed trader: it reads this socket, sees the
+    close as `subscription ended (EOF)`, and pulls every resting quote plus a
+    sweep of both venues before it can reconnect. That cost appeared nowhere on
+    this side — the only trace in the entire system was on the client. This
+    pins that it now says so, and names the numbers an operator needs.
+
+    `MAX_BUFFER = -1` makes any buffer at all overflow, which is the whole
+    condition under test; forcing a real 1 MB backlog would test the kernel's
+    socket buffer instead.
+    """
+    b = UnixBroadcaster(tmp_path / "arb.sock")
+    b.MAX_BUFFER = -1
+    await b.start()
+    reader, writer = await asyncio.open_unix_connection(str(tmp_path / "arb.sock"))
+    await asyncio.sleep(0.05)
+    assert len(b._writers) == 1
+    b.publish(snap())
+    assert b._writers == set(), "the over-buffered subscriber must be dropped"
+    err = capsys.readouterr().err
+    assert "DROPPED a subscriber" in err, f"the drop was silent: {err!r}"
+    assert "-1" in err, "the line must name the limit that was crossed"
+    writer.close()
+    await b.stop()
+
+
 async def test_polymarket_ws_task_records_from_fake_server(tmp_path):
     """Fake-WS harness (test mandate): serve book + price_change + trade,
     assert the recorder persists normalized events and stays subscribed."""
