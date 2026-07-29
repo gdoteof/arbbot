@@ -860,6 +860,28 @@ pub(crate) fn cancel_result(
     v
 }
 
+/// The venue's ANSWER to a halt sweep, as an event.
+///
+/// The engine discharges a `sweeps_owed` entry on PROOF, and this is the proof:
+/// it is the executor that awaits `cancel_all_and_verify`, so it is the only
+/// thing in the process that knows whether the venue answered. Without it the
+/// engine retired the obligation on `try_send` — and a sweep that was queued,
+/// ran, and came back `KILL SWEEP FAILED` left a log line and no state, which is
+/// exactly what happened on both venues inside the four-minute outage on
+/// 2026-07-29.
+///
+/// It carries no market: a sweep is the account-wide command, and the engine
+/// reads it above its own market guard for that reason.
+pub(crate) fn sweep_result(venue: Venue, err: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "sweep_result",
+        "venue": venue.as_str(),
+        "ok": err.is_none(),
+        "error": err,
+        "ts_local_ns": now_ns(),
+    })
+}
+
 /// Whether a failed place left us UNABLE TO SAY if the venue took the order.
 ///
 /// This is the entire scope of the lost-response recovery, and it is a much
@@ -989,17 +1011,48 @@ async fn run_executor(
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
-        let Some(sink) = sink.clone() else { continue }; // dry-run: counted, dropped
+        let Some(sink) = sink.clone() else {
+            // dry-run: counted, dropped. A SWEEP still answers. A venue this
+            // process holds no sink for is one it has never placed an order at,
+            // so there is nothing of ours resting there to prove gone — and
+            // saying nothing is no longer free, now that the engine holds the
+            // obligation until something proves it. `spawn_executors` makes a
+            // channel for all three venues however few are armed, so without
+            // this every ARMED session would owe an INTL sweep for ever.
+            //
+            // ARMED is the whole of its reach, and it is worth being exact
+            // about why: `main` passes `acks: None` when there is no sink at
+            // ALL (`sinks.is_empty()`), so in a genuinely unarmed run this
+            // answer is built and dropped, and the engine's obligation stands
+            // for the life of the process. That is not the omission it looks
+            // like — an unarmed process has no order path to prove anything
+            // with, and its `sweeps_owed` reads as the standing "this run
+            // swept nothing" it truthfully is. The case this branch exists for
+            // is the mixed one, which is every armed session: Kalshi and PM-US
+            // hold sinks, INTL never does.
+            if matches!(cmd.action, Action::SweepAndVerify) {
+                tell_engine(&acks, sweep_result(venue, None)).await;
+            }
+            continue;
+        };
         // Not a per-order verb: it owns its own blocking + polling, so
         // it is handled before the place/cancel dispatch below.
         if matches!(cmd.action, Action::SweepAndVerify) {
-            match crate::sink::cancel_all_and_verify(sink).await {
-                Ok(()) => eprintln!("[exec] {venue:?}: kill sweep verified clean"),
+            let failure = match crate::sink::cancel_all_and_verify(sink).await {
+                Ok(()) => {
+                    eprintln!("[exec] {venue:?}: kill sweep verified clean");
+                    None
+                }
                 Err(e) => {
                     st.failed.fetch_add(1, Ordering::Relaxed);
                     eprintln!("[exec] {venue:?}: KILL SWEEP FAILED — {e}");
+                    Some(e.to_string())
                 }
-            }
+            };
+            // Both outcomes, not just the good one: the failure is the whole
+            // reason this channel exists (`sweep_result`), and a sweep that
+            // reports nothing is one the engine has to assume the worst of.
+            tell_engine(&acks, sweep_result(venue, failure.as_deref())).await;
             continue;
         }
         // The gateways block; running one on this worker would stall
@@ -1919,6 +1972,89 @@ mod tests {
         assert_eq!(told[0]["ok"], true);
         assert_eq!(told[0]["venue_order_id"], "v1");
         assert!(told[0]["error"].is_null());
+    }
+
+    /// A sweep the VENUE refused must reach the engine as a refusal.
+    ///
+    /// The same defect as the cancel above, one command up: the executor awaits
+    /// `cancel_all_and_verify` and was the only thing in the process that knew
+    /// the answer, and it kept it — `st.failed` and one `KILL SWEEP FAILED`
+    /// line. The engine had already retired the obligation on `try_send`, so
+    /// the halt sat over a book nothing had proven. Both venues did exactly
+    /// this inside four minutes on 2026-07-29.
+    ///
+    /// Asserted on the WIRE VALUE the engine parses, not on a shape this test
+    /// builds for itself: `ok` reading false is what keeps the entry owed.
+    #[tokio::test]
+    async fn a_sweep_the_venue_could_not_prove_is_reported_to_the_engine_as_failed() {
+        let wedged = Arc::new(Recorder { wedged: true, ..Default::default() });
+        wedged.resting.lock().unwrap().push("66e1c799".into());
+        let (st, told) = drain_reporting(
+            Venue::Kalshi,
+            wedged.clone(),
+            vec![ExecCmd { t_read: Instant::now(), action: Action::SweepAndVerify }],
+        )
+        .await;
+
+        assert!(*wedged.sweeps.lock().unwrap() >= 1, "the sweep did reach the venue");
+        assert_eq!(st.failed.load(Ordering::Relaxed), 1);
+        assert_eq!(told.len(), 1, "and the engine is TOLD, which is the whole fix");
+        assert_eq!(told[0]["kind"], "sweep_result");
+        assert_eq!(told[0]["venue"], "kalshi");
+        assert_eq!(told[0]["ok"], false, "the book was NOT proven clean");
+        assert!(
+            told[0]["error"].as_str().unwrap_or_default().contains("SURVIVED"),
+            "carrying the venue's own reason: {}",
+            told[0]
+        );
+    }
+
+    /// The other half: a sweep the venue PROVED is reported too. Without it the
+    /// engine could never retire the obligation and would re-sweep a clean book
+    /// on the backoff for ever.
+    #[tokio::test]
+    async fn a_sweep_the_venue_proved_clean_is_reported_as_done() {
+        let sink = Arc::new(Recorder::default());
+        let (st, told) = drain_reporting(
+            Venue::PolymarketUs,
+            sink,
+            vec![ExecCmd { t_read: Instant::now(), action: Action::SweepAndVerify }],
+        )
+        .await;
+        assert_eq!(st.failed.load(Ordering::Relaxed), 0);
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0]["kind"], "sweep_result");
+        assert_eq!(told[0]["ok"], true);
+        assert!(told[0]["error"].is_null());
+    }
+
+    /// A DRY-RUN executor answers the sweep it drops.
+    ///
+    /// Nothing of ours can rest at a venue this process holds no sink for, so
+    /// the answer is `ok` — and it has to be sent, because the engine now keeps
+    /// the obligation until something proves it. `spawn_executors` makes a
+    /// channel for all three venues however few are armed, so without this
+    /// every armed session would owe an INTL sweep for ever and the
+    /// `sweeps_owed` gauge would be useless from its first halt.
+    #[tokio::test]
+    async fn a_dry_run_executor_answers_the_sweep_it_drops() {
+        let (tx, rx) = mpsc::channel::<ExecCmd>(8);
+        tx.try_send(ExecCmd { t_read: Instant::now(), action: Action::SweepAndVerify })
+            .expect("test queue fits");
+        drop(tx);
+        let (atx, mut arx) = mpsc::channel::<crate::feed::FeedMsg>(8);
+        let st = stats();
+        // `None` is the whole point: this is the posture arb-recorder runs in,
+        // and the one INTL is in for the life of every armed session.
+        let halt = Arc::new(Halt::default());
+        run_executor(Venue::Polymarket, 0.0, None, rx, st.clone(), halt, Some(atx)).await;
+
+        assert_eq!(st.sent.load(Ordering::Relaxed), 0, "a dry run reaches no venue, ever");
+        let m = arx.try_recv().expect("the engine is answered even so");
+        let v: serde_json::Value = serde_json::from_str(&m.line).expect("the engine parses these");
+        assert_eq!(v["kind"], "sweep_result");
+        assert_eq!(v["venue"], "polymarket");
+        assert_eq!(v["ok"], true, "nothing of ours can rest where we have never placed");
     }
 
     /// **DEFECT 2.** A place whose RESPONSE was lost leaves an order this engine

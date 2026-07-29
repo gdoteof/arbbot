@@ -259,19 +259,31 @@ struct Engine {
     next_hedge_oid: u64,
     next_tt_oid: u64,
     killed: bool,
-    /// Halt sweeps an executor would not take, by venue, with the halt that
-    /// owes each — retried on the kill watch until one is really queued.
+    /// Halt sweeps this engine owes a venue, by venue — retried on the kill
+    /// watch until a venue PROVES the book empty.
     ///
-    /// `try_send` LOSES the command when the channel is full, and this is the
-    /// one command that reaches orders the engine holds no id for and PROVES
-    /// the book empty. It used to be offered exactly ONCE per halt, after
-    /// `killed`/`feed_reason` had already latched — and both halts are entered
-    /// on an edge (`kill_now && !self.killed`, `was.is_none()`), so a full
-    /// channel bought one log line and a book that was never swept at all,
-    /// under a stats line that reads `"killed": true`. `cancel.rs` refuses the
-    /// same move for a per-order cancel, for the same reason: an obligation the
-    /// engine forgot is not an obligation discharged.
-    sweeps_owed: BTreeMap<Venue, String>,
+    /// This is the one command that reaches orders the engine holds no id for
+    /// and the only one that proves the outcome, and it used to be offered
+    /// exactly ONCE per halt, after `killed`/`feed_reason` had already latched.
+    /// Both halts are entered on an edge (`kill_now && !self.killed`,
+    /// `was.is_none()`), so nothing ever re-offered it. There are two ways to
+    /// lose it and both were open:
+    ///
+    ///   * `try_send` LOSES the command when the executor's channel is full.
+    ///     Closed 2026-07-29, and never once observed.
+    ///   * the executor TAKES it and the VENUE refuses it — `KILL SWEEP FAILED`
+    ///     — which is the half that happens. A four-minute DNS outage on
+    ///     2026-07-29 failed it on both venues inside thirty seconds of the
+    ///     pull, and the engine then sat `feed_pulled: true` over an unproven
+    ///     book for the rest of it. Discharging on the QUEUE is what made that
+    ///     invisible: `exec_dropped` moves only on a refusal, so the accepted
+    ///     sweep left one `eprintln!` and no state at all.
+    ///
+    /// So the entry survives being queued and is retired by `on_sweep_result`
+    /// and nothing else. `cancel.rs` reached the same rule for a per-order
+    /// cancel by the same route: an obligation the engine forgot is not an
+    /// obligation discharged.
+    sweeps_owed: BTreeMap<Venue, OwedSweep>,
     /// Feed-health pull (card 0a7e5478). Holds the REASON, not just a flag, so
     /// a pulled engine can always say why it is silent. Starts pulled when the
     /// check is on: we have not yet proven the feeds are healthy, and the first
@@ -339,6 +351,80 @@ struct Engine {
     n_ack: u64,
     n_fill: u64,
     n_hedge: u64,
+}
+
+/// One venue's outstanding halt sweep. See [`Engine::sweeps_owed`].
+struct OwedSweep {
+    /// The halt that owes it, for the log line.
+    why: String,
+    /// Offers that cannot succeed on their own — the backoff step. See
+    /// [`sweep_backoff`] for which refusals count and which do not.
+    attempts: u32,
+    /// Kill watches to sit out before offering again, counted from the venue's
+    /// ANSWER (see `in_flight`), never from the offer.
+    ///
+    /// A COUNT of watches rather than a deadline, because the 1 Hz kill watch
+    /// is the only thing that ever drives this retry: it needs no second clock,
+    /// and it stretches with a backlog rather than firing a burst of catch-up
+    /// offers after one (`MissedTickBehavior::Skip`), which is the safe
+    /// direction for a command that costs a venue round trip.
+    wait_ticks: u32,
+    /// A sweep is on this venue's executor channel, or on its wire.
+    ///
+    /// THE INTERLOCK, and it is load-bearing rather than an optimisation: no
+    /// backoff can stand in for it, because NOTHING BOUNDS HOW LONG A SWEEP
+    /// RUNS. `SweepPolicy::budget` reads like a 20s cap and is not one — its
+    /// guard is `rounds_done > 0 && ...` (`sink.rs`), so round 1 is never
+    /// budget-checked, and Kalshi's `cancel_all_open` is 1+N HTTP requests that
+    /// consult no clock of their own. At the 15s transport timeout a
+    /// slow-but-answering venue with N resting orders spends `15*(1+N)` seconds
+    /// inside round 1 alone. The 2026-07-29 sweep that motivated this PR took
+    /// THIRTY seconds, not twenty.
+    ///
+    /// Without this bit a timed retry offers again while sweep #1 is still
+    /// running, and every offer succeeds — the channel has 1024 slots. The
+    /// executor then drains them serially once the venue recovers: N
+    /// account-wide cancel-alls landing AFTER the halt cleared, on quotes the
+    /// quoter has just re-rested and still believes in. That is the failure the
+    /// retry gate in `kill_tick` exists to prevent, arriving by another door,
+    /// and once per attempt instead of once per halt.
+    in_flight: bool,
+}
+
+/// How many kill watches (1 Hz, so seconds) a halt sweep sits out after the
+/// venue answers, or after an offer that can never be taken.
+///
+/// The ways to lose a sweep cost differently, so they are retried differently.
+/// A `try_send` the executor REFUSED because its channel was full never touched
+/// a wire, and the channel drains at the venue's rate limit — so that one is
+/// re-offered on the very next watch, for free, exactly as it was. The two that
+/// need a backoff are the ones where a second is not long enough to change
+/// anything:
+///
+///   * the venue ANSWERED and refused. Re-offering at 1 Hz would buy 240 real
+///     account-wide cancel-alls out of the four-minute outage on 2026-07-29, on
+///     a shared, rate-limited account;
+///   * the channel is CLOSED. Nothing will ever drain it, so a 1 Hz retry is a
+///     log line a second and no sweep at all.
+///
+/// The floor is 30 watches for the SHARED ACCOUNT, not to outlast a sweep —
+/// `OwedSweep::in_flight` is what does that, because the sweep has no
+/// enforceable duration to outlast. It doubles to a 120 ceiling so a venue that
+/// keeps refusing costs one attempt every two minutes instead of 3,600, and so
+/// a venue that recovers is swept within two minutes of doing so.
+///
+/// Kalshi's `premise_broken` (`Book::premise_broken`, mid-session only) is the
+/// case that can never succeed, and it is the expensive one to be wrong about:
+/// the venue is UP, so nothing spends the budget and all 4 rounds run, which is
+/// 4 x (1 paged `cancel_all_open` + 3 `resting_order_ids` reads) = 16 paged
+/// account reads per attempt. At the ceiling that is 16 every two minutes, on
+/// the same key `arbbot-hedge.timer` trades under — costly, bounded, and it
+/// settles there rather than spinning.
+fn sweep_backoff(attempts: u32) -> u32 {
+    const FLOOR: u32 = 30;
+    const CEILING: u32 = 120;
+    let doubled = 1u32.checked_shl(attempts.saturating_sub(1)).unwrap_or(u32::MAX);
+    FLOOR.saturating_mul(doubled).min(CEILING)
 }
 
 impl Engine {
@@ -684,16 +770,30 @@ impl Engine {
     /// no executors at all.
     fn owe_sweeps(&mut self, why: &str) {
         for venue in self.exec_txs.keys() {
-            self.sweeps_owed.insert(*venue, why.to_string());
+            // Overwriting any entry still owed, backoff and all: a NEW halt is
+            // new evidence about the book, and it is offered at once rather
+            // than waiting out a backoff earned by the previous one.
+            self.sweeps_owed.insert(
+                *venue,
+                OwedSweep {
+                    why: why.to_string(),
+                    attempts: 0,
+                    wait_ticks: 0,
+                    // NOT preserved from any entry this overwrites: a sweep
+                    // already on the wire cannot prove a book that has changed
+                    // since it started, and its answer will clear this anyway.
+                    in_flight: false,
+                },
+            );
         }
         self.sweep_owed_venues();
     }
 
-    /// Offer `SweepAndVerify` to every venue that still owes one, and keep
-    /// owing it wherever the executor would not take it.
+    /// Offer `SweepAndVerify` to every venue that owes one and is due, and go on
+    /// owing it until a venue answers that the book is clean.
     ///
-    /// The retry is the whole of it: see [`Engine::sweeps_owed`]. The halt
-    /// state still LATCHES on the lost sweep — a halt that cannot prove the
+    /// The retry is the whole of it: see [`Engine::sweeps_owed`]. The halt state
+    /// still LATCHES on a sweep that never lands — a halt that cannot prove the
     /// book clean must stop quoting all the more — so what is retried is the
     /// sweep alone, on the 1s kill watch.
     ///
@@ -704,22 +804,102 @@ impl Engine {
     /// never a statement this process could support — the counter could not
     /// see the command. It can now.
     ///
-    /// What it still does NOT prove is that the book is clean: the entry is
-    /// discharged by the executor ACCEPTING the command, and the venue can
-    /// refuse the sweep 20s later (`KILL SWEEP FAILED`) with nothing re-owing
-    /// it. That is the same gap `cancel.rs` closed for a per-order cancel with
-    /// a `cancel_result` channel, and it is not closed here.
+    /// QUEUEING IS NOT PROOF, and this no longer pretends otherwise. The entry
+    /// stays owed across a successful `try_send` and is retired only by
+    /// [`Engine::on_sweep_result`], which is the venue's own answer relayed by
+    /// the executor that awaited it.
     fn sweep_owed_venues(&mut self) {
-        for (venue, why) in std::mem::take(&mut self.sweeps_owed) {
-            if self.dispatch(venue, Action::SweepAndVerify) {
+        for (venue, mut owed) in std::mem::take(&mut self.sweeps_owed) {
+            // A sweep is already queued or running for this venue. Nothing to
+            // decide until it answers — and the backoff cannot stand in for
+            // this check, because a sweep has no bounded duration to wait out
+            // (see `OwedSweep::in_flight`).
+            if owed.in_flight {
+                self.sweeps_owed.insert(venue, owed);
                 continue;
             }
-            eprintln!(
-                "[engine] {why}: could not queue sweep for {venue:?} — executor \
-                 backlogged; book NOT proven clean, still owed"
-            );
-            self.sweeps_owed.insert(venue, why);
+            if owed.wait_ticks > 0 {
+                owed.wait_ticks -= 1;
+                self.sweeps_owed.insert(venue, owed);
+                continue;
+            }
+            let queued = self.dispatch(venue, Action::SweepAndVerify);
+            if !queued {
+                // A full channel and a dead executor are the SAME `try_send`
+                // failure and the same `false` — only `is_closed` tells them
+                // apart. Worth telling apart because they need opposite
+                // handling and mean opposite things: one is a backlog that
+                // drains, the other is a process that can no longer sweep
+                // anything at all (close to unreachable —
+                // `install_armed_panic_hook` takes the process down first — but
+                // it is a mode the old fire-and-forget did not have).
+                let closed = self.exec_txs.get(&venue).is_none_or(|tx| tx.is_closed());
+                eprintln!(
+                    "[engine] {}: could not queue sweep for {venue:?} — executor {}; book \
+                     NOT proven clean, still owed",
+                    owed.why,
+                    if closed {
+                        "GONE, its channel is closed and NO sweep is possible from this \
+                         process"
+                    } else {
+                        "backlogged"
+                    }
+                );
+                if !closed {
+                    // Free to re-offer: nothing reached a wire, and the channel
+                    // drains. Back onto the next watch, unchanged.
+                    self.sweeps_owed.insert(venue, owed);
+                    continue;
+                }
+                // A dead channel changes nothing within a second, and nothing
+                // will answer for it either — so it is the one refusal that
+                // takes the backoff instead of the interlock.
+                owed.attempts += 1;
+                owed.wait_ticks = sweep_backoff(owed.attempts);
+                self.sweeps_owed.insert(venue, owed);
+                continue;
+            }
+            // An executor took it. The entry is now BLOCKED on the venue's
+            // answer, not on a clock: `on_sweep_result` is what unblocks it,
+            // and what starts the backoff if the answer is a refusal.
+            owed.attempts += 1;
+            owed.in_flight = true;
+            self.sweeps_owed.insert(venue, owed);
         }
+    }
+
+    /// The venue's answer to a halt sweep — the ONLY thing that discharges one,
+    /// and the only thing that releases the interlock.
+    ///
+    /// Both branches clear `in_flight`: an answer means this venue's executor is
+    /// free, whichever way it went. A refusal then starts the backoff HERE
+    /// rather than at the offer, so the wait is measured from when the venue
+    /// actually finished — the sweep it waits out has no bounded duration to
+    /// pre-empt (see [`OwedSweep::in_flight`]). Nothing is logged, because the
+    /// executor has already said what went wrong in the venue's own words
+    /// (`KILL SWEEP FAILED`) at the moment it happened.
+    ///
+    /// An unparseable or absent `ok` reads as a refusal, which keeps the
+    /// obligation owed. That is the direction to fail in: the cost is one extra
+    /// sweep, and the alternative is calling a book proven on a field nobody
+    /// could read.
+    ///
+    /// A late answer is not told from a current one, unlike `cancel_result`'s
+    /// numbered attempts. Per venue there is ONE executor draining ONE channel
+    /// in order, so the only way to get a stale answer is for a halt to re-owe a
+    /// venue while a sweep is in flight — and the sweep that re-owed it is
+    /// already queued behind the one answering, so the book still gets proven
+    /// and the gauge is early rather than wrong.
+    fn on_sweep_result(&mut self, v: &serde_json::Value, venue: Venue, t_read: std::time::Instant) {
+        if let Some(owed) = self.sweeps_owed.get_mut(&venue) {
+            owed.in_flight = false;
+            if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                self.sweeps_owed.remove(&venue);
+            } else {
+                owed.wait_ticks = sweep_backoff(owed.attempts);
+            }
+        }
+        self.decision.record(t_read.elapsed().as_nanos() as u64);
     }
 
     /// Re-read the research toxicity feed onto every quoter.
@@ -823,6 +1003,26 @@ impl Engine {
             "cancels_unaddressable":
                 self.parked_cancels.values().filter(|p| p.escalated).count(),
             "cancels_escalated": self.n_cancel_escalated,
+            // Venues a halt has told to cancel EVERYTHING and prove it, that
+            // no venue has yet proven clean. The per-order obligation above
+            // has had a gauge since it had a retry; this one is the same
+            // thing for the account-wide command, and it is the only state
+            // that can say "this halt never proved its book" — `exec_dropped`
+            // moves for a sweep the executor REFUSED and cannot see one it
+            // accepted and the venue then failed, which is the case that
+            // happens.
+            //
+            // 0 is the healthy value, and a NON-zero one does not by itself
+            // mean anything is wrong right now. It deliberately does NOT come
+            // back down when a halt clears over an unproven book (`kill_tick`):
+            // the obligation is kept, so a session that recovered fully from
+            // this morning's outage would read 2 for the rest of its life. It
+            // is a record that a book went unproven, not a live fault — and
+            // while it stands, the venues it names are ones this process has
+            // not swept, whether because they refused, because their executor
+            // is gone, or because no halt has been in force to retry under
+            // since. Nothing reads it automatically.
+            "sweeps_owed": self.sweeps_owed.len(),
             "hedges_pending": self.pending_hedges.len(),
             // ...of which THIS process knows nothing: contracts a previous run
             // owed a hedge for and never booked. `hedges_pending` counts only
@@ -952,6 +1152,16 @@ impl Engine {
         let Some(venue) = v.get("venue").and_then(|x| x.as_str()).and_then(Venue::parse) else {
             return;
         };
+        // ...and the venue's answer to a halt SWEEP:
+        //   {"kind":"sweep_result","venue":...,"ok":bool,"error":str|null,
+        //    "ts_local_ns":int}
+        // Read here, above the market guard, because a sweep is the
+        // account-wide command and names no market. It is the only thing that
+        // discharges a `sweeps_owed` entry.
+        if kind == "sweep_result" {
+            self.on_sweep_result(&v, venue, m.t_read);
+            return;
+        }
         let Some(market_id) = v.get("market_id").and_then(|x| x.as_str()).map(str::to_owned) else {
             return;
         };
@@ -1306,10 +1516,34 @@ impl Engine {
     }
 
     /// The kill-switch watch — and, on the same 1s period, the retry for any
-    /// halt sweep an executor would not take. Both in-process halts end in the
-    /// same owed sweep, and this is the deadline that is due while one is.
+    /// halt sweep no venue has proven. Both in-process halts end in the same
+    /// owed sweep, and this is the deadline that is due while one is.
+    ///
+    /// ONLY WHILE THE HALT IS STILL IN FORCE, and that gate is the reason a
+    /// venue failure could not simply be retried where a full channel is. A
+    /// halt can clear with a sweep still owed, and on the venue-failure path it
+    /// is the likely case rather than the unlucky one: the outage that made the
+    /// venue refuse the sweep is the same outage whose recovery clears the pull.
+    /// A sweep offered after that point is an account-wide cancel-all landing on
+    /// quotes the quoter has just re-rested — and the engine would go on
+    /// believing they rest, because a sweep tells it nothing about individual
+    /// orders. That is the state `Engine::new` records markets going quietly
+    /// dark from, and it is self-inflicted: the engine sees no reason to
+    /// re-quote something it thinks is already working.
+    ///
+    /// The obligation is KEPT rather than dropped, because nothing has proven
+    /// this book: `sweeps_owed` goes on saying so, and the next halt offers it
+    /// again with a fresh backoff. What is NOT closed is the window inside one
+    /// offer — a sweep queued while halted can still be dequeued after the halt
+    /// clears — which is the pre-existing shape of every halt sweep and not
+    /// something the engine can decide from here.
+    ///
+    /// The retry runs BELOW the kill-file read, so "still in force" means this
+    /// tick and not the last one. Above it, the tick that finally notices an
+    /// operator's removal still reads `self.killed == true` and would dispatch
+    /// one last sweep on the way out — the exact offer the gate exists to
+    /// refuse, one tick late.
     fn kill_tick(&mut self, quoters: &mut [Quoter]) {
-        self.sweep_owed_venues();
         let kill_now = std::path::Path::new(&self.cfg.kill_file).exists();
         if kill_now && !self.killed {
             self.killed = true;
@@ -1336,6 +1570,9 @@ impl Engine {
         } else if !kill_now && self.killed {
             self.killed = false;
             eprintln!("[engine] KILL switch cleared — quoting resumes");
+        }
+        if self.killed || self.feed_reason.is_some() {
+            self.sweep_owed_venues();
         }
     }
 
@@ -2070,6 +2307,307 @@ mod feed_wiring_tests {
         drop(tx);
         let summary = engine.await.expect("engine task");
         assert_eq!(summary["killed"], json!(true), "{summary}");
+    }
+
+    /// The venue's answer to a sweep, built by the PRODUCER rather than
+    /// re-spelled here: a hand-written copy of the schema would keep every one
+    /// of these tests green through a field rename in `exec.rs`, which is the
+    /// one change that would silently stop the engine ever discharging one.
+    fn sweep_result(venue: Venue, err: Option<&str>) -> String {
+        crate::exec::sweep_result(venue, err).to_string()
+    }
+
+    fn feed(tx: &mpsc::Sender<FeedMsg>, line: String) {
+        tx.try_send(FeedMsg { line, t_read: std::time::Instant::now() }).expect("test channel");
+    }
+
+    /// Feed lines that take the engine from quoting to PULLED: connect, one
+    /// book, then the disconnect.
+    fn pull(tx: &mpsc::Sender<FeedMsg>) {
+        for l in [
+            json!({"kind": crate::feed::FEED_UP}).to_string(),
+            snapshot("kalshi", "K", "0.03", "0.04", 1_785_211_200.0),
+            json!({"kind": crate::feed::FEED_DOWN, "note": "subscriber dropped"}).to_string(),
+        ] {
+            feed(tx, l);
+        }
+    }
+
+    /// **THE OTHER HALF: A SWEEP THE VENUE REFUSED IS NOT A BOOK PROVEN CLEAN.**
+    ///
+    /// The channel-full case above has been observed zero times. This one fired
+    /// twice inside four minutes on 2026-07-29, on both venues, during a DNS
+    /// outage: the sweep was QUEUED (the channel was empty, so the obligation was
+    /// discharged on the spot), and 30s later the executor logged
+    /// `KILL SWEEP FAILED — book could NOT be proven clean` for each. Neither
+    /// this engine nor the retry above re-offered it, so `feed_pulled: true` sat
+    /// over an unproven book for the rest of the outage.
+    ///
+    /// It also pins the SHAPE of the retry, which is not the same as the
+    /// channel-full one: a refused `try_send` never touched a wire and is
+    /// re-offered on the next kill tick for free, but a sweep the executor TOOK
+    /// costs a real account-wide cancel-all plus a polled resting-list read on a
+    /// shared, rate-limited account. At 1 Hz that four-minute outage would have
+    /// bought 240 of them.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_the_venue_could_not_prove_is_owed_again_and_backs_off() {
+        let out = scratch("failed-sweep-intents.jsonl");
+        let (quoters, by_market) = fixture();
+        let (tx, rx) = mpsc::channel(256);
+        pull(&tx);
+        let (txs, mut rxs) = executors();
+        let engine = tokio::spawn(run(quoters, by_market, rx, txs, stats(), cfg(&out, None, None)));
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            sweeps(&mut rxs),
+            vec![(Venue::Kalshi, 1), (Venue::PolymarketUs, 1)],
+            "the pull offers one sweep per venue, and the channel has room for it"
+        );
+
+        // ...and the venue refuses it, which is what the 20s sweep budget
+        // reports when a venue has stopped answering.
+        for v in [Venue::Kalshi, Venue::PolymarketUs] {
+            feed(&tx, sweep_result(v, Some("book could NOT be proven clean")));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert_eq!(
+            sweeps(&mut rxs),
+            vec![(Venue::Kalshi, 0), (Venue::PolymarketUs, 0)],
+            "a sweep that reached a venue and failed must NOT be re-offered at the 1 Hz \
+             the kill watch runs at: it is a real API round trip on a shared account, and \
+             a venue down for four minutes would buy 240 of them"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        assert_eq!(
+            sweeps(&mut rxs),
+            vec![(Venue::Kalshi, 1), (Venue::PolymarketUs, 1)],
+            "...and it must be offered AGAIN once the backoff expires. Queueing a sweep \
+             is not proving a book: the executor is the only thing that knows whether the \
+             venue answered, and until it says so the halt still owes one"
+        );
+
+        drop(tx);
+        let summary = engine.await.expect("engine task");
+        assert_eq!(summary["feed_pulled"], json!(true), "{summary}");
+        assert_eq!(
+            summary["sweeps_owed"],
+            json!(2),
+            "...and a halt that never proved its book must SAY so. `exec_dropped` cannot: \
+             it moves only on a refused `try_send`, and this sweep was accepted. One \
+             `eprintln!` was the entire trace: {summary}"
+        );
+    }
+
+    /// **A SWEEP THAT HAS NOT ANSWERED IS STILL RUNNING, AND NOTHING BOUNDS HOW
+    /// LONG.**
+    ///
+    /// The backoff cannot double as the in-flight interlock, because there is no
+    /// duration to outlast. `SweepPolicy::budget` reads like a 20s cap and is
+    /// not one: its guard is `rounds_done > 0 && ...`, so round 1 is never
+    /// budget-checked, and Kalshi's `cancel_all_open` is 1+N HTTP requests that
+    /// consult no clock. At the 15s transport timeout a slow-but-answering venue
+    /// with ~10 resting orders spends minutes inside it. The sweep that motivated
+    /// this PR took THIRTY seconds — the floor exactly, not comfortably inside it.
+    ///
+    /// A purely timed retry offers again while sweep #1 is still running and
+    /// every offer SUCCEEDS: the channel has 1024 slots. The executor then drains
+    /// them serially once the venue recovers — N account-wide cancel-alls landing
+    /// after the halt cleared, on quotes the quoter has just re-rested and still
+    /// believes in. Once per attempt, where base manages it only once per halt.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_that_has_not_answered_is_never_offered_again() {
+        let out = scratch("inflight-sweep-intents.jsonl");
+        let (quoters, by_market) = fixture();
+        let (tx, rx) = mpsc::channel(256);
+        pull(&tx);
+        let (txs, mut rxs) = executors();
+        let engine = tokio::spawn(run(quoters, by_market, rx, txs, stats(), cfg(&out, None, None)));
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(sweeps(&mut rxs), vec![(Venue::Kalshi, 1), (Venue::PolymarketUs, 1)]);
+
+        // The venue says NOTHING for five minutes — it is up, slow, and still
+        // inside round 1. Every backoff in the design has expired several times.
+        tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+        assert_eq!(
+            sweeps(&mut rxs),
+            vec![(Venue::Kalshi, 0), (Venue::PolymarketUs, 0)],
+            "not one more sweep may be queued while the last has not answered: they do \
+             not overtake each other, they QUEUE, and the executor runs the backlog \
+             serially into a halt that may since have cleared"
+        );
+
+        drop(tx);
+        let summary = engine.await.expect("engine task");
+        assert_eq!(summary["sweeps_owed"], json!(2), "and it is still owed, not forgotten");
+    }
+
+    /// A sweep the venue PROVED discharges the obligation — the engine must not
+    /// go on re-offering a sweep against a book that is already clean.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_the_venue_proved_clean_is_discharged() {
+        let out = scratch("proven-sweep-intents.jsonl");
+        let (quoters, by_market) = fixture();
+        let (tx, rx) = mpsc::channel(256);
+        pull(&tx);
+        let (txs, mut rxs) = executors();
+        let engine = tokio::spawn(run(quoters, by_market, rx, txs, stats(), cfg(&out, None, None)));
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(sweeps(&mut rxs), vec![(Venue::Kalshi, 1), (Venue::PolymarketUs, 1)]);
+        for v in [Venue::Kalshi, Venue::PolymarketUs] {
+            feed(&tx, sweep_result(v, None));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        assert_eq!(
+            sweeps(&mut rxs),
+            vec![(Venue::Kalshi, 0), (Venue::PolymarketUs, 0)],
+            "the book is proven empty; nothing is owed and nothing may be re-offered"
+        );
+
+        drop(tx);
+        let summary = engine.await.expect("engine task");
+        assert_eq!(summary["sweeps_owed"], json!(0), "{summary}");
+    }
+
+    /// **THE HALT CAN CLEAR WHILE A SWEEP IS STILL OWED**, and on this path it is
+    /// LIKELY: the outage that made the venue refuse the sweep is the same outage
+    /// whose recovery clears the pull.
+    ///
+    /// A sweep offered after that point is an account-wide cancel-all against a
+    /// book the quoter has just re-quoted — and the engine would go on believing
+    /// those orders rest, because nothing tells it otherwise. That is the state
+    /// `Engine::new` documents markets going quietly dark from. So the retry is
+    /// gated on the halt still being in force, and the obligation is KEPT rather
+    /// than dropped: the book was never proven, the gauge says so, and the next
+    /// halt offers it again.
+    ///
+    /// Driven off the KILL file rather than the feed pull, because that is the
+    /// halt whose clearing a test can actually reach: `resync_reason` measures
+    /// the welcome burst with `std::time::Instant`, which `start_paused` does
+    /// not move, so a feed pull can never settle inside a paused test.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_still_owed_when_the_halt_clears_is_kept_but_not_fired() {
+        let kill = scratch("cleared-halt-KILL");
+        std::fs::write(&kill, "halt").unwrap();
+        let out = scratch("cleared-halt-sweep-intents.jsonl");
+        let mut cfg = cfg(&out, None, None);
+        cfg.kill_file = kill.to_string_lossy().into_owned();
+        // The one mode whose feed health cannot pull on its own: a live engine
+        // starts `Link::Down` and pulls before the first tick, which would
+        // leave a second halt in force and nothing to observe.
+        cfg.bench = true;
+
+        let (quoters, by_market) = fixture();
+        let (tx, rx) = mpsc::channel(256);
+        let (txs, mut rxs) = executors();
+        let engine = tokio::spawn(run(quoters, by_market, rx, txs, stats(), cfg));
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(sweeps(&mut rxs), vec![(Venue::Kalshi, 1), (Venue::PolymarketUs, 1)]);
+        for v in [Venue::Kalshi, Venue::PolymarketUs] {
+            feed(&tx, sweep_result(v, Some("book could NOT be proven clean")));
+        }
+        // ...and the operator lifts the halt while the book is still unproven.
+        std::fs::remove_file(&kill).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        assert_eq!(
+            sweeps(&mut rxs),
+            vec![(Venue::Kalshi, 0), (Venue::PolymarketUs, 0)],
+            "the halt has cleared and the quoter may rest fresh orders: a sweep now would \
+             cancel them at the venue while the engine went on believing they rest"
+        );
+
+        drop(tx);
+        let summary = engine.await.expect("engine task");
+        assert_eq!(summary["killed"], json!(false), "the halt cleared: {summary}");
+        assert_eq!(
+            summary["sweeps_owed"],
+            json!(2),
+            "...and the obligation is KEPT, not forgotten: this book was never proven \
+             clean by anything, and the next halt is what offers it again: {summary}"
+        );
+    }
+
+    /// The halt gate must read THIS tick's halt, not the last one's.
+    ///
+    /// `kill_tick` used to retry before re-reading the kill file, so on the tick
+    /// that finally notices an operator's removal `self.killed` was still true
+    /// and one last sweep went out — the precise offer the gate exists to
+    /// refuse, one tick late, and landing on a book the engine is about to start
+    /// re-quoting.
+    ///
+    /// Driven on the channel-full path because that is the one always DUE: a
+    /// refused offer keeps `wait_ticks` at 0, so the stale tick is reachable
+    /// rather than a coincidence of the backoff. Refusals are counted by
+    /// `exec_dropped`, and the file is removed with no await in between, so
+    /// `before` is exactly the state the noticing tick starts from.
+    #[tokio::test(start_paused = true)]
+    async fn the_halt_gate_is_read_on_the_tick_it_fires_not_the_one_before() {
+        let kill = scratch("stale-gate-KILL");
+        std::fs::write(&kill, "halt").unwrap();
+        let out = scratch("stale-gate-intents.jsonl");
+        let mut cfg = cfg(&out, None, None);
+        cfg.kill_file = kill.to_string_lossy().into_owned();
+        cfg.bench = true; // no feed pull, so `killed` is the only halt in force
+
+        let (quoters, by_market) = fixture();
+        let (tx, rx) = mpsc::channel(256);
+        let (txs, _rxs) = full_executors(); // never drained: every offer is refused
+        let stats = stats();
+        let engine = tokio::spawn(run(quoters, by_market, rx, txs, stats.clone(), cfg));
+
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        let before = stats.dropped.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(before > 0, "the halt is in force and its sweep is being refused every tick");
+        // No await between the read and the removal: the engine task cannot run
+        // in the gap, so the next tick is the one that notices.
+        std::fs::remove_file(&kill).unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        assert_eq!(
+            stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "the tick that notices the halt has cleared must not dispatch on its way out"
+        );
+
+        drop(tx);
+        let summary = engine.await.expect("engine task");
+        assert_eq!(summary["killed"], json!(false), "{summary}");
+    }
+
+    /// A CLOSED executor channel is not a full one. `try_send` returns false for
+    /// both and the engine could not tell them apart, so a dead executor — the
+    /// one state where no sweep is possible at all — retried at 1 Hz for ever,
+    /// logging a line a second and moving `exec_dropped` with it.
+    ///
+    /// Close to unreachable (`install_armed_panic_hook` takes the process down
+    /// first), but it is a mode the old fire-and-forget did not have.
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_executor_is_not_retried_at_1hz() {
+        let out = scratch("closed-exec-sweep-intents.jsonl");
+        let (quoters, by_market) = fixture();
+        let (tx, rx) = mpsc::channel(256);
+        pull(&tx);
+        let (txs, rxs) = executors();
+        drop(rxs); // the executor tasks are gone; nothing can ever drain these
+        let stats = stats();
+        let engine =
+            tokio::spawn(run(quoters, by_market, rx, txs, stats.clone(), cfg(&out, None, None)));
+
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let dropped = stats.dropped.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            dropped <= 4,
+            "a sweep into a channel nobody will ever drain must back off like any other \
+             offer that cannot succeed within a tick — 1 Hz for ten seconds is {dropped} \
+             refusals and no sweep"
+        );
+
+        drop(tx);
+        let _ = engine.await.expect("engine task");
     }
 
     /// C4(c) on the health-file path. The tick's decision is a pure function so
