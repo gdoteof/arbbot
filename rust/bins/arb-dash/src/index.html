@@ -562,6 +562,21 @@ function venueChips(vs){
 const staleVenues = (d) => (d.venues||[]).filter(v=>!v.current && v.coverage_age_s>=0)
   .map(v=>v.venue);
 
+/* A pair the rollup has no book for is not evaluated AT ALL, and a view that
+   silently shrinks reads as "no edge" rather than "no data" — the same lie as a
+   green badge over a dead book, pointing the other way. The per-venue counts do
+   not partition the total: a pair missing BOTH books is one pair and two broken
+   venues, so they can sum higher, and the wording never claims otherwise. */
+function unevalBanner(d, noun, evaluated){
+  const by = d.unevaluated_by_venue || {};
+  const parts = Object.keys(by).map(v=>`${by[v]} missing a ${esc(v)} book`);
+  if(!parts.length) return '';
+  return `<div class="warn" style="margin-bottom:8px">▲ ${d.unevaluated_pairs} ${noun} were
+    NOT evaluated (${parts.join(', ')}). They are absent from every count above, including
+    &ldquo;${d.actionable} actionable&rdquo; — that number is about the ${evaluated} pair(s)
+    that had books, not the whole set. Rebuild the rollup above.</div>`;
+}
+
 const ROUTE_LABEL={'take-take':'take / take','make-a-take-b':'make A → take B',
                    'take-a-make-b':'take A → make B','none':'—'};
 const SERIES_KEYS=[['take_take','take/take','var(--accent)'],
@@ -664,6 +679,7 @@ const COLS=[
   ['take_depth','take depth','Contracts resting at the touch on the leg(s) this route CROSSES. Below the clip, the price shown is only good for part of the order. "?" means the tape carried no size.','n'],
   ['reprices','reprices','Times the quote has been moved. High means the quoter is chasing, which is a cost.','n'],
   ['since_change_s','since move','Time since this book last MOVED. Not staleness — the series emits on change, so a quiet market has an old sample and a valid quote.','n'],
+  ['coverage_age_s','coverage','How far the ROLLUP covers on the older of this row\'s two venues. THIS is the staleness flag, not "since move": past the limit the row is history and cannot be actionable.','n'],
 ];
 
 function intentsPanel(d){
@@ -679,7 +695,7 @@ function intentsPanel(d){
     fee_b:r.priced?+r.priced.fee_b:null, edge_f:r.edge_f,
     rest_spread:r.rest_spread, take_depth:r.take_depth,
     reprices:(r.leg_a.reprices??0)+(r.leg_b.reprices??0),
-    since_change_s:r.since_change_s,
+    since_change_s:r.since_change_s, coverage_age_s:r.coverage_age_s,
   })[k];
 
   const all=(d.rows||[]).slice();
@@ -724,6 +740,7 @@ function intentsPanel(d){
       <td class="num ${r.deep_enough?'dim':'warn'}">${r.take_depth==null?'?':Math.floor(r.take_depth).toLocaleString()}</td>
       <td class="num dim">${(r.leg_a.reprices??0)+(r.leg_b.reprices??0)}</td>
       <td class="num dim">${dur(r.since_change_s)}</td>
+      <td class="num ${r.coverage_age_s>d.max_coverage_age_s?'bad':'dim'}" title="${esc(r.leg_a.venue)} / ${esc(r.leg_b.venue)}">${dur(r.coverage_age_s)}</td>
     </tr>${S.expanded===r.relationship_id ? expanderRow(r.relationship_id) : ''}`;}).join('');
 
   // An empty table is a claim, and it must say which claim. Filters hiding
@@ -735,10 +752,12 @@ function intentsPanel(d){
       ? 'The engine is resting ' + d.resting_orders + ' order(s), but none of them are on a '
         + 'pair with both books in the rollup.'
       : (!d.rollup_current
-        ? 'All ' + all.length + ' pair(s) are filtered out, and no pair with a '
-          + staleVenues(d).join(' or ') + ' leg can be actionable while that rollup is '
-          + dur(d.rollup_coverage_age_s) + ' behind — rebuild it above, '
-          + 'or turn off <b>actionable only</b> to see the pairs as last priced.'
+        ? 'All ' + all.length + ' pair(s) are filtered out, and ' + (staleVenues(d).length
+            ? 'no pair with a ' + staleVenues(d).join(' or ') + ' leg can be actionable '
+              + 'while that rollup is ' + dur(d.rollup_coverage_age_s) + ' behind'
+            : 'nothing can be actionable while the rollup carries no samples at all')
+          + ' — rebuild it above, or turn off <b>actionable only</b> to see the pairs '
+          + 'as last priced.'
         : 'All ' + all.length + ' pair(s) are hidden by the filters above.')}</div>`;
 
   const rbtn=(k,l)=>`<a href="#" data-route="${k}" class="rf ${S.filter.route===k?'on':''}">${l}</a>`;
@@ -754,6 +773,7 @@ function intentsPanel(d){
       <a href="#" id="f-act" class="${S.filter.actionable?'on':''}">actionable only</a>
       <a href="#" id="f-trd" class="${S.filter.tradable?'on':''}">tradable only</a>
     </nav>
+    ${unevalBanner(d, 'pair(s) the engine is resting on', d.pairs)}
     ${why}
     <div class="scroll" style="${rows.length?'':'display:none'}"><table>
       <thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>
@@ -765,7 +785,8 @@ function intentsPanel(d){
       <b>Actionable</b> = positive edge, the rested leg's book within ${d.max_rest_spread},
       at least ${d.min_take_depth} contracts resting at the touch we would cross, both
       books known, and BOTH of the row's venues covered by the rollup within the last
-      ${(d.max_coverage_age_s/60)|0} minutes.<br>
+      ${(d.max_coverage_age_s/60)|0} minutes — that last one is the <b>coverage</b> column,
+      which is the older of the row's two venues and turns red when it is past the limit.<br>
       ${intlNote(d.rows)}</div>
   </section>`);
 
@@ -871,8 +892,6 @@ function currentPanel(d){
   }).join('');
 
   const stales = staleVenues(d);
-  const uneval = d.unevaluated_by_venue || {};
-  const unevalWhy = Object.keys(uneval).map(v=>`${uneval[v]} with a ${esc(v)} leg`).join(', ');
 
   return $(`<section class="wide">
     <h2>Current opportunities &middot; ${esc(d.day)}
@@ -882,15 +901,12 @@ function currentPanel(d){
       &middot; ${venueChips(d.venues)}
       &middot; <span class="dim">${d.only_tradable?'tradable only':'all pairs'}</span></h2>
     ${d.rollup_current ? '' : `<div class="warn" style="margin-bottom:8px">▲ ${stales.length
-      ? stales.join(' and ') + ' stopped covering ' + dur(d.rollup_coverage_age_s) + ' ago'
-      : 'The rollup carries no samples at all'}. Every row with a leg on a venue that
-      stopped covering is priced off a dead book and cannot be actionable until the rollup
-      is rebuilt — the other venues are unaffected.</div>`}
-    ${unevalWhy ? `<div class="warn" style="margin-bottom:8px">▲ ${d.unevaluated_pairs}
-      permitted pair(s) were NOT evaluated — the rollup carried no book for one of their
-      legs (${unevalWhy}). They are absent from every count above, including
-      &ldquo;${d.actionable} actionable&rdquo;, so that number is about ${d.priced_pairs}
-      pair(s), not the whole universe.</div>` : ''}
+      ? stales.join(' and ') + ' stopped covering ' + dur(d.rollup_coverage_age_s)
+        + ' ago. Every row with a leg there is priced off a dead book and cannot be '
+        + 'actionable until the rollup is rebuilt — the other venues are unaffected.'
+      : 'The rollup carries no samples at all, so nothing on this board is evidence '
+        + 'about now. Rebuild it above.'}</div>`}
+    ${unevalBanner(d, d.only_tradable ? 'permitted pair(s)' : 'pair(s)', d.priced_pairs)}
     <nav style="padding:0;border:0;margin-bottom:6px">${SCENARIOS.map(([k,l])=>tab(k,l)).join('')}</nav>
     <div class="sub" style="margin-bottom:10px">clip size:
       <nav style="display:inline-flex;padding:0;border:0">${clips}</nav>
@@ -1113,7 +1129,10 @@ const DRAW = {
   '/intents': (f) => {
     const d = S.data.intents;
     if(!d) return loading(f, 'engine intents');
-    if(!d.error && !d.rollup_current) f.append(rollupHost(S.stream.today || ''));
+    // `rollup_current` is the stalest venue the rollup CARRIES, so a venue
+    // missing entirely leaves it true — and that is exactly the state where the
+    // rebuild is the fix, so the un-evaluated count has to open this too.
+    if(!d.error && (!d.rollup_current || d.unevaluated_pairs)) f.append(rollupHost(S.stream.today || ''));
     f.append(topSeriesPanel(S.data.top || {rows:[]}));
     f.append(intentsPanel(d));
     return d.error ? 'engine not running'

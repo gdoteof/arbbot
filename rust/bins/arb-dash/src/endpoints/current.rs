@@ -98,12 +98,18 @@ impl Pricing {
 enum Row {
     /// A ranked row.
     Ranked(serde_json::Value),
-    /// Permitted, two priceable legs — and the rollup carried no book for the
-    /// leg on THIS venue, so the pair was never evaluated at all. Counted
-    /// rather than silently dropped: 32 of 43 tradable pairs have a
+    /// Permitted, two priceable legs — and the rollup carried no book for a
+    /// leg on EACH of these venues, so the pair was never evaluated at all.
+    /// Counted rather than silently dropped: 32 of 43 tradable pairs have a
     /// polymarket_us leg, and a board that is quietly 32 pairs short reads to
     /// an operator as "no edge today" and stands them down.
-    NoBook(String),
+    ///
+    /// Both legs when both are missing. Naming only leg A points the operator
+    /// at kalshi — leg A on 38 of the 40 tradable pairs — which is the venue
+    /// the chips beside the banner have just certified green, and telling
+    /// someone to rebuild the venue that is working is worse than saying
+    /// nothing.
+    NoBook(Vec<String>),
     /// Not this board's question: not two legs, an unknown venue, not
     /// permitted when only permitted pairs were asked for, or unpriceable
     /// under the chosen scenario.
@@ -138,8 +144,13 @@ fn row(
     let ka = (la.venue.clone(), la.market_id.clone());
     let kb = (lb.venue.clone(), lb.market_id.clone());
     let (Some(sa), Some(sb)) = (latest.get(&ka), latest.get(&kb)) else {
-        let missing = if latest.contains_key(&ka) { &lb.venue } else { &la.venue };
-        return Row::NoBook(missing.clone());
+        return Row::NoBook(
+            [(&ka, &la.venue), (&kb, &lb.venue)]
+                .iter()
+                .filter(|(k, _)| !latest.contains_key(*k))
+                .map(|(_, v)| (*v).clone())
+                .collect(),
+        );
     };
     let qa = Quote {
         bid: sa.bid.clone(), bid_size: sa.bid_size.clone(),
@@ -238,10 +249,20 @@ pub fn json(a: &Args, query: &str) -> String {
     // the board comes back SMALLER with no field saying so — "0 actionable"
     // that means "never evaluated" reads exactly like "no edge".
     let mut no_book: std::collections::BTreeMap<String, usize> = Default::default();
+    let mut unevaluated = 0usize;
     for r in &reg.relationships {
         match row(&mut pricing, &q, r, &allow, &latest, &cov, now_ns) {
             Row::Ranked(v) => rows.push(v),
-            Row::NoBook(venue) => *no_book.entry(venue).or_default() += 1,
+            Row::NoBook(venues) => {
+                // PAIRS in the headline, LEGS in the attribution: a pair
+                // missing both books is one pair and two broken venues, so the
+                // per-venue counts can sum higher than the total and the banner
+                // says so rather than pretending they partition.
+                unevaluated += 1;
+                for v in venues {
+                    *no_book.entry(v).or_default() += 1;
+                }
+            }
             Row::Skip => {}
         }
     }
@@ -254,7 +275,6 @@ pub fn json(a: &Args, query: &str) -> String {
         .count();
     let actionable =
         rows.iter().filter(|v| v["actionable"].as_bool().unwrap_or(false)).count();
-    let unevaluated: usize = no_book.values().sum();
     rows.truncate(q.n);
 
     serde_json::json!({
@@ -294,6 +314,11 @@ mod tests {
     /// One permitted cross-venue pair. `verdict: equivalent` + `vetted_by:
     /// human` is the registry half of the tradable gate, so no allowlist file
     /// is needed and `Args::for_test`'s nonexistent one stays nonexistent.
+    ///
+    /// The second is REJECTED and has no book on either leg, so it is the
+    /// pair that would land in `unevaluated_pairs` if the permitted-universe
+    /// filter had stayed BEHIND the book lookup. Every board test below
+    /// therefore also pins that reorder.
     const REGISTRY: &str = "\
 relationships:
   - id: xvus-fixture
@@ -304,6 +329,14 @@ relationships:
         market_id: K1
       - venue: polymarket_us
         market_id: P1
+  - id: xvus-rejected
+    verdict: rejected
+    vetted_by: human
+    legs:
+      - venue: kalshi
+        market_id: K2
+      - venue: polymarket_us
+        market_id: P2
 ";
 
     fn now_ns() -> i64 {
@@ -418,6 +451,37 @@ relationships:
         assert_eq!(d["unevaluated_pairs"], 0, "nothing was dropped, so nothing to warn about: {d}");
         assert_eq!(venue(&d, "kalshi")["current"], true, "{d}");
         assert_eq!(venue(&d, "polymarket_us")["current"], true, "{d}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The permitted-universe filter moved AHEAD of the book lookup so the
+    /// un-evaluated count is about the same pairs the board is showing. That
+    /// reorder decides what a permitted pair IS, so it is pinned end to end
+    /// rather than by inspection.
+    ///
+    /// `xvus-rejected` has no book on either leg. On the permitted board it
+    /// must reach NEITHER output — a pair we are forbidden to trade is not a
+    /// hole in the board, and counting it would have the banner tell an
+    /// operator to go rebuild a rollup for a pair that would still be
+    /// untradable afterwards. Ask for the whole universe and it IS evaluated,
+    /// still unpriced, and now correctly counted — against BOTH its venues,
+    /// because both books are the ones that are missing.
+    #[test]
+    fn a_pair_we_may_not_trade_is_not_a_hole_in_the_permitted_board() {
+        let (a, base) = args("rejected");
+        rolled_up(&base, "kalshi", &[sample("kalshi", "K1", 10, "0.29", "0.30")]);
+        rolled_up(&base, "polymarket_us", &[sample("polymarket_us", "P1", 20, "0.75", "0.76")]);
+        let d = board(&a);
+        assert_eq!(d["priced_pairs"], 1, "a rejected verdict is not tradable: {d}");
+        assert_eq!(d["unevaluated_pairs"], 0, "nor is it a pair we failed to evaluate: {d}");
+        assert_eq!(d["unevaluated_by_venue"], serde_json::json!({}), "{d}");
+
+        let raw = json(&a, &format!("day={DAY}&all=1"));
+        let all: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(all["priced_pairs"], 1, "still unpriced — it has no book: {all}");
+        assert_eq!(all["unevaluated_pairs"], 1, "and in the full universe it is counted: {all}");
+        assert_eq!(all["unevaluated_by_venue"]["kalshi"], 1, "both legs are missing: {all}");
+        assert_eq!(all["unevaluated_by_venue"]["polymarket_us"], 1, "{all}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
