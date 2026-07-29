@@ -174,6 +174,11 @@ pub fn price_at(
 /// Price one basket under one scenario. `None` when a needed side is missing —
 /// making on a leg needs the side you would REST on, taking needs the side you
 /// would HIT, and they are different sides.
+// Allowed for the same reason as `price_at` above, which it mirrors argument
+// for argument: a parameter struct would have to be introduced at both, and
+// rewriting sixteen call sites of a money-pricing function to satisfy a lint
+// is how a refactor changes a decision.
+#[allow(clippy::too_many_arguments)]
 pub fn price(
     cx: &mut Cx,
     sched: &FeeSchedule,

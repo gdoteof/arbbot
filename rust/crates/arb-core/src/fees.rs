@@ -94,6 +94,10 @@ impl FeeSchedule {
 }
 
 /// leg_fee — venue-reported per-market coefficient beats the schedule.
+// Every argument is an input to the fee formula itself (plus the decimal `Cx`
+// this workspace threads explicitly rather than hiding in a thread-local).
+// Grouping them into a struct would name the formula's terms twice.
+#[allow(clippy::too_many_arguments)]
 pub fn leg_fee(cx: &mut Cx, schedule: &FeeSchedule, venue: Venue, role: Role, price: D,
                size: D, category: &str, taker_coef_override: Option<D>) -> D {
     if matches!(venue, Venue::Polymarket | Venue::PolymarketUs)

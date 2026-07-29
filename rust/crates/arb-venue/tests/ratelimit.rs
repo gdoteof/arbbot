@@ -9,6 +9,10 @@ use arb_venue::{KalshiSigner, PmusGateway, VenueError};
 
 const SEC: u64 = 1_000_000_000;
 
+// `1 * SEC` reads as a point on the injected timeline, next to `11 * SEC` and
+// `100 * SEC`. Reducing it to a bare `SEC` would hide which line moves the
+// clock and by how much, which is the only thing this test is about.
+#[allow(clippy::identity_op)]
 #[test]
 fn bucket_drains_then_refills_on_injected_clock() {
     // capacity 3, refill 1/sec, start at t=0

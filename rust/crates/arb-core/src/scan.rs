@@ -196,7 +196,7 @@ pub enum RelType {
 impl RelType {
     /// The registry spelling. This is the `by_class` key the risk manager
     /// aggregates exposure under (Python `rel.type.value`), so it must stay
-    /// the exact inverse of `from_str`.
+    /// the exact inverse of `parse`.
     pub fn as_str(self) -> &'static str {
         match self {
             RelType::CrossVenueEquivalent => "cross-venue-equivalent",
@@ -210,7 +210,13 @@ impl RelType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<RelType> {
+    /// Inverse of [`RelType::as_str`]. Named `parse` and not `from_str`
+    /// deliberately: an inherent `from_str` shadows `std::str::FromStr` at
+    /// every call site, and `FromStr` would force a named error type that all
+    /// three callers immediately discard — each one is inside a `filter_map`
+    /// where an unrecognised registry `kind` means "skip this relationship".
+    /// `Venue::parse` and `Dec::parse` already spell this shape `parse`.
+    pub fn parse(s: &str) -> Option<RelType> {
         Some(match s {
             "cross-venue-equivalent" => RelType::CrossVenueEquivalent,
             "equivalent-pair" => RelType::EquivalentPair,

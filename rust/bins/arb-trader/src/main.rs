@@ -239,11 +239,17 @@ fn parse_args() -> Args {
     a
 }
 
+/// Quoter indices touching each market, so a book event fans out to only the
+/// quoters that can care about it.
+type MarketIndex = HashMap<(Venue, String), Vec<usize>>;
+/// Relationship id -> (oracle_risk, kind). See `rel_meta` below for why.
+type RelMeta = HashMap<String, (String, String)>;
+
 fn load_quoters(
     registry: &str,
     tradable: &str,
     rel_prefixes: &[String],
-) -> (Vec<Quoter>, HashMap<(Venue, String), Vec<usize>>, HashMap<String, (String, String)>) {
+) -> (Vec<Quoter>, MarketIndex, RelMeta) {
     let reg = arb_registry::Registry::load(registry).expect("read registry");
     // THE GATE (card c9ac7d1d, exec/main.py:131-146): a relationship is
     // tradable only if it is HUMAN-vetted in the registry or explicitly
@@ -258,7 +264,7 @@ fn load_quoters(
     // cap and the type is the class-exposure key, and neither is carried on
     // `Rel`. Built from the FULL registry, not the quoting subset — a basket we
     // no longer quote still consumes capital.
-    let mut rel_meta: HashMap<String, (String, String)> = HashMap::new();
+    let mut rel_meta: RelMeta = HashMap::new();
     for r in &reg.relationships {
         rel_meta.insert(
             r.id.clone(),
@@ -286,7 +292,7 @@ fn load_quoters(
         .filter_map(|r| {
             Some(Quoter::new(Rel {
                 id: r.id,
-                rtype: RelType::from_str(r.kind.as_deref()?)?,
+                rtype: RelType::parse(r.kind.as_deref()?)?,
                 tranche: r.tranche.unwrap_or_else(|| "long-tail".into()),
                 legs: r
                     .legs
@@ -309,7 +315,7 @@ fn load_quoters(
         allow.len()
     );
 
-    let mut by_market: HashMap<(Venue, String), Vec<usize>> = HashMap::new();
+    let mut by_market: MarketIndex = HashMap::new();
     for (qi, q) in quoters.iter().enumerate() {
         for leg in &q.rel.legs {
             by_market.entry((leg.venue, leg.market_id.clone())).or_default().push(qi);
