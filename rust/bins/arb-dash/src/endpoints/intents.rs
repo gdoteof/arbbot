@@ -235,7 +235,12 @@ fn rank(rows: &mut [serde_json::Value]) {
 /// execution style:
 ///   resting on leg A only  -> make A, take B when it fills
 ///   resting on leg B only  -> take A, make B
-///   resting on both        -> make/make (no taking at all)
+///   resting on both        -> BOTH of the above, priced and ranked
+///
+/// That last line used to read "make/make (no taking at all)". The code has
+/// never done that, `routes_for` says the opposite four lines from here, and
+/// `resting_on_both_legs_is_two_make_take_routes_not_one_make_make` now pins
+/// which of the two was right.
 ///
 /// The take leg is priced off the venue quote from the ToB rollup, so its age
 /// is reported per row: a stale quote makes the edge a guess, not a number.
@@ -351,4 +356,375 @@ pub fn json(a: &Args) -> String {
         "rows": rows,
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NS: i64 = 1_785_250_000_000_000_000;
+
+    fn rel(id: &str, legs: &[(&str, &str)]) -> Relationship {
+        let legs: Vec<serde_json::Value> = legs
+            .iter()
+            .map(|(v, m)| serde_json::json!({ "venue": v, "market_id": m }))
+            .collect();
+        serde_json::from_value(serde_json::json!({ "id": id, "legs": legs }))
+            .expect("relationship fixture")
+    }
+
+    fn order(venue: &str, market: &str, side: &str, price: &str) -> intents::LiveOrder {
+        intents::LiveOrder {
+            order_id: format!("m-{market}-{side}"),
+            venue: venue.into(),
+            market: market.into(),
+            side: side.into(),
+            price: price.into(),
+            count: 25.0,
+            ts: 1_785_250_000.0,
+            reprices: 0,
+        }
+    }
+
+    /// A book with sizes. `None` for a size is a real shape — the tape does
+    /// not always carry one — so it is spelled out rather than defaulted.
+    fn tob(bid: &str, ask: &str, bid_size: Option<&str>, ask_size: Option<&str>) -> TobSample {
+        TobSample {
+            venue: "kalshi".into(),
+            market_id: "M".into(),
+            ts_local_ns: NS,
+            bid: Some(bid.into()),
+            bid_size: bid_size.map(String::from),
+            ask: Some(ask.into()),
+            ask_size: ask_size.map(String::from),
+        }
+    }
+
+    fn deep(bid: &str, ask: &str) -> TobSample {
+        tob(bid, ask, Some("100"), Some("100"))
+    }
+
+    fn pair<'a>(
+        r: &'a Relationship,
+        rest_a: Option<&'a intents::LiveOrder>,
+        rest_b: Option<&'a intents::LiveOrder>,
+        qa: Option<&'a TobSample>,
+        qb: Option<&'a TobSample>,
+    ) -> Pair<'a> {
+        Pair {
+            rel: r,
+            la: &r.legs[0],
+            lb: &r.legs[1],
+            va: Venue::parse(&r.legs[0].venue).expect("leg a venue"),
+            vb: Venue::parse(&r.legs[1].venue).expect("leg b venue"),
+            rest_a,
+            rest_b,
+            qa,
+            qb,
+        }
+    }
+
+    fn priced(p: &Pair) -> (serde_json::Map<String, serde_json::Value>, Option<(f64, &'static str)>)
+    {
+        let mut cx = Cx::default();
+        let sched = FeeSchedule::new(&mut cx);
+        let clip = cx.parse_exact("25");
+        routes_for(p, &mut cx, &sched, clip)
+    }
+
+    fn xv() -> Relationship {
+        rel("xv-test", &[("kalshi", "KXA"), ("polymarket_us", "PMB")])
+    }
+
+    // ----- the index that keeps `Pair::join` from panicking ----------------
+
+    /// `Pair::join` reads `legs[0]` and `legs[1]` with no length check of its
+    /// own, and handed a one-leg relationship it panics on `legs[1]` —
+    /// verified by calling it directly. The ONLY thing between that and a
+    /// 500 on a live operator tool is this filter, three functions upstream:
+    /// the ids that reach `join` come from `resting`, which reads them out of
+    /// this index and nowhere else. The coupling is invisible at both sites
+    /// and one edit away, so it is pinned here rather than assumed.
+    #[test]
+    fn only_two_leg_relationships_are_indexed_because_pair_join_indexes_both() {
+        let reg = Registry {
+            relationships: vec![
+                rel("one-leg", &[("kalshi", "KXSOLO")]),
+                xv(),
+                rel("three-leg", &[("kalshi", "KX1"), ("kalshi", "KX2"), ("kalshi", "KX3")]),
+            ],
+        };
+        let idx = market_index(&reg);
+        let at = |v: &str, m: &str| idx.get(&(v.to_string(), m.to_string())).cloned();
+        assert_eq!(at("kalshi", "KXA").as_deref(), Some("xv-test"));
+        assert_eq!(at("polymarket_us", "PMB").as_deref(), Some("xv-test"));
+        assert_eq!(at("kalshi", "KXSOLO"), None, "a one-leg id would panic Pair::join");
+        assert_eq!(at("kalshi", "KX1"), None, "a three-leg id would silently lose leg 3");
+        for id in idx.values() {
+            let n = reg.get(id).expect("indexed id is in the registry").legs.len();
+            assert_eq!(n, 2, "{id} reached the index with {n} legs");
+        }
+    }
+
+    /// The same coupling from the other end. We can genuinely be resting a
+    /// quote on a market that only a one-leg relationship names, and the fold
+    /// hands that order to `resting` like any other — it must yield no pair to
+    /// join, while the order itself stays tracked.
+    #[test]
+    fn a_quote_on_a_one_leg_relationship_produces_no_pair_to_join() {
+        let reg = Registry { relationships: vec![rel("one-leg", &[("kalshi", "KXSOLO")])] };
+        let st = intents::IntentState {
+            live: vec![order("kalshi", "KXSOLO", "bid", "0.40")],
+            ..Default::default()
+        };
+        let (ours, rels) = resting(&st, &market_index(&reg));
+        assert!(rels.is_empty(), "nothing to join, so nothing indexes legs[1]");
+        assert_eq!(ours.len(), 1, "the order is still ours and still tracked");
+    }
+
+    // ----- what counts as OUR quote on a pair ------------------------------
+
+    /// We buy YES on leg A and sell YES on leg B, so our quote on A is a BID
+    /// and our quote on B is an ASK. Quotes on the other sides belong to some
+    /// other strategy; joining them would price a basket we are not working.
+    #[test]
+    fn ours_is_a_bid_on_leg_a_and_an_ask_on_leg_b_and_nothing_else() {
+        let reg = Registry { relationships: vec![xv()] };
+        let latest = Latest::new();
+        let wrong = [order("kalshi", "KXA", "ask", "0.40"), order("polymarket_us", "PMB", "bid", "0.60")];
+        let mut ours: Resting = HashMap::new();
+        for o in &wrong {
+            ours.insert((o.venue.clone(), o.market.clone(), o.side.clone()), o);
+        }
+        assert!(
+            Pair::join(&reg, "xv-test", &ours, &latest).is_none(),
+            "an ask on A and a bid on B are not this pair's quotes"
+        );
+
+        let right = order("kalshi", "KXA", "bid", "0.40");
+        ours.insert(("kalshi".into(), "KXA".into(), "bid".into()), &right);
+        let p = Pair::join(&reg, "xv-test", &ours, &latest).expect("our bid on A joins");
+        assert!(p.rest_a.is_some());
+        assert!(p.rest_b.is_none(), "the bid on B is still not ours");
+    }
+
+    /// A venue this cannot price is not a pair, and must fall out before
+    /// anything downstream tries to fee it.
+    #[test]
+    fn a_pair_on_an_unpriceable_venue_is_not_joined() {
+        let reg = Registry {
+            relationships: vec![rel("odd", &[("ftx", "FTXA"), ("kalshi", "KXB")])],
+        };
+        let o = order("ftx", "FTXA", "bid", "0.40");
+        let mut ours: Resting = HashMap::new();
+        ours.insert(("ftx".into(), "FTXA".into(), "bid".into()), &o);
+        assert!(Pair::join(&reg, "odd", &ours, &Latest::new()).is_none());
+    }
+
+    // ----- routes: the execution styles a pair currently supports ----------
+
+    /// Resting on leg A only is ONE make-take entry point: our bid fills and
+    /// we immediately take B. The mirror route needs a resting ask on B that
+    /// we do not have, and must not be priced as if we did.
+    #[test]
+    fn resting_on_leg_a_only_offers_make_a_take_b() {
+        let r = xv();
+        let o = order("kalshi", "KXA", "bid", "0.30");
+        let (qa, qb) = (deep("0.40", "0.42"), deep("0.62", "0.64"));
+        let (routes, best) = priced(&pair(&r, Some(&o), None, Some(&qa), Some(&qb)));
+        assert!(routes.contains_key("make-a-take-b"));
+        assert!(routes.contains_key("take-take"), "the crossing is always available");
+        assert!(!routes.contains_key("take-a-make-b"), "we are not resting on B");
+        assert!(best.is_some());
+    }
+
+    /// The mirror.
+    #[test]
+    fn resting_on_leg_b_only_offers_take_a_make_b() {
+        let r = xv();
+        let o = order("polymarket_us", "PMB", "ask", "0.70");
+        let (qa, qb) = (deep("0.40", "0.42"), deep("0.62", "0.64"));
+        let (routes, _) = priced(&pair(&r, None, Some(&o), Some(&qa), Some(&qb)));
+        assert!(routes.contains_key("take-a-make-b"));
+        assert!(routes.contains_key("take-take"));
+        assert!(!routes.contains_key("make-a-take-b"), "we are not resting on A");
+    }
+
+    /// Resting on BOTH legs is not "make/make hoping both fill" — it is two
+    /// make-take entry points, whichever side gets hit first. No make/make
+    /// route exists in the output and none may: a basket that needs both of
+    /// our quotes to fill is not one that can be priced as available.
+    ///
+    #[test]
+    fn resting_on_both_legs_is_two_make_take_routes_not_one_make_make() {
+        let r = xv();
+        let (oa, ob) =
+            (order("kalshi", "KXA", "bid", "0.30"), order("polymarket_us", "PMB", "ask", "0.70"));
+        let (qa, qb) = (deep("0.40", "0.42"), deep("0.62", "0.64"));
+        let (routes, _) = priced(&pair(&r, Some(&oa), Some(&ob), Some(&qa), Some(&qb)));
+        assert_eq!(routes.len(), 3, "take-take and both make-take entry points");
+        for want in ["take-take", "make-a-take-b", "take-a-make-b"] {
+            assert!(routes.contains_key(want), "{want} missing");
+        }
+    }
+
+    /// The best route drives the row's rank, its displayed edge AND which
+    /// feasibility test is applied to it, so it must be the highest-edge route
+    /// and not simply the last one considered.
+    ///
+    /// The fixture is built so those two answers differ, because otherwise
+    /// this test proves nothing: routes are considered take-take, then
+    /// make-a-take-b, then take-a-make-b, and here the WINNER is the middle
+    /// one. Making leg A at 0.30 against a 0.42 ask is worth 12c a contract;
+    /// our ask on B is a stale 0.50 against a venue bid that has since moved
+    /// up to 0.62, so the route considered last is the worst of the three.
+    #[test]
+    fn the_best_route_is_the_one_with_the_most_edge() {
+        let r = xv();
+        let o = order("kalshi", "KXA", "bid", "0.30");
+        let stale = order("polymarket_us", "PMB", "ask", "0.50");
+        let (qa, qb) = (deep("0.40", "0.42"), deep("0.62", "0.64"));
+        let (routes, best) = priced(&pair(&r, Some(&o), Some(&stale), Some(&qa), Some(&qb)));
+        let (edge, label) = best.expect("a priced route");
+        assert_eq!(label, "make-a-take-b", "making A beats crossing it at 0.42");
+        let from_routes = routes[label]["edge_per_contract"]
+            .as_str()
+            .and_then(|s| s.parse::<f64>().ok())
+            .expect("the winning route's own edge");
+        assert!((edge - from_routes).abs() < 1e-12, "the ranked edge is the row's edge");
+        let of = |route: &str| {
+            routes[route]["edge_per_contract"]
+                .as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .expect("a route's own edge")
+        };
+        assert!(edge > of("take-take"), "{edge} should beat the crossing");
+        assert!(edge > of("take-a-make-b"), "and the stale quote considered after it");
+    }
+
+    /// A route may only be priced off books it actually has. A leg with no ToB
+    /// sample cannot be crossed, so every route that crosses it is absent —
+    /// not priced at zero, and not priced off our own quote standing in for
+    /// the venue's.
+    #[test]
+    fn a_leg_with_no_book_prices_no_route_that_crosses_it() {
+        let r = xv();
+        let (oa, ob) =
+            (order("kalshi", "KXA", "bid", "0.30"), order("polymarket_us", "PMB", "ask", "0.70"));
+        let qa = deep("0.40", "0.42");
+        let (routes, best) = priced(&pair(&r, Some(&oa), Some(&ob), Some(&qa), None));
+        assert_eq!(routes.len(), 1, "only the route that crosses A survives");
+        assert!(routes.contains_key("take-a-make-b"));
+        assert_eq!(best.map(|(_, l)| l), Some("take-a-make-b"));
+    }
+
+    // ----- feasibility: whether the best route is a trade or a number ------
+
+    /// A take-take crosses both books and rests nothing, so no rest spread
+    /// gates it. Applying the spread test to it would drop crossings that were
+    /// available to take at that instant.
+    #[test]
+    fn a_take_take_rests_nothing_so_no_spread_gates_it() {
+        let r = xv();
+        let (qa, qb) = (deep("0.20", "0.80"), deep("0.20", "0.80"));
+        let f = feasible(&pair(&r, None, None, Some(&qa), Some(&qb)), "take-take");
+        assert!(f.rest_spread.is_none());
+        assert!(f.fillable, "a 60c book is fine to CROSS at the touch");
+    }
+
+    /// Fill plausibility applies to the leg we REST on, and to that leg only.
+    /// Reading the other leg's spread rejects a quote sitting inside a 1c book
+    /// because the leg we were going to cross happened to be wide.
+    #[test]
+    fn the_spread_that_gates_a_rest_is_the_one_we_rest_on() {
+        let r = xv();
+        let (oa, ob) =
+            (order("kalshi", "KXA", "bid", "0.40"), order("polymarket_us", "PMB", "ask", "0.70"));
+        let (tight, wide) = (deep("0.40", "0.41"), deep("0.20", "0.80"));
+        let p = pair(&r, Some(&oa), Some(&ob), Some(&tight), Some(&wide));
+
+        let make_a = feasible(&p, "make-a-take-b");
+        assert!((make_a.rest_spread.expect("leg A spread") - 0.01).abs() < 1e-9);
+        assert!(make_a.fillable, "resting inside a 1c book fills");
+
+        let make_b = feasible(&p, "take-a-make-b");
+        assert!((make_b.rest_spread.expect("leg B spread") - 0.60).abs() < 1e-9);
+        assert!(!make_b.fillable, "resting inside a 60c book does not");
+    }
+
+    /// Five cents is the line, and it is inclusive.
+    #[test]
+    fn the_rest_spread_limit_is_five_cents() {
+        let r = xv();
+        let o = order("kalshi", "KXA", "bid", "0.40");
+        let qb = deep("0.62", "0.64");
+        let at = |bid: &str, ask: &str| {
+            let qa = deep(bid, ask);
+            feasible(&pair(&r, Some(&o), None, Some(&qa), Some(&qb)), "make-a-take-b").fillable
+        };
+        assert!(at("0.40", "0.45"), "exactly 5c is still fillable");
+        assert!(!at("0.40", "0.46"));
+    }
+
+    /// A leg we would have to CROSS is only good for what is resting behind
+    /// its price, and `None` — the tape carried no size — is not permission to
+    /// assume it is deep. That default is the difference between a clip that
+    /// fills and one that walks the book.
+    #[test]
+    fn missing_size_on_a_leg_we_cross_is_not_permission_to_assume_depth() {
+        let r = xv();
+        let o = order("kalshi", "KXA", "bid", "0.40");
+        let (qa, qb) = (deep("0.40", "0.42"), tob("0.62", "0.64", None, Some("100")));
+        let f = feasible(&pair(&r, Some(&o), None, Some(&qa), Some(&qb)), "make-a-take-b");
+        assert!(f.take_depth.is_none(), "no size on the bid we would hit");
+        assert!(!f.deep_enough);
+        assert!(f.have_books, "the book is there; only its size is not");
+    }
+
+    /// Depth on a take-take is the THINNER of the two legs. A 25-lot needs 25
+    /// on both sides; the max, or an average, would size off a book that
+    /// cannot fill it.
+    #[test]
+    fn take_take_depth_is_the_thinner_of_the_two_legs() {
+        let r = xv();
+        let at = |a: &str, b: &str| {
+            let qa = tob("0.40", "0.42", Some("999"), Some(a));
+            let qb = tob("0.62", "0.64", Some(b), Some("999"));
+            feasible(&pair(&r, None, None, Some(&qa), Some(&qb)), "take-take")
+        };
+        let f = at("100", "30");
+        assert_eq!(f.take_depth, Some(30.0), "the ask on A is 100 but the bid on B is 30");
+        assert!(f.deep_enough);
+        assert_eq!(at("30", "100").take_depth, Some(30.0), "either side may be the thin one");
+        assert!(at("25", "25").deep_enough, "a clip of 25 needs exactly 25");
+        assert!(!at("24", "100").deep_enough);
+    }
+
+    /// A leg we REST on needs no depth — we are the size there. Counting the
+    /// rested leg's size would reject a route on the strength of a book we
+    /// were never going to cross.
+    #[test]
+    fn a_rested_leg_needs_no_depth_because_we_are_the_size() {
+        let r = xv();
+        let o = order("kalshi", "KXA", "bid", "0.40");
+        let qa = tob("0.40", "0.42", Some("1"), Some("1"));
+        let qb = tob("0.62", "0.64", Some("100"), Some("100"));
+        let f = feasible(&pair(&r, Some(&o), None, Some(&qa), Some(&qb)), "make-a-take-b");
+        assert_eq!(f.take_depth, Some(100.0), "only leg B is crossed");
+        assert!(f.deep_enough);
+    }
+
+    /// `have_books` is a separate claim from fillability: a route can price
+    /// off one venue book and our own quote and still not be a trade, because
+    /// nothing knows what the other leg is worth.
+    #[test]
+    fn a_missing_book_on_either_leg_is_not_a_trade() {
+        let r = xv();
+        let o = order("polymarket_us", "PMB", "ask", "0.70");
+        let qa = deep("0.40", "0.42");
+        assert!(!feasible(&pair(&r, None, Some(&o), None, Some(&qa)), "take-a-make-b").have_books);
+        assert!(!feasible(&pair(&r, None, Some(&o), Some(&qa), None), "take-a-make-b").have_books);
+        assert!(feasible(&pair(&r, None, Some(&o), Some(&qa), Some(&qa)), "take-a-make-b")
+            .have_books);
+    }
 }

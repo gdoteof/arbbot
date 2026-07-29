@@ -295,3 +295,164 @@ pub fn json(a: &Args) -> String {
     v["sources"] = serde_json::Value::Array(sources);
     v.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PM-US's four figures in the order `import_pmus` returns them:
+    /// buyingPower, currentBalance, marginRequirement, |short contracts|.
+    fn pmus_figures(bp: &str, cb: &str, mr: &str, shorts: &str) -> Option<PmusFigures> {
+        Some((bp.into(), cb.into(), mr.into(), shorts.into()))
+    }
+
+    fn checks(a: &Args, pmus: &Option<PmusFigures>) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        let mut cx = Cx::default();
+        let j = Journal::new();
+        let mut sources = Vec::new();
+        let out = recon_checks(a, &mut cx, &j, pmus, &mut sources);
+        (out, sources)
+    }
+
+    fn row<'a>(checks: &'a [serde_json::Value], account: &str) -> &'a serde_json::Value {
+        checks.iter().find(|c| c["account"] == account).expect("reconciliation row")
+    }
+
+    /// The 2026-07-28 audit found both reconciliation rows reading EXACT and
+    /// neither of them able to read anything else. `cash:kalshi` is compared
+    /// against a constant typed at startup; `cash:pmus` against the very
+    /// buyingPower that `PmusImport::apply`'s plug entry forces it to equal.
+    /// They are kept because the figures are worth seeing, but a page that
+    /// renders them as passing checks is a page that manufactures confidence.
+    #[test]
+    fn the_two_cash_rows_declare_themselves_not_checks() {
+        let mut a = Args::for_test();
+        a.kalshi_balance = Some("123.45".into());
+        let (out, _) = checks(&a, &pmus_figures("10.00", "11.00", "1.00", "1.00"));
+        assert_eq!(row(&out, accounts::CASH_KALSHI)["falsifiable"], false);
+        assert_eq!(row(&out, accounts::CASH_PMUS)["falsifiable"], false);
+        assert_eq!(
+            row(&out, "cash:pmus vs currentBalance − marginRequirement")["falsifiable"],
+            false,
+            "a PM-US identity compared to itself through a plug entry"
+        );
+        for c in &out {
+            assert!(
+                c["why"].as_str().is_some_and(|w| w.len() > 40),
+                "{} carries no explanation of what it is",
+                c["account"]
+            );
+        }
+    }
+
+    /// The one accounting cross-check in this codebase that can genuinely
+    /// fail. PM-US withholds $1.00 of collateral per short contract, so
+    /// |shorts| must equal marginRequirement exactly — and this existed only
+    /// in the hand-run `arb-books` CLI, which has no unit, so nothing was
+    /// watching it.
+    #[test]
+    fn the_short_contracts_row_is_the_one_that_can_fail() {
+        let a = Args::for_test();
+        let (out, _) = checks(&a, &pmus_figures("10.00", "51.00", "41.00", "41.00"));
+        let c = row(&out, "pmus short contracts vs marginRequirement");
+        assert_eq!(c["falsifiable"], true);
+        assert_eq!(c["exact"], true, "41 shorts against $41.00 of margin");
+        assert_eq!(out.iter().filter(|c| c["falsifiable"] == true).count(), 1);
+    }
+
+    /// A short missing from the positions snapshot is still costing collateral
+    /// at the venue, so the gap shows up here and nowhere else.
+    #[test]
+    fn a_short_missing_from_the_snapshot_fails_the_check() {
+        let a = Args::for_test();
+        let (out, _) = checks(&a, &pmus_figures("10.00", "51.00", "41.00", "40.00"));
+        let c = row(&out, "pmus short contracts vs marginRequirement");
+        assert_eq!(c["exact"], false);
+        assert_eq!(c["diff"], "-1.00", "one contract short of the margin PM-US is holding");
+    }
+
+    /// With no PM-US snapshot the Kalshi half stands on its own — but nothing
+    /// falsifiable is left, and the payload must be able to say so rather than
+    /// showing a green statement built from one unfalsifiable row.
+    #[test]
+    fn without_a_pmus_snapshot_nothing_falsifiable_remains() {
+        let mut a = Args::for_test();
+        a.kalshi_balance = Some("123.45".into());
+        let (out, _) = checks(&a, &None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.iter().filter(|c| c["falsifiable"] == true).count(), 0);
+    }
+
+    /// No `--kalshi-balance` means no row at all, not a row against zero: a
+    /// books balance compared to an absent venue figure would read as a
+    /// catastrophic discrepancy on a set of books that are fine.
+    #[test]
+    fn an_absent_kalshi_balance_produces_no_row_rather_than_a_zero() {
+        let a = Args::for_test();
+        let (out, _) = checks(&a, &None);
+        assert!(out.is_empty());
+    }
+
+    /// `--kalshi-balance` is typed once at startup and never re-read, so its
+    /// provenance row must say `frozen` — that flag is what keeps `age_sources`
+    /// from aging it against a file mtime it does not have.
+    #[test]
+    fn the_typed_kalshi_balance_is_marked_frozen_in_provenance() {
+        let mut a = Args::for_test();
+        a.kalshi_balance = Some("123.45".into());
+        let (_, sources) = checks(&a, &None);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["frozen"], true);
+    }
+
+    // ----- provenance ageing ----------------------------------------------
+
+    /// Stale is a THIRD state, not a pass. A green EXACT over a 20.2-hour-old
+    /// snapshot — the state the audit actually found — says nothing about the
+    /// account now, and the oldest source is what the page reports.
+    #[test]
+    fn the_reported_snapshot_age_is_the_oldest_source() {
+        let mut sources = vec![
+            serde_json::json!({ "what": "kalshi fills", "age_s": 30 }),
+            serde_json::json!({ "what": "pm-us positions", "age_s": 72_000 }),
+        ];
+        assert_eq!(age_sources(&mut sources), Some(72_000));
+        assert_eq!(sources[0]["stale"], false);
+        assert_eq!(sources[1]["stale"], true);
+    }
+
+    /// One hour is the line, and it is exclusive: a snapshot pulled exactly an
+    /// hour ago is still evidence.
+    #[test]
+    fn a_snapshot_is_stale_past_an_hour() {
+        let at = |age: u64| {
+            let mut s = vec![serde_json::json!({ "what": "x", "age_s": age })];
+            age_sources(&mut s);
+            s[0]["stale"].clone()
+        };
+        assert_eq!(at(SNAPSHOT_STALE_S), false);
+        assert_eq!(at(SNAPSHOT_STALE_S + 1), true);
+    }
+
+    /// A figure typed at startup has no file behind it, so ageing it against
+    /// this process's uptime would report a fresh dashboard as having fresh
+    /// venue data. It is skipped entirely and cannot pull the headline age.
+    #[test]
+    fn a_frozen_source_is_not_aged_and_does_not_move_the_headline() {
+        let mut sources = vec![
+            serde_json::json!({ "what": "kalshi fills", "age_s": 30 }),
+            serde_json::json!({ "what": "kalshi cash balance", "age_s": 99_999, "frozen": true }),
+        ];
+        assert_eq!(age_sources(&mut sources), Some(30));
+        assert!(sources[1].get("stale").is_none(), "a frozen row carries no staleness verdict");
+    }
+
+    /// A source whose file could not be stat-ed has an UNKNOWN age, and
+    /// unknown must not render as fresh. `null` is the honest answer.
+    #[test]
+    fn a_source_with_no_age_is_unknown_not_fresh() {
+        let mut sources = vec![serde_json::json!({ "what": "pm-us balances", "age_s": null })];
+        assert_eq!(age_sources(&mut sources), None);
+        assert!(sources[0]["stale"].is_null());
+    }
+}

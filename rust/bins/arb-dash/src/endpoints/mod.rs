@@ -60,3 +60,64 @@ pub fn coverage_age_s(latest: &Latest, now_ns: i64) -> i64 {
         i64::MAX
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{coverage_age_s, Latest, MAX_COVERAGE_AGE_S};
+
+    const NOW_NS: i64 = 1_785_250_000_000_000_000;
+    const S: i64 = 1_000_000_000;
+
+    fn book(market: &str, age_s: i64) -> ((String, String), arb_tob::TobSample) {
+        (
+            ("kalshi".to_string(), market.to_string()),
+            arb_tob::TobSample {
+                venue: "kalshi".into(),
+                market_id: market.into(),
+                ts_local_ns: NOW_NS - age_s * S,
+                bid: Some("0.40".into()),
+                bid_size: Some("100".into()),
+                ask: Some("0.42".into()),
+                ask_size: Some("100".into()),
+            },
+        )
+    }
+
+    fn aged(samples: impl IntoIterator<Item = ((String, String), arb_tob::TobSample)>) -> i64 {
+        let mut latest = Latest::new();
+        latest.extend(samples);
+        coverage_age_s(&latest, NOW_NS)
+    }
+
+    /// The distinction in this function's doc comment, and the one that cost a
+    /// wrong headline. The ToB series emits on CHANGE, so a 13-hour-old sample
+    /// on a market nobody has quoted since IS the current book. Coverage is
+    /// therefore the NEWEST sample in the rollup, never the oldest: reading it
+    /// per market conflates "quiet" with "unknown" and reported 0 of 67 pairs
+    /// actionable when 47 had a perfectly fillable book.
+    #[test]
+    fn a_quiet_market_does_not_age_the_rollup() {
+        let age = aged([book("KXQUIET", 13 * 3600), book("KXBUSY", 10)]);
+        assert_eq!(age, 10, "the newest sample is the coverage, not the oldest");
+        assert!(age <= MAX_COVERAGE_AGE_S, "a rollup sampled 10s ago is current");
+    }
+
+    /// What actually goes stale is the rollup itself: built at noon, it knows
+    /// nothing about the afternoon. Thirty minutes is the line and it is
+    /// inclusive — without this gate the board reported "10 actionable" off
+    /// 22-hour-old quotes.
+    #[test]
+    fn a_rollup_that_stopped_covering_is_not_evidence_about_now() {
+        assert_eq!(aged([book("KXONE", MAX_COVERAGE_AGE_S)]), MAX_COVERAGE_AGE_S);
+        assert!(aged([book("KXONE", MAX_COVERAGE_AGE_S)]) <= MAX_COVERAGE_AGE_S);
+        assert!(aged([book("KXONE", MAX_COVERAGE_AGE_S + 1)]) > MAX_COVERAGE_AGE_S);
+    }
+
+    /// An EMPTY rollup is UNKNOWN, not fresh. Zero would read as "sampled this
+    /// instant" and mark every row on the board actionable off no book at all.
+    #[test]
+    fn a_rollup_with_no_samples_is_unknown_not_current() {
+        assert_eq!(aged([]), i64::MAX);
+        assert!(aged([]) > MAX_COVERAGE_AGE_S);
+    }
+}

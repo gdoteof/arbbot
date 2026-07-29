@@ -84,6 +84,33 @@ pub struct Args {
     started_at: u64,
 }
 
+#[cfg(test)]
+impl Args {
+    /// An `Args` whose every path points at nothing, for the endpoint builders
+    /// that parse a URL or fold a value in memory. A path that does not exist
+    /// is deliberate: a test that silently picked up this machine's real
+    /// `data/` would pass here and nowhere else.
+    fn for_test() -> Args {
+        Args {
+            kalshi_dir: "/nonexistent/kalshi".into(),
+            pmus_dir: String::new(),
+            pmus_deposits: "0".into(),
+            kalshi_balance: None,
+            data_dir: "/nonexistent/data".into(),
+            scan_dir: "/nonexistent/data/scan".into(),
+            raw_dir: "/nonexistent/data/raw".into(),
+            parquet_dir: "/nonexistent/data/parquet".into(),
+            rollup_dir: "/nonexistent/data/rollup".into(),
+            intents_path: "/nonexistent/data/intents.jsonl".into(),
+            ledger_path: "/nonexistent/data/trades.jsonl".into(),
+            registry: "/nonexistent/config/registry.yaml".into(),
+            tradable: "/nonexistent/config/tradable.yaml".into(),
+            port: 0,
+            started_at: 0,
+        }
+    }
+}
+
 fn main() {
     let mut a = Args {
         kalshi_dir: String::new(),

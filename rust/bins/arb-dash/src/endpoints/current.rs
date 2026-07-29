@@ -231,3 +231,84 @@ pub fn json(a: &Args, query: &str) -> String {
     })
     .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Query;
+    use crate::Args;
+    use arb_scenario::Scenario;
+
+    fn parse(query: &str) -> Query {
+        Query::parse(&Args::for_test(), query)
+    }
+
+    /// The defaults are the whole view when someone opens `/current` with no
+    /// query at all, which is how it is normally opened.
+    #[test]
+    fn the_default_board_is_the_permitted_universe_at_a_twenty_five_clip() {
+        let q = parse("");
+        assert_eq!(q.scenario, Scenario::TakeTake);
+        assert_eq!(q.clip_s, "25");
+        assert_eq!(q.n, 25);
+        assert_eq!(q.max_spread_s, "0.05");
+        assert!(q.only_tradable, "detected-but-not-permitted edge must be asked for");
+    }
+
+    /// Detected is not permitted. Only the exact `all=1` opens the untradable
+    /// universe: a bare `?all`, or any other value, leaves the board showing
+    /// what this system is actually allowed to trade.
+    #[test]
+    fn only_an_explicit_all_flag_opens_the_untradable_universe() {
+        assert!(!parse("all=1").only_tradable);
+        assert!(parse("all=0").only_tradable);
+        assert!(parse("all=true").only_tradable);
+        assert!(parse("all").only_tradable, "a bare flag carries no value");
+        assert!(parse("all=").only_tradable, "and neither does an empty one");
+    }
+
+    /// `?n=` garbage must fall back to the default, not to zero: `truncate(0)`
+    /// renders an empty board, which reads as "no edge anywhere" rather than
+    /// as a bad URL.
+    #[test]
+    fn an_unreadable_row_count_falls_back_to_the_default_not_to_zero() {
+        assert_eq!(parse("n=abc").n, 25);
+        assert_eq!(parse("n=-1").n, 25);
+        assert_eq!(parse("n=").n, 25);
+        assert_eq!(parse("n=3").n, 3);
+        assert_eq!(parse("n=0").n, 0, "an explicit zero is still the operator's choice");
+    }
+
+    /// An unknown scenario name ranks the board on take-take rather than
+    /// erroring — but it must not silently rank on a DIFFERENT one, because
+    /// the page echoes `scenario` back and the operator reads it as confirmed.
+    #[test]
+    fn an_unknown_scenario_ranks_on_take_take() {
+        assert_eq!(parse("scenario=nonsense").scenario, Scenario::TakeTake);
+        assert_eq!(parse("scenario=make-a-take-b").scenario, Scenario::MakeATakeB);
+        assert_eq!(parse("scenario=take-a-make-b").scenario, Scenario::TakeAMakeB);
+    }
+
+    /// The day names the rollup files this view reads. When the URL gives one
+    /// it wins; when it does not, the default must be a real date — a blank
+    /// would build `tob-kalshi-.jsonl` and report "no ToB rollup" for a day
+    /// that was rolled up perfectly well.
+    #[test]
+    fn the_day_comes_off_the_url_or_is_a_real_date() {
+        assert_eq!(parse("day=2026-07-01").day, "2026-07-01");
+        let today = parse("").day;
+        assert!(
+            arb_core::resolve::parse_iso(&today).is_some(),
+            "the default day must be a date, got {today:?}"
+        );
+    }
+
+    /// Clip and max-spread are carried as STRINGS all the way to `Cx`, which
+    /// parses them exactly. Reading them as f64 here would round a decimal
+    /// before the exact arithmetic ever saw it.
+    #[test]
+    fn the_sizes_stay_strings_so_the_decimal_arithmetic_stays_exact() {
+        let q = parse("clip=1000&max_spread=0.02");
+        assert_eq!(q.clip_s, "1000");
+        assert_eq!(q.max_spread_s, "0.02");
+    }
+}
