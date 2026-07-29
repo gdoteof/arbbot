@@ -7,6 +7,7 @@
 //! because `arbbot-report.service` pipes the ETL to /dev/null.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use arb_core::clock::now_secs;
@@ -20,7 +21,9 @@ pub struct DayRow {
     pub day: String,
     pub jsonl_bytes: Option<u64>,
     pub parquet_bytes: Option<u64>,
-    /// A closed day with raw JSONL and no Parquet has failed to archive.
+    /// A closed day with no COMPLETE Parquet has failed to archive, whether
+    /// the file is missing or merely unreadable. `parquet_bytes` is still the
+    /// size on disk: for a broken archive that IS the evidence.
     pub unarchived: bool,
 }
 
@@ -106,13 +109,38 @@ pub fn build(data_dir: &str) -> Integrity {
     days.extend(pq.keys().cloned());
 
     let mut coverage = Vec::new();
+    let mut warnings = Vec::new();
     let mut unarchived_days = 0usize;
     let mut unarchived_bytes = 0u64;
     for (stem, day) in days {
         let j = raw.get(&(stem.clone(), day.clone())).copied();
         let p = pq.get(&(stem.clone(), day.clone())).copied();
+        // Existence is not evidence of an archive. A failed nightly ETL left
+        // `kalshi-2026-07-27.parquet` at ZERO BYTES beside a 128 MB tape, so
+        // `p` was `Some(0)`, the row rendered green, and the day stayed out of
+        // the headline — this module's own failure mode, wearing the shape of
+        // a success.
+        let archived = p.is_some()
+            && arb_query::parquet_is_complete(Path::new(&format!(
+                "{data_dir}/parquet/{stem}-{day}.parquet"
+            )));
+        if let Some(bytes) = p.filter(|_| !archived) {
+            // The ETL deletes the JSONL only after the archive verifies, so a
+            // broken Parquet with a raw tape behind it is a re-run and one
+            // without it is a day nobody can read. Different jobs.
+            warnings.push(match j {
+                Some(_) => format!(
+                    "{stem} {day}: parquet is {bytes} bytes, not a complete file — \
+                     the day is NOT archived"
+                ),
+                None => format!(
+                    "{stem} {day}: parquet is {bytes} bytes, not a complete file, \
+                     and there is no raw tape behind it"
+                ),
+            });
+        }
         // Today is legitimately raw-only; earlier days are not.
-        let unarchived = day < today && j.is_some() && p.is_none();
+        let unarchived = day < today && !archived;
         if unarchived {
             unarchived_days += 1;
             unarchived_bytes += j.unwrap_or(0);
@@ -127,7 +155,6 @@ pub fn build(data_dir: &str) -> Integrity {
     }
 
     let mut live_feeds = Vec::new();
-    let mut warnings = Vec::new();
     for stem in STEMS {
         let path = format!("{data_dir}/raw/{stem}-{today}.jsonl");
         match std::fs::metadata(&path) {
@@ -192,4 +219,92 @@ pub fn build(data_dir: &str) -> Integrity {
     }
 
     Integrity { today, live_feeds, derived, coverage, unarchived_days, unarchived_bytes, warnings }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A complete Parquet file in the 12 bytes the archive check reads: magic,
+    /// footer length, magic. This view never opens the body.
+    const COMPLETE: &[u8] = b"PAR1\0\0\0\0PAR1";
+
+    /// A closed day (2020 is closed under any clock this runs on) with a raw
+    /// tape, plus whatever the ETL is supposed to have left in `parquet/`.
+    fn data_dir(name: &str, parquet: Option<&[u8]>) -> String {
+        let base =
+            std::env::temp_dir().join(format!("arb-dash-integrity-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("raw")).unwrap();
+        std::fs::create_dir_all(base.join("parquet")).unwrap();
+        std::fs::write(base.join("raw/kalshi-2020-01-01.jsonl"), b"{}\n").unwrap();
+        if let Some(bytes) = parquet {
+            std::fs::write(base.join("parquet/kalshi-2020-01-01.parquet"), bytes).unwrap();
+        }
+        base.to_string_lossy().to_string()
+    }
+
+    fn day(iv: &Integrity) -> &DayRow {
+        iv.coverage.iter().find(|r| r.day == "2020-01-01").expect("the fixture day")
+    }
+
+    /// The live defect, on the endpoint that exists to catch exactly this: a
+    /// failed nightly ETL left a ZERO-BYTE `kalshi-2026-07-27.parquet` beside a
+    /// 128,685,072-byte tape and `/api/integrity` answered
+    /// `"parquet_bytes": 0, "unarchived": false` — green, and excluded from the
+    /// "N unarchived day(s)" headline an operator reads to decide whether the
+    /// archive is healthy.
+    #[test]
+    fn a_zero_byte_parquet_is_not_an_archive() {
+        let d = data_dir("zero", Some(b""));
+        let iv = build(&d);
+        assert!(day(&iv).unarchived, "an empty archive is not an archive");
+        assert_eq!(day(&iv).parquet_bytes, Some(0), "the size is the evidence — keep showing it");
+        assert_eq!(iv.unarchived_days, 1, "and it counts in the headline");
+        assert!(
+            iv.warnings.iter().any(|w| w.contains("2020-01-01") && w.contains("not a complete")),
+            "no warning names the broken file: {:?}",
+            iv.warnings
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Bytes are not completeness either. The ETL writes the footer LAST, so a
+    /// run killed part-way leaves a plausibly-sized file that no reader can
+    /// open — and a `> 0` check would pass it.
+    #[test]
+    fn a_truncated_parquet_is_not_an_archive() {
+        let d = data_dir("truncated", Some(b"PAR1rows rows rows"));
+        let iv = build(&d);
+        assert!(day(&iv).unarchived, "a footerless parquet is not an archive");
+        assert_eq!(iv.unarchived_days, 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The other direction, which matters just as much: a real archive must
+    /// not be flagged, or the headline becomes noise and stops being read.
+    #[test]
+    fn a_complete_parquet_closes_the_day() {
+        let d = data_dir("complete", Some(COMPLETE));
+        let iv = build(&d);
+        assert!(!day(&iv).unarchived);
+        assert_eq!(iv.unarchived_days, 0);
+        assert!(
+            !iv.warnings.iter().any(|w| w.contains("2020-01-01")),
+            "an archived day warned about: {:?}",
+            iv.warnings
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The case this check was built for is still caught.
+    #[test]
+    fn a_missing_parquet_is_still_unarchived() {
+        let d = data_dir("missing", None);
+        let iv = build(&d);
+        assert!(day(&iv).unarchived);
+        assert_eq!(day(&iv).parquet_bytes, None);
+        assert_eq!(iv.unarchived_bytes, 3, "the raw tape's bytes are what is still raw");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

@@ -300,6 +300,41 @@ mod tests {
         let _ = std::fs::remove_file(p);
     }
 
+    /// The cross-crate half of the resolver fix, and the one that was easy to
+    /// miss because it lives in neither file that was edited: `POST
+    /// /api/rollup --day 2026-07-27` was BROKEN before it.
+    ///
+    /// A zero-byte `kalshi-2026-07-27.parquet` outranked the good 128 MB raw
+    /// tape beside it, `iter_parquet` failed on the empty file, and `build_day`
+    /// returns `Err` for the WHOLE day on any venue's error — so one broken
+    /// archive took out every venue's series with the raw tape sitting there
+    /// readable. Only "no tape for this day" is tolerated, and this was not
+    /// that.
+    #[test]
+    fn a_broken_archive_does_not_take_the_whole_day_down_with_it() {
+        let base = std::env::temp_dir().join(format!("arb-tob-day-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["raw", "parquet", "out"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        std::fs::write(base.join("raw/kalshi-2026-07-27.jsonl"), SNAP).unwrap();
+        std::fs::write(base.join("parquet/kalshi-2026-07-27.parquet"), b"").unwrap();
+        let dir = |d: &str| base.join(d).to_string_lossy().to_string();
+
+        let got = build_day(
+            &dir("raw"),
+            &dir("parquet"),
+            &dir("out"),
+            "2026-07-27",
+            DEFAULT_INTERVAL_NS,
+            &["kalshi"],
+        )
+        .expect("the raw tape is right there");
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].1.samples, 1, "built from the raw tape, not the empty archive");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn damaged_lines_are_counted_not_fatal() {
         let p = jsonl(&[SNAP, "\0\0\0", "{not json", ""], "damaged");

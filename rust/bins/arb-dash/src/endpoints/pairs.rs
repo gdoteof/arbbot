@@ -91,7 +91,24 @@ pub fn detail_json(a: &Args, query: &str) -> String {
         .fold(f64::INFINITY, f64::min);
 
     let sources = sources_for_range(&a.scan_dir, &a.parquet_dir, "opportunities", &from, &to);
-    let opp = opps::summarize(&sources, Some(&rel_id)).unwrap_or_default();
+    // Every Err out of `summarize` is a read that FAILED. `unwrap_or_default()`
+    // turned each one into an empty Vec, which serialized as
+    // `"opportunity": null` — identical to a pair the scanner watched and never
+    // logged, and rendered as "no opportunity in range". Silence and evidence
+    // of absence are opposite facts.
+    //
+    // Reported BESIDE the payload, not as the top-level `error` that
+    // `/api/opportunities` returns, because the two are not the same shape of
+    // answer. There, the error kills a panel that is entirely about
+    // opportunities; here it would trip `if(d.error) return fail(...)` in the
+    // router and replace the whole drill-down — including the basket-cost
+    // chart, which comes off the ToB rollup and the registry and is the main
+    // forensic instrument during exactly the broken-archive incident this
+    // reports. One unreadable file must not blank seven fields it never fed.
+    let (opp, opp_error) = match opps::summarize(&sources, Some(&rel_id)) {
+        Ok(rows) => (rows, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
 
     serde_json::json!({
         "from": from, "to": to,
@@ -109,6 +126,7 @@ pub fn detail_json(a: &Args, query: &str) -> String {
         "fresh_points_under_1": fresh_under_1,
         "best_fresh_cost": if best_fresh.is_finite() { Some(best_fresh) } else { None },
         "opportunity": opp.first(),
+        "opportunity_error": opp_error,
     })
     .to_string()
 }
@@ -130,7 +148,93 @@ fn day_range(from: &str, to: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::day_range;
+    use super::{day_range, detail_json};
+    use crate::Args;
+
+    const REGISTRY: &str = "\
+relationships:
+  - id: xvus-fixture
+    legs:
+      - venue: kalshi
+        market_id: K
+      - venue: polymarket_us
+        market_id: P
+";
+
+    /// A dash whose scan archive holds exactly one day, in whichever state the
+    /// caller wants it. The registry is real (the endpoint loads one before it
+    /// reads anything); the ToB rollup is not, so the chart is empty and the
+    /// only thing under test is what the opportunity read answers.
+    fn args(name: &str, parquet: Option<&[u8]>, jsonl: Option<&str>) -> (Args, String) {
+        let base =
+            std::env::temp_dir().join(format!("arb-dash-pairs-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("scan")).unwrap();
+        std::fs::create_dir_all(base.join("parquet")).unwrap();
+        std::fs::write(base.join("registry.yaml"), REGISTRY).unwrap();
+        if let Some(b) = parquet {
+            std::fs::write(base.join("parquet/opportunities-2026-07-27.parquet"), b).unwrap();
+        }
+        if let Some(t) = jsonl {
+            std::fs::write(base.join("scan/opportunities-2026-07-27.jsonl"), t).unwrap();
+        }
+        let mut a = Args::for_test();
+        a.scan_dir = base.join("scan").to_string_lossy().to_string();
+        a.parquet_dir = base.join("parquet").to_string_lossy().to_string();
+        a.registry = base.join("registry.yaml").to_string_lossy().to_string();
+        (a, base.to_string_lossy().to_string())
+    }
+
+    fn detail(a: &Args) -> serde_json::Value {
+        let raw = detail_json(a, "rel=xvus-fixture&from=2026-07-27&to=2026-07-27");
+        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("not json ({e}): {raw}"))
+    }
+
+    /// A read that FAILED must not answer the question. `unwrap_or_default()`
+    /// collapsed every `Err` from `opps::summarize` into an empty Vec, so an
+    /// unreadable archive serialized as `"opportunity": null` — the same bytes
+    /// a pair the scanner watched all day and never logged produces, and the
+    /// UI says "the scanner logged no opportunity for this pair in range" over
+    /// both. Silence and evidence of absence are opposite facts.
+    ///
+    /// The rest of the payload SURVIVES: the basket-cost chart is read off the
+    /// ToB rollup and the registry, it is the instrument an operator wants
+    /// most while an archive is broken, and a top-level `error` would blank it
+    /// (`index.html`: `if(d.error) return fail(f, d.error)`).
+    #[test]
+    fn an_unreadable_scan_archive_is_an_error_beside_the_payload_not_instead_of_it() {
+        // Magic at both ends and garbage between: a file the resolver is right
+        // to hand over and the reader cannot open.
+        let (a, base) = args("broken", Some(b"PAR1not a parquetPAR1"), None);
+        let out = detail(&a);
+        assert!(
+            out["opportunity_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("opportunities-2026-07-27.parquet")),
+            "the failing file is not named: {out}"
+        );
+        assert!(out["opportunity"].is_null(), "a failed read still answered: {out}");
+        assert!(out["error"].is_null(), "one unreadable file must not blank the drill-down");
+        assert_eq!(out["relationship"]["id"], "xvus-fixture", "the payload survived: {out}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The distinction that has to survive the fix. A tape that was read and
+    /// holds nothing for this pair is still `"opportunity": null` and no
+    /// error — otherwise the drill-down cries wolf on every quiet pair, which
+    /// is the same defect pointed the other way.
+    #[test]
+    fn a_tape_that_was_read_and_held_nothing_is_still_null() {
+        let (a, base) = args(
+            "quiet",
+            None,
+            Some("{\"relationship_id\":\"someone-else\",\"ts_local_ns\":0}\n"),
+        );
+        let out = detail(&a);
+        assert!(out["opportunity_error"].is_null(), "a readable tape reported an error: {out}");
+        assert!(out["opportunity"].is_null(), "{out}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// Every day this returns becomes a `tob-<venue>-<day>.jsonl` stat, three
     /// venues wide, so an unbounded or malformed range is a filesystem storm
