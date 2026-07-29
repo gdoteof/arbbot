@@ -85,7 +85,32 @@ class UnixBroadcaster:
     immediately instead of waiting for organic snapshots (Kalshi WS sends
     them only on subscribe/gap — a late subscriber would wait forever)."""
 
-    MAX_BUFFER = 1_000_000  # bytes per subscriber
+    # Bytes queued per subscriber before it is dropped as slow.
+    #
+    # 16MB, matching `arb_tape::broadcast::MAX_BUFFER`, which moved off 1MB on
+    # 2026-07-23 after the arb-trader shadow was seen "flapping on exact 30s
+    # boundaries" against the Rust socket. That comment reasoned this recorder
+    # was immune — "the Python recorder's transport-buffer policy is measured at
+    # the socket, so it never had this enqueue-race" — and it is not. Measured
+    # 2026-07-28 with the new drop log below: an eviction on EVERY 30s
+    # rebroadcast, 21 in ten minutes, at 1,000,816 / 1,002,005 / 1,002,740
+    # bytes. Different mechanism, same outcome. Rust's race is queueing the
+    # burst before its writer task drains; here the burst genuinely outruns the
+    # kernel socket buffer plus the reader. Either way a 1MB cap sits AT the
+    # burst size and so fires every time.
+    #
+    # The burst is `rebroadcast_snapshots`: one snapshot per tracked book, all
+    # at once. Measured off the live socket 2026-07-28 — 1,163 markets averaging
+    # 806 bytes on the wire = ~0.94MB, against the old 1MB cap. That is why the
+    # readings were only ~2KB over: the heal-burst alone nearly fills the
+    # buffer, so any backlog at all tips it.
+    #
+    # 16MB is ~2 minutes of headroom at the measured 130KB/s steady rate, so it
+    # never fires on a burst but still sheds a genuinely wedged reader. It does
+    # NOT fix the burst, which is O(universe) and will chase any fixed cap as
+    # the market count grows — rotating the rebroadcast across cycles is the
+    # change that scales, and it is not this one.
+    MAX_BUFFER = 16_000_000  # bytes per subscriber
 
     def __init__(self, socket_path: str | Path,
                  welcome_events=None):

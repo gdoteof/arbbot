@@ -22,8 +22,21 @@ use tokio::sync::mpsc;
 // 2026-07-23 by the first real subscriber of the rs socket (arb-trader
 // shadow flapping on exact 30s boundaries). 16MB never triggers on a burst
 // but still sheds a genuinely stalled subscriber within ~35s of recorded
-// peak rate (the Python recorder's transport-buffer policy is measured at
-// the socket, so it never had this enqueue-race).
+// peak rate.
+//
+// This used to end "(the Python recorder's transport-buffer policy is
+// measured at the socket, so it never had this enqueue-race)". Right about
+// the RACE, wrong about the CONSEQUENCE — and that sentence is why the
+// Python recorder kept a 1MB cap for another five days while serving the
+// ARMED trader. It has no enqueue race; its real socket buffer fills
+// instead, because the burst outruns the kernel plus the reader. Measured
+// 2026-07-28: an eviction on every single 30s rebroadcast, 21 in ten
+// minutes. Both recorders sit at 16MB now.
+//
+// The burst is the thing that actually wants fixing: one snapshot per
+// tracked book in a single cycle — ~0.94MB across 1,163 markets on
+// 2026-07-28 — so it grows with the universe and will chase any fixed cap.
+// Rotating it across cycles is the change that scales.
 pub const MAX_BUFFER: usize = 16_000_000;
 
 struct Subscriber {
