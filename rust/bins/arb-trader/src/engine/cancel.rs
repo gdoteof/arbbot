@@ -458,13 +458,18 @@ fn cancel_work(
 ///
 /// That last case goes out UNVERIFIED, deliberately, and it is somebody else's
 /// defect: it is the permanently-lost-ack case `hedge_plan`'s ack-hold names as
-/// the one it cannot close, and the remedy is to RECOVER the id (the executor's
-/// `recover_place` path, which runs only when the place's own answer was lost),
-/// not to refuse here — refusing would strand the leg for good rather than for
-/// 15s. When that recovery lands, `oid_venue` is populated after the fact and
-/// these attempts get verified too, at no cost: a fill already replayed through
-/// `on_order_ack` has credited the obligation, so the venue's total no longer
-/// runs ahead of our books and the retry is `Accounted`.
+/// the one it cannot close, and the remedy is to RECOVER the id, not to refuse
+/// here — refusing would strand the leg for good rather than for 15s.
+///
+/// That remedy now exists. `KalshiGateway::recover_place` hands back the venue's
+/// id for `Ours::Gone` as well as `Ours::Resting` — an IOC hedge that finished
+/// by EXECUTING is exactly the order whose id the engine still has to learn —
+/// and the executor turns it into an `order_ack`. So `oid_venue` is populated
+/// after the fact and these attempts start being verified here too, at no extra
+/// cost: the ack also replays the held fill through `on_order_ack`, which
+/// credits the obligation, so the venue's total no longer runs ahead of our
+/// books and the retry reads `Accounted`. The two repairs compose in either
+/// landing order and neither double-counts.
 pub(super) fn intent_actions(
     intent: &Intent,
     armed: bool,

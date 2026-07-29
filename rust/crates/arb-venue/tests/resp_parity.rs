@@ -74,6 +74,34 @@ fn kalshi_order_fill_count_is_plain_count() {
     // K3: fill_count_fp "2.00" == 2 contracts.
     let env = resp::kalshi_order_envelope(r#"{"order":{"order_id":"o1","status":"executed","fill_count_fp":"2.00"}}"#).unwrap();
     assert_eq!(env.order.filled_qty(), 2);
+    // A 200 whose count field is ABSENT must be UNKNOWN, never "did not
+    // trade": the hedge-verification read acts on a low number by sending
+    // another order. Every recorded row carries it at zero ("0.00"), so an
+    // absent one is a payload shape change.
+    assert_eq!(
+        resp::kalshi_order_envelope(r#"{"order":{"order_id":"o1","status":"resting"}}"#)
+            .unwrap()
+            .order
+            .try_filled_qty(),
+        None,
+        "absent is not zero"
+    );
+    assert_eq!(
+        resp::kalshi_order_envelope(r#"{"order":{"order_id":"o1","fill_count_fp":"wat"}}"#)
+            .unwrap()
+            .order
+            .try_filled_qty(),
+        None,
+        "unparseable is not zero"
+    );
+    assert_eq!(
+        resp::kalshi_order_envelope(r#"{"order":{"order_id":"o1","fill_count_fp":"0.00"}}"#)
+            .unwrap()
+            .order
+            .try_filled_qty(),
+        Some(0),
+        "...but a real zero still reads as zero, or no hedge could ever be retried"
+    );
     // absent fill_count_fp -> 0 (never a panic)
     let env0 = resp::kalshi_order_envelope(r#"{"order":{"order_id":"o1","status":"resting"}}"#).unwrap();
     assert_eq!(env0.order.filled_qty(), 0);
