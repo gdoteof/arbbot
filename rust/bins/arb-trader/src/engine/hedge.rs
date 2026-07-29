@@ -746,6 +746,9 @@ mod hedge_deadline_tests {
             bench: false, // the whole point: the deadlines must run
             wal_path: None,
             health_file: None, // no feed-health pull, so quoting is never suppressed
+            toxgate_file: None,
+            apr: None,
+            apr_installed: (0.0, String::new()),
             risk: None,
             ledger_path: None, // never write the accounting ledger from a test
             hedge_retry: Some(HedgeRetry {

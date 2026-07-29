@@ -92,25 +92,8 @@ fn main() {
         }
     }
     let toxgate: Option<Arc<Toxgate>> = toxgate_file.map(|p| {
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&p).expect("read toxgate"))
-                .expect("parse toxgate");
-        let ts = v.get("ts").and_then(|x| x.as_f64()).unwrap_or(0.0);
-        let mut markets = std::collections::HashMap::new();
-        if let Some(ms) = v.get("markets").and_then(|x| x.as_object()) {
-            for (mid, sides) in ms {
-                let mut by_side = std::collections::HashMap::new();
-                if let Some(so) = sides.as_object() {
-                    for (side, score) in so {
-                        if let Some(f) = score.as_f64() {
-                            by_side.insert(side.clone(), f);
-                        }
-                    }
-                }
-                markets.insert(mid.clone(), by_side);
-            }
-        }
-        Arc::new(Toxgate { ts, markets })
+        let doc = std::fs::read_to_string(&p).expect("read toxgate");
+        Arc::new(Toxgate::from_json(&doc).expect("parse toxgate"))
     });
 
     let text = std::fs::read_to_string(&registry).expect("read registry");

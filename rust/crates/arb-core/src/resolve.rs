@@ -24,6 +24,21 @@ const RULES: &[(&str, &str, bool)] = &[
     ("xvus-nobel-peace-26", "2026-10-09", true),
     ("xvus-fedcut-26", "2026-12-31", false),
     ("xvus-btcmax-26-31", "2026-12-31", false),
+    // Added 2026-07-29 with the maker APR hurdle: an id with no date here gets
+    // NO hurdle, and this family was quoting without one. The date is READ OFF
+    // the relationship's own Kalshi legs — the same December-2026 FOMC decision
+    // as `xvus-fedcut-26` above, reached through Kalshi's own ladder
+    // (`KXFED-26DEC-T3.75` implies `-T3.50`) — so it is not `estimated`.
+    //
+    // A DATE HERE IS NOT ONLY A HURDLE. `taketake::detect` refuses a family
+    // with no date (`Skip::NoResolveDate`, taketake.rs:476), which the engine
+    // swallows silently, so adding one can WIDEN the armed auto-execution set.
+    // This entry cannot: the relationship is `implies` with two KALSHI legs, so
+    // `leg_market(rel, Venue::PolymarketUs)` is None and `detect` stops at
+    // `Skip::NoBook` whatever the date. Anything added here with a
+    // kalshi + polymarket_us pair DOES widen it and is a separate decision —
+    // see `the_dated_families_that_were_quoting_unhurdled_now_resolve`.
+    ("kalshi-fed-dec26", "2026-12-31", false),
 ];
 
 /// `-> (YYYY-MM-DD, estimated)`. `None` when the family is unknown, which
@@ -116,6 +131,41 @@ mod tests {
         assert_eq!(resolve_date("xvus-nobel-peace-26-elonmusk"), Some(("2026-10-09", true)));
         assert_eq!(resolve_date("xvus-fedcut-26-usfed-2026-cut"), Some(("2026-12-31", false)));
         assert_eq!(resolve_date("xvus-unknown-family-99"), None);
+    }
+
+    /// The family quoting WITHOUT a hurdle until 2026-07-29, because a rel with
+    /// no date here gets `years_to == None` and `set_apr` then leaves the
+    /// hurdle off. The date is read off the relationship's own Kalshi legs.
+    ///
+    /// The absences are the load-bearing half, and they are absent for TWO
+    /// different reasons:
+    ///
+    /// * `xv-*-nom-2028-*` settle at conventions whose dates are not
+    ///   published, so any date would be invented.
+    /// * `xvus-btc150k-ladder-*` DO carry their expiry in their own ids and
+    ///   tickers (`KXBTCMAX150-25-26JUL31`), so the date is knowable — but they
+    ///   are `cross-venue-equivalent` with a kalshi + polymarket_us pair, and
+    ///   for those a date is also the ONLY thing that was keeping them out of
+    ///   armed auto take-take (`Skip::NoResolveDate`). Dating them widens the
+    ///   auto-execution set, which is a separate decision from a maker hurdle.
+    ///   The 07-31 rung is the sharp end: two days from expiry a 1c edge
+    ///   annualizes near 185%/yr, so the APR test cannot refuse anything on it.
+    #[test]
+    fn the_dated_families_that_were_quoting_unhurdled_now_resolve() {
+        assert_eq!(
+            resolve_date("kalshi-fed-dec26-t375-implies-t350"),
+            Some(("2026-12-31", false)),
+            "same December FOMC as xvus-fedcut-26"
+        );
+        for still_undated in [
+            "xv-dem-nom-2028-newsom",
+            "xv-rep-nom-2028-vance",
+            "xvus-btc150k-ladder-07-31-2026",
+            "xvus-btc150k-ladder-08-31-2026",
+            "xvus-btc150k-ladder-12-31-2026",
+        ] {
+            assert_eq!(resolve_date(still_undated), None, "{still_undated}");
+        }
     }
 
     #[test]
