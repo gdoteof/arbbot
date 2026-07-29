@@ -36,7 +36,7 @@ fn pair_levels(v: Option<&Value>) -> Vec<(String, String)> {
             arr.iter()
                 .filter_map(|pq| {
                     let pq = pq.as_array()?;
-                    Some((dec_string(pq.first()?), dec_string(pq.get(1)?)))
+                    Some((dec_string(pq.first()?)?, dec_string(pq.get(1)?)?))
                 })
                 .collect()
         })
@@ -78,8 +78,8 @@ pub fn normalize_ws_trade(msg: &Value, seq: u64) -> Option<TapeEvent> {
     Some(TapeEvent::Trade {
         venue: Venue::Kalshi,
         market_id: msg.get("market_ticker")?.as_str()?.to_owned(),
-        price: dec_string(msg.get("yes_price_dollars")?),
-        size: dec_string(msg.get("count_fp")?),
+        price: dec_string(msg.get("yes_price_dollars")?)?,
+        size: dec_string(msg.get("count_fp")?)?,
         taker_side: Some(if msg.get("taker_side").and_then(Value::as_str) == Some("yes") {
             TakerSide::Buy
         } else {
@@ -87,7 +87,7 @@ pub fn normalize_ws_trade(msg: &Value, seq: u64) -> Option<TapeEvent> {
         }),
         seq,
         ts_local_ns: now_local_ns(),
-        ts_venue: Some(dec_string(msg.get("ts_ms").unwrap_or(&Value::String(String::new())))),
+        ts_venue: dec_string(msg.get("ts_ms").unwrap_or(&Value::String(String::new()))),
     })
 }
 
@@ -144,8 +144,8 @@ impl KalshiWsBook {
     pub fn on_delta(&mut self, msg: &Value, seq: u64) -> Option<TapeEvent> {
         let ticker = msg.get("market_ticker")?.as_str()?.to_owned();
         let side = msg.get("side")?.as_str()?.to_owned();
-        let price_str = dec_string(msg.get("price_dollars")?);
-        let change = Dec::parse(&dec_string(msg.get("delta_fp")?)).ok()?;
+        let price_str = dec_string(msg.get("price_dollars")?)?;
+        let change = Dec::parse(&dec_string(msg.get("delta_fp")?)?).ok()?;
         let key = (ticker.clone(), side.clone(), price_str.clone());
         let old = self.sizes.get(&key).copied().unwrap_or(Dec::ZERO);
         let mut new_size = old.add(&change);
@@ -862,6 +862,23 @@ mod tests {
         }
         assert_eq!(resnap_batch(191, 10), 20, "must round up, not down");
         assert_eq!(resnap_batch(0, 10), 0, "an empty universe asks for nothing");
+    }
+
+    /// Ticket #58 landed on PM-US, but the hole was in the helper all three
+    /// feeds share, so this is the same assertion on the venue that has never
+    /// exercised it. Nothing downstream of `normalize_ws_trade` re-parses
+    /// either field — the level ladders get a `Dec::parse` filter, a trade gets
+    /// none — so a `count_fp` that stops being a scalar would go to the tape
+    /// verbatim and re-serialize byte-identically forever.
+    #[test]
+    fn a_composite_where_a_decimal_belongs_drops_the_trade() {
+        let msg = json!({"market_ticker": "T", "yes_price_dollars": "0.4300",
+                         "count_fp": {"currency": "USD", "value": "3.00"},
+                         "taker_side": "yes", "ts_ms": 1700000000123i64});
+        assert!(
+            normalize_ws_trade(&msg, 1).is_none(),
+            "a trade whose count is not a decimal must not reach the tape at all"
+        );
     }
 
     /// The blocking window is what makes this safe to run inline in the WS read

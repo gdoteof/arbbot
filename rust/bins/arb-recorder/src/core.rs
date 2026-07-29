@@ -23,12 +23,59 @@ struct Inner {
 
 /// Shared JSON helper: a venue field that may arrive as string or number,
 /// rendered the way Python's str()/Decimal(str()) pipeline renders it.
-pub fn dec_string(v: &serde_json::Value) -> String {
+///
+/// `None` for anything that is NOT a scalar — object, array, bool. That arm
+/// used to read `other => other.to_string()`, and that one line is the whole of
+/// ticket #58. PM-US sends a trade's `quantity` inside its money wrapper,
+/// `{"currency":"USD","value":"5.0000"}`; the recorder stringified the WHOLE
+/// OBJECT into `TapeEvent::Trade.size`, which is a `String` and therefore
+/// accepts it. 11,541 of 11,541 PM-US trade lines on the Rust tape carry a size
+/// like `"{\"currency\":\"USD\",\"value\":\"4.0000\"}"` — 100%, across every
+/// day the Rust recorder has run.
+///
+/// Nothing caught it, and could not have: `serde_json` round-trips it, and so
+/// does `arb-recorder --parse-check`, because that gate asks only whether a
+/// line re-serializes BYTE-IDENTICALLY and a string that was already a string
+/// when it arrived always does. Python never hit it either — it does
+/// `Decimal(str(t["quantity"]))`, which raises on a dict and lost the trade
+/// entirely, which is why the Python tape has ZERO PM-US trades to compare
+/// against.
+///
+/// So the rule is: a shape that is not a scalar is not a VALUE. Returning
+/// `Option` hands the decision to the caller instead of handing it a
+/// plausible-looking string, and every caller drops the field, the level or the
+/// event. Some of them were already protected by accident — `sorted_levels`
+/// runs `Dec::parse` over a level's SIZE, and a stringified object does not
+/// parse — but a level's PRICE, every trade's price and size, and both INTL
+/// delta fields had nothing between the venue and the tape writer at all.
+pub fn dec_string(v: &serde_json::Value) -> Option<String> {
     match v {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Null => Some(String::new()),
+        other => {
+            warn_composite(other);
+            None
+        }
+    }
+}
+
+/// Say it ONCE per process, with the offending payload.
+///
+/// A venue shape change is not a per-event condition, it is a standing one: the
+/// feeds run at ~7/87/140 events per second, so a line each would be a flooded
+/// journal and an unreadable one. Same reasoning as `evict_book`, which logs on
+/// the transition rather than on every poll that re-reports it.
+fn warn_composite(v: &serde_json::Value) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let mut shape = v.to_string();
+        shape.truncate(300);
+        eprintln!(
+            "[recorder] a venue sent a COMPOSITE where a scalar belongs: {shape}\n\
+             [recorder] the field/level/event is being DROPPED rather than written to the tape \
+             as a stringified object (ticket #58). Logged once per process."
+        );
     }
 }
 
@@ -602,6 +649,24 @@ mod tests {
             assert_eq!(*seq, want, "lost {} event(s) at the connect ({kind})", seq.abs_diff(want));
         }
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The helper itself, since the three feed modules only reach it through
+    /// their own shapes. Scalars are unchanged — that half must be pinned too,
+    /// or "reject everything" would pass the composite half and silently empty
+    /// the tape.
+    #[test]
+    fn dec_string_takes_scalars_and_refuses_composites() {
+        use serde_json::json;
+        assert_eq!(dec_string(&json!("0.6300")).as_deref(), Some("0.6300"));
+        assert_eq!(dec_string(&json!(1700000000123i64)).as_deref(), Some("1700000000123"));
+        assert_eq!(dec_string(&json!(null)).as_deref(), Some(""));
+        // The literal PM-US payload of ticket #58. It used to come back as
+        // `{"currency":"USD","value":"5.0000"}` — a String, so `TapeEvent`
+        // accepted it and `--parse-check` re-serialized it byte-identically.
+        assert_eq!(dec_string(&json!({"currency": "USD", "value": "5.0000"})), None);
+        assert_eq!(dec_string(&json!(["5.0000"])), None);
+        assert_eq!(dec_string(&json!(true)), None);
     }
 
     /// The mechanism both of the above rest on, deterministically and with no

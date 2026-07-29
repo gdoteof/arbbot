@@ -19,9 +19,26 @@ pub const GATEWAY_BASE: &str = "https://gateway.polymarket.us/v1";
 pub const WS_MARKETS_URL: &str = "wss://api.polymarket.us/v1/ws/markets";
 pub const WS_MARKETS_PATH: &str = "/v1/ws/markets";
 
+/// Unwrap PM-US's money type, `{"currency":"USD","value":"5.0000"}`.
+///
+/// The `currency` label travels with the WRAPPER, not with the meaning: the
+/// venue reuses the same type for a price (dollars) and for a trade's
+/// `quantity` (CONTRACTS — see `trade_size_is_the_contract_count_inside_the_
+/// money_wrapper`, which settles it against the book depth the print consumes).
+/// Reading `currency` as the unit is the trap this helper exists to keep in one
+/// place.
+///
+/// A field that arrives BARE is taken as-is, which is the same spelling the
+/// venue already uses for a book level's `qty` in this very feed. A field that
+/// is an object without `value` is a shape nobody has seen: `dec_string`
+/// refuses it and says so.
+fn money_value(v: &Value) -> Option<String> {
+    dec_string(v.get("value").unwrap_or(v))
+}
+
 fn levels(raw: Option<&Value>, descending: bool) -> Vec<Level> {
     sorted_levels(raw, descending, |l| {
-        Some((dec_string(l.get("px")?.get("value")?), dec_string(l.get("qty")?)))
+        Some((money_value(l.get("px")?)?, dec_string(l.get("qty")?)?))
     })
 }
 
@@ -33,7 +50,7 @@ pub fn normalize_book(slug: &str, md: &Value, seq: u64) -> TapeEvent {
         asks: levels(md.get("offers"), false), // ask side = "offers"
         seq,
         ts_local_ns: now_local_ns(),
-        ts_venue: Some(dec_string(md.get("transactTime").unwrap_or(&Value::String(String::new())))),
+        ts_venue: dec_string(md.get("transactTime").unwrap_or(&Value::String(String::new()))),
     }
 }
 
@@ -50,9 +67,18 @@ fn parse_ws_message(msg: &Value, seq: &mut SeqCounter) -> Vec<TapeEvent> {
             .and_then(|x| x.get("intent"))
             .and_then(Value::as_str)
             .unwrap_or("");
+        // BOTH legs are money-wrapped, and `size` is a contract count despite
+        // the wrapper's `"currency":"USD"` — see `money_value`. Resolved before
+        // the sequence number is taken, so a frame we cannot read does not also
+        // spend a seq; and all-or-nothing, because a trade with an empty price
+        // (which is what `unwrap_or_default` used to write) is a lie in the
+        // same way a stringified object is.
+        let (Some(price), Some(size)) =
+            (t.get("price").and_then(money_value), t.get("quantity").and_then(money_value))
+        else {
+            return vec![];
+        };
         let s = seq.next(&format!("{slug}|tape"));
-        let price = t.get("price").and_then(|p| p.get("value")).map(dec_string).unwrap_or_default();
-        let size = t.get("quantity").map(dec_string).unwrap_or_default();
         return vec![TapeEvent::Trade {
             venue: Venue::PolymarketUs,
             market_id: slug,
@@ -61,7 +87,7 @@ fn parse_ws_message(msg: &Value, seq: &mut SeqCounter) -> Vec<TapeEvent> {
             taker_side: Some(if taker.contains("BUY") { TakerSide::Buy } else { TakerSide::Sell }),
             seq: s,
             ts_local_ns: now_local_ns(),
-            ts_venue: Some(dec_string(t.get("tradeTime").unwrap_or(&Value::String(String::new())))),
+            ts_venue: dec_string(t.get("tradeTime").unwrap_or(&Value::String(String::new()))),
         }];
     }
     vec![] // heartbeat/error/lite ignored
@@ -258,14 +284,102 @@ mod tests {
     #[test]
     fn trade_takes_tape_seq_stream() {
         let mut seq = SeqCounter::default();
-        let t = json!({"trade": {"marketSlug": "s-1", "price": {"value": "0.55"},
-                                  "quantity": "12.0000",
+        let t = json!({"trade": {"marketSlug": "s-1", "price": {"value": "0.55", "currency": "USD"},
+                                  "quantity": {"value": "12.0000", "currency": "USD"},
                                   "taker": {"intent": "INTENT_BUY_LONG"},
                                   "tradeTime": "2026-07-23T02:03:04Z"}});
         match &parse_ws_message(&t, &mut seq)[0] {
             TapeEvent::Trade { taker_side, seq, .. } => {
                 assert_eq!(*taker_side, Some(TakerSide::Buy));
                 assert_eq!(*seq, 1); // independent |tape stream
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// The frame below is REAL, reconstructed field-for-field from a print on
+    /// the recorded tape.
+    ///
+    /// `quantity` arrives inside the venue's generic money wrapper —
+    /// `{"currency":"USD","value":"5.0000"}` — and the `currency: USD` label is
+    /// the whole trap, because it reads as "these are dollars". They are not.
+    /// The BOOK settles it, in the same feed and across this very print: the
+    /// resting bid at 0.2800 goes 240.0000 -> 235.0000, so the level is
+    /// consumed by exactly the printed `value`. Book sizes are contracts, so
+    /// the printed value is contracts. USD notional would have had to take
+    /// 5.0000/0.28 = 17.86 off that level instead.
+    ///
+    /// So the wrapper is an over-general money type reused for a quantity, and
+    /// `size` here means the same thing it means on every other tape event.
+    /// A non-integral value is NOT evidence against that reading — PM-US
+    /// positions are genuinely fractional and about half of all live prints
+    /// are too.
+    #[test]
+    fn trade_size_is_the_contract_count_inside_the_money_wrapper() {
+        let mut seq = SeqCounter::default();
+        let t = json!({"trade": {
+            "marketSlug": "ewc-pres-bra-2026-10-04-flabol",
+            "price": {"currency": "USD", "value": "0.2800"},
+            "quantity": {"currency": "USD", "value": "5.0000"},
+            "taker": {"intent": "ORDER_INTENT_BUY_LONG"},
+            "tradeTime": "2026-07-29T01:56:27.328744187Z"}});
+        match &parse_ws_message(&t, &mut seq)[0] {
+            TapeEvent::Trade { price, size, .. } => {
+                assert_eq!(price, "0.2800");
+                assert_eq!(size, "5.0000", "size must be the contract count, not the wrapper");
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// A shape nobody anticipated must COST us the event, not be laundered into
+    /// a decimal-shaped string.
+    ///
+    /// The money wrapper without its `value` stands in for any future venue
+    /// change. Before this was fixed the whole object went into `size` as
+    /// `"{\"currency\":\"USD\"}"` and then round-tripped `serde_json` and
+    /// `arb-recorder --parse-check` untouched, because both only ask whether the
+    /// string survives re-serialization — and a string that was already a string
+    /// when it arrived always does.
+    #[test]
+    fn a_trade_field_of_an_unknown_shape_is_dropped_not_stringified() {
+        let mut seq = SeqCounter::default();
+        let t = json!({"trade": {
+            "marketSlug": "s-1",
+            "price": {"currency": "USD", "value": "0.2800"},
+            "quantity": {"currency": "USD"},
+            "taker": {"intent": "ORDER_INTENT_BUY_LONG"},
+            "tradeTime": "2026-07-29T01:56:27Z"}});
+        assert!(
+            parse_ws_message(&t, &mut seq).is_empty(),
+            "a trade whose quantity is not a decimal must not reach the tape at all"
+        );
+    }
+
+    /// The same exposure one call site over: `quantity` was never special, the
+    /// silent `to_string()` under it was.
+    ///
+    /// A level's SIZE happens to be safe already — `sorted_levels` runs
+    /// `Dec::parse` over it and a stringified object does not parse, so the
+    /// level is dropped. Nothing checks the PRICE. A composite there survived
+    /// into `Level.price` verbatim, and the sort reads it back as `Dec::ZERO`
+    /// (`sorted_levels`' `unwrap_or`), so the bad level sorts to the far end of
+    /// the ladder and reads as an ordinary deep quote.
+    ///
+    /// That accidental half-protection is exactly why this is fixed in
+    /// `dec_string` and not at the `quantity` call site.
+    #[test]
+    fn a_book_level_of_an_unknown_shape_is_dropped_not_stringified() {
+        let md = json!({"marketSlug": "s-1",
+                        "bids": [{"px": {"value": {"amount": "0.6300"}}, "qty": "42.0000"},
+                                 {"px": {"value": "0.6200"}, "qty": "17.0000"}],
+                        "offers": [],
+                        "transactTime": "2026-07-23T01:02:03.123456789Z"});
+        let mut seq = SeqCounter::default();
+        match &parse_ws_message(&json!({"marketData": md}), &mut seq)[0] {
+            TapeEvent::Snapshot { bids, .. } => {
+                assert_eq!(bids.len(), 1, "the composite-price level must be dropped");
+                assert_eq!(bids[0].price, "0.6200");
             }
             _ => panic!(),
         }
