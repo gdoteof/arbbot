@@ -1,0 +1,11 @@
+[package]
+name = "arb-shadow-gate"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[dependencies]
+arb-core = { path = "../../crates/arb-core" }
+serde_json = { workspace = true }

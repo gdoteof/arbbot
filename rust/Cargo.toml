@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/arb-core", "crates/arb-tape", "crates/arb-venue", "crates/arb-ledger", "crates/arb-query", "crates/arb-tob", "crates/arb-registry", "crates/arb-scenario", "bins/bench-replay", "bins/arb-recorder", "bins/arb-golden", "bins/arb-intent", "bins/arb-trader", "bins/arb-books", "bins/arb-dash", "bins/arb-order"]
+members = ["crates/arb-core", "crates/arb-tape", "crates/arb-venue", "crates/arb-ledger", "crates/arb-query", "crates/arb-tob", "crates/arb-registry", "crates/arb-scenario", "bins/bench-replay", "bins/arb-recorder", "bins/arb-golden", "bins/arb-shadow-gate", "bins/arb-intent", "bins/arb-trader", "bins/arb-books", "bins/arb-dash", "bins/arb-order"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 # reassure yourself with.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 
-# Lint policy. All 16 members opt in with `[lints] workspace = true`.
+# Lint policy. All 17 members opt in with `[lints] workspace = true`.
 #
 # Every lint below is at deny/forbid AND was measured at zero violations across
 # `cargo clippy --all-targets --workspace` on 2026-07-28. That is the selection
