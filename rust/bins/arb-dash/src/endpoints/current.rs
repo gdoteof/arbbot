@@ -238,7 +238,7 @@ pub fn json(a: &Args, query: &str) -> String {
     // built this morning is ranking this morning's board. Per-market sample age
     // cannot stand in for it: the series emits on change, so a quiet market's
     // old sample is still the current book.
-    let cov = coverage_by_venue(&latest, now_ns);
+    let cov = coverage_by_venue(&latest, &reg, now_ns);
     let coverage_age_s = stalest_age_s(&cov);
     let rollup_current = coverage_age_s <= MAX_COVERAGE_AGE_S;
 
@@ -415,6 +415,72 @@ relationships:
         assert_eq!(d["rollup_current"], false, "one dead venue is not a current rollup: {d}");
         assert_eq!(venue(&d, "kalshi")["current"], true, "kalshi is genuinely still live: {d}");
         assert_eq!(venue(&d, "polymarket_us")["current"], false, "{d}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The same defect one subscription finer. The polymarket_us recorder
+    /// subscribes the sports catalog by tag as well as the registry's markets —
+    /// 749 markets in the real 07-28 tape against 88 registry legs — so losing
+    /// the arb subscription alone leaves the venue's tape LOUD and its priced
+    /// books dead. Coverage taken over every market on the venue read one
+    /// second, chipped green, and called this row actionable.
+    #[test]
+    fn a_sports_catalog_still_ticking_does_not_certify_the_arb_book() {
+        let (a, base) = args("sports-only");
+        rolled_up(&base, "kalshi", &[sample("kalshi", "K1", 10, "0.29", "0.30")]);
+        rolled_up(
+            &base,
+            "polymarket_us",
+            &[
+                sample("polymarket_us", "P1", 6 * 3600, "0.75", "0.76"),
+                sample("polymarket_us", "nfl-kc-buf", 1, "0.50", "0.51"),
+                sample("polymarket_us", "nba-lal-bos", 2, "0.44", "0.45"),
+            ],
+        );
+        let d = board(&a);
+        assert_eq!(d["priced_pairs"], 1, "the arb book is old, not absent — it still prices: {d}");
+        assert_eq!(d["profitable"], 1, "and still profitable at those prices: {d}");
+        assert_eq!(d["actionable"], 0, "the sports feed is not evidence about P1: {d}");
+        assert_eq!(d["rows"][0]["coverage_age_s"], 6 * 3600, "{d}");
+        assert_eq!(venue(&d, "polymarket_us")["coverage_age_s"], 6 * 3600, "{d}");
+        assert_eq!(venue(&d, "polymarket_us")["current"], false, "{d}");
+        assert_eq!(d["rollup_current"], false, "{d}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// And the regression this must not become. Per-MARKET age cannot be the
+    /// gate: the series emits on change and 33 of the 40 priceable tradable
+    /// pairs in the real 07-28 tape have a leg more than six hours behind, so
+    /// gating on it would empty the board. Here P1 — the priced row's own leg —
+    /// last moved 19 hours ago, while P2 (also a registry leg) ticked 50s ago
+    /// and the sports catalog ticks constantly. The venue is COVERED, the row
+    /// is ACTIONABLE, and its coverage reads the venue's, not the market's.
+    ///
+    /// P2 is the REJECTED pair's leg, and it certifies the venue anyway: the
+    /// basis is ALL registry legs because coverage is a claim about the
+    /// recorder, which subscribes off exactly those legs, while a verdict is a
+    /// claim about a pair. Narrowing it to the tradable ones would let a
+    /// vetting decision change what a venue's freshness reads.
+    #[test]
+    fn a_quiet_arb_leg_on_a_covered_venue_still_makes_an_actionable_row() {
+        let (a, base) = args("quiet-leg");
+        rolled_up(&base, "kalshi", &[sample("kalshi", "K1", 10, "0.29", "0.30")]);
+        rolled_up(
+            &base,
+            "polymarket_us",
+            &[
+                sample("polymarket_us", "P1", 19 * 3600, "0.75", "0.76"),
+                sample("polymarket_us", "P2", 50, "0.60", "0.61"),
+                sample("polymarket_us", "nfl-kc-buf", 1, "0.50", "0.51"),
+            ],
+        );
+        let d = board(&a);
+        assert_eq!(d["rollup_current"], true, "a quiet market is not a dead venue: {d}");
+        assert_eq!(venue(&d, "polymarket_us")["coverage_age_s"], 50, "P2's tick covers it: {d}");
+        assert_eq!(d["actionable"], 1, "the board must not empty: {d}");
+        assert_eq!(d["rows"][0]["actionable"], true, "{d}");
+        assert_eq!(d["rows"][0]["quote_age_b_s"], 19 * 3600, "the leg really is that quiet: {d}");
+        assert_eq!(d["rows"][0]["coverage_age_s"], 50, "and that is not what gates it: {d}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

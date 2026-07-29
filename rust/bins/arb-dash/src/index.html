@@ -550,12 +550,13 @@ function dur(sec){
 /* Coverage is per VENUE, so the badge is too. One recorder dying leaves the
    other venues sampling, and a single ROLLUP CURRENT badge off the newest
    sample anywhere said "go" over a six-hour-dead book. Three chips instead:
-   green = covering now, red = covering but behind, amber = not in the rollup
-   at all, which is a different fact and gets a different colour. */
+   green = covering now, red = covering but behind, amber = the rollup carries
+   no book we price on that venue at all — no file, or a file holding only the
+   sports catalog — which is a different fact and gets a different colour. */
 function venueChips(vs){
   return (vs||[]).map(v=>{
     const cls = v.current ? 'ok' : (v.coverage_age_s<0 ? 'warn' : 'bad');
-    const age = v.coverage_age_s<0 ? 'NO ROLLUP' : dur(v.coverage_age_s);
+    const age = v.coverage_age_s<0 ? 'NO BOOK' : dur(v.coverage_age_s);
     return `<span class="badge ${cls}">${esc(v.venue)} ${age}</span>`;
   }).join(' ');
 }
@@ -755,7 +756,7 @@ function intentsPanel(d){
         ? 'All ' + all.length + ' pair(s) are filtered out, and ' + (staleVenues(d).length
             ? 'no pair with a ' + staleVenues(d).join(' or ') + ' leg can be actionable '
               + 'while that rollup is ' + dur(d.rollup_coverage_age_s) + ' behind'
-            : 'nothing can be actionable while the rollup carries no samples at all')
+            : 'nothing can be actionable while the rollup carries no book for any pair we quote')
           + ' — rebuild it above, or turn off <b>actionable only</b> to see the pairs '
           + 'as last priced.'
         : 'All ' + all.length + ' pair(s) are hidden by the filters above.')}</div>`;
@@ -904,8 +905,8 @@ function currentPanel(d){
       ? stales.join(' and ') + ' stopped covering ' + dur(d.rollup_coverage_age_s)
         + ' ago. Every row with a leg there is priced off a dead book and cannot be '
         + 'actionable until the rollup is rebuilt — the other venues are unaffected.'
-      : 'The rollup carries no samples at all, so nothing on this board is evidence '
-        + 'about now. Rebuild it above.'}</div>`}
+      : 'The rollup carries no book for any pair on this board, so nothing here is '
+        + 'evidence about now. Rebuild it above.'}</div>`}
     ${unevalBanner(d, d.only_tradable ? 'permitted pair(s)' : 'pair(s)', d.priced_pairs)}
     <nav style="padding:0;border:0;margin-bottom:6px">${SCENARIOS.map(([k,l])=>tab(k,l)).join('')}</nav>
     <div class="sub" style="margin-bottom:10px">clip size:

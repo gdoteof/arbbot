@@ -274,7 +274,7 @@ pub fn json(a: &Args) -> String {
 
     let day = integrity::build(&a.data_dir).today;
     let latest = series::latest_by_market(&rollup_paths(&a.rollup_dir, &day));
-    let cov = coverage_by_venue(&latest, (now * 1e9) as i64);
+    let cov = coverage_by_venue(&latest, &reg, (now * 1e9) as i64);
     let coverage_age_s = stalest_age_s(&cov);
     let rollup_current = coverage_age_s <= MAX_COVERAGE_AGE_S;
 

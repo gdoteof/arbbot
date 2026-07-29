@@ -11,10 +11,11 @@ pub mod opportunities;
 pub mod pairs;
 pub mod trades;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::UNIX_EPOCH;
 
 use arb_core::clock::now_secs;
+use arb_registry::Registry;
 
 use crate::VENUES;
 
@@ -22,8 +23,8 @@ use crate::VENUES;
 /// rollup knows it.
 pub type Latest = HashMap<(String, String), arb_tob::TobSample>;
 
-/// Seconds of coverage age per VENUE. A venue the rollup carries no sample for
-/// is ABSENT, not zero.
+/// Seconds of coverage age per VENUE. A venue the rollup carries no
+/// registry-backed sample for is ABSENT, not zero.
 pub type Coverage = HashMap<String, i64>;
 
 pub fn age_secs(path: &str) -> Option<u64> {
@@ -64,11 +65,36 @@ pub const MAX_COVERAGE_AGE_S: i64 = 1800;
 /// painted the board ROLLUP CURRENT over a six-hour-dead book — the same wrong
 /// headline this gate was built to stop, one venue too coarse.
 ///
+/// Over the REGISTRY-BACKED markets only, because `min` over the whole venue
+/// reports the freshness of its NOISIEST market. The 2026-07-28 polymarket_us
+/// tape carries 749 markets and the registry names 88 of them; the rest are the
+/// sports catalog `arb-recorder` subscribes by tag. A recorder that loses the
+/// arb subscription while sports keep flowing — this repo's documented silent
+/// eviction — still read SECONDS on the venue, painted the chip green, and left
+/// every arb row `actionable` off books that stopped hours ago.
+///
+/// ALL registry legs, not the tradable ones. Coverage is a claim about the
+/// RECORDER — `config::load_universe` builds its subscription from exactly
+/// these legs — while vetting is a claim about a PAIR, so a `verdict: rejected`
+/// must not move a venue's freshness. And the narrow subset is measurably
+/// wrong: only 6 polymarket markets back a tradable pair, and the newest of
+/// those 6 is 3 to 17 hours old on all three real tapes (07-26..28) while the
+/// feed is demonstrably alive. That is the quiet-market trap this doc comment
+/// opens with, re-entered through a basis too narrow to notice a tick.
+///
 /// The clock is the caller's because the two views that ask derive it
 /// differently.
-pub fn coverage_by_venue(latest: &Latest, now_ns: i64) -> Coverage {
+pub fn coverage_by_venue(latest: &Latest, reg: &Registry, now_ns: i64) -> Coverage {
+    let backed: HashSet<(&str, &str)> = reg
+        .relationships
+        .iter()
+        .flat_map(|r| r.legs.iter().map(|l| (l.venue.as_str(), l.market_id.as_str())))
+        .collect();
     let mut cov = Coverage::new();
-    for ((venue, _), s) in latest {
+    for ((venue, market), s) in latest {
+        if !backed.contains(&(venue.as_str(), market.as_str())) {
+            continue;
+        }
         let age = (now_ns - s.ts_local_ns) / 1_000_000_000;
         let e = cov.entry(venue.clone()).or_insert(age);
         *e = (*e).min(age);
@@ -76,8 +102,11 @@ pub fn coverage_by_venue(latest: &Latest, now_ns: i64) -> Coverage {
     cov
 }
 
-/// `i64::MAX` for a venue the rollup carried no sample for at all. Zero would
-/// read as "sampled this instant" over no book whatsoever.
+/// `i64::MAX` for a venue the rollup carried no registry-backed sample for.
+/// Zero would read as "sampled this instant" over no book whatsoever — and a
+/// rollup holding only markets no pair prices is exactly that: it is evidence
+/// that the venue's socket is up, and none at all about the books this board
+/// prices off.
 pub fn venue_age_s(cov: &Coverage, venue: &str) -> i64 {
     cov.get(venue).copied().unwrap_or(i64::MAX)
 }
@@ -132,10 +161,44 @@ mod tests {
         )
     }
 
+    /// A registry naming exactly these legs. The coverage basis is all
+    /// `coverage_by_venue` reads off a registry, so that is all this builds.
+    fn registry(legs: &[(String, String)]) -> arb_registry::Registry {
+        arb_registry::Registry {
+            relationships: legs
+                .iter()
+                .map(|(v, m)| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": format!("{v}-{m}"),
+                        "legs": [{ "venue": v, "market_id": m }],
+                    }))
+                    .expect("a relationship")
+                })
+                .collect(),
+        }
+    }
+
+    /// Coverage over a rollup where the registry names only `backed` — the
+    /// venue's other markets are recorded (sports, by tag) and priced by
+    /// nothing.
+    fn cov_backed(
+        backed: &[(&str, &str)],
+        samples: impl IntoIterator<Item = ((String, String), arb_tob::TobSample)>,
+    ) -> Coverage {
+        let mut latest = Latest::new();
+        latest.extend(samples);
+        let legs: Vec<(String, String)> =
+            backed.iter().map(|(v, m)| (v.to_string(), m.to_string())).collect();
+        coverage_by_venue(&latest, &registry(&legs), NOW_NS)
+    }
+
+    /// Every sampled market backed by the registry: the tests below this one
+    /// are about freshness, not about which markets we subscribed to.
     fn cov(samples: impl IntoIterator<Item = ((String, String), arb_tob::TobSample)>) -> Coverage {
         let mut latest = Latest::new();
         latest.extend(samples);
-        coverage_by_venue(&latest, NOW_NS)
+        let legs: Vec<(String, String)> = latest.keys().cloned().collect();
+        coverage_by_venue(&latest, &registry(&legs), NOW_NS)
     }
 
     fn aged(samples: impl IntoIterator<Item = ((String, String), arb_tob::TobSample)>) -> i64 {
@@ -187,5 +250,43 @@ mod tests {
         assert!(venue_age_s(&c, "polymarket_us") > MAX_COVERAGE_AGE_S);
         assert_eq!(stalest_age_s(&c), 6 * 3600, "a rollup is as current as its worst venue");
         assert_eq!(venue_age_s(&c, "polymarket"), i64::MAX, "a venue with no samples is unknown");
+    }
+
+    /// The hole the per-venue gate left, and the one this basis closes. `min`
+    /// over EVERY market reports the venue's NOISIEST one: polymarket_us
+    /// carries 749 markets and the registry names 88, the rest being the sports
+    /// catalog the recorder subscribes by tag. A recorder that silently loses
+    /// the arb subscription while sports keep flowing then read SECONDS on a
+    /// venue whose every priced book had stopped hours ago.
+    #[test]
+    fn a_sports_feed_does_not_certify_the_arb_book_it_stopped_carrying() {
+        let c = cov_backed(
+            &[("polymarket_us", "PMARB")],
+            [
+                book("polymarket_us", "PMARB", 6 * 3600),
+                book("polymarket_us", "nfl-kc-buf", 1),
+                book("polymarket_us", "nba-lal-bos", 2),
+            ],
+        );
+        assert_eq!(venue_age_s(&c, "polymarket_us"), 6 * 3600, "only priced books certify");
+        assert!(venue_age_s(&c, "polymarket_us") > MAX_COVERAGE_AGE_S);
+    }
+
+    /// The end of that same road: the arb subscription never arrived at all and
+    /// the rollup is sports only. UNKNOWN, not fresh — a ticking sports catalog
+    /// is evidence the venue's socket is up and none at all about the books
+    /// this board prices. The headline is unchanged because it reports the
+    /// venues the rollup COVERS; what carries the hole is the venue's own chip
+    /// and the row gate, both of which read `venue_age_s`.
+    #[test]
+    fn a_venue_whose_rollup_holds_no_market_we_price_is_unknown_not_fresh() {
+        let c = cov_backed(
+            &[("kalshi", "KXONE")],
+            [book("kalshi", "KXONE", 10), book("polymarket_us", "nfl-kc-buf", 1)],
+        );
+        assert_eq!(venue_age_s(&c, "kalshi"), 10, "kalshi is genuinely current");
+        assert_eq!(venue_age_s(&c, "polymarket_us"), i64::MAX, "sports are not our coverage");
+        assert!(venue_age_s(&c, "polymarket_us") > MAX_COVERAGE_AGE_S, "so no row on it is live");
+        assert_eq!(stalest_age_s(&c), 10, "a venue we have no evidence about is a hole, not an age");
     }
 }
