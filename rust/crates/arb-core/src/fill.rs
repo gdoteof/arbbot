@@ -1,10 +1,17 @@
 //! Fill ingestion + the exactly-once-hedge invariant as a type (P4 item 1,
 //! sans-IO half; design: migration plan "Trader concurrency").
 //!
-//! Both fill paths — private WS and the poll fallback — funnel into ONE
-//! `FillLedger::observe_cum_fill` caller. Venue fill reports are cumulative,
-//! so duplicates and replays are no-ops by construction; only an INCREASE in
-//! cumulative fill mints a `HedgeObligation` for the delta. The obligation is
+//! Every fill path funnels into ONE `FillLedger::observe_cum_fill` caller, and
+//! the count it is handed is CUMULATIVE per order, so duplicates and replays are
+//! no-ops by construction; only an INCREASE mints a `HedgeObligation` for the
+//! delta. What this ledger cannot see is where that number came from: PM-US
+//! reports the venue's own cumulative count, while the Kalshi feed sums per-fill
+//! deltas locally, so a frame Kalshi never delivered is a fill this ledger is
+//! never told about — no arm of `FillOutcome` can represent it, and no counter
+//! here will move. (This header used to claim a poll fallback cross-checked the
+//! WS; there is no such caller in the binary. `arb-trader`'s
+//! `fills::kalshi_fill_gaps()` is the signal that a gap happened.) The
+//! obligation is
 //! non-clonable, `#[must_use]`, constructed only here, and consumed by value
 //! by the hedger — the `hedged_by_oid` dict invariant from the Python trader
 //! becomes compiler-checked. Dropping one unconsumed bumps a process-wide

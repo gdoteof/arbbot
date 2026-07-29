@@ -559,6 +559,13 @@ impl Engine {
             // programming-bug alarm: an obligation that was minted and
             // never hedged (arb_core::fill) — must stay 0.
             "dropped_unconsumed": dropped_unconsumed(),
+            // Kalshi fill-WS reconnects. That feed sums per-fill deltas
+            // locally, so a fill inside a gap is only recovered if the venue
+            // replays on resubscribe — unestablished (see `fills`). Every
+            // other gauge here is blind to it: no frame arrived, so nothing
+            // was unattributed and no obligation was minted. Non-zero =>
+            // reconcile the Kalshi fill history by hand.
+            "kalshi_fill_gaps": crate::fills::kalshi_fill_gaps(),
             "would_place": self.exec_stats.placed.load(std::sync::atomic::Ordering::Relaxed),
             "would_cancel": self.exec_stats.cancelled.load(std::sync::atomic::Ordering::Relaxed),
             "exec_dropped": self.exec_stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
