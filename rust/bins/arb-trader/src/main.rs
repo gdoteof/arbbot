@@ -693,13 +693,26 @@ fn load_toxgate(path: &str, now: f64) -> ToxLoad {
     let Some(gate) = Toxgate::from_json(&doc) else {
         return ToxLoad { gate: None, stale: Some(format!("{path}: not a toxgate document")) };
     };
+    // BOTH directions, and the same two bounds `Toxgate::verdict` applies — a
+    // gauge that disagreed with the refusal would be worse than no gauge. The
+    // future arm is not symmetry for its own sake: an unbounded forward `ts`
+    // reads as permanently current, which disables this reload, the gauge and
+    // every `Untrusted` verdict at once.
     let age = now - gate.ts;
-    let stale = (age > arb_core::quoter::TOXGATE_MAX_AGE).then(|| {
-        format!(
+    let stale = if age > arb_core::quoter::TOXGATE_MAX_AGE {
+        Some(format!(
             "{path}: feed is {age:.0}s old (max {:.0}s) — the research writer is not running",
             arb_core::quoter::TOXGATE_MAX_AGE
-        )
-    });
+        ))
+    } else if age < -arb_core::quoter::TOXGATE_MAX_SKEW {
+        Some(format!(
+            "{path}: feed is stamped {:.0}s in the FUTURE — a clock or a unit is wrong, and a \
+             forward ts would otherwise never expire",
+            -age
+        ))
+    } else {
+        None
+    };
     ToxLoad { gate: Some(std::sync::Arc::new(gate)), stale }
 }
 
@@ -1757,10 +1770,12 @@ relationships:
     /// 80ff7987, ported from `exec/main.py:_tt_refresh`, which pushed the same
     /// number onto every maker ("makers clear the same bar").
     ///
-    /// A flat constant is wrong in the expensive direction: at the utilization
-    /// actually observed on 2026-07-29 ($299.39 of a $343.00 class budget) the
-    /// policy asks 14.47%/yr, so a flat 12.0 would have rested quotes the
-    /// policy refuses exactly when capital is scarcest.
+    /// A flat constant is wrong in the expensive direction. `utilization()`
+    /// divides the exposure accumulator — CONTRACTS, as Python's
+    /// `risk.exposure.total` was — by the dollar class budget, and on
+    /// 2026-07-29 the ledger seeds 346 open contracts against $343, so util
+    /// clamps to 1.000 and the policy asks the CEILING. A flat 12.0 would have
+    /// rested quotes the policy refuses, exactly when capital is scarcest.
     #[test]
     fn the_hurdle_floats_with_capital_utilization() {
         assert_eq!(apr_bar(0.0), APR_FLOOR, "idle capital takes the floor");
@@ -1768,9 +1783,9 @@ relationships:
         // Geoff's 8% reference sits at ~1/3 utilization (exec/main.py:47-51).
         assert!((apr_bar(1.0 / 3.0) - 8.0).abs() < 0.01, "{}", apr_bar(1.0 / 3.0));
 
-        // The live figures, and the crossing that makes a flat 12.0 unsafe.
-        let live = apr_bar(299.39 / 343.00);
-        assert!((live - 14.47).abs() < 0.01, "2026-07-29 policy bar: {live}");
+        // The live figure, and the crossing that makes a flat 12.0 unsafe.
+        let live = apr_bar(346.0 / 343.0);
+        assert_eq!(live, APR_CEIL, "an over-cap book is clamped to the ceiling");
         assert!(live > 12.0, "a flat 12.0 would UNDER-charge a full book: {live}");
         // 12.0 is the bar only at util 2/3, and take-take's own DEFAULT_BAR_APR
         // is the cold-start arm of `Bar::tradable`, never the bar in force with
@@ -1948,7 +1963,7 @@ relationships:
         );
 
         // ...and an explicit bar bites in bench exactly as it does live.
-        a.min_apr = Some(14.47);
+        a.min_apr = Some(APR_CEIL);
         let (mut quoters, _, _) = load_quoters(&a.registry, &a.tradable, &[]);
         install_policy(&a, &mut quoters, None);
         assert!(place_on(&decide_now(&mut quoters), "P").is_none());

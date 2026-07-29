@@ -2137,11 +2137,23 @@ mod apr_refresh_tests {
     use super::toxgate_reload_tests::quoter_and_books;
     use super::*;
 
-    /// A risk view on the real defaults ($980 bankroll x 0.35 = $343 class
+    /// A risk view on a REAL cap file ($980 bankroll x 0.35 = $343 class
     /// budget), with nothing at work yet.
+    ///
+    /// The file has to exist. This fixture originally passed
+    /// `/nonexistent/exec.yaml` and leaned on the compiled-in defaults, which
+    /// #19 (`f0f5593`) removed: an absent cap file is now `Caps::corrupt`, so
+    /// bankroll and per_class are "0", `utilization()` reads that as a FULL
+    /// book by design, and the bar comes out at the ceiling instead of the
+    /// floor. That composition is correct and is pinned below; what it is not
+    /// is an idle book, which is what this fixture is for.
     fn idle_risk() -> Arc<crate::risk::RiskView> {
+        let d = std::env::temp_dir().join(format!("arb-trader-apr-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let exec = d.join("exec.yaml");
+        std::fs::write(&exec, "bankroll_usd: 980\nper_class_cap: 0.35\n").unwrap();
         Arc::new(crate::risk::RiskView::load(
-            "/nonexistent/exec.yaml",
+            &exec.to_string_lossy(),
             "/nonexistent/topics.yaml",
             Vec::new(),
             HashMap::new(),
@@ -2187,6 +2199,27 @@ mod apr_refresh_tests {
         assert!(
             (eng.summary()["maker_apr_bar"].as_f64().unwrap() - eng.apr_bar).abs() < 1e-9
         );
+    }
+
+    /// **A cap file this engine cannot read asks the MOST of a new quote.**
+    ///
+    /// `Caps::corrupt` (#19) forces bankroll and per_class to "0" so every cap
+    /// refuses; `utilization()` reads a zero budget as a FULL book, so the
+    /// hurdle goes to the ceiling rather than the floor. Both halves fail
+    /// closed, and this pins that they fail closed in the SAME direction —
+    /// a damaged `exec.yaml` must not hand the maker its cheapest bar.
+    #[test]
+    fn an_unreadable_cap_file_asks_the_ceiling_not_the_floor() {
+        let risk = Arc::new(crate::risk::RiskView::load(
+            "/nonexistent/exec.yaml",
+            "/nonexistent/topics.yaml",
+            Vec::new(),
+            HashMap::new(),
+        ));
+        assert_eq!(risk.utilization(), 1.0, "a $0 budget is not an empty one");
+        let (mut quoters, _) = quoter_and_books();
+        let (bar, _, _) = crate::apply_apr(&mut quoters, None, Some("2026-07-29"), Some(&risk));
+        assert!((bar - crate::APR_CEIL).abs() < 1e-9, "expected the ceiling, got {bar}");
     }
 
     /// No `cfg.apr` is bench/replay, where a moving bar would break the digest.

@@ -24,6 +24,12 @@ use std::sync::Arc;
 pub const TOXGATE_MAX: f64 = 0.03;
 pub const TOXGATE_MAX_AGE: f64 = 120.0;
 
+/// How far AHEAD of the reader's clock a feed's `ts` may sit before it stops
+/// being clock jitter and starts being a corrupt timestamp. Both processes
+/// share a machine, so a real skew here is seconds at most; the bound exists
+/// because the failure it catches is unbounded in the permissive direction.
+pub const TOXGATE_MAX_SKEW: f64 = 5.0;
+
 /// The research toxicity shadow feed (data/exec/toxgate.json), loaded by the
 /// caller (file I/O stays outside arb-core). Mirrors quoter.py `_toxgate`
 /// EXCEPT that a stale feed (doc ts older than TOXGATE_MAX_AGE vs `now`) no
@@ -127,16 +133,22 @@ impl Toxgate {
     /// the age — silence from a model is not a refusal by it. A side the model
     /// DOES cover is only ever quoted on a CURRENT opinion.
     ///
-    /// A feed stamped in the FUTURE stays usable: the research writer and this
-    /// engine share a machine, so a fractionally-ahead `ts` is float rounding,
-    /// and withholding scored sides over it would be the wrong failure.
+    /// A feed stamped SLIGHTLY in the future stays usable — the research
+    /// writer and this engine share a machine, so a fractionally-ahead `ts` is
+    /// float rounding, and withholding scored sides over it is the wrong
+    /// failure. Past `TOXGATE_MAX_SKEW` it is not rounding, and the direction
+    /// matters: an unbounded future `ts` is PERMANENTLY current, which
+    /// silently disables `tox_tick`, the staleness gauge and every `Untrusted`
+    /// verdict at once. That is a gate frozen open — the exact defect this
+    /// type exists to prevent, arrived at from the other side. A writer that
+    /// starts emitting milliseconds is all it takes.
     pub fn verdict(&self, market_id: &str, side: BookSide, now: f64) -> ToxVerdict {
         let Some(score) = self.markets.get(market_id).and_then(|m| m.get(side.as_str())).copied()
         else {
             return ToxVerdict::Clear; // not covered by the model
         };
         let age_s = now - self.ts;
-        if age_s > TOXGATE_MAX_AGE {
+        if !(-TOXGATE_MAX_SKEW..=TOXGATE_MAX_AGE).contains(&age_s) {
             return ToxVerdict::Untrusted { age_s };
         }
         if score > TOXGATE_MAX {
@@ -813,6 +825,40 @@ pub(crate) mod tests_support {
             q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
             assert_eq!(any_place(&intents), want_place, "age {age}: {intents:?}");
         }
+    }
+
+    /// **A `ts` in the future is a gate frozen OPEN.**
+    ///
+    /// `now - ts` was tested one-sidedly, so a forward-corrupted timestamp — a
+    /// writer that starts emitting milliseconds is enough — makes the feed
+    /// permanently current: `tox_tick` never reports it, the staleness gauge
+    /// never sets, and every scored side is waved through on a number nobody
+    /// is updating. That is this PR's own defect reached from the other side,
+    /// which is why the bound is two-sided and why the slack is seconds.
+    #[test]
+    fn a_feed_stamped_far_in_the_future_is_untrusted_not_permanently_current() {
+        // Milliseconds mistaken for seconds: ts ~1000x `now`.
+        let ms = Toxgate {
+            ts: 100.0 * 1000.0,
+            markets: HashMap::from([(
+                "P".to_string(),
+                HashMap::from([("bid".to_string(), 0.001)]),
+            )]),
+        };
+        assert!(
+            matches!(ms.verdict("P", BookSide::Bid, 100.0), ToxVerdict::Untrusted { .. }),
+            "a far-future ts must not read as current"
+        );
+        // ...but ordinary jitter between two processes on one machine does not
+        // pull the book: inside the skew slack it is still a usable score.
+        let jitter = Toxgate {
+            ts: 100.0 + TOXGATE_MAX_SKEW / 2.0,
+            markets: HashMap::from([(
+                "P".to_string(),
+                HashMap::from([("bid".to_string(), 0.001)]),
+            )]),
+        };
+        assert_eq!(jitter.verdict("P", BookSide::Bid, 100.0), ToxVerdict::Clear);
     }
 
     /// **PROPORTIONALITY — the side the model never covered keeps quoting.**
