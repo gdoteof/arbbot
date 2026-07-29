@@ -1277,7 +1277,11 @@ fn arm_venues(args: &Args, bench: bool) -> HashMap<Venue, std::sync::Arc<dyn sin
 
 /// The fill feed runs whenever the order path does: a live order with no
 /// fill feed is an unhedged position waiting to happen.
-fn spawn_fill_feeds(args: &Args, tx_acks: Option<&tokio::sync::mpsc::Sender<feed::FeedMsg>>) {
+fn spawn_fill_feeds(
+    args: &Args,
+    tx_acks: Option<&tokio::sync::mpsc::Sender<feed::FeedMsg>>,
+    kalshi: Option<std::sync::Arc<dyn sink::OrderSink>>,
+) {
     let sfx = args
         .cred_suffix
         .iter()
@@ -1309,7 +1313,10 @@ fn spawn_fill_feeds(args: &Args, tx_acks: Option<&tokio::sync::mpsc::Sender<feed
     match (credential(&kid_n), credential(&pem_n)) {
         (Ok(kid), Ok(pem)) => {
             if let Some(t) = tx_acks {
-                tokio::spawn(fills::kalshi_fill_feed(kid, pem, t.clone()));
+                // The sink is the fill feed's read handle for venue truth, so
+                // its reconciliation spends the SAME background budget as the
+                // rest of the process (quirk `xv-shared-api-budget`).
+                tokio::spawn(fills::kalshi_fill_feed(kid, pem, t.clone(), kalshi.clone()));
             }
         }
         (a, b) => {
@@ -1479,7 +1486,7 @@ async fn main() {
             std::process::exit(exec::EXIT_BOOK_UNCONFIRMED);
         }
         spawn_shutdown_sweep();
-        spawn_fill_feeds(&args, tx_acks.as_ref());
+        spawn_fill_feeds(&args, tx_acks.as_ref(), sinks.get(&Venue::Kalshi).cloned());
     }
 
     let armed = !sinks.is_empty();

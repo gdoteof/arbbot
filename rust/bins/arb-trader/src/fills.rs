@@ -11,10 +11,23 @@
 //! twice. WHERE that number comes from differs by venue, and the difference is
 //! load-bearing: PM-US sends the venue's own cumulative `cumQuantity`, so its
 //! `cum` is venue truth. Kalshi sends per-fill DELTAS, so `KalshiFills` sums
-//! them locally — its `cum` is what this process received, not what the venue
-//! filled. The two agree only while no frame is lost. See `KalshiFills` for why
-//! that is an open exposure rather than a solved one, and `kalshi_fill_gaps()`
-//! for the signal that it may have happened.
+//! them locally — and a frame lost while the socket was dark would leave that
+//! sum permanently short of the venue, with the contracts filled and unhedged.
+//!
+//! So the Kalshi sum is RECONCILED: on every reconnect the venue's own fill
+//! history for the window is read back through `GET /portfolio/fills` and
+//! MERGED, not overwritten. Merging is the whole design — those rows carry the
+//! same `trade_id` the WS dedupes on, so venue truth and the socket write into
+//! one set and one accumulator, and neither can double-count the other. That is
+//! what makes the repair independent of whether Kalshi replays on resubscribe,
+//! which this repo still has not established. See `KalshiFills`,
+//! `kalshi_fills_recovered()` for the signal that a frame really was lost,
+//! `kalshi_reconcile_failures()` for the signal that the repair is down, and
+//! `kalshi_reconcile_rejected()` for the guard that keeps it safe against the
+//! one assumption no capture in this repo can settle.
+//!
+//! It holds credentials and, when armed, the Kalshi order sink — for the fill
+//! HISTORY read only. There is still no order code path here.
 
 use crate::feed::FeedMsg;
 use arb_core::clock::now_ns;
@@ -291,6 +304,112 @@ pub fn kalshi_fill_dust_hundredths() -> i64 {
     KALSHI_FILL_DUST.load(Ordering::Relaxed)
 }
 
+/// Fills the venue had that this process's WS never delivered, recovered by
+/// `reconcile` reading `GET /portfolio/fills`.
+///
+/// This is the gauge that says THE DEFECT HAPPENED. `kalshi_fill_gaps` counts
+/// windows in which a fill *could* have been lost and cannot tell a blip over
+/// an empty book from a blip over a live 25-lot; this counts trades that were
+/// real, were ours, and reached the hedge path only because the reconciliation
+/// went and got them. Nonzero is not an error — it is the repair working.
+static KALSHI_FILLS_RECOVERED: AtomicU64 = AtomicU64::new(0);
+
+pub fn kalshi_fills_recovered() -> u64 {
+    KALSHI_FILLS_RECOVERED.load(Ordering::Relaxed)
+}
+
+/// Reconciliations that could not be completed: the venue refused, the local
+/// background budget was spent, the response could not be parsed, or the
+/// history was longer than the page cap.
+///
+/// Must stay 0. While it is rising the engine is back to exactly its old
+/// posture — a local running sum with no venue truth behind it — so
+/// `kalshi_fill_gaps` becomes the only signal again and the runbook below is
+/// live. A failed reconciliation changes NO state.
+///
+/// RUNBOOK for that state, because a bounded window is checkable and "reconcile
+/// by hand" is not: each failure is stamped in the log with the window it could
+/// not read. `arbbot-hedge.timer` independently reads Kalshi venue truth every
+/// 5 minutes (`scripts/hedge_naked_legs.py` GETs `/portfolio/positions` and
+/// keys on `position_fp`), printing the exact shape this defect produces —
+/// `[HEDGE] <rel> Kalshi-long naked imb +N — not auto-hedged (v1)`. Caveats
+/// that make it a floor and not a proof: that timer iterates only registry
+/// pairs while this channel subscribes account-wide, so a fill on an unpaired
+/// market is invisible to it; the Kalshi-long direction is `print`ed, not
+/// `Alerter`ed, so nothing pages; and it is frozen Python.
+static KALSHI_RECONCILE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+pub fn kalshi_reconcile_failures() -> u64 {
+    KALSHI_RECONCILE_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Orders whose venue rows this process REFUSED to merge, because merging them
+/// would have pushed the running total above what the venue reports for the
+/// same window.
+///
+/// THE CHECK THAT MAKES THE MERGE SAFE TO SHIP. The whole design rests on WS
+/// `trade_id` and REST `trade_id` being the same identifier, and no raw WS fill
+/// frame has ever been captured, so that rests on them being the same field
+/// name from the same account. If they are NOT, every venue row looks new: an
+/// order 12-filled and 12-hedged over the socket would take 12 more from the
+/// reconciliation, `observe_cum_fill` clamps that to the RESTING size rather
+/// than to zero, and 12 extra contracts get hedged the wrong way.
+///
+/// It is checkable for free from data already in hand. The window starts at
+/// this process's start, so the venue's rows for it are a SUPERSET of what the
+/// socket delivered — if the ids share a space. Project the merge before doing
+/// it: `local + (rows whose trade_id is new)` must not exceed the venue's own
+/// total for that order. Under matching ids the already-seen rows drop out and
+/// it lands exactly on the venue's total; under mismatched ids nothing drops
+/// out and it lands at roughly double. An order the socket never saw projects
+/// to exactly the venue total either way, so the case this repair exists for is
+/// untouched.
+///
+/// A REST read that simply LAGS the socket trips this too — Kalshi is not
+/// read-your-writes (`Settle::retry_404`) — and that is fine: both causes want
+/// the same response, which is to merge nothing for that order and try again on
+/// the next reconnect.
+///
+/// TELLING THE TWO APART IS NOT THIS COUNTER'S JOB, IT IS THE LOG'S. Two
+/// earlier versions of this comment claimed otherwise and both were wrong, so
+/// the retractions are worth keeping: "lag is transient, a mismatch climbs with
+/// the fill rate" is false because BOTH climb with the fill rate — the
+/// reconciliation fires immediately after resubscribe, exactly when a post-gap
+/// burst is landing, so lag-driven rejections are expected on a busy account
+/// rather than alarming. "Under lag `kalshi_fills_recovered` keeps moving" is
+/// false in both directions: recovering nothing is the COMMON case on a healthy
+/// reconnect, so recovered sits at zero under lag too; and under a mismatch it
+/// still MOVES, because an order the socket never saw has `local == 0`, passes
+/// the guard by construction, and merges.
+///
+/// The discriminant that IS true is the ORDER ID in the refusal log below.
+/// `local` never shrinks and the window never advances, so under a mismatch the
+/// guard reduces to `local > 0` and the same order is refused on every
+/// reconcile for the life of the process; the per-reconcile refusal count also
+/// equals the number of orders this process has counted a fill on, not the one
+/// or two that were racing. Under lag the order merges as soon as REST catches
+/// up and its id stops appearing. So: THE SAME ORDER ID REPEATING ACROSS
+/// CONSECUTIVE REFUSALS is the mismatch signature. Evidence, not proof — an
+/// order that is filling continuously could race two reconciles 30s apart —
+/// but it is the only signal here that distinguishes rather than merely counts.
+///
+/// What the guard does and does not contain, stated exactly, because the
+/// tempting summary ("a mismatch makes this inert") is another overclaim: for
+/// an order this process has already counted a fill on, a mismatch is refused
+/// and nothing is double-hedged. For an order with `local == 0` the merge is
+/// CORRECT even under a mismatch — the venue's rows are that order's real fills
+/// and there is nothing local to double them against. The residual is a
+/// mismatch AND a replay together: the socket would redeliver that fill under
+/// an id the merge has not banked, and it would count twice. That needs both
+/// unproven venue behaviours at once, and it is self-detecting afterwards —
+/// `local` is then above venue truth, so the order is refused from the next
+/// reconcile on, which is exactly the signature above.
+static KALSHI_RECONCILE_REJECTED: AtomicU64 = AtomicU64::new(0);
+
+pub fn kalshi_reconcile_rejected() -> u64 {
+    KALSHI_RECONCILE_REJECTED.load(Ordering::Relaxed)
+}
+
 /// The contract count in a Kalshi fill payload, or the diagnostic to log.
 ///
 /// Split out so the unreadable path is testable and, above all, SAYS something.
@@ -403,28 +522,44 @@ fn count_fp_hundredths(raw: &str) -> Option<i64> {
 /// its id makes the corrected or replayed frame for that trade look like one we
 /// already hedged, and those contracts then mint no obligation at all.
 ///
-/// UNRESOLVED, and the reason `kalshi_fill_gaps()` exists: the running total is
-/// what THIS PROCESS received, not what the venue filled. Whether Kalshi replays
-/// the fills missed during a WS gap on resubscribe was never established — the
-/// commit that introduced this channel asserted it in prose, and nothing in the
-/// repo tests or records it: Python never subscribed to this channel (its only
-/// private WS is PM-US), and `docs/venue-quirks.md` has no entry for it. The one
-/// adjacent behavior that IS documented points the other way:
-/// `kalshi-ws-snapshots-only-on-subscribe` records that Kalshi's WS does not
-/// re-send state after a gap, and its port requirement is "do not rely on the
-/// venue re-sending snapshots". So the dedupe defends against a replay, and
-/// NOTHING defends against a loss: if Kalshi does not replay, a gap
-/// under-reports this total permanently and the missing contracts are naked.
+/// THE RUNNING TOTAL IS RECONCILED AGAINST VENUE TRUTH, and what makes that
+/// safe is that `GET /portfolio/fills` returns IDENTITIES, not a count. Every
+/// row carries the same `trade_id` this channel dedupes on — verified across
+/// every row of the live dump, where `fill_id == trade_id` on all of them — so
+/// `merge_venue` feeds the venue's fills through the SAME
+/// `claim` the WS uses. A fill the socket missed enters the set and is counted;
+/// a fill it already delivered is a duplicate and is not. One accumulator, one
+/// dedupe set, two sources writing to them the same way.
 ///
-/// What live evidence there is does not reach the question. `data/trader-rs/
-/// m3-wal.jsonl` holds five Kalshi fill lines, but they are this parser's
-/// OUTPUT, not raw venue frames — they pin that `count_fp` arrived as an
-/// f64-parseable string (the pre-fix parser could read nothing else) and no more
-/// than that. All five are `cum: 5` on five distinct order ids: one frame per
-/// order, so they exercise neither multi-frame accumulation nor a resubscribe.
-/// The raw frame shape is still unpinned by any capture, and the fixtures below
-/// are hand-written. Settling replay needs a live probe — drop the socket
-/// mid-fill, resubscribe, see what arrives.
+/// That is what removes the dependency on the open question. Whether Kalshi
+/// replays the missed fills on resubscribe is still NOT established — the
+/// commit that introduced this channel asserted it in prose, nothing in the
+/// repo tests or records it, Python never subscribed to this channel, and the
+/// one adjacent documented behaviour points the other way
+/// (`kalshi-ws-snapshots-only-on-subscribe`: this WS does not re-send state
+/// after a gap). It no longer decides anything. If Kalshi replays, the replayed
+/// frames carry trade_ids the reconciliation has already banked and `claim`
+/// drops them. If it does not, the reconciliation is the only way those
+/// contracts ever arrive. Both branches land on the same total.
+///
+/// THE INVARIANT TO PRESERVE IN ANY FUTURE EDIT: the emitted count is the floor
+/// of a sum over a DISTINCT subset of the order's real fills. It can therefore
+/// never exceed what the venue filled, so `arb_core::fill::observe_cum_fill` —
+/// monotone, and clamped to the resting size — can never be made to mint a
+/// contract that does not exist. Overwriting the total with a NUMBER instead of
+/// merging identities breaks exactly this, and a replay would then hedge the
+/// recovered contracts a second time: directional exposure the opposite way,
+/// which is worse than the missed hedge it repairs.
+///
+/// The one assumption left is that WS `trade_id` and REST `trade_id` are the
+/// same identifier. No raw WS fill frame has ever been captured — the five
+/// Kalshi lines in `data/trader-rs/m3-wal.jsonl` are this parser's OUTPUT, all
+/// `cum: 5` on five distinct order ids, so they exercise neither multi-frame
+/// accumulation nor a resubscribe — so it rests on them being the same field
+/// name from the same account. That assumption is not merely documented: it is
+/// CHECKED on every merge, per order, against the venue's own total for the
+/// window. See `kalshi_reconcile_rejected`, which is what turns a wrong guess
+/// here into an inert reconciliation plus a counter rather than a double hedge.
 #[derive(Default)]
 pub struct KalshiFills {
     seen: std::collections::HashSet<String>,
@@ -434,7 +569,138 @@ pub struct KalshiFills {
     hundredths: std::collections::HashMap<String, i64>,
 }
 
+/// What one claimed fill did to its order's running total.
+struct Claimed {
+    /// Whole contracts filled on the order, after this fill.
+    cum: i64,
+    /// ...and whether that number MOVED. A sub-contract piece is counted
+    /// without being reportable: the engine hedges whole contracts, and the
+    /// piece is banked so its sibling completes it.
+    moved: bool,
+}
+
 impl KalshiFills {
+    /// Bank one fill. `None` if this trade was already counted — from the WS,
+    /// from a replay of it, or from the venue's own history.
+    ///
+    /// THE single place the running total changes. Both sources go through it
+    /// precisely so neither can invent an accumulation rule of its own.
+    fn claim(&mut self, trade_id: &str, order_id: &str, hundredths: i64) -> Option<Claimed> {
+        if !self.seen.insert(trade_id.to_string()) {
+            return None; // already counted — never hedge a fill twice
+        }
+        let entry = self.hundredths.entry(order_id.to_string()).or_insert(0);
+        let before = *entry;
+        *entry += hundredths;
+        // Track the fraction that is banked but not yet hedgeable.
+        KALSHI_FILL_DUST.fetch_add((*entry % 100) - (before % 100), Ordering::Relaxed);
+        let cum = *entry / 100;
+        Some(Claimed { cum, moved: cum > before / 100 })
+    }
+
+    /// Merge the venue's own fill history in, and return the lines to emit.
+    ///
+    /// The rows are venue truth for the window they cover, but they are MERGED
+    /// rather than believed: each is offered to `claim`, which counts it only
+    /// if its `trade_id` is new. So this can add contracts the WS never
+    /// delivered and can never re-add one it did — including one delivered
+    /// after this read was issued, because the socket is already resubscribed
+    /// by the time it runs and the dedupe covers the overlap.
+    ///
+    /// GUARDED PER ORDER, and that guard is what makes it safe to ship against
+    /// an unverified id space — see `kalshi_reconcile_rejected` for the whole
+    /// argument. The projection below is what the merge WOULD produce; if it
+    /// exceeds the venue's own total for that order, the ids are not merging
+    /// the way the design assumes and this refuses to touch the order at all.
+    pub fn merge_venue(&mut self, rows: &[arb_venue::resp::KalshiFillRow]) -> Vec<String> {
+        use std::collections::{HashMap, HashSet};
+        // ONE ROW PER TRADE, before anything counts them.
+        //
+        // The guard below reduces to `local > (already-seen rows)`, which is
+        // only an invariant while that second term is a sum over DISTINCT
+        // fills. A row repeated inside this page set would add to the venue
+        // total on both passes and to the projection on neither — because its
+        // trade_id is already spent — so each repeat would LOOSEN the guard by
+        // exactly its own size, and under a foreign id space the already-seen
+        // total is precisely the quantity the guard fires on.
+        //
+        // Repeats are not exotic: this walks a cursor over a list that grows at
+        // the head, at the moment a post-gap burst is landing, and it takes two
+        // pages as soon as the process's own window holds more than one page of
+        // fills. Whether Kalshi's cursor actually repeats a row across pages is
+        // unprobed — which is the point. Checking is free from rows already in
+        // hand, and this is the same assumption the walk in
+        // `KalshiGateway::fills_since` refuses to make about sort order.
+        let mut in_page: HashSet<&str> = HashSet::new();
+        let rows: Vec<&arb_venue::resp::KalshiFillRow> =
+            rows.iter().filter(|r| in_page.insert(r.trade_id.as_str())).collect();
+
+        // The venue's own total per order, and what merging would make ours.
+        let mut venue: HashMap<&str, i64> = HashMap::new();
+        let mut projected: HashMap<&str, i64> = HashMap::new();
+        for r in &rows {
+            let Some(n) = count_fp_hundredths(&r.count_fp).filter(|n| *n > 0) else { continue };
+            *venue.entry(&r.order_id).or_insert(0) += n;
+            if !self.seen.contains(&r.trade_id) {
+                *projected.entry(&r.order_id).or_insert(0) += n;
+            }
+        }
+        let rejected: std::collections::HashSet<&str> = venue
+            .iter()
+            .filter(|(oid, v)| {
+                let local = self.hundredths.get(**oid).copied().unwrap_or(0);
+                local + projected.get(**oid).copied().unwrap_or(0) > **v
+            })
+            .map(|(oid, _)| *oid)
+            .collect();
+        for oid in &rejected {
+            KALSHI_RECONCILE_REJECTED.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[fills] kalshi reconcile REFUSED order {oid}: merging the venue's rows would \
+                 take this process to {} hundredths against the venue's own {} for the same \
+                 window. Either the REST fill list lags the socket (Kalshi is not \
+                 read-your-writes) or WS and REST trade_ids are different id spaces — and the \
+                 second would double-hedge. TELL THEM APART BY THIS ORDER ID: under lag it \
+                 merges once REST catches up and stops appearing; under a mismatch the SAME \
+                 id is refused on every reconcile for the life of this process. NOTHING \
+                 merged for this order; the next reconnect retries. \
+                 kalshi_reconcile_rejected={}",
+                self.hundredths.get(*oid).copied().unwrap_or(0)
+                    + projected.get(*oid).copied().unwrap_or(0),
+                venue.get(*oid).copied().unwrap_or(0),
+                kalshi_reconcile_rejected()
+            );
+        }
+
+        let mut out = Vec::new();
+        let mut recovered = 0u64;
+        for r in rows {
+            if rejected.contains(r.order_id.as_str()) {
+                continue;
+            }
+            // Same posture as the WS path: say so, do not guess, and leave the
+            // trade re-countable.
+            let Some(n) = count_fp_hundredths(&r.count_fp).filter(|n| *n > 0) else {
+                KALSHI_FILLS_UNREADABLE.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[fills] kalshi venue fill {} on order {}: count_fp `{}` unreadable or \
+                     non-positive — NOT counted",
+                    r.trade_id, r.order_id, r.count_fp
+                );
+                continue;
+            };
+            let Some(c) = self.claim(&r.trade_id, &r.order_id, n) else { continue };
+            recovered += 1;
+            if c.moved {
+                out.push(fill_line(&r.order_id, r.market(), c.cum));
+            }
+        }
+        if recovered > 0 {
+            KALSHI_FILLS_RECOVERED.fetch_add(recovered, Ordering::Relaxed);
+        }
+        out
+    }
+
     pub fn line(&mut self, raw: &str) -> Option<String> {
         let v: Value = serde_json::from_str(raw).ok()?;
         if v.get("type").and_then(|t| t.as_str())? != "fill" {
@@ -455,16 +721,8 @@ impl KalshiFills {
                 return None;
             }
         };
-        if !self.seen.insert(trade_id.to_string()) {
-            return None; // already counted — never hedge a fill twice
-        }
-        let entry = self.hundredths.entry(order_id.to_string()).or_insert(0);
-        let before = *entry;
-        *entry += n;
-        let (cum, prev) = (*entry / 100, before / 100);
-        // Track the fraction that is banked but not yet hedgeable.
-        KALSHI_FILL_DUST.fetch_add((*entry % 100) - (before % 100), Ordering::Relaxed);
-        if cum == prev {
+        let c = self.claim(trade_id, order_id, n)?;
+        if !c.moved {
             // A sub-contract piece. COUNTED — its trade_id is spent and its
             // hundredths are banked — but there is no whole contract to hedge
             // yet, and reporting an unchanged cumulative total would be a
@@ -472,36 +730,168 @@ impl KalshiFills {
             return None;
         }
         let market = msg.get("market_ticker").and_then(|x| x.as_str()).unwrap_or_default();
-        Some(
-            serde_json::json!({
-                "kind": "fill",
-                "venue": "kalshi",
-                "market_id": market,
-                "order_id": order_id,
-                "cum": cum,
-                "ts_local_ns": now_ns(),
-            })
-            .to_string(),
-        )
+        Some(fill_line(order_id, market, c.cum))
     }
 }
 
-pub async fn kalshi_fill_feed(key_id: String, pem: String, tx: Sender<FeedMsg>) {
+/// The engine's `fill` line. One writer, so the WS and the venue read cannot
+/// disagree about the schema the engine parses.
+fn fill_line(order_id: &str, market: &str, cum: i64) -> String {
+    serde_json::json!({
+        "kind": "fill",
+        "venue": "kalshi",
+        "market_id": market,
+        "order_id": order_id,
+        "cum": cum,
+        "ts_local_ns": now_ns(),
+    })
+    .to_string()
+}
+
+/// Shortest interval between two reconciliations.
+///
+/// The reconnect backoff is 2s, so an unthrottled reconcile would issue a paged
+/// venue read every two seconds against a 60/min background budget shared with
+/// every other read this process makes.
+///
+/// It DEFERS rather than drops. Dropping was wrong for a reason that only shows
+/// up in the failure it causes: the reconnect is the only trigger, so "the next
+/// one will cover it" assumes a next one, and a flap at gap #3 twelve seconds
+/// after gap #2 followed by a socket that stays up all day means that fill is
+/// never reconciled at all. What IS dropped is a request made while one is
+/// already queued, and that is free: the window is [process start, now], so the
+/// queued reconciliation covers strictly more ground than the one being
+/// dropped.
+const RECONCILE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Shared state, so the reconciliation can run as its OWN task.
+///
+/// It cannot run inline. `spawn_blocking` keeps the tokio worker free, but a
+/// task that awaits it stops polling its socket — and tungstenite only answers
+/// Pings while polled. With the 15s HTTP timeout and a 5-page cap, an inline
+/// reconcile can leave the fill socket unpolled for over a minute, long enough
+/// for Kalshi to close it: a gap CAUSED by the repair for the last gap.
+type Shared = std::sync::Arc<std::sync::Mutex<KalshiFills>>;
+
+/// Queue a reconciliation. At most one is ever queued or running.
+fn spawn_reconcile(
+    state: Shared,
+    sink: std::sync::Arc<dyn crate::sink::OrderSink>,
+    since_s: i64,
+    tx: Sender<FeedMsg>,
+    gate: std::sync::Arc<tokio::sync::Mutex<Option<Instant>>>,
+) {
+    tokio::spawn(async move {
+        // Already queued or running: that one covers this window too.
+        let Ok(mut last) = gate.try_lock() else { return };
+        if let Some(t) = *last {
+            let waited = t.elapsed();
+            if waited < RECONCILE_MIN_INTERVAL {
+                tokio::time::sleep(RECONCILE_MIN_INTERVAL - waited).await;
+            }
+        }
+        reconcile(&state, &sink, since_s, &tx).await;
+        // Stamped after the ATTEMPT, success or not, so a venue that is
+        // refusing cannot be hammered every 2s by a flapping socket.
+        *last = Some(Instant::now());
+    });
+}
+
+/// Read the venue's fill history for this process's lifetime and merge it.
+///
+/// `Priority::Background` all the way down (`KalshiGateway::fills_since`): this
+/// is a poll, no hedge waits on it, and a spent budget must refuse it rather
+/// than earn a venue-side 429 (quirk `xv-shared-api-budget`).
+///
+/// FAILURE CHANGES NOTHING. A refused, unreachable, unparseable or truncated
+/// read merges no rows, so the engine keeps exactly what it had before this
+/// existed: a local running sum. It is counted (`kalshi_reconcile_failures`)
+/// and logged with the window it could not read, because the one thing worse
+/// than being blind is being blind quietly.
+async fn reconcile(
+    state: &Shared,
+    sink: &std::sync::Arc<dyn crate::sink::OrderSink>,
+    since_s: i64,
+    tx: &Sender<FeedMsg>,
+) {
+    let s = sink.clone();
+    let rows = match tokio::task::spawn_blocking(move || s.fills_since(since_s)).await {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
+            KALSHI_RECONCILE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[fills] kalshi reconcile FAILED ({e}) — the fill totals for the window since \
+                 unix {since_s} are this process's local sum with nothing behind them, exactly \
+                 as before this existed. kalshi_reconcile_failures={}",
+                kalshi_reconcile_failures()
+            );
+            return;
+        }
+        Err(e) => {
+            KALSHI_RECONCILE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            eprintln!("[fills] kalshi reconcile task failed ({e}); window since unix {since_s}");
+            return;
+        }
+    };
+    let n = rows.len();
+    // Scoped: a std guard is not Send and must not be held across the sends.
+    let lines = { state.lock().expect("fill state").merge_venue(&rows) };
+    for line in lines {
+        eprintln!("[fills] RECOVERED {line}");
+        if tx.send(FeedMsg { line, t_read: Instant::now() }).await.is_err() {
+            return; // engine gone
+        }
+    }
+    eprintln!(
+        "[fills] kalshi reconcile ok — {n} venue fill(s) in the window since unix {since_s}; \
+         kalshi_fills_recovered={} rejected={}",
+        kalshi_fills_recovered(),
+        kalshi_reconcile_rejected()
+    );
+}
+
+/// `sink` is the Kalshi order sink, present only when the process is armed. It
+/// is what the reconciliation reads venue truth through — the SAME sink, and so
+/// the same background token bucket, as every other venue read here. Without
+/// orders there is nothing to hedge and nothing to reconcile, so `None` simply
+/// runs the feed as it always ran.
+pub async fn kalshi_fill_feed(
+    key_id: String,
+    pem: String,
+    tx: Sender<FeedMsg>,
+    sink: Option<std::sync::Arc<dyn crate::sink::OrderSink>>,
+) {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::Message;
 
-    // State lives ACROSS reconnects: IF Kalshi replays, the dedupe is what stops
-    // that becoming a double hedge. It does nothing for the other direction —
-    // see `KalshiFills` and `kalshi_fill_gaps()`.
+    // State lives ACROSS reconnects: the dedupe is what stops a replay becoming
+    // a double hedge, and it is now also what stops the RECONCILIATION becoming
+    // one — both sources claim the same `trade_id`s out of the same set.
     //
     // It does NOT live across restarts, and this is where that is counted. The
     // state below starts empty while the venue's positions do not, so the
     // downtime before this line is a gap of exactly the same kind as a
     // reconnect, and the largest one: it is the whole window in which no
-    // process was subscribed. Counting it here is what stops the next run from
-    // opening with a clean 0 over contracts the last run left naked.
+    // process was subscribed. It is also the one gap this cannot reconcile —
+    // see `kalshi_fill_gaps` for what covers it instead.
     KALSHI_FILL_GAPS.fetch_add(1, Ordering::Relaxed);
-    let mut state = KalshiFills::default();
+    let state: Shared = std::sync::Arc::new(std::sync::Mutex::new(KalshiFills::default()));
+    let gate = std::sync::Arc::new(tokio::sync::Mutex::new(None::<Instant>));
+    // The reconciliation window opens HERE, not at the venue's epoch. A fill
+    // older than this process belongs to an order it never registered, so
+    // replaying one would reach `FillOutcome::Unknown`, sit in
+    // `unclaimed_fills` for 15s and alarm as money we cannot explain — turning
+    // a repair into a false alarm on every restart.
+    //
+    // `+1` because the venue's `ts` is in whole SECONDS: without it a fill from
+    // the same second as this line, but before it, reads as inside the window.
+    // The second it costs is safe — an order cannot be placed before the
+    // preconditions that spawn this task have been met.
+    let since_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        + 1;
 
     loop {
         let attempt = async {
@@ -530,10 +920,31 @@ pub async fn kalshi_fill_feed(key_id: String, pem: String, tx: Sender<FeedMsg>) 
             .map_err(|e| format!("subscribe: {e}"))?;
             eprintln!("[fills] kalshi fill channel connected");
 
+            // AFTER the resubscribe, never before: the read then covers
+            // [process start, now] while the socket covers [subscribe, ...],
+            // and the two overlap. A fill landing in that overlap is claimed
+            // once, by whichever arrives first. Reconciling before subscribing
+            // would leave the interval between them covered by neither.
+            //
+            // The BOOT gap is skipped (`kalshi_fill_gaps() == 1` only here):
+            // the window is empty by construction, and reading further back
+            // would pull in fills on orders this engine never registered.
+            if let (Some(s), true) = (sink.as_ref(), kalshi_fill_gaps() > 1) {
+                spawn_reconcile(
+                    state.clone(),
+                    s.clone(),
+                    since_s,
+                    tx.clone(),
+                    gate.clone(),
+                );
+            }
+
             while let Some(frame) = ws.next().await {
                 let msg = frame.map_err(|e| format!("read: {e}"))?;
                 let Message::Text(raw) = msg else { continue };
-                if let Some(line) = state.line(&raw) {
+                // Scoped: the guard must not be alive across the send below.
+                let out = { state.lock().expect("fill state").line(&raw) };
+                if let Some(line) = out {
                     eprintln!("[fills] {line}");
                     if tx.send(FeedMsg { line, t_read: Instant::now() }).await.is_err() {
                         return Ok::<(), String>(());
@@ -548,12 +959,14 @@ pub async fn kalshi_fill_feed(key_id: String, pem: String, tx: Sender<FeedMsg>) 
             Err(e) => {
                 KALSHI_FILL_GAPS.fetch_add(1, Ordering::Relaxed);
                 eprintln!(
-                    "[fills] kalshi dropped ({e}); reconnecting in 2s. Any fill inside this \
-                     gap is recovered ONLY if Kalshi replays on resubscribe, which this repo \
-                     has never established — if it does not, the running fill totals are \
-                     short of the venue and those contracts are naked. Check the \
-                     arbbot-hedge.timer journal either side of this line for a Kalshi-long \
-                     naked imbalance (see kalshi_fill_gaps). kalshi_fill_gaps={}",
+                    "[fills] kalshi dropped ({e}); reconnecting in 2s, then reconciling the \
+                     window against GET /portfolio/fills — a fill inside this gap is \
+                     recovered whether or not Kalshi replays, because the venue's rows carry \
+                     the same trade_id the dedupe uses. Watch for the reconcile line that \
+                     follows: FAILED means the totals are a local sum again \
+                     (kalshi_reconcile_failures runbook), REFUSED means they are a local sum \
+                     for that order and possibly always will be \
+                     (kalshi_reconcile_rejected). kalshi_fill_gaps={}",
                     kalshi_fill_gaps()
                 );
             }
@@ -847,5 +1260,272 @@ mod kalshi_tests {
     fn a_numeric_count_fp_floors_rather_than_rounds() {
         let v: Value = serde_json::from_str(r#"{"count_fp":2.999}"#).unwrap();
         assert_eq!(kalshi_count(&v), Ok(299), "2.999 is 2 contracts and change, not 3");
+    }
+
+    // ------------------------------------------ reconciliation (venue truth) ---
+
+    use arb_venue::resp::KalshiFillRow;
+
+    fn row(trade: &str, order: &str, count: &str) -> KalshiFillRow {
+        KalshiFillRow {
+            trade_id: trade.into(),
+            order_id: order.into(),
+            count_fp: count.into(),
+            market_ticker: Some("KXTEST".into()),
+            ticker: None,
+            ts: 1_767_225_600,
+        }
+    }
+
+    /// Contracts the engine's own ledger would hedge for one emitted line. The
+    /// REAL consumer: `observe_cum_fill` is the single funnel every fill path
+    /// goes through, and the whole question here is what IT is told.
+    fn hedged(fl: &mut arb_core::fill::FillLedger, order_id: &str, line: &str) -> i64 {
+        let cum = serde_json::from_str::<Value>(line).unwrap()["cum"].as_i64().expect("cum");
+        match fl.observe_cum_fill(order_id, cum) {
+            arb_core::fill::FillOutcome::Minted(ob) => ob.into_parts().2,
+            _ => 0,
+        }
+    }
+
+    /// THE test this whole change exists for.
+    ///
+    /// A fill is lost while the socket is dark. The reconciliation reads the
+    /// venue's own history and the contracts reach the hedge path. Then Kalshi
+    /// replays the gap on resubscribe — the behaviour this repo has never been
+    /// able to establish — and NOTHING is hedged twice.
+    ///
+    /// It works because the venue's rows carry the same `trade_id` the WS
+    /// dedupes on: the replayed frame is already in `seen`, so `claim` drops
+    /// it. Overwriting the running total with a NUMBER instead — the obvious
+    /// repair — would add the recovered contracts a second time here.
+    #[test]
+    fn venue_truth_survives_a_replay_because_it_carries_trade_ids() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        let mut fl = arb_core::fill::FillLedger::new();
+        fl.register_order("o1", "KXTEST", 25, None);
+        let mut total = 0;
+
+        total += hedged(&mut fl, "o1", &s.line(&frame("t1", "o1", "2.00")).unwrap());
+        total += hedged(&mut fl, "o1", &s.line(&frame("t2", "o1", "3.00")).unwrap());
+        assert_eq!(total, 5, "5 filled, 5 hedged");
+
+        // The socket drops. The venue fills 4 more on t3 and no frame arrives.
+        // On reconnect the reconciliation reads the window back: t1 and t2 are
+        // already counted, t3 is not.
+        let lines = s.merge_venue(&[
+            row("t1", "o1", "2.00"),
+            row("t2", "o1", "3.00"),
+            row("t3", "o1", "4.00"),
+        ]);
+        assert_eq!(lines.len(), 1, "only the trade the socket missed is reported");
+        total += hedged(&mut fl, "o1", &lines[0]);
+        assert_eq!(total, 9, "the lost 4 are recovered and hedged");
+
+        // ...and NOW Kalshi replays the gap. t3's frame arrives for the first
+        // time on this socket, but not for the first time in `seen`.
+        assert!(s.line(&frame("t3", "o1", "4.00")).is_none(), "the replay is a duplicate");
+
+        // The next genuine fill continues from venue truth, not from a total
+        // that is short by the gap.
+        total += hedged(&mut fl, "o1", &s.line(&frame("t4", "o1", "6.00")).unwrap());
+        assert_eq!(total, 15, "9 + 6 — the running sum was HEALED, not just reported over");
+    }
+
+    /// ...and if Kalshi does NOT replay, the same sequence lands on the same
+    /// total. That is the point: the branch is no longer load-bearing.
+    #[test]
+    fn the_total_is_the_same_whether_or_not_the_venue_replays() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        s.line(&frame("t1", "o1", "2.00"));
+        s.merge_venue(&[row("t1", "o1", "2.00"), row("t3", "o1", "4.00")]);
+        // No replay of t3 — just the next real fill.
+        let v: Value = serde_json::from_str(&s.line(&frame("t4", "o1", "6.00")).unwrap()).unwrap();
+        assert_eq!(v["cum"], 12, "2 + 4 + 6, identical to the replay path above");
+    }
+
+    /// THE GUARD, and the reason this is shippable against an id space no
+    /// capture in this repo can confirm.
+    ///
+    /// If WS `trade_id` and REST `trade_id` were different id spaces, every
+    /// venue row would look new. An order 12-filled and 12-hedged over the
+    /// socket would take 12 MORE from the reconciliation — and
+    /// `observe_cum_fill` clamps that to the RESTING size, not to zero, so on a
+    /// 25-lot it mints 12 extra contracts hedged the wrong way.
+    ///
+    /// It is detectable for free: the window starts at process start, so the
+    /// venue's rows for it are a superset of what the socket delivered — if the
+    /// ids share a space. Project the merge first. Under matching ids the
+    /// already-seen rows drop out and it lands exactly on the venue's total;
+    /// under mismatched ids nothing drops out and it lands at double.
+    #[test]
+    fn a_foreign_id_space_is_refused_rather_than_double_counted() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        let mut fl = arb_core::fill::FillLedger::new();
+        fl.register_order("o1", "KXTEST", 25, None);
+
+        let mut total = 0;
+        total += hedged(&mut fl, "o1", &s.line(&frame("ws-a", "o1", "5.00")).unwrap());
+        total += hedged(&mut fl, "o1", &s.line(&frame("ws-b", "o1", "7.00")).unwrap());
+        assert_eq!(total, 12, "12 filled over the socket, 12 hedged");
+
+        // The venue reports the SAME twelve contracts under ids from a
+        // different space.
+        let before = kalshi_reconcile_rejected();
+        let lines = s.merge_venue(&[row("rest-a", "o1", "5.00"), row("rest-b", "o1", "7.00")]);
+        assert!(lines.is_empty(), "nothing may be emitted for an order that does not reconcile");
+        assert_eq!(kalshi_reconcile_rejected(), before + 1, "and the refusal must be countable");
+
+        // The state is untouched, so the next real fill continues from 12.
+        let v: Value = serde_json::from_str(&s.line(&frame("ws-c", "o1", "3.00")).unwrap()).unwrap();
+        assert_eq!(v["cum"], 15, "12 + 3 — not 24 + 3");
+    }
+
+    /// ...and a row REPEATED inside the page set must not buy the merge past
+    /// that guard.
+    ///
+    /// The guard reduces to `local > (already-seen rows)`, which is an
+    /// invariant only while the second term is a sum over DISTINCT fills. A
+    /// repeat adds to the venue total on both passes and to the projection on
+    /// neither — its trade_id is already spent — so it loosens the guard by
+    /// exactly its own size, and under a foreign id space that is precisely
+    /// the quantity being tested against.
+    ///
+    /// The trace, and none of it is exotic: gap #1 loses an order's first fill,
+    /// the reconciliation recovers it (`local` is 0, so the guard correctly
+    /// cannot fire); the socket returns and delivers genuinely new contracts;
+    /// gap #2's walk takes two pages — which it does as soon as the process's
+    /// own window holds more than one page of fills — and they overlap, the
+    /// ordinary artifact of paging a list that grows at the head while a
+    /// post-gap burst is landing. Whether Kalshi's cursor really repeats a row
+    /// is unprobed, which is the reason to check rather than assume.
+    #[test]
+    fn a_row_repeated_across_pages_cannot_loosen_the_guard() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        let mut fl = arb_core::fill::FillLedger::new();
+        fl.register_order("o1", "KXTEST", 25, None);
+        let mut total = 0;
+
+        // Gap #1 missed o1's first fill entirely. `local` is 0, so the guard
+        // cannot fire and the recovery goes through — correctly.
+        let lines = s.merge_venue(&[row("rest-b", "o1", "5.00")]);
+        total += hedged(&mut fl, "o1", &lines[0]);
+        assert_eq!(total, 5, "the terminal case still reconciles");
+
+        // The socket returns and delivers 5 genuinely new contracts. Under a
+        // FOREIGN id space the venue will report that same fill as `rest-a`.
+        total += hedged(&mut fl, "o1", &s.line(&frame("ws-a", "o1", "5.00")).unwrap());
+        assert_eq!(total, 10);
+
+        // Gap #2. Two pages, overlapping on the row already merged in step 1.
+        let before = kalshi_reconcile_rejected();
+        let lines = s.merge_venue(&[
+            row("rest-b", "o1", "5.00"),
+            row("rest-b", "o1", "5.00"), // the repeat
+            row("rest-a", "o1", "5.00"),
+        ]);
+        assert!(lines.is_empty(), "the repeat must not pay for the merge");
+        assert_eq!(kalshi_reconcile_rejected(), before + 1, "it is a refusal, and counted");
+
+        // ...and the ledger never saw a second helping of those 5 contracts.
+        assert_eq!(total, 10, "10 filled, 10 hedged — not 15");
+        let v: Value = serde_json::from_str(&s.line(&frame("ws-c", "o1", "2.00")).unwrap()).unwrap();
+        assert_eq!(v["cum"], 12, "the running total is untouched by the refusal");
+    }
+
+    /// The guard must not fire on the case the repair exists FOR: an order
+    /// whose fills the socket never saw at all projects to exactly the venue's
+    /// own total, which is not an excess.
+    #[test]
+    fn an_order_the_socket_never_saw_still_reconciles() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        let before = kalshi_reconcile_rejected();
+        let lines = s.merge_venue(&[row("t1", "lost", "4.00")]);
+        assert_eq!(lines.len(), 1, "the terminal case — the only fill was lost in the gap");
+        assert_eq!(kalshi_reconcile_rejected(), before, "and it is not a mismatch");
+        let v: Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(v["cum"], 4);
+        assert_eq!(v["order_id"], "lost");
+    }
+
+    /// A REST list that LAGS the socket trips the same guard — Kalshi is not
+    /// read-your-writes — and that is the right answer for it too: merge
+    /// nothing for that order and let the next reconnect retry. It must not
+    /// poison the OTHER orders in the same read.
+    #[test]
+    fn a_lagging_venue_list_refuses_one_order_without_touching_the_rest() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        assert!(s.line(&frame("t1", "o1", "2.00")).is_some());
+        assert!(s.line(&frame("t2", "o1", "3.00")).is_some());
+        // The venue has caught up with t1 but not t2, while o2 is complete.
+        let lines = s.merge_venue(&[row("t1", "o1", "2.00"), row("t9", "o2", "1.00")]);
+        assert_eq!(lines.len(), 1, "o2 still reconciles");
+        let v: Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(v["order_id"], "o2");
+        // ...and o1 kept its own total, so the next fill continues from 5.
+        let w: Value = serde_json::from_str(&s.line(&frame("t3", "o1", "1.00")).unwrap()).unwrap();
+        assert_eq!(w["cum"], 6);
+    }
+
+    /// A reconciliation that recovers nothing must change nothing — it runs on
+    /// EVERY reconnect and the common case is that nothing was lost.
+    #[test]
+    fn a_reconcile_that_recovers_nothing_emits_nothing() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        assert!(s.line(&frame("t1", "o1", "2.00")).is_some());
+        let before = kalshi_fills_recovered();
+        assert!(s.merge_venue(&[row("t1", "o1", "2.00")]).is_empty());
+        assert_eq!(kalshi_fills_recovered(), before, "nothing recovered, so nothing counted");
+    }
+
+    /// Fractional pieces merge like whole ones, and the count that reaches the
+    /// engine is still the floor. `2.13` over the socket plus `1.87` recovered
+    /// is the venue's 4 — the same real 4-lot the parser tests use, split across
+    /// the two sources.
+    #[test]
+    fn a_recovered_fractional_piece_completes_its_sibling() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        let a: Value = serde_json::from_str(&s.line(&frame("t1", "o1", "2.13")).unwrap()).unwrap();
+        assert_eq!(a["cum"], 2);
+        let lines = s.merge_venue(&[row("t1", "o1", "2.13"), row("t2", "o1", "1.87")]);
+        let b: Value = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(b["cum"], 4, "213 + 187 = 400 across two sources");
+    }
+
+    /// A venue row we cannot read must be SAID, not skipped silently, and must
+    /// not consume its trade — same posture as the WS path, for the same
+    /// reason: a corrected or re-read row for that trade must still count.
+    #[test]
+    fn an_unreadable_venue_row_is_counted_and_stays_recountable() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        let before = kalshi_fills_unreadable();
+        assert!(s.merge_venue(&[row("t1", "o1", "not-a-number")]).is_empty());
+        assert_eq!(kalshi_fills_unreadable(), before + 1);
+        let lines = s.merge_venue(&[row("t1", "o1", "2.00")]);
+        assert_eq!(lines.len(), 1, "t1 must still be countable on the next read");
+    }
+
+    /// The market comes from `market_ticker` when present and `ticker`
+    /// otherwise — the live rows carry both, the WS frame only the first, and
+    /// an empty market_id would strand the fill in the engine.
+    #[test]
+    fn a_venue_row_reports_its_market_either_spelling() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        let mut r = row("t1", "o1", "1.00");
+        r.market_ticker = None;
+        r.ticker = Some("KXFROMTICKER".into());
+        let v: Value = serde_json::from_str(&s.merge_venue(&[r])[0]).unwrap();
+        assert_eq!(v["market_id"], "KXFROMTICKER");
+        assert_eq!(v["venue"], "kalshi");
     }
 }

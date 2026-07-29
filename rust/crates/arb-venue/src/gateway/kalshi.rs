@@ -20,7 +20,18 @@ use std::sync::Mutex;
 const K_PLACE: &str = "/trade-api/v2/portfolio/events/orders";
 /// GET/list + status still live under `/portfolio/orders`.
 const K_ORDERS: &str = "/trade-api/v2/portfolio/orders";
+/// Fill history — the venue's own record of every fill, with the `trade_id`
+/// the WS `fill` frame dedupes on. See [`KalshiGateway::fills_since`].
+const K_FILLS: &str = "/trade-api/v2/portfolio/fills";
 const K_BALANCE: &str = "/trade-api/v2/portfolio/balance";
+/// Pages of fill history one `fills_since` will walk before it gives up.
+///
+/// 100 rows a page, so 5 pages is 500 fills — comfortably more than the busiest
+/// quoting day this stack has recorded, against a window that is normally
+/// seconds. A venue that keeps handing back cursors must not be able to spin a
+/// reconciliation forever on a background budget. Exceeding it is an ERROR, not
+/// a truncated list: see [`KalshiGateway::fills_since`].
+const K_FILLS_MAX_PAGES: usize = 5;
 const K_POSITIONS: &str = "/trade-api/v2/portfolio/positions";
 
 /// Kalshi gateway. Generic over its [`Transport`]; the default is
@@ -176,6 +187,108 @@ impl<T: Transport> KalshiGateway<T> {
             }
         }
         Ok(Listing { orders: out, cut_short })
+    }
+
+    /// Every fill on this account at or after `min_ts` (unix SECONDS), oldest
+    /// first.
+    ///
+    /// This is venue truth for the private `fill` WS channel, and it is truth
+    /// with IDENTITIES rather than a count: each row carries the `trade_id`
+    /// that channel dedupes on, so a caller can merge the venue's fills into
+    /// its own set instead of overwriting a running total with a number. That
+    /// difference is the whole reason a reconciliation is safe — see
+    /// `arb-trader`'s `KalshiFills::claim`.
+    ///
+    /// [`Priority::Background`], and this one really is a poll: unlike
+    /// [`Self::all_orders`] no order-path limb needs it, a hedge never waits on
+    /// it, and refusing it locally when the budget is spent is exactly right
+    /// (quirk `xv-shared-api-budget`). A refused reconciliation leaves the
+    /// engine no worse than it was; a refused cancel leaves an order resting.
+    ///
+    /// `min_ts` is filtered CLIENT-side. Kalshi may well accept a `min_ts`
+    /// query parameter, but nothing in this repo has ever sent one, and a
+    /// parameter the venue rejects fails the whole read while one it silently
+    /// ignores costs only pages.
+    ///
+    /// THE SORT ORDER IS NOT ASSUMED. Every row of the live dump in
+    /// `data/venue/kalshi_fills.json` is newest-first, but nothing in this repo
+    /// produces that dump, so "the venue sorts descending" and "whatever
+    /// fetched it sorted descending" are indistinguishable from the artifact.
+    /// Stopping early on that assumption would, against an oldest-first venue,
+    /// discard page 1 as entirely pre-window and return `Ok(vec![])` — a
+    /// permanently inert reconciliation reporting itself healthy, which is the
+    /// exact silent-zero `resp::kalshi_fills_page` exists to prevent. So the
+    /// walk stops early only on a page it can SEE is descending, and otherwise
+    /// pages to the cursor's end.
+    ///
+    /// Running out of pages with a cursor still live is an ERROR, not a partial
+    /// answer, for the same reason: a truncated list is indistinguishable from
+    /// a complete one to the caller, and this one is used to decide whether
+    /// contracts are unhedged.
+    pub fn fills_since(&self, min_ts: i64) -> Result<Vec<resp::KalshiFillRow>, VenueError> {
+        let mut out: Vec<resp::KalshiFillRow> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            if pages >= K_FILLS_MAX_PAGES {
+                return Err(VenueError::Status {
+                    endpoint: "kalshi fills",
+                    status: 0,
+                    body: format!(
+                        "fill history still has a cursor after {K_FILLS_MAX_PAGES} pages; \
+                         refusing to return a truncated list, which the caller cannot tell \
+                         from a complete one"
+                    ),
+                });
+            }
+            let q = cursor.as_ref().map(|c| format!("limit=100&cursor={c}"));
+            let r = self.call(
+                Priority::Background,
+                "GET",
+                K_FILLS,
+                q.as_deref().or(Some("limit=100")),
+                None,
+            )?;
+            pages += 1;
+            if r.status != 200 {
+                return Err(VenueError::Status {
+                    endpoint: "kalshi fills",
+                    status: r.status,
+                    body: r.body,
+                });
+            }
+            let page = resp::kalshi_fills_page(&r.body)?;
+            // A row with no `ts` reads as 0 and would look pre-window, so
+            // absence is treated as "inside the window" and kept. The trade_id
+            // merge makes an extra row free; a missing one is a fill nobody
+            // hedges.
+            //
+            // Two or more rows, non-increasing, AT LEAST ONE STRICT DECREASE,
+            // and one of them already outside the window: only then is "no
+            // later page can help" a fact rather than a guess.
+            //
+            // The strict decrease is not pedantry. Equal timestamps are common
+            // here — a fill split across price levels reports its pieces on the
+            // same second — and a page whose `ts` never changes is
+            // simultaneously non-increasing and non-decreasing, i.e. evidence
+            // of neither direction. A one-row page proves nothing either.
+            let descending = page.fills.len() >= 2
+                && page.fills.windows(2).all(|w| w[0].ts >= w[1].ts)
+                && page.fills.windows(2).any(|w| w[0].ts > w[1].ts);
+            let has_older = page.fills.iter().any(|f| f.ts != 0 && f.ts < min_ts);
+            out.extend(page.fills.into_iter().filter(|f| f.ts == 0 || f.ts >= min_ts));
+            if descending && has_older {
+                break;
+            }
+            match page.cursor {
+                Some(c) if !c.is_empty() => cursor = Some(c),
+                _ => break,
+            }
+        }
+        // Oldest first, whatever order the venue used. Stable, so rows sharing
+        // a timestamp keep the venue's own sequence.
+        out.sort_by_key(|r| r.ts);
+        Ok(out)
     }
 
     /// Where an order carrying OUR `client_order_id` stands on this account.
@@ -397,6 +510,10 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
 
     fn order_id(order: &Self::Order) -> String {
         order.order_id.clone()
+    }
+
+    fn fills_since(&self, min_ts: i64) -> Result<Vec<resp::KalshiFillRow>, VenueError> {
+        KalshiGateway::fills_since(self, min_ts)
     }
 
     /// DELETE /portfolio/events/orders/{venue order id}.
