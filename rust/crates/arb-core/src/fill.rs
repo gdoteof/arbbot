@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// was placed/refreshed. Prices stay strings (venue-verbatim decimals).
 #[derive(Clone, Debug, PartialEq)]
 pub struct HedgeAnchor {
-    pub venue: &'static str,
+    pub venue: crate::model::Venue,
     pub market_id: String,
     /// hedge-leg BOOK side the anchor price came from — consistent with
     /// `price` (maker bid fills => we sell into the hedge bid => "bid").
@@ -210,7 +210,7 @@ mod tests {
 
     fn anchor() -> HedgeAnchor {
         HedgeAnchor {
-            venue: "polymarket_us",
+            venue: crate::model::Venue::PolymarketUs,
             market_id: "hedge-mkt".into(),
             side: "ask",
             price: "0.41".into(),

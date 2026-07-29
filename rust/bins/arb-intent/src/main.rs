@@ -7,6 +7,7 @@
 
 use arb_core::book::{ApplyError, BookBuilder};
 use arb_core::fees::FeeSchedule;
+use arb_core::intent::Intent;
 use arb_core::model::{BookSide, Level, Venue};
 use arb_core::quoter::{Quoter, Toxgate};
 use arb_core::scan::{Cx, Rel, RelLeg, RelType};
@@ -157,7 +158,7 @@ fn main() {
     let mut next_oid: u64 = 0;
     let mut out =
         out_path.map(|p| std::io::BufWriter::new(std::fs::File::create(p).expect("out")));
-    let mut intents: Vec<String> = Vec::new();
+    let mut intents: Vec<Intent> = Vec::new();
 
     let f = std::fs::File::open(&tape).expect("open tape");
     for line in std::io::BufReader::new(f).lines() {
@@ -221,7 +222,8 @@ fn main() {
         if let Some(idxs) = by_market.get(&(venue, market_id)) {
             for &qi in idxs {
                 quoters[qi].on_book(&mut cx, &fees, &books, now, &mut next_oid, &mut intents);
-                for l in intents.drain(..) {
+                for it in intents.drain(..) {
+                    let l = it.to_line();
                     digest.update(l.as_bytes());
                     digest.update(b"\n");
                     n_int += 1;

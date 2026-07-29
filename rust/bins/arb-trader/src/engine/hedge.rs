@@ -12,9 +12,9 @@ use super::fill::{UnclaimedFill, FILL_ACK_GRACE};
 use super::{Engine, HedgeRetry};
 use arb_core::book::BookBuilder;
 use arb_core::fill::HedgeAnchor;
+use arb_core::intent::{self, Intent, Tag};
 use arb_core::model::Venue;
 use arb_core::scan::{Cx, Rel};
-use serde_json::json;
 use std::collections::HashMap;
 
 /// THE HEDGE ACCOUNTING INVARIANT — what must hold between maker fills, hedge
@@ -158,7 +158,7 @@ pub(super) struct HedgeOrder {
     /// across retries, so a fill on attempt 3 credits what attempt 1 owed.
     pub(super) chain_id: String,
     pub(super) market_id: String,
-    pub(super) venue: &'static str,
+    pub(super) venue: Venue,
     pub(super) side: &'static str,
     pub(super) price: String,
     pub(super) qty: i64,
@@ -393,7 +393,7 @@ pub(super) fn hedge_anchor(
     let book = books.get(hedge.venue, &hedge.market_id).filter(|b| !b.is_crossed())?;
     let lvl = if side == "bid" { book.bids.first() } else { book.asks.first() }?;
     Some(HedgeAnchor {
-        venue: hedge.venue.as_str(),
+        venue: hedge.venue,
         market_id: hedge.market_id.clone(),
         side,
         price: lvl.price.clone(),
@@ -426,8 +426,7 @@ fn hedge_tick_plans(
         // OBLIGATION's anchor, not off the last attempt: the anchor
         // is the one thing about this obligation that never moves.
         let book_side = p.anchor.side;
-        let hedge_book =
-            Venue::parse(p.anchor.venue).and_then(|vn| books.get(vn, &p.anchor.market_id));
+        let hedge_book = books.get(p.anchor.venue, &p.anchor.market_id);
         // The touch is read even off a CROSSED book, unlike
         // `hedge_anchor`, and the asymmetry is deliberate. Refusing to
         // OPEN an obligation on corrupt data costs nothing; refusing to
@@ -458,7 +457,7 @@ fn hedge_tick_plans(
         // so holding it would be added naked time bought for nothing.
         let ack_outstanding = p.latest_attempt.as_ref().is_some_and(|a| !oid_venue.contains_key(a))
             && unclaimed.values().any(|u| {
-                u.market_id == p.anchor.market_id && Venue::parse(p.anchor.venue) == Some(u.venue)
+                u.market_id == p.anchor.market_id && p.anchor.venue == u.venue
             });
         let plan = hedge_plan(
             cx,
@@ -495,7 +494,7 @@ fn hedge_tick_plans(
                  the {} side, budget {}){crossed}",
                 p.owed - p.filled,
                 p.anchor.market_id,
-                p.anchor.venue,
+                p.anchor.venue.as_str(),
                 mono.saturating_duration_since(p.first_at).as_secs_f64(),
                 p.tries,
                 p.anchor.price,
@@ -572,7 +571,7 @@ impl Engine {
                              fills_unattributed rises, CHECK FOR A DUPLICATE HEDGE.",
                             p.owed - p.filled,
                             p.anchor.market_id,
-                            p.anchor.venue,
+                            p.anchor.venue.as_str(),
                             p.latest_attempt.as_deref().unwrap_or("?"),
                             HOLD_FOR_ACK.as_secs()
                         );
@@ -613,14 +612,20 @@ impl Engine {
                          obligation {chain} owed {owed}, {filled} hedged)",
                         ho.market_id
                     );
-                    self.intents.push(
-                        json!({"ts": self.last_now, "place": ho.market_id,
-                               "venue": ho.venue, "side": ho.side,
-                               "price": ho.price, "count": ho.qty,
-                               "order_id": hoid, "tag": "hedge", "taker": true,
-                               "retry": tries})
-                        .to_string(),
-                    );
+                    self.intents.push(Intent::Place(intent::Place {
+                        count: ho.qty,
+                        old_price: None,
+                        order_id: hoid.clone(),
+                        place: ho.market_id.clone(),
+                        price: ho.price.clone(),
+                        replaces: None,
+                        retry: Some(tries),
+                        side: ho.side.to_string(),
+                        tag: Some(Tag::Hedge),
+                        taker: true,
+                        ts: self.last_now,
+                        venue: ho.venue,
+                    }));
                     // EVERY attempt stays in `hedge_orders`, superseded
                     // ones included: an IOC that filled late still has to
                     // credit its obligation, and the obligation's key does
@@ -1434,7 +1439,7 @@ mod hedge_accounting_tests {
             maker_order_id: "m1".into(),
             chain_id: "h1".into(),
             market_id: "SYNTH-P-YES".into(),
-            venue: "polymarket_us",
+            venue: Venue::PolymarketUs,
             side: "ask",
             price: "0.40".into(),
             qty: 10,
@@ -1491,7 +1496,7 @@ mod hedge_tick_tests {
             owed: 5,
             filled: 0,
             anchor: HedgeAnchor {
-                venue: "polymarket_us",
+                venue: Venue::PolymarketUs,
                 market_id: "P".into(),
                 side: "bid",
                 price: "0.40".into(),
