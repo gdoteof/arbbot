@@ -537,6 +537,12 @@ mod kalshi_tests {
 
     #[test]
     fn a_zero_count_is_not_a_fill() {
+        // Takes the turn too: a zero count is a `type: fill` frame that reaches
+        // `kalshi_count`'s Err arm, so it BUMPS `KALSHI_FILLS_UNREADABLE` on its
+        // way to returning None. Without the lock this raced the two tests that
+        // assert an exact delta on that counter and failed roughly one run in
+        // six — a gate that is red at random is worse than one that is slow.
+        let _g = COUNTER.lock();
         let mut s = KalshiFills::default();
         assert!(s.line(&frame("t1", "o1", "0.00")).is_none());
     }
