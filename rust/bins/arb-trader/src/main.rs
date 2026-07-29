@@ -22,6 +22,17 @@
 //!   arb-trader --socket ... --wal data/trader-rs/wal.jsonl
 //!   arb-trader --replay-wal data/trader-rs/wal.jsonl --registry ...
 
+// `Engine::summary` is one flat `serde_json::json!` of ~50 gauges, and the
+// macro recurses once per key, so the default limit of 128 is a cap on how
+// many things this engine may report about itself. It is not a design budget
+// and nothing should be left out of the summary to stay under it.
+//
+// It bit on 2026-07-29: #31 added `exec_recovered` and this change added
+// `toxgate_stale` and `maker_apr_bar`. Each fit alone; together they did not,
+// so both branches gated green and the merge would not have built — the same
+// shape as #33, caught here only because the gate now refuses a stale base.
+#![recursion_limit = "256"]
+
 mod engine;
 mod exec;
 mod feed;
