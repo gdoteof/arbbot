@@ -76,13 +76,36 @@ pub struct RiskView {
 ///
 /// A string that is not a number is not a number, in either file: the value is
 /// carried to `arb_core::risk` as a decimal STRING and parsed there under an
-/// `expect`, so `"none"` would panic the gate mid-run rather than refuse.
+/// `expect`, so `"none"` would panic the gate mid-run rather than refuse. Same
+/// for `nan`/`inf`, which `f64::from_str` and libdecnumber both accept: an
+/// infinite cap is no cap, and NaN refuses everything by accident rather than
+/// by design. The string is TRIMMED before it is returned, not merely before it
+/// is validated — `"500 "` is a decimal to a human and to `f64::from_str`, but
+/// libdecnumber's numeric-string syntax admits no surrounding whitespace.
+///
+/// None therefore means "not a usable number", which is NOT the same question
+/// as "was the key there" — see `unusable`.
 fn num(v: Option<&serde_yaml::Value>) -> Option<String> {
     let v = v?;
-    v.as_str()
-        .filter(|s| s.trim().parse::<f64>().is_ok())
-        .map(|s| s.to_string())
-        .or_else(|| v.as_f64().map(|f| f.to_string()))
+    let n = v
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .or_else(|| v.as_f64().map(|f| f.to_string()))?;
+    n.parse::<f64>().ok().filter(|f| f.is_finite()).map(|_| n)
+}
+
+/// The key is PRESENT and its value is not a usable number.
+///
+/// `num` answers None to both "no such key" and "unusable value", and for the
+/// caps those two collapse safely: either way there is no cap, and no cap is
+/// damage. For `only_below_util` they are OPPOSITES. Absent means "this family
+/// has no utilisation gate", which is a configuration. Unusable must mean
+/// damage, because the gate is a RESTRICTION and `arb_core::risk` applies it
+/// under `if let Some(gate_s) = gate` — a None there does not fail closed, it
+/// deletes the check. `only_below_util: 50%` is exactly the typo the field's
+/// own units invite, and the live config/topics.yaml carries two of these.
+fn unusable(v: Option<&serde_yaml::Value>) -> bool {
+    v.is_some() && num(v).is_none()
 }
 
 /// The per-topic caps, or the reason they cannot be trusted.
@@ -168,6 +191,12 @@ fn topics_from_yaml(path: &str) -> Topics {
                     "{path}: topic `{family}` has no usable `budget_usd`"
                 ));
             };
+            // ...and a gate that cannot be READ is not a family without a gate.
+            if unusable(t.get("only_below_util")) {
+                return Topics::corrupt(format!(
+                    "{path}: topic `{family}` has an unusable `only_below_util`"
+                ));
+            }
             out.push((family.to_string(), budget, num(t.get("only_below_util"))));
         }
     }
@@ -191,6 +220,13 @@ fn topics_from_yaml(path: &str) -> Topics {
         return Topics::corrupt(format!(
             "{path} has no `default_topic_budget`, which leaves the `other` \
              catch-all uncapped (truncated at the tail?)"
+        ));
+    }
+    // The catch-all's gate, which covers every family without one of its own.
+    if unusable(doc.get("default_only_below_util")) {
+        return Topics::corrupt(format!(
+            "{path} has an unusable `default_only_below_util`, which would delete the \
+             utilisation gate for every family that does not set its own"
         ));
     }
     Topics {
@@ -238,8 +274,8 @@ impl Caps {
 /// compiled-in `980` / `0.35`, and it is the OUTERMOST cap: the bankroll scales
 /// both the class cap and the global cap, and nothing sits behind it. Four
 /// distinct failures all read as "980 is what the file says":
-///   * the file cannot be read (permissions, EIO, wrong working directory),
-///   * it does not parse (a 4-line file caught mid-write),
+///   * the file cannot be read (permissions, EIO, a `--exec-config` typo),
+///   * it does not parse (a 5-line file caught mid-write),
 ///   * a key is absent (`per_class_cap` is the LAST line — a tail truncation
 ///     drops it and leaves valid YAML behind, exactly as it does in topics.yaml),
 ///   * the value is not a YAML float — and `bankroll_usd: "500"` is an ordinary
@@ -256,9 +292,14 @@ impl Caps {
 /// apply). `exec.yaml` is tracked, so a correct checkout always has one, and its
 /// absence removes the only ceiling there is — leaving a transcription of a
 /// Python default in place of the file this module's header calls the one source
-/// of truth. The likeliest way to lose it is not deleting it but starting the
-/// process somewhere else; both systemd units set WorkingDirectory, and this is
-/// what says so out loud if one stops.
+/// of truth.
+///
+/// A wrong working directory is NOT among the cases this sees, though it looks
+/// like it should be: `load_quoters` runs first and its `Registry::load(...)
+/// .expect("read registry")` dies several frames earlier on the same kind of
+/// relative default. What reaches here is exec.yaml going missing on its own —
+/// a `--exec-config` pointed at nothing, or the file deleted beside an intact
+/// registry.
 fn caps_from_yaml(path: &str) -> Caps {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -866,7 +907,7 @@ mod tests {
         assert_caps_failed_closed(std::path::Path::new("/nonexistent/exec.yaml"));
     }
 
-    /// Mode 2: caught mid-write. The file is four lines long, so the window is
+    /// Mode 2: caught mid-write. The file is five lines long, so the window is
     /// small but the whole file is inside it.
     #[test]
     fn an_unparseable_exec_file_does_not_leave_the_permissive_default() {
@@ -920,13 +961,102 @@ mod tests {
         }
     }
 
-    /// A string that is not a number is not a number in EITHER loader: the value
-    /// reaches `arb_core::risk` as a decimal string and is parsed under an
-    /// `expect`, so accepting it would panic the gate mid-run instead.
+    /// A value that is not a FINITE number is not a number in either loader.
+    /// `none` reaches `arb_core::risk` as a decimal string and is parsed there
+    /// under an `expect`, so accepting it would panic the gate mid-run; `.inf`
+    /// and `nan` are worse, because libdecnumber accepts them — an infinite cap
+    /// is no cap, and NaN refuses everything by accident rather than by design.
     #[test]
-    fn a_non_numeric_string_is_damage_not_a_cap() {
-        let p = write_exec("exec-notanumber", "bankroll_usd: none\nper_class_cap: 0.35\n");
-        assert_caps_failed_closed(&p);
+    fn a_value_that_is_not_a_finite_number_is_damage_not_a_cap() {
+        for (i, v) in ["none", ".inf", "\"nan\"", "\"1e400\""].iter().enumerate() {
+            let p = write_exec(
+                &format!("exec-notanumber-{i}"),
+                &format!("bankroll_usd: {v}\nper_class_cap: 0.35\n"),
+            );
+            assert_caps_failed_closed(&p);
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
+    }
+
+    /// `num` must TRIM what it returns, not merely what it validates: `"500 "`
+    /// is a decimal to `f64::from_str` but not to libdecnumber, whose
+    /// numeric-string syntax admits no surrounding whitespace — and the value is
+    /// carried there as a string, under an `expect`.
+    #[test]
+    fn a_padded_number_is_trimmed_before_the_decimal_parser_sees_it() {
+        let p = write_exec("exec-padded", "bankroll_usd: \"500 \"\nper_class_cap: \" 0.35\"\n");
+        let v = view_with_configs(
+            p.to_str().unwrap(),
+            "/nonexistent/topics.yaml",
+            vec![("kalshi", "1000"), ("polymarket_us", "1000")],
+            "low",
+        );
+        assert!(v.describe().contains("bankroll $500 per_class 0.35"), "{}", v.describe());
+        // The check itself is the assertion: an untrimmed "500 " panics here.
+        v.record_open("other-rel", "cross-venue-equivalent", 170.0);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 10);
+        assert!(d.reasons.iter().any(|r| r.contains("class cap") && r.contains("175")), "{:?}", d.reasons);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    // ---- and `only_below_util`, where None is not damage but DELETION ----
+
+    /// The gate is a RESTRICTION, so an unreadable one must not read as "this
+    /// family has no gate": `arb_core::risk` applies it under `if let Some(..)`,
+    /// and a None there deletes the utilisation check outright. `50%` is the
+    /// typo the field's own units invite — it is documented as a fraction — and
+    /// the live config/topics.yaml gates france-pres-27 exactly this way.
+    #[test]
+    fn an_unusable_only_below_util_is_damage_not_a_deleted_gate() {
+        let p = write_topics(
+            "gate-typo",
+            "topics:\n  - {family: france-pres-27, budget_usd: 60, only_below_util: 50%}\n\
+             default_topic_budget: 30\ndefault_only_below_util: 0.5\n",
+        );
+        let v = view_with_topics(
+            p.to_str().unwrap(),
+            vec![("kalshi", "1000"), ("polymarket_us", "1000")],
+            "low",
+        );
+        assert!(v.describe().contains("only_below_util"), "{}", v.describe());
+        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5).allowed);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// Same for the catch-all's gate, which covers every family that does not
+    /// set one — including `other`, where everything unlisted lands.
+    #[test]
+    fn an_unusable_default_only_below_util_is_damage_too() {
+        let p = write_topics(
+            "default-gate-typo",
+            "topics:\n  - {family: france-pres-27, budget_usd: 60}\n\
+             default_topic_budget: 30\ndefault_only_below_util: 50%\n",
+        );
+        let v = view_with_topics(
+            p.to_str().unwrap(),
+            vec![("kalshi", "1000"), ("polymarket_us", "1000")],
+            "low",
+        );
+        assert!(v.describe().contains("default_only_below_util"), "{}", v.describe());
+        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5).allowed);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// ...but an ABSENT gate is still a configuration, not damage: most families
+    /// in the live file have no `only_below_util` of their own.
+    #[test]
+    fn an_absent_only_below_util_is_still_just_no_gate() {
+        let p = write_topics(
+            "gate-absent",
+            "topics:\n  - {family: nobel-peace-26, budget_usd: 80}\ndefault_topic_budget: 30\n",
+        );
+        let v = view_with_topics(
+            p.to_str().unwrap(),
+            vec![("kalshi", "1000"), ("polymarket_us", "1000")],
+            "low",
+        );
+        assert!(!v.describe().contains("UNUSABLE"), "{}", v.describe());
+        assert!(v.check(&rel("xvus-nobel-peace-26-djt"), Venue::Kalshi, 5).allowed);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }
