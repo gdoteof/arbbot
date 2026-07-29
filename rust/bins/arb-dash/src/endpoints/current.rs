@@ -288,7 +288,7 @@ pub fn json(a: &Args, query: &str) -> String {
         "unevaluated_by_venue": no_book,
         "rollup_current": rollup_current,
         "rollup_coverage_age_s": if coverage_age_s == i64::MAX { -1 } else { coverage_age_s },
-        "venues": coverage_json(&cov),
+        "venues": coverage_json(&cov, &latest),
         "max_coverage_age_s": MAX_COVERAGE_AGE_S,
         "max_spread": q.max_spread_s,
         "fee_category": FEE_CATEGORY,
@@ -418,33 +418,65 @@ relationships:
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// The same defect one subscription finer. The polymarket_us recorder
-    /// subscribes the sports catalog by tag as well as the registry's markets —
-    /// 749 markets in the real 07-28 tape against 88 registry legs — so losing
-    /// the arb subscription alone leaves the venue's tape LOUD and its priced
-    /// books dead. Coverage taken over every market on the venue read one
-    /// second, chipped green, and called this row actionable.
+    /// The same defect one market finer. Most of a venue's tape is markets no
+    /// pair prices — the pm-us universe comes from `polymarket_us_tags`, 749
+    /// markets against 88 registry legs on the real 07-28 tape — and the
+    /// recorder freezes markets ONE AT A TIME: a gap whose resnapshot fails
+    /// leaves that market "dark until the next sweep", `evict_book` drops a
+    /// single book, and a subscribe chunk that never lands takes 150 slugs with
+    /// it. Coverage taken over every market on the venue then read one second
+    /// off a Billboard market and called this row actionable.
     #[test]
-    fn a_sports_catalog_still_ticking_does_not_certify_the_arb_book() {
-        let (a, base) = args("sports-only");
+    fn a_market_we_do_not_price_does_not_certify_the_one_this_row_needs() {
+        let (a, base) = args("unpriced-noise");
         rolled_up(&base, "kalshi", &[sample("kalshi", "K1", 10, "0.29", "0.30")]);
         rolled_up(
             &base,
             "polymarket_us",
             &[
                 sample("polymarket_us", "P1", 6 * 3600, "0.75", "0.76"),
-                sample("polymarket_us", "nfl-kc-buf", 1, "0.50", "0.51"),
-                sample("polymarket_us", "nba-lal-bos", 2, "0.44", "0.45"),
+                sample("polymarket_us", "ccpc-bilbrd-1album-any2026-eminem", 1, "0.50", "0.51"),
+                sample("polymarket_us", "ccpc-bilbrd-1album-any2026-ladgag", 2, "0.44", "0.45"),
             ],
         );
         let d = board(&a);
         assert_eq!(d["priced_pairs"], 1, "the arb book is old, not absent — it still prices: {d}");
         assert_eq!(d["profitable"], 1, "and still profitable at those prices: {d}");
-        assert_eq!(d["actionable"], 0, "the sports feed is not evidence about P1: {d}");
+        assert_eq!(d["actionable"], 0, "a Billboard tick is not evidence about P1: {d}");
         assert_eq!(d["rows"][0]["coverage_age_s"], 6 * 3600, "{d}");
         assert_eq!(venue(&d, "polymarket_us")["coverage_age_s"], 6 * 3600, "{d}");
         assert_eq!(venue(&d, "polymarket_us")["current"], false, "{d}");
+        assert_eq!(venue(&d, "polymarket_us")["recorded"], true, "the tape is being written: {d}");
         assert_eq!(d["rollup_current"], false, "{d}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// And the state the operator has to be able to tell apart from the one
+    /// below: the venue's rollup is being written, and not one market the
+    /// registry names is in it. Coverage is ABSENT, exactly as for a missing
+    /// file — but `recorded` is TRUE, because the repair is the recorder's
+    /// subscription and not the rollup, and a board that says "rebuild the
+    /// rollup" here sends the operator to replay the same markets again.
+    #[test]
+    fn a_rollup_of_markets_we_never_price_is_a_subscription_hole_not_a_rollup_one() {
+        let (a, base) = args("unpriced-only");
+        rolled_up(&base, "kalshi", &[sample("kalshi", "K1", 10, "0.29", "0.30")]);
+        rolled_up(
+            &base,
+            "polymarket_us",
+            &[
+                sample("polymarket_us", "ccpc-bilbrd-1album-any2026-eminem", 1, "0.50", "0.51"),
+                sample("polymarket_us", "ccpc-bilbrd-1album-any2026-ladgag", 2, "0.44", "0.45"),
+            ],
+        );
+        let d = board(&a);
+        assert_eq!(venue(&d, "polymarket_us")["coverage_age_s"], -1, "unpriced is not covered: {d}");
+        assert_eq!(venue(&d, "polymarket_us")["current"], false, "{d}");
+        assert_eq!(venue(&d, "polymarket_us")["recorded"], true, "the tape IS there: {d}");
+        assert_eq!(venue(&d, "polymarket")["recorded"], false, "and this one is not: {d}");
+        assert_eq!(d["priced_pairs"], 0, "no book for P1, so nothing prices: {d}");
+        assert_eq!(d["unevaluated_pairs"], 1, "counted, not silently dropped: {d}");
+        assert_eq!(d["unevaluated_by_venue"]["polymarket_us"], 1, "{d}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -453,8 +485,9 @@ relationships:
     /// pairs in the real 07-28 tape have a leg more than six hours behind, so
     /// gating on it would empty the board. Here P1 — the priced row's own leg —
     /// last moved 19 hours ago, while P2 (also a registry leg) ticked 50s ago
-    /// and the sports catalog ticks constantly. The venue is COVERED, the row
-    /// is ACTIONABLE, and its coverage reads the venue's, not the market's.
+    /// and an unpriced catalog market ticks constantly. The venue is COVERED,
+    /// the row is ACTIONABLE, and its coverage reads the venue's, not the
+    /// market's.
     ///
     /// P2 is the REJECTED pair's leg, and it certifies the venue anyway: the
     /// basis is ALL registry legs because coverage is a claim about the
@@ -471,7 +504,7 @@ relationships:
             &[
                 sample("polymarket_us", "P1", 19 * 3600, "0.75", "0.76"),
                 sample("polymarket_us", "P2", 50, "0.60", "0.61"),
-                sample("polymarket_us", "nfl-kc-buf", 1, "0.50", "0.51"),
+                sample("polymarket_us", "ccpc-bilbrd-1album-any2026-eminem", 1, "0.50", "0.51"),
             ],
         );
         let d = board(&a);
