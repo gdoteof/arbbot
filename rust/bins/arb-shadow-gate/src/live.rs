@@ -24,7 +24,7 @@
 //!    things, and the claim that it could only be the first was retracted from
 //!    here: either a frame the fan-out numbered and this subscriber never got,
 //!    or a number the recorder SPENT on a call that then failed —
-//!    `pmintl.rs:344`, `kalshi.rs:304`, `pmus.rs:218` all bump the counter
+//!    `pmintl::ws_task`, `kalshi::resnap_slice` and `pmus::poll_task` all bump it
 //!    before a fallible `.await` and drop it on `Err`. That second reading is
 //!    the recorder defect filed separately; the long comment in `main.rs`'s
 //!    tape gating carries the measurement and the way to tell the two apart.
@@ -238,7 +238,8 @@ impl StreamCheck {
         if self.gaps > 0 {
             return Err(format!(
                 "{} sequence gap(s) on the wire: either a frame this subscriber never got, or a \
-                 number the recorder spent on a call that failed (pmintl.rs:344, kalshi.rs:304). \
+                 number the recorder spent on a call that failed (pmintl::ws_task, \
+                 kalshi::resnap_slice). \
                  Check the venue's resnapshot-failure line before reading it as loss",
                 self.gaps
             ));

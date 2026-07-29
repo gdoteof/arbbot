@@ -339,24 +339,27 @@ fn tape_stage(a: &Args, fails: &mut Vec<String>) -> HashMap<&'static str, HashSe
         // been wrong. It used to read: "every event the recorder numbered n+1
         // was numbered while holding the same lock it writes under, so a hole
         // means a line the recorder numbered never reached the tape". THAT IS
-        // FALSE. `SeqCounter::next` (`arb-recorder/src/core.rs:92`) is a plain
-        // `HashMap` bump in the VENUE TASK; the core mutex is taken later, in
-        // `Core::on_event` (`core.rs:115`). Nothing ties the two together, and
-        // there are call sites that SPEND a number and then drop it:
+        // FALSE. `SeqCounter::next` (`arb-recorder/src/core.rs`) is a plain
+        // `HashMap` bump in the VENUE TASK; the core mutex is taken later, on
+        // the first line of `Core::on_event`. Nothing ties the two together,
+        // and there are call sites that SPEND a number and then drop it —
+        // named by symbol, not by line, because these moved twice while this
+        // comment was being written:
         //
-        //   pmintl.rs:344  `let s = seq.next(tid);` then `clob.book(tid, s)`,
-        //                  `Err(_) => resnap.failed += 1` — number gone
-        //   pmintl.rs:309  the same shape on the gap-recovery resnapshot
-        //   kalshi.rs:304  the same shape around `catalog.orderbook_fp(t)`
-        //   kalshi.rs:405  `on_delta` returns None on a missing field, seq spent
-        //   pmus.rs:218    `catalog.book(slug, seq.next(slug)).await`
+        //   pmintl::ws_task, integrity sweep  `let s = seq.next(tid);` then
+        //     `clob.book(tid, s).await`, `Err(_) => resnap.failed += 1`
+        //   pmintl::ws_task, gap recovery     the same shape on `seq.next(&need)`
+        //   kalshi::resnap_slice              the same around `orderbook_fp(t)`
+        //   kalshi::on_ws_message             `on_delta` returns None on a
+        //     missing field with the number already spent
+        //   pmus::poll_task                   `catalog.book(slug, seq.next(slug))`
         //
         // A spent-and-dropped number leaves the NEXT delta one ahead of what
-        // `apply_delta` expects, which is read as a gap and DELETES the book
-        // (`arb-core/src/book.rs:159`). The repo already documents that exact
-        // consequence at `pmintl.rs:89`. So a hole here is "a numbered event
-        // that is not in the file", which is a WEAKER claim than "a line was
-        // lost" — the wording of the failure below says so.
+        // `BookBuilder::apply_delta` expects, which is read as a gap and
+        // DELETES the book. The repo already documents that exact consequence
+        // in `pmintl::parse_ws_frame`, over the `{asset}|tape` trade counter.
+        // So a hole here is "a numbered event that is not in the file", which
+        // is a WEAKER claim than "a line was lost" — the failure text says so.
         //
         // The check still GATES, and the reason is measurement rather than
         // argument. Replaying the Rust tapes under this rule, in independent
@@ -412,7 +415,8 @@ fn tape_stage(a: &Args, fails: &mut Vec<String>) -> HashMap<&'static str, HashSe
                     "{} sequence hole(s) in the RUST tape slice: the recorder numbers its own \
                      events +1 per market, so a hole is a numbered event that is NOT in the file. \
                      Two readings — a line was lost, or the recorder SPENT a number on a call that \
-                     then failed (pmintl.rs:344, kalshi.rs:304, pmus.rs:218). Check the venue's \
+                     then failed (pmintl::ws_task, kalshi::resnap_slice, pmus::poll_task). Check \
+                     the venue's \
                      resnapshot-failure line first; a hole wider than one number is the lost-line \
                      reading",
                     rss.gaps
@@ -430,7 +434,7 @@ fn tape_stage(a: &Args, fails: &mut Vec<String>) -> HashMap<&'static str, HashSe
         // these and not a gate, but NOT for the reason this comment used to
         // give. It said "the Rust recorder dedups consecutive-identical
         // snapshots". There is no dedup anywhere in the recorder:
-        // `Core::on_event` (`core.rs:114`) writes every event it is handed, and
+        // `Core::on_event` writes every event it is handed, and
         // `JsonlWriter::write` appends unconditionally. Every emitter always
         // emits.
         //

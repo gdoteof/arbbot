@@ -279,15 +279,21 @@ afterwards.
 
 ## 5. Known-open at the time of writing (2026-07-29)
 
-* **THE GATE CANNOT GO GREEN TODAY, AND DAY 1 OF THE SEVEN CANNOT START.**
-  `bad_field > 0` is a gating check and PM-US `trade.size` is corrupt on every
-  such line, so the gate is structurally red until `pmus.rs:55` is fixed (see
-  below; a separate change owns it). This is stated here rather than left to be
-  discovered because a gate that cannot go green is how the last one came to be
-  ignored — three months of `RESULT: FAIL`, then three months of a 153-byte
-  error nobody read. If the first seven runs of this one are red for a reason
-  everybody already knows about, it will train the same reflex. Fix `pmus.rs`
-  FIRST, then start counting days.
+* **DAY 1 CANNOT START UNTIL THE TRAILING SLICE IS CLEAR OF PRE-FIX TRADES,
+  which is about 77 minutes after the recorder restart.** `bad_field > 0` is a
+  gating check, PM-US `trade.size` was a stringified JSON object on every such
+  line, and `c292f04` fixed it — the recorder carrying that fix was restarted
+  2026-07-29 18:15 and its new trade lines read `"size":"8.0000"`. But
+  `bad_field` is counted over the whole 256 MiB SLICE and not over the 900s
+  window (deliberately: an undecodable line has no timestamp to place), so the
+  gate stays red while that slice still reaches back past the restart. At
+  PM-US's measured 58 KB/s that is ~77 minutes. **Check the first green run's
+  slice actually starts after the restart before counting it as day 1.**
+
+  Stated here rather than left to be discovered, because a gate that cannot go
+  green is how the last one came to be ignored — three months of `RESULT:
+  FAIL`, then three months of a 153-byte error nobody read. A run that is red
+  for a reason everybody already knows about trains the same reflex.
 * **The shadow recorder that gathered this evidence predated PR #27
   (`47e3c9b`); it has since been RESTARTED and the new process carries it.**
   See §1. Two consequences of the old image, both now historical: its welcome
@@ -305,14 +311,19 @@ afterwards.
   broken eviction, and the restarted process has the notice. Re-verify it on the
   running image before the flip: the trace on the engine's side is
   `subscription ended (EOF)`, followed by every resting quote being pulled.
-* **PM-US `trade.size` is not a number.** `pmus.rs:55` reads `quantity`
-  straight through `dec_string`, and the venue sends it as
-  `{"currency":"USD","value":"4.0000"}`, so the tape and the socket both carry
-  `"size":"{\"currency\":\"USD\",\"value\":\"4.0000\"}"`. Measured on the live
-  wire, not inferred. `price` on the line above digs into `.value` correctly;
-  `size` does not. Compare `pmus.rs:54` and `:55`. This is why the gate is red;
-  it is a cutover blocker for the tape, and it needs the `quantity` units
-  question settled (USD notional, not contracts) before it is fixed.
+* **PM-US `trade.size` was not a number — FIXED in `c292f04`.** The trade
+  parser dug into `.value` for `price` and not for `quantity`, so `dec_string`
+  put the whole money wrapper into `TapeEvent::Trade.size`:
+  `"size":"{\"currency\":\"USD\",\"value\":\"4.0000\"}"` on 11,541 of 11,541
+  PM-US trade lines, every day the Rust recorder had run. The units question is
+  settled and the answer is the opposite of what was written here: the value is
+  **CONTRACTS, not USD notional**, despite the `currency` label — a print at
+  0.2800 carrying `value 5.0000` took the resting bid from 240.0000 to
+  235.0000, so the level is consumed by exactly the printed value.
+  `tape.rs`'s `REAL_PMUS_TRADE` keeps a verbatim corrupt line as a test
+  fixture: it is the only thing in this gate that can see that shape, since
+  `size` is a `String` and both `serde_json` and `arb-recorder --parse-check`
+  round-trip it happily.
 * **Rust PM-US is WS-event-driven; Python polls.** So any window-shaped view of
   the Rust tape covers fewer markets than Python's — 66 fewer on PM-US over
   900s on 2026-07-29. Censused, not sampled: **all 66** appear in the same day's
