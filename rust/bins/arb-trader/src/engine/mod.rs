@@ -61,6 +61,13 @@ pub struct RunCfg {
     /// carries one `ts` fixed at load, so a gate nothing reloads goes
     /// permanently open two minutes after startup — see `tox_tick`.
     pub toxgate_file: Option<String>,
+    /// Maker APR hurdle inputs to RE-APPLY; None = never (bench/replay, which
+    /// have no utilization to float on and a digest that cannot move).
+    pub apr: Option<AprCfg>,
+    /// The (bar, day) `install_policy` already put on the quoters. Carried
+    /// separately from `apr` because a bench run has a hurdle it will never
+    /// refresh, and the gauge must still report the bar actually in force.
+    pub apr_installed: (f64, String),
     /// Shared risk view. The quoters consult it per place; the engine feeds it
     /// exposure on fills. None = risk off (bench/replay).
     pub risk: Option<std::sync::Arc<crate::risk::RiskView>>,
@@ -113,6 +120,22 @@ pub struct TakeTake {
     /// detect-only run on 2026-07-28 logged one fedcut crossing ~10x in
     /// seconds, which is exactly that failure with the orders removed.
     pub cooldown_s: f64,
+}
+
+/// What the maker APR hurdle is sized from, kept so it can be re-sized.
+///
+/// BOTH of its terms drift, and both drift in the direction that makes a
+/// frozen bar too permissive: utilization rises as baskets book, and the hold
+/// shortens every day. Python re-derived this on a timer
+/// (`exec/main.py:_tt_refresh`); a value computed once at startup and never
+/// revisited is the exact shape of the toxgate defect this same change fixes.
+#[derive(Clone)]
+pub struct AprCfg {
+    /// Explicit `--min-apr`, or None to float with capital utilization.
+    pub min_apr: Option<f64>,
+    /// Explicit `--apr-asof`, or None for "today", re-derived each refresh so
+    /// the hurdle follows the calendar across a multi-day run.
+    pub asof: Option<String>,
 }
 
 #[derive(Clone)]
@@ -235,13 +258,20 @@ struct Engine {
     /// check is on: we have not yet proven the feeds are healthy, and the first
     /// tick either clears it or names the problem.
     feed_reason: Option<String>,
-    /// Why the toxicity feed may not be gated behind, when it may not be.
+    /// Why the toxicity feed cannot be scored against, when it cannot.
     ///
-    /// Held as a REASON for the same purpose `feed_reason` is: a maker that has
-    /// stopped quoting must always be able to say what stopped it. Kept
-    /// separate from `feed_reason` because they fail independently and the
-    /// remedies differ — one is the recorder, the other is the research writer.
+    /// Held as a REASON for the same purpose `feed_reason` is: an engine that
+    /// has stopped quoting something must be able to say what stopped it. It
+    /// does NOT gate the quote path the way `feed_reason` does — the refusal
+    /// is per (market, side) inside the quoter, because this feed covers only
+    /// 35 of the 80 legs in the book and a blanket pull would withhold the
+    /// other 45 for nothing. This is the operator-visible half: one line on
+    /// the edge, and a standing `toxgate_stale` gauge.
     tox_reason: Option<String>,
+    /// Last APR bar and as-of day logged, so a refresh that changes nothing
+    /// says nothing. Reported in the summary: the bar in force was invisible.
+    apr_bar: f64,
+    apr_asof: String,
     /// The engine's own subscription to the recorder, tracked separately from
     /// what the recorder says about the venues: a bench tape cannot disconnect,
     /// a socket can and did (ten times on 2026-07-28).
@@ -356,7 +386,8 @@ impl Engine {
         let tox_reason = cfg
             .toxgate_file
             .as_deref()
-            .and_then(|p| crate::load_toxgate(p, wall_now()).err());
+            .and_then(|p| crate::load_toxgate(p, wall_now()).stale);
+        let (apr_bar, apr_asof) = cfg.apr_installed.clone();
         let link = if cfg.bench { Link::Fresh } else { Link::Down };
         let required = required_feeds(by_market);
         let t_start = std::time::Instant::now();
@@ -399,6 +430,8 @@ impl Engine {
             killed: false,
             feed_reason,
             tox_reason,
+            apr_bar,
+            apr_asof,
             link,
             stale_seen: HashMap::new(),
             last_now: 0.0,
@@ -586,46 +619,66 @@ impl Engine {
         }
     }
 
-    /// Re-read the research toxicity feed onto every quoter, and refuse to
-    /// quote at all while it cannot be read.
+    /// Re-read the research toxicity feed onto every quoter.
     ///
     /// `Toxgate` carries a single `ts` captured when the file was parsed, and
-    /// `Toxgate::verdict` refuses to score anything past `TOXGATE_MAX_AGE`. So
-    /// without this the gate is not merely frozen, it is a two-minute gate: at
-    /// startup + 120s every side goes `Untrusted` and stays there. Reloading is
-    /// what makes the gate a gate.
+    /// `Toxgate::verdict` will not score against an opinion past
+    /// `TOXGATE_MAX_AGE`. So without this the gate is not merely frozen, it is
+    /// a two-minute gate: at startup + 120s every scored side goes `Untrusted`
+    /// and stays there. Reloading is what makes the gate a gate.
     ///
-    /// The BLOCK lives here rather than being left to the per-side
-    /// `Untrusted` skip because that skip fires once per leg per side per book
-    /// event: on a live feed a dead research writer would mean thousands of
-    /// identical skip lines a second, forever. One edge-triggered line and one
-    /// pull says the same thing once. The per-side refusal stays as the
-    /// backstop that covers the window between ticks.
+    /// The refusal itself is NOT here. It is per (market, side) in the quoter,
+    /// where it is scoped to sides this feed actually covers — 35 of the 80
+    /// legs in the live book, all of them Kalshi. An engine-level pull would
+    /// withhold the other 45, including 38 Polymarket / PM-US legs the model
+    /// has never scored and never will. What is here is the operator-visible
+    /// half: one line on the edge, and a standing gauge.
     pub(super) fn tox_tick(&mut self, quoters: &mut [Quoter]) {
         let Some(path) = self.cfg.toxgate_file.clone() else { return };
-        let reason = match crate::load_toxgate(&path, wall_now()) {
-            Ok(gate) => {
-                for q in quoters.iter_mut() {
-                    q.set_toxgate(Some(gate.clone()));
-                }
-                None
+        let load = crate::load_toxgate(&path, wall_now());
+        // Install whatever PARSED, stale or not: a stale document is still the
+        // coverage map the per-side refusal needs. A read that fails outright
+        // leaves the last good document in place for the same reason — the set
+        // of sides this model covers is the one thing that does not go stale.
+        if let Some(gate) = &load.gate {
+            for q in quoters.iter_mut() {
+                q.set_toxgate(Some(gate.clone()));
             }
-            Err(why) => Some(why),
-        };
+        }
+        let reason = load.stale;
         // Edge-triggered, like `feed_reason` and the take-take bar: the reason
         // string carries an age that moves every tick, so comparing the strings
         // would log every tick and a line every tick is a line nobody reads.
-        let changed = reason.is_some() != self.tox_reason.is_some();
-        if changed {
+        if reason.is_some() != self.tox_reason.is_some() {
             match &reason {
-                Some(why) => eprintln!("[toxgate] UNUSABLE ({why}) — maker quotes pulled"),
-                None => eprintln!("[toxgate] feed current again — maker quoting resumes"),
+                Some(why) => {
+                    eprintln!("[toxgate] UNUSABLE ({why}) — every side it covers is withheld")
+                }
+                None => eprintln!("[toxgate] feed current again — scored sides quote again"),
             }
         }
-        let entering = changed && reason.is_some();
         self.tox_reason = reason;
-        if entering {
-            self.pull_quotes(quoters, "TOXGATE UNUSABLE");
+    }
+
+    /// Re-size the maker APR hurdle. Port of `exec/main.py:_tt_refresh`, which
+    /// recomputed the bar on a timer and pushed it onto every quoter.
+    ///
+    /// Both terms drift the same way — utilization RISES as baskets book, and
+    /// the hold SHORTENS every day — so a bar computed once at startup decays
+    /// toward being too permissive, which is the direction that costs money.
+    pub(super) fn apr_tick(&mut self, quoters: &mut [Quoter]) {
+        let Some(a) = self.cfg.apr.clone() else { return };
+        let (bar, asof, _) =
+            crate::apply_apr(quoters, a.min_apr, a.asof.as_deref(), self.cfg.risk.as_deref());
+        // 0.05%/yr: below that the quantized cent price cannot move, so it is
+        // not a change anyone could act on.
+        if (bar - self.apr_bar).abs() >= 0.05 || asof != self.apr_asof {
+            eprintln!(
+                "[apr] maker hurdle {:.2} -> {bar:.2}%/yr, holds measured from {asof}",
+                self.apr_bar
+            );
+            self.apr_bar = bar;
+            self.apr_asof = asof;
         }
     }
 
@@ -639,7 +692,11 @@ impl Engine {
             "take_take_net_under_slip": self.n_tt_under_slip,
             "killed": self.killed,
             "feed_pulled": self.feed_reason.is_some(),
-            "toxgate_pulled": self.tox_reason.is_some(),
+            // NOT a pull: scored sides are withheld, the rest quote on. The
+            // bar is reported because "what hurdle is in force right now" was
+            // not answerable from anything this process emitted.
+            "toxgate_stale": self.tox_reason.is_some(),
+            "maker_apr_bar": self.apr_bar,
             "risk_allowed": self.cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
             "risk_rejected": self.cfg.risk.as_ref().map(|r| r.stats().1).unwrap_or(0),
             // Cancels the engine has DECIDED and the venue has not yet
@@ -844,14 +901,7 @@ impl Engine {
         self.last_now = now;
         if !self.killed && self.feed_reason.is_none() {
             if let Some(idxs) = by_market.get(&(venue, market_id)) {
-                // The toxicity gate scores MAKER sides, so an unusable feed
-                // stops the maker and nothing else. Take-take is a different
-                // decision behind a different bar (`taketake::Bar`), and
-                // silently widening this pull to cover it would be a policy
-                // change wearing a safety check's clothes.
-                if self.tox_reason.is_none() {
-                    self.quote(quoters, idxs, now);
-                }
+                self.quote(quoters, idxs, now);
                 // Take-take on the SAME event that moved the book: the
                 // crossing exists for as long as the slower side takes
                 // to react, which is not minutes.
@@ -1244,6 +1294,10 @@ pub async fn run(
     // installed and one that stopped is noticed long before the next quote.
     let mut tox_iv = tokio::time::interval(std::time::Duration::from_secs(30));
     tox_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The APR bar moves only when a basket books or the day rolls over, so a
+    // minute is ample; what matters is that it moves at all.
+    let mut apr_iv = tokio::time::interval(std::time::Duration::from_secs(60));
+    apr_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Unbounded in bench/replay: the budget never reaches zero, so both guards
     // below are constant, the select polls exactly the arms it polled before in
@@ -1283,6 +1337,10 @@ pub async fn run(
             // re-reads a file another process rewrites, which no pinned tape
             // can reproduce. Bench keeps whatever `install_policy` installed.
             _ = tox_iv.tick(), if !bench => eng.tox_tick(&mut quoters),
+            // Same rule: `cfg.apr` is already None in bench, and re-sizing a
+            // hurdle mid-replay off a moving utilization would break the
+            // digest even if it were not.
+            _ = apr_iv.tick(), if !bench => eng.apr_tick(&mut quoters),
             _ = stats_iv.tick(), if !bench => eng.stats_tick(),
             // The budget is spent and every deadline that was DUE has now had
             // its turn: the arms above are polled first and this one is always
@@ -1316,6 +1374,8 @@ fn test_cfg() -> RunCfg {
         wal_path: None,
         health_file: None,
         toxgate_file: None,
+        apr: None,
+        apr_installed: (0.0, String::new()),
         risk: None,
         ledger_path: None,
         hedge_retry: None,
@@ -1499,6 +1559,8 @@ mod feed_wiring_tests {
             wal_path: None,
             health_file,
             toxgate_file: None,
+            apr: None,
+            apr_installed: (0.0, String::new()),
             risk: None,
             ledger_path: None,
             // Take-take now prices its net edge against the hedge's slip
@@ -1902,7 +1964,7 @@ mod toxgate_reload_tests {
 
     /// Same fixture the quoter's own tests use: Kalshi's 0.60 bid funds a
     /// PM-US maker YES bid one tick inside PM-US's 0.30.
-    fn quoter_and_books() -> (Vec<Quoter>, BookBuilder) {
+    pub(super) fn quoter_and_books() -> (Vec<Quoter>, BookBuilder) {
         let rel = Rel {
             id: "xvus-france-pres-27-test".into(),
             rtype: RelType::CrossVenueEquivalent,
@@ -2007,19 +2069,35 @@ mod toxgate_reload_tests {
         assert_eq!(eng.tox_reason, None, "and the tick is a no-op");
     }
 
-    /// And the reason is CONSULTED, not merely computed. A gate the engine
-    /// works out and then quotes straight past is the same defect this whole
-    /// change exists to fix, one level up.
+    /// **A stale feed is REPORTED without stopping the book.**
+    ///
+    /// The first cut of this pulled every quote in the engine whenever the feed
+    /// went unreadable. That is disproportionate by a factor this model cannot
+    /// justify: it scores 35 of the 80 legs in the live registry, all Kalshi,
+    /// and 38 of the rest are Polymarket / PM-US legs it has never scored and
+    /// never will. So the reason is a GAUGE and a log line; the refusal is per
+    /// (market, side) inside the quoter, where it can tell the two apart.
+    ///
+    /// The feed here is three days stale — the real file's age — and scores a
+    /// Kalshi ticker this relationship does not touch.
     #[test]
-    fn a_blocked_gate_stops_the_engine_emitting_anything_for_a_book_event() {
-        let d = scratch("consulted");
+    fn a_stale_feed_is_reported_without_stopping_the_book_it_never_covered() {
+        let d = scratch("proportion");
         let p = d.join("toxgate.json");
+        std::fs::write(
+            &p,
+            format!(
+                r#"{{"ts": {}, "markets": {{"KXALIENS-27": {{"bid": 0.0584}}}}}}"#,
+                wall_now() - 3.0 * 86_400.0
+            ),
+        )
+        .unwrap();
+
         let (mut quoters, _) = quoter_and_books();
         let by_market: ByMarket = HashMap::from([
             ((Venue::Kalshi, "K".to_string()), vec![0usize]),
             ((Venue::PolymarketUs, "P".to_string()), vec![0usize]),
         ]);
-        // The same two snapshots `quoter_and_books` builds, as feed lines.
         let feed = |venue: &str, market: &str, bid: &str| FeedMsg {
             line: serde_json::json!({
                 "kind": "snapshot", "venue": venue, "market_id": market,
@@ -2030,18 +2108,93 @@ mod toxgate_reload_tests {
             t_read: std::time::Instant::now(),
         };
 
-        write_feed(&p, 3.0 * 86_400.0, 0.001); // stale: the engine starts pulled
         let mut eng = engine_watching(&p);
-        assert!(eng.tox_reason.is_some());
+        assert!(eng.tox_reason.is_some(), "the staleness must be visible");
+        assert_eq!(
+            eng.summary()["toxgate_stale"],
+            serde_json::json!(true),
+            "and standing, not just a startup line"
+        );
+
         eng.on_feed(feed("kalshi", "K", "0.60"), 0, &mut quoters, &by_market);
         eng.on_feed(feed("polymarket_us", "P", "0.30"), 0, &mut quoters, &by_market);
-        assert_eq!(eng.n_int, 0, "a blocked gate must decide nothing");
+        assert!(
+            eng.n_int > 0,
+            "a model that never scored this side must not silence it"
+        );
+    }
+}
 
-        // Same books, same engine, feed current: the quote comes out.
-        write_feed(&p, 1.0, 0.001);
-        eng.tox_tick(&mut quoters);
-        assert_eq!(eng.tox_reason, None);
-        eng.on_feed(feed("polymarket_us", "P", "0.30"), 0, &mut quoters, &by_market);
-        assert!(eng.n_int > 0, "and a current one must not");
+/// **A hurdle computed once at startup decays toward permissive.**
+///
+/// Both of its terms drift the same way: utilization RISES as baskets book,
+/// and the hold SHORTENS every day. Python re-derived it on a timer
+/// (`exec/main.py:_tt_refresh`, "makers clear the same bar"). Freezing it here
+/// would repeat, in the same PR, the frozen-`ts` defect this change fixes for
+/// the toxgate.
+#[cfg(test)]
+mod apr_refresh_tests {
+    use super::toxgate_reload_tests::quoter_and_books;
+    use super::*;
+
+    /// A risk view on the real defaults ($980 bankroll x 0.35 = $343 class
+    /// budget), with nothing at work yet.
+    fn idle_risk() -> Arc<crate::risk::RiskView> {
+        Arc::new(crate::risk::RiskView::load(
+            "/nonexistent/exec.yaml",
+            "/nonexistent/topics.yaml",
+            Vec::new(),
+            HashMap::new(),
+        ))
+    }
+
+    fn engine_with(risk: Arc<crate::risk::RiskView>, quoters: &mut [Quoter]) -> Engine {
+        let mut cfg = test_cfg();
+        let (bar, asof, _) = crate::apply_apr(quoters, None, Some("2026-07-29"), Some(&risk));
+        cfg.apr = Some(AprCfg { min_apr: None, asof: Some("2026-07-29".into()) });
+        cfg.apr_installed = (bar, asof);
+        cfg.risk = Some(risk);
+        test_engine(cfg)
+    }
+
+    /// The bar an idle book asks for is the floor; the bar a full one asks for
+    /// is higher, and the REFRESH is what moves it. Without `apr_tick` the
+    /// engine would still be charging the startup bar after the book filled.
+    #[test]
+    fn a_book_that_fills_raises_the_bar_without_a_restart() {
+        let (mut quoters, _) = quoter_and_books();
+        let risk = idle_risk();
+        let mut eng = engine_with(risk.clone(), &mut quoters);
+        assert!(
+            (eng.apr_bar - crate::APR_FLOOR).abs() < 1e-9,
+            "an idle book starts at the floor, got {}",
+            eng.apr_bar
+        );
+
+        // Half the $343 class budget goes to work.
+        risk.record_open("xvus-france-pres-27-test", "cross-venue-equivalent", 171.5);
+        eng.apr_tick(&mut quoters);
+        let want = crate::apr_bar(0.5);
+        assert!(
+            (eng.apr_bar - want).abs() < 0.05,
+            "the refresh must follow utilization: {} vs {want}",
+            eng.apr_bar
+        );
+        assert!(eng.apr_bar > crate::APR_FLOOR, "and it must have MOVED");
+
+        // ...and it is reportable, which it was not before: nothing this
+        // process emitted said what hurdle was in force.
+        assert!(
+            (eng.summary()["maker_apr_bar"].as_f64().unwrap() - eng.apr_bar).abs() < 1e-9
+        );
+    }
+
+    /// No `cfg.apr` is bench/replay, where a moving bar would break the digest.
+    #[test]
+    fn a_run_with_no_apr_config_never_refreshes() {
+        let (mut quoters, _) = quoter_and_books();
+        let mut eng = test_engine(test_cfg()); // apr: None
+        eng.apr_tick(&mut quoters);
+        assert_eq!(eng.apr_bar, 0.0, "bench must not acquire a hurdle mid-replay");
     }
 }

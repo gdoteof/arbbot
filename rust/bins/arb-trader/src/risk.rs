@@ -385,6 +385,28 @@ impl RiskView {
         self.exposure.lock().expect("exposure").by_rel.get(rel_id).copied().unwrap_or(0.0)
     }
 
+    /// Utilization of the class budget, in [0, 1] — the term the floating APR
+    /// bar rides on. Port of `exec/main.py:_tt_refresh`:
+    ///
+    /// ```python
+    /// cap  = risk.config.bankroll * risk.config.per_class_cap
+    /// util = min(max(risk.exposure.total / cap if cap else 1.0, 0.0), 1.0)
+    /// ```
+    ///
+    /// Exposure is in CONTRACTS and the cap in dollars, which is the same
+    /// ~$1-a-contract equivalence `RiskGate::check` is built on and `risk.rs`
+    /// already divides by. A cap of zero reads as FULL, not empty: it is the
+    /// direction that demands more of a new quote rather than less.
+    pub fn utilization(&self) -> f64 {
+        let cap = self.bankroll.parse::<f64>().unwrap_or(0.0)
+            * self.per_class_cap.parse::<f64>().unwrap_or(0.0);
+        if cap <= 0.0 {
+            return 1.0;
+        }
+        let total: f64 = self.exposure.lock().expect("exposure").by_rel.values().sum();
+        (total / cap).clamp(0.0, 1.0)
+    }
+
     pub fn stats(&self) -> (u64, u64) {
         *self.checked.lock().expect("checked")
     }

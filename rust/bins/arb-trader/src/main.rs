@@ -113,23 +113,54 @@ struct Args {
     marks: String,
     /// MAKER APR hurdle, %/yr: the extra per-contract lock a resting quote must
     /// carry so that a fill annualizes to at least this over the hold to
-    /// resolution (`Quoter::set_apr`). Negative is the sentinel for "default by
-    /// mode" — see `install_policy`. 0 disables the hurdle.
-    min_apr: f64,
-    /// The day the hold is measured FROM, `YYYY-MM-DD`. Defaults to today UTC;
-    /// pin it to make a bench replay reproducible, because the hurdle shrinks
-    /// as the resolve date approaches and so would the digest.
+    /// resolution (`Quoter::set_apr`). `None` FLOATS it with capital
+    /// utilization, which is the policy; `Some(0.0)` disables it.
+    min_apr: Option<f64>,
+    /// The day the hold is measured FROM, `YYYY-MM-DD`. Defaults to today UTC,
+    /// re-derived on every refresh; pin it to make a bench replay
+    /// reproducible, because the hurdle shrinks as the resolve date nears.
     apr_asof: Option<String>,
-    /// Research toxicity feed. `None` = default by mode; an empty string turns
-    /// the gate off explicitly.
+    /// Research toxicity feed. `None` = OFF, because no writer for it exists
+    /// (see `install_policy`); a path turns the gate on.
     toxgate: Option<String>,
     /// `--suppress market:side`, repeatable: (market, side) pairs some OTHER
     /// order-owner holds, which the quoter cancels out of and stays out of.
     suppress: Vec<(String, BookSide)>,
 }
 
-/// Where the research toxicity feed is written.
-const DEFAULT_TOXGATE: &str = "data/exec/toxgate.json";
+/// The floating maker APR bar (Geoff 2026-07-22, card 80ff7987), port of
+/// `exec/main.py` `TT_APR_FLOOR` / `TT_APR_CEIL`:
+///
+/// > scales with capital utilization of the class budget — near-idle capital
+/// > should grab modest APRs (floor ~= the trivially-redeployable yield), while
+/// > a full book demands fresh take-take beat what maker capital earns before
+/// > crowding it out. Linear in utilization; Geoff's 8% reference sits at ~1/3
+/// > utilization.
+///
+/// Python applied the SAME number to the makers — `for q4 in quoters.values():
+/// q4.min_apr = tt["bar"]`, with the comment "makers clear the same bar (card
+/// 80ff7987)" — which is the policy this binary was missing entirely.
+const APR_FLOOR: f64 = 4.0;
+const APR_CEIL: f64 = 16.0;
+
+/// The maker APR bar at a given class-budget utilization.
+pub fn apr_bar(util: f64) -> f64 {
+    APR_FLOOR + (APR_CEIL - APR_FLOOR) * util.clamp(0.0, 1.0)
+}
+
+/// The half of the quoter policy that goes STALE, and so has to be re-derived
+/// while the process runs rather than installed once (`Engine::tox_tick` and
+/// `Engine::apr_tick`). `suppress` is absent because it does not drift: it is
+/// an operator declaration, fixed for the run.
+struct Policy {
+    /// Research toxicity feed to re-read; `None` = the gate is off.
+    toxgate_file: Option<String>,
+    /// APR hurdle inputs to re-apply; `None` = never (bench/replay).
+    apr: Option<engine::AprCfg>,
+    /// The (bar, day) already installed, for the gauge — a bench run has a
+    /// hurdle it will never refresh, and it must still be reportable.
+    apr_installed: (f64, String),
+}
 
 /// The default Args, factored out of `parse_args` so the precondition tests can
 /// build one without going through the command line.
@@ -166,7 +197,7 @@ fn default_args() -> Args {
         tt_max_ct_per_rel: 50,
         tt_max_clip: 20,
         marks: "data/exec/marks.json".into(),
-        min_apr: -1.0, // sentinel: default by mode in `install_policy`
+        min_apr: None, // float with utilization; see `apr_bar`
         apr_asof: None,
         toxgate: None,
         suppress: Vec::new(),
@@ -241,7 +272,9 @@ fn parse_args() -> Args {
                 a.tt_max_clip = it.next().and_then(|v| v.parse().ok()).expect("--tt-max-clip value")
             }
             "--marks" => a.marks = it.next().expect("--marks value"),
-            "--min-apr" => a.min_apr = it.next().expect("pct").parse().expect("float"),
+            "--min-apr" => {
+                a.min_apr = Some(it.next().expect("pct").parse().expect("float"))
+            }
             "--apr-asof" => a.apr_asof = it.next(),
             "--toxgate" => a.toxgate = it.next(),
             "--suppress" => {
@@ -633,24 +666,79 @@ fn build_pmus_sink(
     )))
 }
 
-/// Read the research toxicity feed. `Err` is the reason it may not be gated
-/// behind, and there is no fourth answer: unreadable, unparseable and stale all
-/// mean the same thing to a caller that has to decide whether to quote.
+/// The research toxicity feed as loaded.
 ///
-/// FAIL CLOSED. Every one of these used to be indistinguishable from "the gate
-/// says fine" — the file was read once at startup or not at all, and a feed
-/// past `TOXGATE_MAX_AGE` scored nothing while blocking nothing.
-fn load_toxgate(path: &str, now: f64) -> Result<std::sync::Arc<Toxgate>, String> {
-    let doc = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-    let gate = Toxgate::from_json(&doc).ok_or_else(|| format!("{path}: not a toxgate document"))?;
+/// The two fields are INDEPENDENT, and collapsing them is a fail-open. A stale
+/// document must still be INSTALLED: it is the only record of which (market,
+/// side) pairs the model covers, and `Toxgate::verdict` needs exactly that to
+/// answer `Untrusted` for a covered side while leaving an uncovered one alone.
+/// Returning `Err` and dropping the document — which this function did in its
+/// first cut — leaves the quoter holding NO gate, which is the fail-open the
+/// whole change exists to remove. Measured on the pinned tape: it digested
+/// identically to having no gate at all.
+struct ToxLoad {
+    /// The document, if it parsed — stale or not.
+    gate: Option<std::sync::Arc<Toxgate>>,
+    /// Why it may not be scored against, if it may not be. Unreadable,
+    /// unparseable and stale all land here; only the first two also cost us
+    /// the coverage map.
+    stale: Option<String>,
+}
+
+fn load_toxgate(path: &str, now: f64) -> ToxLoad {
+    let doc = match std::fs::read_to_string(path) {
+        Ok(d) => d,
+        Err(e) => return ToxLoad { gate: None, stale: Some(format!("{path}: {e}")) },
+    };
+    let Some(gate) = Toxgate::from_json(&doc) else {
+        return ToxLoad { gate: None, stale: Some(format!("{path}: not a toxgate document")) };
+    };
     let age = now - gate.ts;
-    if age > arb_core::quoter::TOXGATE_MAX_AGE {
-        return Err(format!(
+    let stale = (age > arb_core::quoter::TOXGATE_MAX_AGE).then(|| {
+        format!(
             "{path}: feed is {age:.0}s old (max {:.0}s) — the research writer is not running",
             arb_core::quoter::TOXGATE_MAX_AGE
-        ));
+        )
+    });
+    ToxLoad { gate: Some(std::sync::Arc::new(gate)), stale }
+}
+
+/// Size and install the maker APR hurdle on every quoter. Shared by startup
+/// and by `Engine::apr_tick`, because BOTH of its terms drift: utilization
+/// moves as baskets book, and the hold shortens every day.
+///
+/// Returns `(bar, asof, relationships with no resolve date)`.
+fn apply_apr(
+    quoters: &mut [Quoter],
+    min_apr: Option<f64>,
+    asof: Option<&str>,
+    risk: Option<&risk::RiskView>,
+) -> (f64, String, Vec<String>) {
+    let bar = match (min_apr, risk) {
+        // An explicit --min-apr wins everywhere, which is how a bench replay
+        // pins the hurdle it is measuring.
+        (Some(x), _) => x,
+        (None, Some(rv)) => apr_bar(rv.utilization()),
+        // No risk view is bench/replay: no utilization to float on, and a
+        // digest pinned to a fixed tape cannot survive a bar that moves.
+        (None, None) => 0.0,
+    };
+    let asof = asof
+        .map(str::to_string)
+        .unwrap_or_else(|| arb_core::resolve::today_iso(arb_core::clock::now_s()));
+    let mut cx = Cx::default();
+    let mut undated: Vec<String> = Vec::new();
+    for q in quoters.iter_mut() {
+        // Per relationship, not one global constant: these resolve on dates
+        // seventeen months apart, and one shared `resolve_years` would size the
+        // hurdle wrong for every family but one.
+        let years = arb_core::resolve::years_to(&q.rel.id, &asof);
+        if years.is_none() && bar > 0.0 {
+            undated.push(q.rel.id.clone());
+        }
+        q.set_apr(&mut cx, bar, years);
     }
-    Ok(std::sync::Arc::new(gate))
+    (bar, asof, undated)
 }
 
 /// The three quoter policies this binary knew how to build and never installed.
@@ -661,44 +749,23 @@ fn load_toxgate(path: &str, now: f64) -> Result<std::sync::Arc<Toxgate>, String>
 /// unreachable in the live process. `bins/arb-intent`, a replay tool, was the
 /// only caller of the other three setters in the workspace. The engine
 /// therefore rested maker quotes locking as little as one tick — 0.27%/yr on
-/// france-pres-27 money committed until 2027 — while take-take in the SAME
-/// process refused anything under its ~12%/yr blended bar, and quoted sides the
-/// research feed scored at up to 7x `TOXGATE_MAX`.
+/// france-pres-27 money committed until 2027 — and quoted sides the research
+/// feed scored at up to 7x `TOXGATE_MAX`.
 ///
-/// Returns the resolved toxgate path (`None` = gate off) for `RunCfg`, which
-/// is what reloads it; see `Engine::tox_tick`.
-fn install_policy(args: &Args, quoters: &mut [Quoter], bench: bool) -> Option<String> {
-    // Bench/replay pins a decision digest against a fixed tape, and BOTH of
-    // these read state that tape cannot pin: the hurdle shrinks every day as
-    // the resolve date approaches, and the toxgate file is rewritten by another
-    // process and carries a wall-clock `ts`. Off by default there for the same
-    // reason `health_file`, `take_take` and `risk` are. An explicit flag still
-    // wins, so either can be replayed against a pinned value.
-    let min_apr = if args.min_apr >= 0.0 {
-        args.min_apr
-    } else if bench {
-        0.0
-    } else {
-        crate::taketake::DEFAULT_BAR_APR
-    };
-    let asof = args
-        .apr_asof
-        .clone()
-        .unwrap_or_else(|| arb_core::resolve::today_iso(arb_core::clock::now_s()));
-    let mut cx = Cx::default();
-    let mut undated: Vec<String> = Vec::new();
-    for q in quoters.iter_mut() {
-        // Per relationship, not one global constant: these resolve on dates
-        // seventeen months apart, and one shared `resolve_years` would size the
-        // hurdle wrong for every family but one.
-        let years = arb_core::resolve::years_to(&q.rel.id, &asof);
-        if years.is_none() {
-            undated.push(q.rel.id.clone());
+/// Returns what the engine has to keep CURRENT — see [`Policy`].
+fn install_policy(args: &Args, quoters: &mut [Quoter], risk: Option<&risk::RiskView>) -> Policy {
+    let (bar, asof, undated) =
+        apply_apr(quoters, args.min_apr, args.apr_asof.as_deref(), risk);
+    if bar > 0.0 {
+        match (args.min_apr, risk) {
+            (None, Some(rv)) => eprintln!(
+                "[apr] maker hurdle {bar:.2}%/yr = {APR_FLOOR} + {}*util at util {:.3}, \
+                 holds measured from {asof}",
+                APR_CEIL - APR_FLOOR,
+                rv.utilization()
+            ),
+            _ => eprintln!("[apr] maker hurdle {bar}%/yr (explicit), holds from {asof}"),
         }
-        q.set_apr(&mut cx, min_apr, years);
-    }
-    if min_apr > 0.0 {
-        eprintln!("[apr] maker hurdle {min_apr}%/yr, holds measured from {asof}");
         if !undated.is_empty() {
             // Not a refusal — `arb_core::resolve` has no date for these
             // families, and inventing one would size a real hurdle off a
@@ -728,29 +795,54 @@ fn install_policy(args: &Args, quoters: &mut [Quoter], bench: bool) -> Option<St
         q.set_suppress(suppress.clone());
     }
 
-    let path = match args.toxgate.as_deref() {
-        Some("") => None,
-        Some(p) => Some(p.to_string()),
-        None if bench => None,
-        None => Some(DEFAULT_TOXGATE.to_string()),
+    // `risk.is_none()` IS bench/replay, and neither term of the bar exists
+    // there, so there is nothing to refresh — but the bar that WAS installed
+    // is still reported, because an explicit `--min-apr` works in bench.
+    let apr = risk.is_some().then(|| engine::AprCfg {
+        min_apr: args.min_apr,
+        asof: args.apr_asof.clone(),
+    });
+    let apr_installed = (bar, asof);
+
+    // OFF unless a path is given, and that is not caution — it is that NOTHING
+    // WRITES THIS FILE. `scripts/toxgate_daemon.py` (216 lines) and
+    // `scripts/toxgate_evidence.py` were deleted in 3e4e80d, the rust rewrite;
+    // no Rust replacement, no unit, no timer exists, and the Python stack is
+    // frozen so the deleted one may not simply be run. Every remaining mention
+    // of `toxgate.json` in the tree is a READER.
+    //
+    // Defaulting this on would therefore not mean "gate on, feed occasionally
+    // stale" — it would mean the gate can never clear, and `arbbot-trader-rs`
+    // (Restart=always, no --bench-tape) would go dark on its next restart and
+    // stay dark, taking the dashboard's /intents view with it. Turning it on is
+    // an explicit `--toxgate <path>` the day something writes one.
+    let Some(path) = args.toxgate.as_deref().filter(|p| !p.is_empty()) else {
+        eprintln!("[toxgate] OFF (no --toxgate) — no adverse-selection gate on maker quotes");
+        return Policy { toxgate_file: None, apr, apr_installed };
     };
-    let Some(path) = path else {
-        eprintln!("[toxgate] OFF — no adverse-selection gate on maker quotes");
-        return None;
-    };
-    match load_toxgate(&path, arb_core::clock::now_s()) {
-        Ok(gate) => {
-            eprintln!("[toxgate] {} markets scored, gate at {}/ct",
-                      gate.markets.len(), arb_core::quoter::TOXGATE_MAX);
-            for q in quoters.iter_mut() {
-                q.set_toxgate(Some(gate.clone()));
-            }
+    let load = load_toxgate(path, arb_core::clock::now_s());
+    if let Some(gate) = &load.gate {
+        eprintln!("[toxgate] {} markets scored, gate at {}/ct",
+                  gate.markets.len(), arb_core::quoter::TOXGATE_MAX);
+        for q in quoters.iter_mut() {
+            q.set_toxgate(Some(gate.clone()));
         }
-        // The engine starts pulled on this (`Engine::new`) and clears it when a
-        // reload succeeds, so an unusable feed is not merely logged here.
-        Err(why) => eprintln!("[toxgate] UNUSABLE ({why}) — maker quoting is BLOCKED"),
     }
-    Some(path)
+    match (&load.stale, &load.gate) {
+        (None, _) => {}
+        // Installed but not current: the quoter withholds every side this
+        // document covers, and `tox_tick` clears it when a fresh file appears.
+        (Some(why), Some(_)) => {
+            eprintln!("[toxgate] STALE ({why}) — every side it covers is withheld")
+        }
+        // Nothing parsed, so we do not even know WHICH sides the model covers
+        // and cannot withhold them individually. Loud, because until a readable
+        // file appears there is no gate on this book at all.
+        (Some(why), None) => eprintln!(
+            "[toxgate] UNREADABLE ({why}) — NO adverse-selection gate is in force"
+        ),
+    }
+    Policy { toxgate_file: Some(path.to_string()), apr, apr_installed }
 }
 
 /// The capital gate every quoter consults, sized from `--exec-config` /
@@ -1027,7 +1119,7 @@ fn run_cfg(
     has_executors: bool,
     risk: Option<std::sync::Arc<risk::RiskView>>,
     undischarged: u64,
-    toxgate_file: Option<String>,
+    policy: Policy,
 ) -> engine::RunCfg {
     engine::RunCfg {
         hedges_undischarged: undischarged,
@@ -1038,7 +1130,9 @@ fn run_cfg(
         wal_path: args.wal,
         // bench/replay must stay byte-deterministic and have no live feed.
         health_file: (!bench && !args.health.is_empty()).then(|| args.health.clone()),
-        toxgate_file,
+        toxgate_file: policy.toxgate_file,
+        apr: policy.apr,
+        apr_installed: policy.apr_installed,
         risk,
         // Only an ARMED engine books baskets. A dry run writing here would
         // invent exposure that the next startup would seed from as if real.
@@ -1103,10 +1197,11 @@ async fn main() {
 
     let (mut quoters, by_market, rel_meta) =
         load_quoters(&args.registry, &args.tradable, &args.rel_prefixes);
-    let toxgate_file = install_policy(&args, &mut quoters, bench);
     // Risk is OFF in bench/replay: those pin a decision digest, and a capital
-    // gate is not part of that contract.
+    // gate is not part of that contract. It is built BEFORE the policy because
+    // the maker APR hurdle floats with the utilization this view holds.
     let risk = (!bench).then(|| build_risk_view(&args, &mut quoters, &rel_meta));
+    let policy = install_policy(&args, &mut quoters, risk.as_deref());
     eprintln!(
         "arb-trader up: {} quoters, {} markets, mode={}",
         quoters.len(),
@@ -1156,7 +1251,8 @@ async fn main() {
     let undischarged = report_undischarged_hedges(&args, &quoters, armed, bench);
     let acks = if sinks.is_empty() { None } else { tx_acks.clone() };
     let (exec_txs, exec_stats) = exec::spawn_executors(rate, sinks, acks);
-    let cfg = run_cfg(args, bench, armed, !exec_txs.is_empty(), risk, undischarged, toxgate_file);
+    let cfg =
+        run_cfg(args, bench, armed, !exec_txs.is_empty(), risk, undischarged, policy);
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;
     println!("{summary}");
     if armed {
@@ -1588,16 +1684,18 @@ relationships:
         a.registry = reg.to_string_lossy().into_owned();
         a.tradable = "/nonexistent/tradable.yaml".into(); // registry vetting alone
         a.apr_asof = Some(ASOF.into());
-        a.min_apr = 0.0;
-        a.toxgate = Some(String::new());
+        a.min_apr = Some(0.0);
+        a.toxgate = None;
         a
     }
 
     /// Wire the policy onto real quoters and decide ONE book event with them.
+    /// `risk` is None, i.e. every assertion below rides on an EXPLICIT
+    /// `--min-apr`; the floating default has its own test.
     fn decide(a: &Args, pm_bid: &str, now: f64) -> Vec<Intent> {
         let (mut quoters, _, _) = load_quoters(&a.registry, &a.tradable, &[]);
         assert_eq!(quoters.len(), 1, "the fixture relationship must survive the gate");
-        install_policy(a, &mut quoters, false);
+        install_policy(a, &mut quoters, None);
 
         let bb = books(pm_bid);
         let mut cx = Cx::default();
@@ -1627,8 +1725,7 @@ relationships:
 
     /// THE hurdle, on the family it was measured on. With none, the engine
     /// rests a quote one tick inside the touch — on france-pres-27 that locks
-    /// $0.01 on $4.99 committed until 2027-04-25, which is 0.27%/yr, while
-    /// take-take in the same process refuses anything under ~12%/yr.
+    /// $0.01 on $4.99 committed until 2027-04-25, which is 0.27%/yr.
     #[test]
     fn the_apr_hurdle_reaches_the_live_quoter() {
         let d = scratch("apr");
@@ -1638,12 +1735,13 @@ relationships:
         let p = place_on(&off, "P").expect("with no hurdle the tick-lock quote rests");
         assert_eq!(p.price, "0.56", "one tick inside the 0.55 touch");
 
-        // Same book, same relationship, hurdle at the take-take bar.
-        a.min_apr = crate::taketake::DEFAULT_BAR_APR;
+        // Same book, same relationship, hurdle at the bar a nearly-full book
+        // asks for (`apr_bar(0.87)` ~ 14.5).
+        a.min_apr = Some(apr_bar(0.87));
         let on = decide(&a, "0.55", 1_000.0);
         assert!(
             place_on(&on, "P").is_none(),
-            "a 0.27%/yr lock must not rest under a 12%/yr hurdle: {on:?}"
+            "a 0.27%/yr lock must not rest under a 14.5%/yr hurdle: {on:?}"
         );
 
         // ...and the hurdle narrows the quote rather than switching the maker
@@ -1653,6 +1751,31 @@ relationships:
             place_on(&wide, "P").is_some(),
             "the hurdle must not silence a genuinely profitable book: {wide:?}"
         );
+    }
+
+    /// **The bar FLOATS with capital utilization** — Geoff 2026-07-22, card
+    /// 80ff7987, ported from `exec/main.py:_tt_refresh`, which pushed the same
+    /// number onto every maker ("makers clear the same bar").
+    ///
+    /// A flat constant is wrong in the expensive direction: at the utilization
+    /// actually observed on 2026-07-29 ($299.39 of a $343.00 class budget) the
+    /// policy asks 14.47%/yr, so a flat 12.0 would have rested quotes the
+    /// policy refuses exactly when capital is scarcest.
+    #[test]
+    fn the_hurdle_floats_with_capital_utilization() {
+        assert_eq!(apr_bar(0.0), APR_FLOOR, "idle capital takes the floor");
+        assert_eq!(apr_bar(1.0), APR_CEIL, "a full book demands the ceiling");
+        // Geoff's 8% reference sits at ~1/3 utilization (exec/main.py:47-51).
+        assert!((apr_bar(1.0 / 3.0) - 8.0).abs() < 0.01, "{}", apr_bar(1.0 / 3.0));
+
+        // The live figures, and the crossing that makes a flat 12.0 unsafe.
+        let live = apr_bar(299.39 / 343.00);
+        assert!((live - 14.47).abs() < 0.01, "2026-07-29 policy bar: {live}");
+        assert!(live > 12.0, "a flat 12.0 would UNDER-charge a full book: {live}");
+        // 12.0 is the bar only at util 2/3, and take-take's own DEFAULT_BAR_APR
+        // is the cold-start arm of `Bar::tradable`, never the bar in force with
+        // a live portfolio. The two are not the same number and never were.
+        assert!((apr_bar(2.0 / 3.0) - crate::taketake::DEFAULT_BAR_APR).abs() < 0.01);
     }
 
     /// `--suppress market:side`, the same spelling `arb-intent` takes. Nothing
@@ -1707,62 +1830,147 @@ relationships:
         std::fs::write(&f, format!(r#"{{"ts": {}, "markets": {{}}}}"#, now - 3.0 * 86_400.0))
             .unwrap();
 
-        let why = load_toxgate(&path, now).err().expect("3 days old must not load");
+        let load = load_toxgate(&path, now);
+        let why = load.stale.expect("3 days old must not read as current");
         assert!(why.contains("old"), "it must say the AGE refused it: {why}");
-        // A MISSING file is the same answer, not a quieter one.
-        assert!(load_toxgate("/nonexistent/toxgate.json", now).is_err());
+        // ...and the DOCUMENT survives the refusal. Dropping it is a
+        // fail-open: the quoter would hold no gate, so it could not tell a
+        // side this model covers from one it has never scored, and the pinned
+        // tape would digest exactly as if no gate existed. It did, at first.
+        assert!(load.gate.is_some(), "a stale document is still the coverage map");
+
+        // A MISSING file is a refusal too — but it costs the coverage map,
+        // which is a strictly worse position and is logged as its own case.
+        let gone = load_toxgate("/nonexistent/toxgate.json", now);
+        assert!(gone.stale.is_some() && gone.gate.is_none());
         // ...and so is a document that cannot say how old it is.
         std::fs::write(&f, r#"{"markets": {}}"#).unwrap();
-        assert!(load_toxgate(&path, now).is_err(), "no ts is not a fresh ts");
+        assert!(load_toxgate(&path, now).stale.is_some(), "no ts is not a fresh ts");
 
-        // Installing it is still reported to the engine, which is what starts
-        // it pulled — an unusable feed is refused, never skipped over.
+        // The path is still handed to the engine, which is what re-reads it and
+        // reports the gauge — an unusable feed is refused, never skipped over.
         let mut a = args(&d);
         a.toxgate = Some(path.clone());
-        assert_eq!(install_policy(&a, &mut [], false), Some(path));
+        assert_eq!(install_policy(&a, &mut [], None).toxgate_file, Some(path));
     }
 
-    /// bench/replay pins a decision digest against a fixed tape, and both new
-    /// policies read state a tape cannot pin: the hurdle shrinks every day, and
-    /// the toxgate file is rewritten by another process with a wall-clock `ts`.
-    /// Off there by default for the same reason `health_file`, `take_take` and
-    /// `risk` are — and an explicit flag still wins, so either can be replayed
-    /// against a pinned value.
+    /// **A stale feed must still be INSTALLED, or the refusal cannot happen.**
+    ///
+    /// Caught by the pinned tape, not by a unit test: with the stale document
+    /// dropped on the floor, `--toxgate <the real 2.7-day-old file>` digested
+    /// byte-identically to having no gate at all (`f4141b53…`, 182 places).
+    /// The quoter held `toxgate: None`, so `verdict` was never consulted and
+    /// every covered side quoted freely — the exact fail-open this change
+    /// exists to remove, reintroduced one layer up.
     #[test]
-    fn bench_defaults_both_new_gates_off_but_honors_an_explicit_flag() {
-        let d = scratch("bench");
+    fn a_stale_feed_is_installed_so_the_covered_side_is_actually_withheld() {
+        let d = scratch("stale-installed");
+        let now = arb_core::clock::now_s();
+        let f = d.join("toxgate.json");
+        // Covers P, and harmlessly clean at 0.001 — the AGE is the refusal.
+        std::fs::write(
+            &f,
+            format!(
+                r#"{{"ts": {}, "markets": {{"P": {{"bid": 0.001}}}}}}"#,
+                now - 3.0 * 86_400.0
+            ),
+        )
+        .unwrap();
         let mut a = args(&d);
-        a.min_apr = -1.0; // the sentinel: "default by mode"
-        a.toxgate = None;
+        a.toxgate = Some(f.to_string_lossy().into_owned());
 
-        assert_eq!(install_policy(&a, &mut [], true), None, "no toxgate in bench by default");
-        assert_eq!(
-            install_policy(&a, &mut [], false),
-            Some(DEFAULT_TOXGATE.to_string()),
-            "live defaults the gate ON"
+        let gated = decide(&a, "0.30", now);
+        assert!(
+            place_on(&gated, "P").is_none(),
+            "a covered side on a stale opinion must be withheld: {gated:?}"
         );
+        assert!(
+            skips(&gated).iter().any(|s| s.contains("toxgate feed")),
+            "and say the feed's age is why: {gated:?}"
+        );
+    }
+
+    /// **The toxgate is OFF unless asked for, because NOTHING WRITES ITS FILE.**
+    ///
+    /// `scripts/toxgate_daemon.py` and `scripts/toxgate_evidence.py` were
+    /// deleted in 3e4e80d (the rust rewrite) and never replaced; every
+    /// remaining mention of `toxgate.json` in the tree is a reader, and the
+    /// Python stack is frozen so the deleted writer may not be run either. A
+    /// default-on gate could therefore never clear, and `arbbot-trader-rs`
+    /// (Restart=always, no `--bench-tape`) would withhold every scored side
+    /// from its next restart onward.
+    #[test]
+    fn the_toxgate_is_off_unless_a_path_is_given() {
+        let d = scratch("default-off");
+        let mut a = args(&d);
+
+        a.toxgate = None;
+        assert_eq!(install_policy(&a, &mut [], None).toxgate_file, None, "no flag, no gate");
+
+        a.toxgate = Some(String::new());
+        assert_eq!(install_policy(&a, &mut [], None).toxgate_file, None, "empty is off too");
 
         a.toxgate = Some("/pinned/toxgate.json".into());
         assert_eq!(
-            install_policy(&a, &mut [], true),
+            install_policy(&a, &mut [], None).toxgate_file,
             Some("/pinned/toxgate.json".to_string()),
-            "an explicit --toxgate is honored in bench too"
+            "and a path turns it on, wherever it points"
+        );
+    }
+
+    /// bench/replay pins a decision digest against a fixed tape, and the
+    /// floating hurdle cannot be pinned by one: it rides on a utilization the
+    /// tape does not contain. `risk: None` IS bench here — same condition, one
+    /// place. An explicit `--min-apr` still wins, which is how the hurdle's
+    /// effect gets replayed against the golden tape at a fixed bar.
+    #[test]
+    fn bench_has_no_floating_bar_but_honors_an_explicit_one() {
+        let d = scratch("bench");
+        let mut a = args(&d);
+        a.min_apr = None; // float — but there is nothing to float on
+
+        let (mut quoters, _, _) = load_quoters(&a.registry, &a.tradable, &[]);
+        let apr = install_policy(&a, &mut quoters, None).apr;
+        assert!(apr.is_none(), "nothing to refresh without a risk view");
+
+        let bb = books("0.55");
+        let decide_now = |quoters: &mut Vec<Quoter>| {
+            let mut cx = Cx::default();
+            let fees = FeeSchedule::new(&mut cx);
+            let (mut oid, mut intents) = (0u64, Vec::new());
+            quoters[0].on_book(&mut cx, &fees, &bb, 1_000.0, &mut oid, &mut intents);
+            intents
+        };
+        assert_eq!(
+            place_on(&decide_now(&mut quoters), "P").map(|p| p.price.as_str()),
+            Some("0.56"),
+            "bench must decide as it always has"
         );
 
-        // The hurdle half, asserted through the decision rather than a return
-        // value: the tick-lock quote of the first test still rests in bench.
-        a.min_apr = -1.0;
+        // ...and an explicit bar bites in bench exactly as it does live.
+        a.min_apr = Some(14.47);
         let (mut quoters, _, _) = load_quoters(&a.registry, &a.tradable, &[]);
-        install_policy(&a, &mut quoters, true);
+        install_policy(&a, &mut quoters, None);
+        assert!(place_on(&decide_now(&mut quoters), "P").is_none());
+    }
+
+    /// `--min-apr -5` used to hit a `< 0.0` sentinel and silently become 12.0.
+    /// A nonsense bar must be the bar you asked for, not a different one.
+    #[test]
+    fn a_negative_min_apr_is_taken_literally_not_read_as_a_sentinel() {
+        let d = scratch("negative");
+        let mut a = args(&d);
+        a.min_apr = Some(-5.0);
+        let (mut quoters, _, _) = load_quoters(&a.registry, &a.tradable, &[]);
+        let (bar, _, _) = apply_apr(&mut quoters, a.min_apr, a.apr_asof.as_deref(), None);
+        assert_eq!(bar, -5.0, "the sentinel must not swallow a real value");
+        // `set_apr` treats <= 0 as OFF, so the decision is the unhurdled one.
+        install_policy(&a, &mut quoters, None);
         let bb = books("0.55");
         let mut cx = Cx::default();
         let fees = FeeSchedule::new(&mut cx);
         let (mut oid, mut intents) = (0u64, Vec::new());
         quoters[0].on_book(&mut cx, &fees, &bb, 1_000.0, &mut oid, &mut intents);
-        assert_eq!(
-            place_on(&intents, "P").map(|p| p.price.as_str()),
-            Some("0.56"),
-            "bench must decide as it always has: {intents:?}"
-        );
+        assert_eq!(place_on(&intents, "P").map(|p| p.price.as_str()), Some("0.56"));
     }
 }

@@ -24,6 +24,23 @@ const RULES: &[(&str, &str, bool)] = &[
     ("xvus-nobel-peace-26", "2026-10-09", true),
     ("xvus-fedcut-26", "2026-12-31", false),
     ("xvus-btcmax-26-31", "2026-12-31", false),
+    // Added 2026-07-29 with the maker APR hurdle: an id with no date here gets
+    // NO hurdle, and these were quoting without one. Every date below is READ
+    // OFF the relationship's own Kalshi leg, not estimated — which is why none
+    // of them is flagged `estimated` and why the 2028 nomination families
+    // (`xv-dem-nom-2028-*`, `xv-rep-nom-2028-*`) are deliberately still absent:
+    // those settle at conventions whose dates are not published, and a guess
+    // here sizes a real refusal off a guess.
+    //
+    // The same December-2026 FOMC decision as `xvus-fedcut-26` above, reached
+    // through Kalshi's own ladder (`KXFED-26DEC-T3.75` implies `-T3.50`).
+    ("kalshi-fed-dec26", "2026-12-31", false),
+    // The ladder carries its expiry in BOTH the relationship id and the Kalshi
+    // ticker: `xvus-btc150k-ladder-07-31-2026` <-> `KXBTCMAX150-25-26JUL31`.
+    // One rule each, because the prefix match cannot read a date out of an id.
+    ("xvus-btc150k-ladder-07-31-2026", "2026-07-31", false),
+    ("xvus-btc150k-ladder-08-31-2026", "2026-08-31", false),
+    ("xvus-btc150k-ladder-12-31-2026", "2026-12-31", false),
 ];
 
 /// `-> (YYYY-MM-DD, estimated)`. `None` when the family is unknown, which
@@ -116,6 +133,31 @@ mod tests {
         assert_eq!(resolve_date("xvus-nobel-peace-26-elonmusk"), Some(("2026-10-09", true)));
         assert_eq!(resolve_date("xvus-fedcut-26-usfed-2026-cut"), Some(("2026-12-31", false)));
         assert_eq!(resolve_date("xvus-unknown-family-99"), None);
+    }
+
+    /// The families quoting WITHOUT a hurdle until 2026-07-29, because a rel
+    /// with no date here gets `years_to == None` and `set_apr` then leaves the
+    /// hurdle off. Each date is read off the relationship's own Kalshi leg.
+    ///
+    /// The three ladder rungs must not collapse into one prefix: they resolve
+    /// five months apart, and a hurdle is linear in the hold.
+    #[test]
+    fn the_dated_families_that_were_quoting_unhurdled_now_resolve() {
+        assert_eq!(
+            resolve_date("kalshi-fed-dec26-t375-implies-t350"),
+            Some(("2026-12-31", false)),
+            "same December FOMC as xvus-fedcut-26"
+        );
+        for (id, want) in [
+            ("xvus-btc150k-ladder-07-31-2026", "2026-07-31"),
+            ("xvus-btc150k-ladder-08-31-2026", "2026-08-31"),
+            ("xvus-btc150k-ladder-12-31-2026", "2026-12-31"),
+        ] {
+            assert_eq!(resolve_date(id), Some((want, false)), "{id}");
+        }
+        // Still absent ON PURPOSE: a 2028 convention date would be invented.
+        assert_eq!(resolve_date("xv-dem-nom-2028-newsom"), None);
+        assert_eq!(resolve_date("xv-rep-nom-2028-vance"), None);
     }
 
     #[test]
