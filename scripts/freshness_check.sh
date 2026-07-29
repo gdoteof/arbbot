@@ -173,8 +173,17 @@ if systemctl --user is-active --quiet arbbot-trader-m3; then
     [ $(( now - started )) -gt "$GAUGE_WINDOW" ] &&
       page "ARMED trader-m3 has printed NO stats line in ${GAUGE_WINDOW}s while ACTIVE — every safety gauge is unread, and that tick shares the engine's select loop with the kill switch and the hedge deadline"
   else
+    # systemd's InvocationID: a fresh UUID for every start of the unit, and the
+    # only EXACT process identity available here. gauge_deltas.py used to detect
+    # a restart from elapsed_s going backwards alone, which misses the case
+    # where the replacement process is already older than the dead one was when
+    # last sampled — and in that case a brand-new process inherited the old
+    # one's sustain streak and paged on its first observation. Empty is a valid
+    # answer (the evaluator falls back to elapsed_s); it is passed positionally
+    # so a caller that forgets it fails loudly.
+    inv=$(systemctl --user show arbbot-trader-m3 -p InvocationID --value 2>/dev/null)
     gout=$(printf '%s\n' "$stats" | python3 scripts/gauge_deltas.py \
-             "$GAUGE_STATE" "$GAUGE_STATE.ok" "$GAUGE_STATE.held")
+             "$GAUGE_STATE" "$GAUGE_STATE.ok" "$GAUGE_STATE.held" "$inv")
     grc=$?
     if [ $grc -ne 0 ]; then
       # Neither candidate state is trustworthy if the writer died, and adopting

@@ -21,11 +21,20 @@ RISE      fire when the value went UP by more than `threshold` since the last
           poll. The right rule for a counter ("how many happened this window")
           and for a level whose danger is a jump.
 
-SUSTAINED fire when the value has stayed AT OR ABOVE `threshold` for
-          SUSTAIN_POLLS consecutive polls. The right rule for a level whose
-          documented danger is "a number that does not come back down"
-          (engine/mod.rs on `cancels_unresolved`) — which a RISE rule is
-          structurally blind to, because a leak of +1 per poll never jumps.
+SUSTAINED fire when the value has stayed AT OR ABOVE `level` for `polls`
+          consecutive samples AND those samples span real time (see
+          SUSTAIN_MIN_POLL_S). The right rule for a level whose documented danger
+          is "a number that does not come back down" (engine/mod.rs on
+          `cancels_unresolved`) — which a RISE rule is structurally blind to,
+          because a leak of +1 per poll never jumps.
+
+          The span requirement is not decoration. Counting POLLS alone assumes
+          polls are 5 minutes apart, and they are not always: the watchdog timer
+          is `Persistent=true`, so missed activations fire back to back after a
+          suspend or a boot. Measured on this evaluator: three samples 60s apart
+          satisfied "3 consecutive polls" and fired, turning a rule that means
+          "this did not clear in a quarter of an hour" into one that means "this
+          did not clear in two minutes".
 
 Neither rule ever fires on a level merely being non-zero, because a standing
 value would page for ever. `hedges_undischarged` is non-zero right now against a
@@ -49,17 +58,24 @@ RISE rule on half of them, for ever. Measured: 4 pages in 8 polls.
 PROCESS RESTARTS
 ----------------
 Every one of these counters is per-process and resets to 0 on restart, so a naive
-delta goes negative across one. `elapsed_s` is the discriminator: it rises
-monotonically within a process, so a stats line whose `elapsed_s` is BELOW the
-last one we saw is a new process — baselines drop to 0 and sustain streaks
-reset. Evaluating a new process's values against 0 rather than against the old
-process's values is deliberate and is the conservative direction.
+delta goes negative across one. Restarts are detected by systemd's
+`InvocationID`, which is a fresh UUID for every start of the unit and is the only
+thing here that identifies a process EXACTLY. `elapsed_s` decreasing is kept as a
+fallback for when the id cannot be read.
 
-That has one blind spot, stated plainly: if the old process was itself young when
-we last sampled it (say elapsed_s 60) and the restart happened just after, the
-new process can be at elapsed_s 290 by the next poll, which is HIGHER, so the
-restart is not detected and the delta is computed across two processes. It
-degrades toward under-counting.
+`elapsed_s` ALONE used to be the discriminator, and the comment here used to say
+its blind spot "degrades toward under-counting". That was true for RISE, which
+clamps with `base = min(base, cur)` — and FALSE, in the dangerous direction, for
+SUSTAINED, which inherits the dead process's streak. Driven through this
+evaluator: a process sampled at elapsed_s 60 and 120 with `cancels_unresolved`
+at 2 (streak 1, then 2), then killed; the REPLACEMENT process's first sample at
+elapsed_s 290 is HIGHER, so no restart was detected, the streak advanced to 3,
+and a brand-new process paged on its first observation. A mitigation that is
+documented backwards is worse than one that is absent, because nobody re-derives
+it.
+
+Both are now reset on a new `InvocationID`: baselines to 0, sustain streaks to
+nothing.
 
 VERDICTS SURVIVE BOTH THE COOLDOWN AND A RESTART
 ------------------------------------------------
@@ -95,10 +111,12 @@ import os
 import sys
 import tempfile
 
-# How many consecutive polls a SUSTAINED gauge must stay at or above its
-# threshold before it fires. 3 polls is 15 minutes at the watchdog's 5-minute
-# cadence: long enough that nothing merely in flight survives it.
-SUSTAIN_POLLS = 3
+# The shortest gap between two samples that counts as a full poll apart, for the
+# SPAN a SUSTAINED rule must cover. 240s is the watchdog's 5-minute cadence with
+# 20% slack for timer drift. A rule of `polls` needs (polls - 1) * this much
+# engine uptime between its first and last sample, so back-to-back catch-up runs
+# cannot satisfy it — see the SUSTAINED note above.
+SUSTAIN_MIN_POLL_S = 240
 
 # How far the engine's own clock may advance between two observations that still
 # count as CONSECUTIVE. 900s is 3x the watchdog's 5-minute cadence, which
@@ -274,7 +292,7 @@ WATCH = [
         "cancels_unresolved",
         "SUSTAINED",
         "PAGE",
-        2,
+        (2, 3),
         "cancels the engine decided and the venue never confirmed — not in "
         "flight, stuck, and each may be an order resting at a price already "
         "rejected",
@@ -287,6 +305,30 @@ WATCH = [
     # (--tt-max-clip 5, 3 relationships), the regime LEAST able to put two
     # cancels on the wire at once. "max 0" is therefore weak evidence that 2 is
     # rare and no evidence at all about heavier quoting.
+    (
+        "cancels_unresolved",
+        "SUSTAINED",
+        "NOTE",
+        (1, 12),
+        "at least one cancel has been owed and unconfirmed for about an hour — "
+        "below the paging bar, but it is not clearing either",
+    ),  # The floor the row above cannot see. A level PINNED AT EXACTLY 1 never
+    # reaches a bar of 2, and neither does 1,3,1,3 — both verified silent for
+    # ever against the previous table. That is precisely the gauge's OWN
+    # documented failure mode ("a number that does not come back down"), and
+    # `cancels_unaddressable`, which would have named the benign case, is
+    # deliberately unwatched. Leaving it invisible would have been this PR
+    # shipping the exact defect it exists to close.
+    #
+    # NOTE and not PAGE, and an hour rather than a quarter of one, because the
+    # doc also says the commonest single parked entry is a place the venue
+    # REJECTED, where nothing rests and nothing is wrong. This fires ONCE per
+    # streak, so the permanently-parked benign entry costs one low-priority line
+    # per session, not a page every 30 minutes.
+    #
+    # A level stuck at 2+ trips both rows: a page at ~15 minutes and this note at
+    # ~an hour. That is deliberate — the second one says the first was not acted
+    # on — and it is one extra low-priority line, not a duplicate page.
 ]
 
 # Gauges deliberately NOT watched, and why. Kept here because "we looked at it
@@ -373,12 +415,18 @@ def write_state(path, obj):
 
 
 def main() -> int:
-    if len(sys.argv) != 4:
+    if len(sys.argv) != 5:
         sys.stderr.write(
-            "usage: gauge_deltas.py STATE PENDING_DELIVERED PENDING_HELD < stats-line\n"
+            "usage: gauge_deltas.py STATE PENDING_DELIVERED PENDING_HELD "
+            "INVOCATION_ID < stats-line\n"
         )
         return 2
     state_path, pend_ok, pend_held = sys.argv[1], sys.argv[2], sys.argv[3]
+    # systemd's InvocationID for the unit: a fresh UUID per start, and the only
+    # exact process identity available here. REQUIRED as an argument (empty
+    # string when systemd cannot supply one) rather than optional, so a caller
+    # that forgets it fails loudly instead of silently falling back.
+    invocation = sys.argv[4].strip()
 
     cur = json.loads(sys.stdin.read())
     prev = load_state(state_path)
@@ -401,21 +449,52 @@ def main() -> int:
     # armed stats lines through an unconditional version produced 168 identical
     # pages: the early sessions ran a binary that predated seven of these
     # gauges, and a downgrade would do it again.
-    names = [g for g, _, _, _, _ in WATCH] + ["elapsed_s"]
+    # set(): one gauge may appear in WATCH twice (two sustain levels), and a
+    # duplicate here would name it twice in the page.
+    names = set(g for g, _, _, _, _ in WATCH) | {"elapsed_s"}
     absent = sorted(n for n in names if n not in cur)
     new_absent = [n for n in absent if n not in prev.get("_absent", [])]
-    if new_absent:
+    # A name we have SEEN and then lost is a rename, and it is a page: the check
+    # that used to read it now reads nothing while reporting all-clear.
+    #
+    # A name we have NEVER seen is a different thing entirely — the running
+    # engine simply predates it. Found by running this against the live journal:
+    # the armed process was started before #44 landed, so it does not emit
+    # `sweeps_owed`, and an undifferentiated rule pages on the very first poll
+    # after deployment about a gauge nobody could have been reading yet. True,
+    # and not actionable, which is the definition of the noise this file is
+    # supposed to avoid. It goes out as a NOTE, and turns into a page the moment
+    # the gauge has actually been seen and then disappears.
+    prev_seen = set(prev.get("_seen", []))
+    vanished = [n for n in new_absent if n in prev_seen]
+    never_seen = [n for n in new_absent if n not in prev_seen]
+    if vanished:
         out.append(
             "PAGE|ARMED trader-m3 stats line no longer carries "
-            + ", ".join(new_absent)
+            + ", ".join(vanished)
             + " — those safety gauges are UNWATCHED (engine summary renamed?)"
+        )
+    if never_seen:
+        out.append(
+            "NOTE|ARMED trader-m3 has never emitted "
+            + ", ".join(never_seen)
+            + " — the running engine predates that gauge, so it is unwatched "
+            "until this unit restarts onto a newer build"
         )
 
     # No elapsed_s means no restart discriminator, so every delta below would be
     # computed against a baseline that may belong to another process. Seed
     # instead; the page above already said why.
     cold = not prev or "elapsed_s" not in cur
-    restarted = not cold and cur.get("elapsed_s", 0) < prev.get("elapsed_s", 0)
+    # InvocationID first: it is exact. `elapsed_s` decreasing is the fallback for
+    # when systemd gives us nothing — it catches the common restart and misses
+    # the one where the replacement process is already OLDER than the dead one
+    # was when last sampled, which is the false page described in the docstring.
+    prev_inv = prev.get("_invocation") or ""
+    restarted = not cold and (
+        (bool(invocation) and bool(prev_inv) and invocation != prev_inv)
+        or cur.get("elapsed_s", 0) < prev.get("elapsed_s", 0)
+    )
 
     prev_streak = prev.get("_streak", {})
     if not isinstance(prev_streak, dict):
@@ -426,40 +505,48 @@ def main() -> int:
         if gauge not in cur:
             continue
         if rule == "SUSTAINED":
+            level, polls = thresh
+            # Keyed per ROW, not per gauge: one gauge may carry two sustain rules
+            # at different levels (cancels_unresolved does), and sharing one
+            # streak between them would let the looser rule reset the stricter.
+            key = f"{gauge}#{level}"
             now_s = float(cur.get("elapsed_s", 0) or 0)
-            p = prev_streak.get(gauge)
+            p = prev_streak.get(key)
             p = p if isinstance(p, dict) else {}
-            n, at, since = 0, 0.0, now_s
+            n, at, since, fired = 0, 0.0, now_s, False
             try:
                 n = int(p.get("n", 0) or 0)
                 at = float(p.get("at", 0) or 0)
                 since = float(p.get("since", now_s) or now_s)
+                fired = bool(p.get("fired", False))
             except (TypeError, ValueError):
-                n, at, since = 0, 0.0, now_s
+                n, at, since, fired = 0, 0.0, now_s, False
             # A restart resets: a fresh process has not held anything anywhere
             # for any length of time. So does a hole — see SUSTAIN_MAX_GAP_S.
             broken = cold or restarted or (now_s - at) > SUSTAIN_MAX_GAP_S
-            if cur[gauge] < thresh:
-                n = 0
+            if cur[gauge] < level:
+                n, fired = 0, False
             elif broken or n == 0:
                 # `n == 0` matters as much as `broken`: a streak restarting
                 # after a DIP must re-date itself too, or the span reported
                 # below is measured from a run that already ended.
-                n, since = 1, now_s
+                n, since, fired = 1, now_s, False
             else:
                 n += 1
-            streak[gauge] = {"n": n, "at": now_s, "since": since}
-            # Exactly AT the crossing, not above it: an incident pages once and
-            # then stays quiet while it persists, the same contract RISE gives.
-            # The SPAN is reported rather than implied: "3 polls" is 15 minutes
-            # only if the watchdog ran on time, and the operator is the one who
-            # has to judge whether it did.
-            if n == SUSTAIN_POLLS:
+            span = now_s - since
+            # BOTH conditions, and `fired` so it says it once. Counting samples
+            # alone would let three back-to-back catch-up runs satisfy a rule
+            # that is supposed to mean "this did not clear in a quarter of an
+            # hour"; requiring span alone would fire off two samples an hour
+            # apart with no idea what happened between them.
+            if not fired and n >= polls and span >= (polls - 1) * SUSTAIN_MIN_POLL_S:
+                fired = True
                 out.append(
                     f"{sev}|ARMED trader-m3 {gauge} has held at {cur[gauge]} across "
-                    f"{SUSTAIN_POLLS} consecutive checks spanning "
-                    f"{int(now_s - since)}s of engine uptime — {why}"
+                    f"{n} consecutive samples spanning {int(span)}s of engine "
+                    f"uptime — {why}"
                 )
+            streak[key] = {"n": n, "at": now_s, "since": since, "fired": fired}
             continue
         if cold:
             continue
@@ -491,6 +578,10 @@ def main() -> int:
     base_state["elapsed_s"] = cur.get("elapsed_s", 0)
     base_state["_absent"] = absent
     base_state["_streak"] = streak
+    base_state["_invocation"] = invocation
+    # Every watched name this deployment has ever actually observed. Only ever
+    # grows: it is what separates "renamed away" from "not built yet".
+    base_state["_seen"] = sorted(prev_seen | {n for n in names if n in cur})
 
     # Deduplicated: a condition that keeps re-firing while suppressed leaves one
     # entry, not one per poll.

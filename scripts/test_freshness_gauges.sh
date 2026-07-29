@@ -53,6 +53,7 @@ case "$2" in
       LoadState) echo "${STUB_LOADSTATE:-loaded}" ;;
       Result) echo exit-code ;;
       ActiveEnterTimestamp) echo "${STUB_ACTIVE_SINCE:-}" ;;
+      InvocationID) echo "${STUB_INVOCATION:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
     esac ;;
 esac
 exit 0
@@ -209,6 +210,55 @@ fresh; stats 3600 > "$TMP/journal"; run
 stats 120 > "$TMP/journal"; run
 check "process restart is silent" silent
 
+# 6b. ...and a DISCRIMINATING version of it. The scenario above has every
+#     watched gauge at 0 in both lines, so it passes whether or not the restart
+#     is detected at all — deleting the reset left it green. Here the old
+#     process carries a non-zero counter and the new one is LOWER but non-zero:
+#     with the restart seen, the baseline drops to 0 and the fresh value is a
+#     +2 that must page; without it, min(5,2) makes the delta 0 and the alarm
+#     is silent about a fresh process that already cannot explain two fills.
+fresh; stats 3600 fills_unattributed=5 > "$TMP/journal"; run
+cooldown_clear
+stats 120 fills_unattributed=2 > "$TMP/journal"; run
+check "a restart re-bases counters against 0, not against the dead process" \
+  "fills_unattributed +2 (now 2, process restarted)"
+
+# 6c. The restart that elapsed_s ALONE cannot see, which is a false PAGE rather
+#     than a missed one — the sustain streak is inherited by a brand-new
+#     process. Driven through the evaluator before the fix: process sampled at
+#     elapsed_s 60 and 120 holding at 2 (streak 1, 2), killed, and the
+#     REPLACEMENT's first sample at 290 is HIGHER, so no restart was detected,
+#     the streak advanced to 3, and a fresh process paged on its first
+#     observation. systemd's InvocationID is what makes it exact.
+#     The elapsed_s values here are deliberately LARGE. An earlier version of
+#     this test used 60/120/290, which passed with the InvocationID ignored
+#     entirely — the span requirement blocked it on its own, so the test proved
+#     nothing about the mechanism it was written for. These span 600s, which
+#     SATISFIES the span rule, leaving the process identity as the only thing
+#     that can tell the two runs apart.
+fresh
+export STUB_INVOCATION=1111111111111111111111111111111a
+stats 1000 cancels_unresolved=2 > "$TMP/journal"; run
+stats 1300 cancels_unresolved=2 > "$TMP/journal"; run
+export STUB_INVOCATION=2222222222222222222222222222222b   # a different process
+stats 1600 cancels_unresolved=2 > "$TMP/journal"; run
+check "a new InvocationID resets the streak a dead process built" silent
+
+# 6d. The same discriminator on the RISE side, where the failure is a MISSED
+#     alarm rather than a false one: a replacement process that already cannot
+#     explain three fills reads as "no change" against the dead process's 5,
+#     because min(5,3) makes the delta 0. elapsed_s cannot see this restart —
+#     290 is greater than 60 — so only the InvocationID saves it.
+fresh
+export STUB_INVOCATION=3333333333333333333333333333333c
+stats 60 fills_unattributed=5 > "$TMP/journal"; run
+cooldown_clear
+export STUB_INVOCATION=4444444444444444444444444444444d
+stats 290 fills_unattributed=3 > "$TMP/journal"; run
+check "a fresh process's own unexplained fills are not masked by the dead one" \
+  "fills_unattributed +3 (now 3, process restarted)"
+unset STUB_INVOCATION
+
 # 7. Rate gauges: below threshold silent, above it pages.
 # exec_failed's all-time armed max is 4, but those 4 were a BURST inside
 # seconds; a burst rate says nothing about a 5-minute total. 60 is a rate at
@@ -228,8 +278,8 @@ check "exec_failed +100 pages" "exec_failed +100"
 # both, the first page silences the remaining seven polls and the test passes
 # against a rule that is firing on half of them.
 fresh; : > "$STUB_POSTS"
-for e in 300 360 420 480 540 600 660 720; do
-  case $e in 360|480|600|720) v=2 ;; *) v=0 ;; esac
+for e in 300 600 900 1200 1500 1800 2100 2400; do
+  case $e in 600|1200|1800|2400) v=2 ;; *) v=0 ;; esac
   stats $e cancels_unresolved=$v > "$TMP/journal"
   cooldown_clear
   ( cd "$ROOT" && ./scripts/freshness_check.sh >"$TMP/stdout" 2>"$TMP/stderr" )
@@ -241,13 +291,13 @@ check_absent "an oscillating cancels_unresolved (0,2,0,2 x4) never pages" "cance
 # down"), and a rise rule is structurally blind to it.
 fresh
 stats 300 cancels_unresolved=2 > "$TMP/journal"; run
-check "sustained poll 1 of 3 is silent" silent
-stats 360 cancels_unresolved=2 > "$TMP/journal"; run
-check "sustained poll 2 of 3 is silent" silent
-stats 420 cancels_unresolved=2 > "$TMP/journal"; run
-check "sustained poll 3 of 3 pages" "held at 2 across 3 consecutive checks"
-check "...reporting the real span, not an implied one" "spanning 120s of engine uptime"
-cooldown_clear; stats 480 cancels_unresolved=2 > "$TMP/journal"; run
+check "sustained sample 1 of 3 is silent" silent
+stats 600 cancels_unresolved=2 > "$TMP/journal"; run
+check "sustained sample 2 of 3 is silent" silent
+stats 900 cancels_unresolved=2 > "$TMP/journal"; run
+check "sustained sample 3 of 3 pages" "held at 2 across 3 consecutive samples"
+check "...reporting the real span, not an implied one" "spanning 600s of engine uptime"
+cooldown_clear; stats 1200 cancels_unresolved=2 > "$TMP/journal"; run
 check "...and does not page again while it persists" silent
 
 # A SKIPPED poll must BREAK the run, not bridge it. Measured before this was
@@ -282,8 +332,43 @@ for e in 300 600 900 1200 1500 1800 2100; do
   ( cd "$ROOT" && ./scripts/freshness_check.sh >"$TMP/stdout" 2>"$TMP/stderr" )
   echo $? > "$TMP/rc"
 done
-check_absent "a level that dips below the bar every poll never sustains" \
-  "cancels_unresolved has held"
+check_absent "a level that dips below the bar every poll never sustains the PAGE" \
+  "has held at 2"
+
+# Counting SAMPLES alone is not enough: the watchdog timer is Persistent=true,
+# so missed activations fire back to back after a suspend or a boot. Three such
+# runs used to satisfy a rule that is supposed to mean "this did not clear in a
+# quarter of an hour" in two minutes flat.
+fresh
+stats 2000 cancels_unresolved=2 > "$TMP/journal"; run
+stats 2060 cancels_unresolved=2 > "$TMP/journal"; run
+stats 2120 cancels_unresolved=2 > "$TMP/journal"; run
+check "three catch-up samples 60s apart do NOT satisfy a 15-minute rule" silent
+stats 2420 cancels_unresolved=2 > "$TMP/journal"; run
+stats 2720 cancels_unresolved=2 > "$TMP/journal"; run
+check "...and it fires once real time has actually passed" "has held at 2 across"
+
+# The level PINNED AT EXACTLY 1 — below the paging bar for ever, and the gauge's
+# own documented failure mode ("a number that does not come back down"). It was
+# invisible until a second sustain row was added at level 1 on a one-hour
+# window, as a NOTE.
+fresh
+for i in $(seq 0 11); do
+  stats $(( 300 + 300 * i )) cancels_unresolved=1 > "$TMP/journal"; run
+done
+check "a level pinned at exactly 1 is eventually noted" "has held at 1 across 12"
+check "...at low priority, not as a page" "PRIORITY=low"
+cooldown_clear
+stats 4200 cancels_unresolved=1 > "$TMP/journal"; run
+check "...once per streak, not every poll thereafter" silent
+
+# ...and 1,3,1,3, which breaks the level-2 streak on every dip but never clears.
+fresh
+for i in $(seq 0 11); do
+  v=1; [ $(( i % 2 )) = 1 ] && v=3
+  stats $(( 300 + 300 * i )) cancels_unresolved=$v > "$TMP/journal"; run
+done
+check "1,3,1,3 never clears and is eventually noted" "has held at"
 
 # ...but the ratchet climbing past the bar DOES fire, which is the case that
 # makes the blind spot above acceptable.
@@ -301,8 +386,8 @@ check "...dated from where the contiguous run began, not the first spike" \
 
 # A slow leak, +1 per poll, never JUMPS — the case RISE cannot see at all.
 fresh
-for e in 300 360 420 480 540; do
-  stats $e cancels_unresolved=$(( (e-300)/60 )) > "$TMP/journal"; run
+for e in 300 600 900 1200 1500; do
+  stats $e cancels_unresolved=$(( (e-300)/300 )) > "$TMP/journal"; run
 done
 check "a +1-per-poll cancels_unresolved leak pages" "cancels_unresolved has held at"
 
@@ -332,6 +417,19 @@ echo "=== the gauge check reporting its own absence ==="
 fresh; stats 300 > "$TMP/journal"; run
 stats 360 fills_unattributed=DROP > "$TMP/journal"; run
 check "a vanished gauge pages" "no longer carries fills_unattributed"
+
+# ...but a gauge the running engine has NEVER emitted is not a rename, it is an
+# engine older than the gauge. Found against the live journal: the armed process
+# was started before #44 added sweeps_owed, so an undifferentiated rule pages on
+# the first poll after deployment about something nobody could have been reading
+# yet. True, and not actionable.
+fresh; stats 300 sweeps_owed=DROP > "$TMP/journal"; run
+check "a never-seen gauge is a NOTE, not a page" "has never emitted sweeps_owed"
+check "...at low priority" "PRIORITY=low"
+# ...and once the engine does emit it, losing it again IS a page.
+cooldown_clear; stats 600 > "$TMP/journal"; run
+cooldown_clear; stats 900 sweeps_owed=DROP > "$TMP/journal"; run
+check "...but once seen, losing it pages" "no longer carries sweeps_owed"
 
 # 10. The engine is up but has stopped printing.
 fresh; : > "$TMP/journal"; run
