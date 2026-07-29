@@ -1050,20 +1050,23 @@ fn an_order_that_never_becomes_visible_fails_and_is_still_cancelled() {
 /// the ids, ticker, prices and fees are synthetic. What is reproduced from the
 /// venue is the field SET (every key the dump has, including the ones this
 /// parser ignores) and the one property the reconciliation depends on: a single
-/// order filled in two FRACTIONAL pieces that sum to its whole size.
+/// order filled in two FRACTIONAL pieces that sum to its whole size. `ts` is
+/// synthetic too, and consistent with `created_time`: on every row of the live
+/// dump the two agree exactly, and a fixture whose whole value is being
+/// EVIDENCE must not contradict the rows it stands in for.
 const LIVE_FILLS: &str = r#"{"fills":[
  {"action":"sell","book_side":"ask","count_fp":"2.13","created_time":"2026-01-01T00:00:00.000000Z",
   "fee_cost":"0.010000","fill_id":"fill-a","is_taker":true,
   "market_ticker":"KXSHAPE-TEST","no_price_dollars":"0.5000",
   "order_id":"order-1","outcome_side":"no","side":"no",
   "subaccount_number":0,"ticker":"KXSHAPE-TEST",
-  "trade_id":"fill-a","ts":1784878633,"yes_price_dollars":"0.5000"},
+  "trade_id":"fill-a","ts":1767225600,"yes_price_dollars":"0.5000"},
  {"action":"sell","book_side":"ask","count_fp":"1.87","created_time":"2026-01-01T00:00:00.000000Z",
   "fee_cost":"0.010000","fill_id":"fill-b","is_taker":true,
   "market_ticker":"KXSHAPE-TEST","no_price_dollars":"0.5000",
   "order_id":"order-1","outcome_side":"no","side":"no",
   "subaccount_number":0,"ticker":"KXSHAPE-TEST",
-  "trade_id":"fill-b","ts":1784878633,"yes_price_dollars":"0.5000"}
+  "trade_id":"fill-b","ts":1767225600,"yes_price_dollars":"0.5000"}
 ]}"#;
 
 /// K6: the row shape parses, and the two fields the reconciliation is FOR —
@@ -1163,6 +1166,25 @@ fn an_ascending_page_is_not_early_stopped() {
         vec!["t3", "t4"],
         "the in-window rows are on the LAST page when the venue sorts ascending"
     );
+}
+
+/// A page whose rows all share a timestamp proves nothing either: it is
+/// simultaneously non-increasing and non-decreasing, so it is evidence of
+/// neither direction. Equal-`ts` runs are ordinary here — a fill split across
+/// price levels reports its pieces on the same second, which is exactly what
+/// the row-shape fixture above is.
+#[test]
+fn a_constant_timestamp_page_does_not_prove_the_order() {
+    let page1 = r#"{"fills":[
+      {"trade_id":"t1","order_id":"o1","count_fp":"1.00","ts":100},
+      {"trade_id":"t2","order_id":"o1","count_fp":"1.00","ts":100}
+    ],"cursor":"more"}"#;
+    let page2 = r#"{"fills":[{"trade_id":"t3","order_id":"o1","count_fp":"1.00","ts":300}]}"#;
+    let g = gw(vec![(200, page1), (200, page2)]);
+    let rows = g.fills_since(200).expect("page");
+    assert_eq!(g.transport.sent().len(), 2, "a flat page is not a descending page");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].trade_id, "t3");
 }
 
 /// A single-row page proves nothing about sort order either, so it must not

@@ -263,11 +263,18 @@ impl<T: Transport> KalshiGateway<T> {
             // merge makes an extra row free; a missing one is a fill nobody
             // hedges.
             //
-            // Two or more rows, non-increasing, and one of them already outside
-            // the window: only then is "no later page can help" a fact rather
-            // than a guess. A one-row page proves nothing about order.
+            // Two or more rows, non-increasing, AT LEAST ONE STRICT DECREASE,
+            // and one of them already outside the window: only then is "no
+            // later page can help" a fact rather than a guess.
+            //
+            // The strict decrease is not pedantry. Equal timestamps are common
+            // here — a fill split across price levels reports its pieces on the
+            // same second — and a page whose `ts` never changes is
+            // simultaneously non-increasing and non-decreasing, i.e. evidence
+            // of neither direction. A one-row page proves nothing either.
             let descending = page.fills.len() >= 2
-                && page.fills.windows(2).all(|w| w[0].ts >= w[1].ts);
+                && page.fills.windows(2).all(|w| w[0].ts >= w[1].ts)
+                && page.fills.windows(2).any(|w| w[0].ts > w[1].ts);
             let has_older = page.fills.iter().any(|f| f.ts != 0 && f.ts < min_ts);
             out.extend(page.fills.into_iter().filter(|f| f.ts == 0 || f.ts >= min_ts));
             if descending && has_older {

@@ -368,9 +368,18 @@ pub fn kalshi_reconcile_failures() -> u64 {
 /// A REST read that simply LAGS the socket trips this too — Kalshi is not
 /// read-your-writes (`Settle::retry_404`) — and that is fine: both causes want
 /// the same response, which is to merge nothing for that order and try again on
-/// the next reconnect. Transient single counts are lag. A number that climbs
-/// with the fill rate is the id spaces differing, and it means this whole
-/// mechanism is inert rather than dangerous.
+/// the next reconnect.
+///
+/// THIS GAUGE CANNOT TELL THE TWO APART, and an earlier version of this comment
+/// claimed it could ("lag is transient, a mismatch climbs with the fill rate").
+/// Both climb with the fill rate. The reconciliation fires immediately after
+/// resubscribe, which is exactly when a post-gap burst is landing, so on a busy
+/// account lag-driven rejections are expected rather than alarming. What
+/// separates them is the OTHER gauges: under lag, `kalshi_fills_recovered`
+/// keeps moving, because the orders that were not racing still merge. A run
+/// where rejections climb while recovered stays pinned at zero is the id spaces
+/// differing — and that means this mechanism is inert rather than dangerous,
+/// which is the property it exists to guarantee.
 static KALSHI_RECONCILE_REJECTED: AtomicU64 = AtomicU64::new(0);
 
 pub fn kalshi_reconcile_rejected() -> u64 {
@@ -580,11 +589,32 @@ impl KalshiFills {
     /// exceeds the venue's own total for that order, the ids are not merging
     /// the way the design assumes and this refuses to touch the order at all.
     pub fn merge_venue(&mut self, rows: &[arb_venue::resp::KalshiFillRow]) -> Vec<String> {
-        use std::collections::HashMap;
+        use std::collections::{HashMap, HashSet};
+        // ONE ROW PER TRADE, before anything counts them.
+        //
+        // The guard below reduces to `local > (already-seen rows)`, which is
+        // only an invariant while that second term is a sum over DISTINCT
+        // fills. A row repeated inside this page set would add to the venue
+        // total on both passes and to the projection on neither — because its
+        // trade_id is already spent — so each repeat would LOOSEN the guard by
+        // exactly its own size, and under a foreign id space the already-seen
+        // total is precisely the quantity the guard fires on.
+        //
+        // Repeats are not exotic: this walks a cursor over a list that grows at
+        // the head, at the moment a post-gap burst is landing, and it takes two
+        // pages as soon as the process's own window holds more than one page of
+        // fills. Whether Kalshi's cursor actually repeats a row across pages is
+        // unprobed — which is the point. Checking is free from rows already in
+        // hand, and this is the same assumption the walk in
+        // `KalshiGateway::fills_since` refuses to make about sort order.
+        let mut in_page: HashSet<&str> = HashSet::new();
+        let rows: Vec<&arb_venue::resp::KalshiFillRow> =
+            rows.iter().filter(|r| in_page.insert(r.trade_id.as_str())).collect();
+
         // The venue's own total per order, and what merging would make ours.
         let mut venue: HashMap<&str, i64> = HashMap::new();
         let mut projected: HashMap<&str, i64> = HashMap::new();
-        for r in rows {
+        for r in &rows {
             let Some(n) = count_fp_hundredths(&r.count_fp).filter(|n| *n > 0) else { continue };
             *venue.entry(&r.order_id).or_insert(0) += n;
             if !self.seen.contains(&r.trade_id) {
@@ -1216,7 +1246,7 @@ mod kalshi_tests {
             count_fp: count.into(),
             market_ticker: Some("KXTEST".into()),
             ticker: None,
-            ts: 1_784_878_633,
+            ts: 1_767_225_600,
         }
     }
 
@@ -1327,6 +1357,59 @@ mod kalshi_tests {
         assert_eq!(v["cum"], 15, "12 + 3 — not 24 + 3");
     }
 
+    /// ...and a row REPEATED inside the page set must not buy the merge past
+    /// that guard.
+    ///
+    /// The guard reduces to `local > (already-seen rows)`, which is an
+    /// invariant only while the second term is a sum over DISTINCT fills. A
+    /// repeat adds to the venue total on both passes and to the projection on
+    /// neither — its trade_id is already spent — so it loosens the guard by
+    /// exactly its own size, and under a foreign id space that is precisely
+    /// the quantity being tested against.
+    ///
+    /// The trace, and none of it is exotic: gap #1 loses an order's first fill,
+    /// the reconciliation recovers it (`local` is 0, so the guard correctly
+    /// cannot fire); the socket returns and delivers genuinely new contracts;
+    /// gap #2's walk takes two pages — which it does as soon as the process's
+    /// own window holds more than one page of fills — and they overlap, the
+    /// ordinary artifact of paging a list that grows at the head while a
+    /// post-gap burst is landing. Whether Kalshi's cursor really repeats a row
+    /// is unprobed, which is the reason to check rather than assume.
+    #[test]
+    fn a_row_repeated_across_pages_cannot_loosen_the_guard() {
+        let _g = COUNTER.lock();
+        let mut s = KalshiFills::default();
+        let mut fl = arb_core::fill::FillLedger::new();
+        fl.register_order("o1", "KXTEST", 25, None);
+        let mut total = 0;
+
+        // Gap #1 missed o1's first fill entirely. `local` is 0, so the guard
+        // cannot fire and the recovery goes through — correctly.
+        let lines = s.merge_venue(&[row("rest-b", "o1", "5.00")]);
+        total += hedged(&mut fl, "o1", &lines[0]);
+        assert_eq!(total, 5, "the terminal case still reconciles");
+
+        // The socket returns and delivers 5 genuinely new contracts. Under a
+        // FOREIGN id space the venue will report that same fill as `rest-a`.
+        total += hedged(&mut fl, "o1", &s.line(&frame("ws-a", "o1", "5.00")).unwrap());
+        assert_eq!(total, 10);
+
+        // Gap #2. Two pages, overlapping on the row already merged in step 1.
+        let before = kalshi_reconcile_rejected();
+        let lines = s.merge_venue(&[
+            row("rest-b", "o1", "5.00"),
+            row("rest-b", "o1", "5.00"), // the repeat
+            row("rest-a", "o1", "5.00"),
+        ]);
+        assert!(lines.is_empty(), "the repeat must not pay for the merge");
+        assert_eq!(kalshi_reconcile_rejected(), before + 1, "it is a refusal, and counted");
+
+        // ...and the ledger never saw a second helping of those 5 contracts.
+        assert_eq!(total, 10, "10 filled, 10 hedged — not 15");
+        let v: Value = serde_json::from_str(&s.line(&frame("ws-c", "o1", "2.00")).unwrap()).unwrap();
+        assert_eq!(v["cum"], 12, "the running total is untouched by the refusal");
+    }
+
     /// The guard must not fire on the case the repair exists FOR: an order
     /// whose fills the socket never saw at all projects to exactly the venue's
     /// own total, which is not an excess.
@@ -1377,8 +1460,8 @@ mod kalshi_tests {
 
     /// Fractional pieces merge like whole ones, and the count that reaches the
     /// engine is still the floor. `2.13` over the socket plus `1.87` recovered
-    /// is the venue's 4 — the real `d538e727` 4-lot, split across the two
-    /// sources.
+    /// is the venue's 4 — the same real 4-lot the parser tests use, split across
+    /// the two sources.
     #[test]
     fn a_recovered_fractional_piece_completes_its_sibling() {
         let _g = COUNTER.lock();
