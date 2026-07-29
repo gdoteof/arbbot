@@ -219,6 +219,10 @@ struct Engine {
     /// what the recorder says about the venues: a bench tape cannot disconnect,
     /// a socket can and did (ten times on 2026-07-28).
     link: Link,
+    /// Last `stale_seconds_total` read per required feed. Differencing that
+    /// monotone counter is what makes the health check a DETECTOR rather than a
+    /// five-second sampler over a one-second flag — see `feed_stale_reason`.
+    stale_seen: HashMap<String, f64>,
     last_now: f64,
     chan_hw: usize,
     fills: FillLedger,
@@ -338,6 +342,7 @@ impl Engine {
             killed: false,
             feed_reason,
             link,
+            stale_seen: HashMap::new(),
             last_now: 0.0,
             chan_hw: 0,
             fills: FillLedger::new(),
