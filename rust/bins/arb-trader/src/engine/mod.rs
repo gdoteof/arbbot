@@ -661,12 +661,25 @@ impl Engine {
                 // cancel is parked when it is decided and discharged only when
                 // the venue answers — see `cancel::resolve_cancel`.
                 let owed = cancel::cancel_target(&it).map(str::to_string);
+                // For a hedge RETRY, the attempt it supersedes. Only hedge
+                // attempts are in `hedge_orders`, so this is `None` for every
+                // other place — and for a first attempt, which supersedes
+                // nothing. See `HedgeOrder::supersedes`: without it a lost fill
+                // frame turns one hedge into two.
+                let supersedes = match &it {
+                    Intent::Place(p) => self
+                        .hedge_orders
+                        .get(&p.order_id)
+                        .and_then(|h| h.supersedes.clone()),
+                    _ => None,
+                };
                 for action in intent_actions(
                     &it,
                     self.cfg.armed,
                     &self.oid_venue,
                     &mut self.parked_cancels,
                     now,
+                    supersedes.as_deref(),
                 ) {
                     let is_cancel = matches!(action, Action::Cancel { .. });
                     let queued = self.dispatch(venue, action);
@@ -2015,7 +2028,7 @@ mod feed_wiring_tests {
                 cmds.push(match c.action {
                     Action::SweepAndVerify => "sweep",
                     Action::Cancel { .. } => "cancel",
-                    Action::Place(_) => "place",
+                    Action::Place { .. } => "place",
                 });
             }
             out.push((*v, cmds));

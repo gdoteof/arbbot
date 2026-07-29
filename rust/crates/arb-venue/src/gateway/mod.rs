@@ -201,6 +201,16 @@ pub trait VenueGateway {
     /// The venue's own id for an order. Kalshi spells it `order_id`, PM-US
     /// spells it `id`; callers that work across venues need one name.
     fn order_id(order: &Self::Order) -> String;
+    /// Cumulative contracts the venue reports FILLED on an order. Kalshi spells
+    /// it `fill_count_fp`, PM-US `cumQuantity`; a caller asking "did this order
+    /// trade?" across venues needs one name, exactly as [`Self::order_id`] does.
+    ///
+    /// WHOLE contracts, so it FLOORS: Kalshi's count is fractional on about a
+    /// tenth of live fills and the engine hedges whole contracts. That matches
+    /// what the private fill feed reports for the same order
+    /// (`arb-trader/src/fills.rs`, `count_fp_hundredths`), so the two sources
+    /// cannot disagree about an order merely by rounding it differently.
+    fn order_filled_qty(order: &Self::Order) -> i64;
     fn order_status(&self, order_id: &str) -> Result<Self::Order, VenueError>;
     /// Cancel every RESTING order THIS STACK owns (kill-switch sweep) — see
     /// [`is_ours`] for what that means and why it is not "this process".

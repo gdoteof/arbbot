@@ -188,6 +188,10 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
         order.id.clone()
     }
 
+    fn order_filled_qty(order: &Self::Order) -> i64 {
+        order.filled_qty()
+    }
+
     /// POST /v1/order/{id}/cancel, with the marketSlug in the BODY.
     ///
     /// Three things differ from Kalshi and all three are deliberate:

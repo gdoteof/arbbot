@@ -616,6 +616,10 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
         order.order_id.clone()
     }
 
+    fn order_filled_qty(order: &Self::Order) -> i64 {
+        order.filled_qty()
+    }
+
     fn fills_since(&self, min_ts: i64) -> Result<Vec<resp::KalshiFillRow>, VenueError> {
         KalshiGateway::fills_since(self, min_ts)
     }

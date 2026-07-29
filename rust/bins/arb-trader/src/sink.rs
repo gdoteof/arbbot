@@ -294,6 +294,19 @@ pub trait OrderSink: Send + Sync {
     fn fills_since(&self, _min_ts: i64) -> Result<Vec<arb_venue::resp::KalshiFillRow>, VenueError> {
         Ok(Vec::new())
     }
+    /// Contracts the venue reports FILLED on ONE order we already sent — venue
+    /// truth for a single order, where `fills_since` is venue truth for a
+    /// window. See [`prior_attempt`] for the one thing that asks.
+    ///
+    /// The default REFUSES rather than answering 0, and that asymmetry is the
+    /// whole point. Every other default on this trait is inert because its
+    /// caller can safely do nothing (`recover_place` -> no recovery,
+    /// `fills_since` -> no history). Here "0" is not inert: it is an
+    /// affirmative claim that the order did not trade, and the caller acts on
+    /// it by sending another order. A sink that cannot answer must say so.
+    fn filled_qty(&self, _order_id: &str) -> Result<i64, VenueError> {
+        Err(VenueError::NotWired)
+    }
 }
 
 /// Every gateway is a sink. The adapter is the same four delegations for both
@@ -329,6 +342,69 @@ where
     }
     fn fills_since(&self, min_ts: i64) -> Result<Vec<arb_venue::resp::KalshiFillRow>, VenueError> {
         VenueGateway::fills_since(self, min_ts)
+    }
+    fn filled_qty(&self, order_id: &str) -> Result<i64, VenueError> {
+        VenueGateway::order_status(self, order_id).map(|o| G::order_filled_qty(&o))
+    }
+}
+
+/// What the venue says about the hedge attempt a retry is about to supersede.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PriorAttempt {
+    /// The venue filled nothing on it. The retry is safe to send.
+    Unfilled,
+    /// It FILLED. Those contracts are ours whether or not the fill frame ever
+    /// arrived, so re-placing on top of them is a double hedge.
+    Filled(i64),
+    /// The venue could not be asked. NOT the same as `Unfilled` — see
+    /// [`OrderSink::filled_qty`].
+    Unreadable(String),
+}
+
+/// Ask the venue whether the attempt a hedge retry supersedes actually filled.
+///
+/// THE DEFECT THIS CLOSES. A hedge is deliberately absent from the
+/// `FillLedger` — registering one would let its own fill mint another hedge,
+/// forever (`engine/fill.rs`) — so nothing but the fill FEED can tell the
+/// engine that a hedge attempt traded. Lose that one frame and the obligation
+/// still reads unhedged, the retry re-places, and both orders fill: long
+/// against our own short, which is the directional exposure the whole hedge
+/// path exists to avoid. `hedges_overfilled` cannot see it either, because the
+/// second fill is credited to an obligation that has already been discharged by
+/// the first — the engine's own boot banner says it would still read 0.
+///
+/// A lost frame is not hypothetical: `kalshi_fill_gaps` counts the windows it
+/// happens in, and the Kalshi fill channel sums per-fill DELTAS, so a frame
+/// missed while the socket was dark leaves the running total permanently short
+/// (`fills.rs`). The reconciliation added with that gauge recovers the fill —
+/// but on RECONNECT, deferred up to `RECONCILE_MIN_INTERVAL`, while the retry
+/// becomes due on `hedge_retry.interval_s`. It repairs the accounting after the
+/// fact; it cannot get there first. This can, because it happens on the same
+/// executor command as the place it gates.
+///
+/// FAIL-CLOSED on an unreadable answer, and that is a real trade: an obligation
+/// whose verification keeps failing is never re-placed and stays naked. It is
+/// the right way round anyway — waiting is already this engine's policy when it
+/// cannot hedge profitably (`hedge_plan` -> `Wait`), waiting is alarmed
+/// (`hedges_naked`), and a double hedge is neither.
+///
+/// `Priority::Background` all the way down (`order_status` on both gateways):
+/// it is metered against the shared read budget rather than the order path, so
+/// it can never take a token the CANCEL path needed. The cost is one extra
+/// venue read, and one extra round trip of naked time, per hedge RETRY — never
+/// per tick and never on a first attempt, which is the only attempt most
+/// obligations ever have.
+pub async fn prior_attempt(
+    sink: std::sync::Arc<dyn OrderSink>,
+    venue_order_id: String,
+) -> PriorAttempt {
+    // The gateways block; running one on this worker would stall every other
+    // task on it — the same reason every other venue call here is spawned.
+    match tokio::task::spawn_blocking(move || sink.filled_qty(&venue_order_id)).await {
+        Ok(Ok(0)) => PriorAttempt::Unfilled,
+        Ok(Ok(n)) => PriorAttempt::Filled(n),
+        Ok(Err(e)) => PriorAttempt::Unreadable(e.to_string()),
+        Err(e) => PriorAttempt::Unreadable(format!("verification task panicked: {e}")),
     }
 }
 

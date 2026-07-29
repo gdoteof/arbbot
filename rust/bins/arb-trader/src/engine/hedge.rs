@@ -173,6 +173,24 @@ pub(super) struct HedgeOrder {
     /// reports are cumulative and arrive over several frames, so only the
     /// increase is credited — the same rule `arb_core::fill` applies to makers.
     pub(super) cum_filled: i64,
+    /// OUR id for the attempt this one supersedes — `None` for the first in a
+    /// chain, which supersedes nothing.
+    ///
+    /// It exists because the retry cannot be trusted to know that attempt is
+    /// dead. A hedge is never in the `FillLedger` (registering one would let
+    /// its own fill mint another hedge), so the fill FEED is the only thing
+    /// that can say an attempt traded — and a Kalshi frame lost while the
+    /// socket was dark is exactly what `kalshi_fill_gaps` counts. With the
+    /// frame gone `filled` stays short, this retry re-places, and BOTH orders
+    /// fill: long against our own short. `hedges_overfilled` does not catch it,
+    /// because the second fill is credited to an obligation the first already
+    /// discharged.
+    ///
+    /// So the executor asks the venue about this id before sending the retry —
+    /// see `sink::prior_attempt`. Kept here rather than on `PendingHedge`
+    /// because the obligation outlives its attempts and this is a fact about
+    /// ONE attempt; `drain_intents` reads it back out by the place's order id.
+    pub(super) supersedes: Option<String>,
 }
 
 /// The order side that TAKES `book_side` of the hedge leg's book: taking a bid
@@ -597,6 +615,12 @@ impl Engine {
                     let Some(p) = self.pending_hedges.get_mut(&chain) else { continue };
                     p.tries += 1;
                     p.last_try_at = mono;
+                    // The attempt this one supersedes, captured BEFORE
+                    // `latest_attempt` moves on. Every retry gets a FRESH
+                    // client_order_id, so the venue sees two unrelated orders
+                    // and would happily fill both — its `409
+                    // order_already_exists` cannot save us here.
+                    let supersedes = p.latest_attempt.clone();
                     // This attempt becomes the one whose `order_ack` the
                     // ack-hold waits for, and it gets its own hold line:
                     // a new attempt is a new ack that can go missing.
@@ -612,6 +636,7 @@ impl Engine {
                         price: price.clone(),
                         qty,
                         cum_filled: 0,
+                        supersedes,
                     };
                     self.n_retry += 1;
                     eprintln!(
@@ -1480,6 +1505,7 @@ mod hedge_accounting_tests {
             price: "0.40".into(),
             qty: 10,
             cum_filled: 0,
+            supersedes: None,
         };
         let f1 = hedge_credit(4, 10, 0, Some((10, 0)));
         let f2 = hedge_credit(10, 10, 4, Some((10, 4)));
@@ -1730,6 +1756,25 @@ mod hedge_tick_tests {
         assert_eq!((ho.qty, ho.cum_filled), (5, 0));
         assert_eq!(ho.side, BookSide::Ask, "taking a bid SELLS");
         assert_eq!(e.n_retry, 1);
+        // ...and it records WHICH attempt it supersedes, captured before
+        // `latest_attempt` moved on. That is the id the executor asks the venue
+        // about before this retry is allowed on the wire: h1 is an IOC that may
+        // have filled with its fill frame lost, and re-placing over it is how
+        // one 5-lot hedge becomes 10 — long against our own short, with
+        // `hedges_overfilled` still reading 0 because the second fill is
+        // credited to an obligation the first already discharged.
+        assert_eq!(
+            ho.supersedes.as_deref(),
+            Some("h1"),
+            "the retry must name the attempt whose fate is unknown"
+        );
+        // A THIRD attempt supersedes the second, not the first: each attempt is
+        // verified before the next goes out, so the chain stays covered.
+        e.apply_hedge_plans(
+            vec![("h1".into(), HedgePlan::Retry { qty: 5, price: "0.40".into() }, None)],
+            after(t, 12.0),
+        );
+        assert_eq!(e.hedge_orders["h3"].supersedes.as_deref(), Some("h2"));
 
         // ...and a Retire really retires, while leaving the attempts behind
         e.apply_hedge_plans(vec![("h1".into(), HedgePlan::Retire, None)], mono);
