@@ -373,6 +373,28 @@ pub enum PriorAttempt {
 /// second fill is credited to an obligation that has already been discharged by
 /// the first — the engine's own boot banner says it would still read 0.
 ///
+/// NOT THE SAME DEFECT AS A LOST ACK, though they end identically. There are
+/// three ways one obligation buys its hedge twice, and only the third is this:
+///
+///   1. the ack is LATE and the fill beats it. The fill is held in
+///      `unclaimed_fills` and replayed by `on_order_ack` the moment the ack
+///      names it; the retry additionally defers via `HedgePlan::HoldForAck`.
+///      Already handled — and the incident that bought that handling is
+///      recorded verbatim at that replay (an ack merely 48 ms late).
+///   2. the ack NEVER comes, because the place's own answer was lost. The held
+///      fill is then never replayed and expires unattributable. That is the
+///      executor's `recover_place` path, which runs ONLY when
+///      `place_answer_was_lost`, and which recovers the venue id so case 1's
+///      replay can finally happen.
+///   3. THIS ONE: the ack landed, and the FILL FRAME is what went missing.
+///      Nothing is held, so there is nothing for any ack to replay, and no id
+///      needs recovering because the id was never lost. The obligation simply
+///      reads short forever, and only venue truth about that order can say so.
+///
+/// The three are disjoint at the mechanism and this handles only the third. It
+/// is also why the resolution below is by ORDER STATUS and not by anything in
+/// `unclaimed_fills`: there is no local trace of this fill to consult.
+///
 /// A lost frame is not hypothetical: `kalshi_fill_gaps` counts the windows it
 /// happens in, and the Kalshi fill channel sums per-fill DELTAS, so a frame
 /// missed while the socket was dark leaves the running total permanently short
@@ -394,6 +416,12 @@ pub enum PriorAttempt {
 /// venue read, and one extra round trip of naked time, per hedge RETRY — never
 /// per tick and never on a first attempt, which is the only attempt most
 /// obligations ever have.
+///
+/// ONE request, not a walk: `order_status` is the single-order GET, so this
+/// costs nothing like the paged `/portfolio/orders` history a lookup by
+/// `client_order_id` has to page through. We can address the order directly
+/// precisely because case 2 above did not happen — its ack landed, so the venue
+/// gave us its id.
 pub async fn prior_attempt(
     sink: std::sync::Arc<dyn OrderSink>,
     venue_order_id: String,

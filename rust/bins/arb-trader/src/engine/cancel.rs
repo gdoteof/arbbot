@@ -453,11 +453,18 @@ fn cancel_work(
 /// `supersedes` is OUR id for the hedge attempt this place replaces, or `None`
 /// for everything else. It is resolved to the VENUE's id here — the same map
 /// and the same reason `resolve_cancel` needs it, since the executor can only
-/// ask the venue about an id the venue issued. An attempt whose `order_ack`
-/// never landed has no venue id, so the place goes out UNVERIFIED: that is the
-/// permanently-lost-ack case `hedge_plan`'s ack-hold already names as the one
-/// it cannot close, and refusing the place instead would strand the leg for
-/// good rather than for 15s.
+/// ask the venue about an id the venue issued.
+///
+/// An attempt whose `order_ack` never landed has no venue id, so the place goes
+/// out UNVERIFIED. That is deliberately somebody else's defect: it is the
+/// permanently-lost-ack case `hedge_plan`'s ack-hold names as the one it cannot
+/// close, and the remedy is to RECOVER the id (the executor's `recover_place`
+/// path, which runs only when the place's own answer was lost), not to refuse
+/// here — refusing would strand the leg for good rather than for 15s. When that
+/// recovery lands, this map is populated after the fact and the verification
+/// starts covering those attempts too, at no cost: a fill already replayed
+/// through `on_order_ack` credits the obligation, and re-reading the same
+/// cumulative total is a zero delta at `hedge_credit`.
 pub(super) fn intent_actions(
     intent: &Intent,
     armed: bool,
