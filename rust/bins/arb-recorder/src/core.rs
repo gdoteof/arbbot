@@ -69,8 +69,12 @@ pub fn dec_string(v: &serde_json::Value) -> Option<String> {
 fn warn_composite(v: &serde_json::Value) {
     static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        let mut shape = v.to_string();
-        shape.truncate(300);
+        // `chars().take()`, not `String::truncate` — truncate panics unless the
+        // byte offset lands on a char boundary, and venue payloads carry
+        // non-ASCII (market titles, subject names). A diagnostic that can panic
+        // inside the feed loop is worse than the defect it reports. Same
+        // spelling as `gateway/pmus.rs`'s raw-body diagnostic.
+        let shape: String = v.to_string().chars().take(300).collect();
         eprintln!(
             "[recorder] a venue sent a COMPOSITE where a scalar belongs: {shape}\n\
              [recorder] the field/level/event is being DROPPED rather than written to the tape \
