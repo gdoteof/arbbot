@@ -503,7 +503,6 @@ impl Engine {
         &mut self,
         v: &serde_json::Value,
         ts_local_ns: i64,
-        t_read: std::time::Instant,
     ) {
         if let (Some(ours), Some(theirs)) = (
             v.get("order_id").and_then(|x| x.as_str()),
@@ -569,7 +568,6 @@ impl Engine {
         }
         self.n_ack += 1;
         self.last_now = ts_local_ns as f64 / 1e9;
-        self.decision.record(t_read.elapsed().as_nanos() as u64);
     }
 
     /// One fill frame off the private feed.
@@ -579,7 +577,6 @@ impl Engine {
         venue: Venue,
         market_id: &str,
         ts_local_ns: i64,
-        t_read: std::time::Instant,
     ) {
         let (Some(reported), Some(cum)) = (
             v.get("order_id").and_then(|x| x.as_str()),
@@ -602,7 +599,6 @@ impl Engine {
         if !matches!(arm, FillArm::Hedge) {
             self.last_now = now;
         }
-        self.decision.record(t_read.elapsed().as_nanos() as u64);
     }
 
     /// Fills held for an `order_ack` that has not come.
@@ -838,7 +834,6 @@ mod attribute_fill_tests {
         e.on_order_ack(
             &json!({"order_id": "m1", "venue_order_id": "BH8H83AY09NG"}),
             2_000_000_000,
-            Instant::now(),
         );
         assert!(e.unclaimed_fills.is_empty(), "the held frame was claimed by its ack");
         assert_eq!(e.pending_hedges.len(), 1, "and minted the obligation it always owed");
@@ -915,7 +910,6 @@ mod attribute_fill_tests {
             Venue::PolymarketUs,
             "P",
             9_000_000_000,
-            Instant::now(),
         );
         assert_eq!(e.n_fill, 0, "a hedge fill is not a maker fill");
         assert_eq!(e.last_now, 0.0, "and a hedge frame has never advanced tape time");
@@ -928,7 +922,6 @@ mod attribute_fill_tests {
             Venue::Kalshi,
             "K",
             9_000_000_000,
-            Instant::now(),
         );
         assert_eq!(e.n_fill, 1);
         assert_eq!(e.last_now, 9.0);
@@ -939,7 +932,6 @@ mod attribute_fill_tests {
             Venue::Kalshi,
             "K",
             10_000_000_000,
-            Instant::now(),
         );
         assert_eq!(e.n_fill, 1, "a foreign fill is not ours to count");
         assert_eq!(e.last_now, 10.0);

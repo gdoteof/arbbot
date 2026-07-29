@@ -210,7 +210,108 @@ struct Engine {
     fees: FeeSchedule,
     books: BookBuilder,
     digest: Sha256,
+    /// DEQUEUE to the end of `on_feed_line` — the engine actually deciding,
+    /// with the channel wait taken out into `queue_wait` below.
+    ///
+    /// CUMULATIVE over the process, like `queue_wait` and unlike `tick` /
+    /// `slowest_tick`, which are windowed. That asymmetry is deliberate (see
+    /// `stats_tick`) and it is the reason the two windowed metrics are EMITTED
+    /// under `_window` names: side by side in one stats line, a lifetime max
+    /// and a 60-second max are indistinguishable, and reading the first as the
+    /// second is exactly the error this whole ticket was about.
     decision: Hist,
+    /// Producer stamp to DEQUEUE — how long the message sat in the channel
+    /// before the loop reached it. Split out of `decision` because `t_read` is
+    /// stamped by the PRODUCER, in `feed`'s `tx.send(..).await`, not here:
+    /// every sample of `decision` used to carry this wait inside it, so a
+    /// quiet engine behind a backlog and a genuinely slow handler produced the
+    /// same number.
+    ///
+    /// This is where the armed engine's ~3s `decision_latency` max always
+    /// lived. `spawn_feed` starts stamping at main.rs:1481 and `engine::run`
+    /// only starts draining at main.rs:1551 — with `arm_venues` and
+    /// `startup_sweep().await`, a live venue round-trip, in between. The
+    /// recorder's connect burst is therefore stamped, in full, before the
+    /// decision loop exists, and the whole of startup is charged to it. That
+    /// artifact is RETIRED: it is `queue_wait` now, and it is explained.
+    ///
+    /// **READ IT WITH `chan_high_water`, NEVER ON ITS OWN.** `queue_wait`
+    /// separates the wait from the decision. It does NOT separate a deep queue
+    /// from a loop that stopped being scheduled — both put the whole pause
+    /// into the wait, and neither is distinguishable from the other by the
+    /// number alone. The depth against the arrival rate is what discriminates:
+    /// if only the CONSUMER stalls for T seconds while the producer keeps
+    /// running at R events/s, the resuming dequeue sees ~T*R queued and
+    /// `chan_high_water` must rise by that much. If it does not, the producer
+    /// stopped too.
+    ///
+    /// That test has already been run, and it came back negative. The dry-run
+    /// unit `arbbot-trader-rs` — which has no startup cohort at all, its first
+    /// stats line being `elapsed_s: 0.0, book_events: 0, max_ns: 0,
+    /// chan_high_water: 0` — took mid-run maxima of 5.55s, 6.50s and 9.04s
+    /// across 2026-07-28/29 at a steady ~250 events/s, and `chan_high_water`
+    /// did not move for any of the three. It sat at 1036 from 20:40 on the
+    /// 28th, through the 6.50s max two hours later, through the 9.04s max at
+    /// 14:10 on the 29th, and to the end of the run. A consumer-only stall of
+    /// 9.04s at 247/s would have queued ~2200. At that run's `p50_ns: 24576` a
+    /// 1036-deep queue drains in ~25ms — it cannot hold a message for nine
+    /// seconds. So the producer paused too: these are whole-process pauses,
+    /// not a backlog and not one blocked handler.
+    ///
+    /// THREE processes, one event. The ARMED unit took its own 6.92s max in the
+    /// 60s window ending 2026-07-28T22:38:05, strictly inside the 300s window
+    /// ending 22:40:39 in which the dry-run took its 6.50s. And the Python
+    /// recorder — a separate process, which writes `data/health.jsonl` on a
+    /// fixed 1s tick with sub-ms drift — wrote nothing at all between
+    /// 22:37:26.687 and 22:37:33.977: a 7.29s gap, inside the armed unit's
+    /// window, of the same magnitude as both traders' maxima. Whatever this is,
+    /// it is not in this binary.
+    ///
+    /// It is also NOT RARE, which is what stops it being a smoking gun: across
+    /// the same 7.2-hour armed run the recorder's heartbeat has 23 gaps over
+    /// 3s, the largest 17.58s. One of them landing in any given minute is a
+    /// ~5% event, so the co-occurrence is suggestive, not decisive. It is not
+    /// the recorder's own 30s snapshot rebroadcast either: that fires every 30
+    /// iterations of the very loop that writes the heartbeat, and the gaps are
+    /// spread evenly across that cycle (their line indices mod 30 cover 0..29)
+    /// instead of clustering on it. So the recorder's stalls are unexplained
+    /// too. That is a WIDER statement of this open incident, not a second one.
+    ///
+    /// The catch-up fits too. In the minute AFTER its 6.92s max the armed unit
+    /// processed 16638 events (277/s) against 13797 and 14234 (230/s, 237/s) in
+    /// the two minutes before — yet `chan_high_water` sat flat at 1905 across
+    /// all five minutes. A backlog held in the KERNEL socket buffer rather than
+    /// in the mpsc looks exactly like that: this counter cannot see a byte until
+    /// `socket_feed` has read it, and a pause that stops the reading task is
+    /// what would put the backlog there. That is a HYPOTHESIS consistent with
+    /// the numbers, not a mechanism anyone has demonstrated — recorded so that a
+    /// flat high-water beside a multi-second wait reads as PREDICTED by it,
+    /// rather than as evidence that nothing happened.
+    ///
+    /// **Their cause is UNKNOWN and the incident is OPEN.** Nothing in this
+    /// file explains them and nothing here would survive one. A future
+    /// `queue_wait: {max_ns: 9e9}` alongside a flat `chan_high_water` is that
+    /// same unexplained event — it is NOT the retired startup artifact above,
+    /// and it is not "backlog, the benign one". Do not close it as either.
+    queue_wait: Hist,
+    /// Wall time inside ONE non-feed select arm, SINCE THE LAST STATS LINE.
+    /// `decision`/`queue_wait` only describe the feed arm, so a timer handler
+    /// that blocked the loop would show up as everyone else's queue wait and
+    /// name nobody. Windowed rather than cumulative — see `stats_tick` — and
+    /// emitted as `tick_latency_window` so the line says which it is.
+    tick: Hist,
+    /// The arm that set `tick`'s maximum in the current window, and its time.
+    /// A histogram says a tick took 6s; this says which one. Emitted as
+    /// `slowest_tick_window`.
+    ///
+    /// On a healthy line this will usually name `"stats"`, and that is correct,
+    /// not a bug to be filtered: `stats_tick` resets the window and only THEN
+    /// does `record_tick("stats", ..)` charge its own cost — the `println!` and
+    /// flush that printed the previous line — to the window that just opened.
+    /// So the stats arm is typically the only arm to have run at all so far.
+    /// `"stats"` here means "nothing else was slow"; a line naming `health`,
+    /// `tox` or `apr` is the one worth reading.
+    slowest_tick: (&'static str, u64),
     /// Intents the current decision produced, awaiting `drain_intents`.
     intents: Vec<Intent>,
     out: Option<std::io::BufWriter<std::fs::File>>,
@@ -514,6 +615,9 @@ impl Engine {
             books: BookBuilder::new(),
             digest: Sha256::new(),
             decision: Hist::new(),
+            queue_wait: Hist::new(),
+            tick: Hist::new(),
+            slowest_tick: ("none", 0),
             intents: Vec::new(),
             out,
             wal,
@@ -904,7 +1008,7 @@ impl Engine {
     /// venue while a sweep is in flight — and the sweep that re-owed it is
     /// already queued behind the one answering, so the book still gets proven
     /// and the gauge is early rather than wrong.
-    fn on_sweep_result(&mut self, v: &serde_json::Value, venue: Venue, t_read: std::time::Instant) {
+    fn on_sweep_result(&mut self, v: &serde_json::Value, venue: Venue) {
         if let Some(owed) = self.sweeps_owed.get_mut(&venue) {
             owed.in_flight = false;
             if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
@@ -913,7 +1017,6 @@ impl Engine {
                 owed.wait_ticks = sweep_backoff(owed.attempts);
             }
         }
-        self.decision.record(t_read.elapsed().as_nanos() as u64);
     }
 
     /// Re-read the research toxicity feed onto every quoter.
@@ -1131,14 +1234,61 @@ impl Engine {
             // this process had not learned.
             "exec_recovered": self.exec_stats.recovered.load(std::sync::atomic::Ordering::Relaxed),
             "chan_high_water": self.chan_hw,
+            // Four latency metrics on one line, and TWO DIFFERENT WINDOWS. The
+            // `_window` suffix is the only thing that says so, and it is on the
+            // emitted key rather than only in a doc comment because the key is
+            // what an operator reads at 3am. Without it, a `decision_latency`
+            // max pinned by startup hours ago sits beside a 60-second
+            // `tick_latency` max looking like a live 6000x discrepancy — which
+            // is a new way to make the exact misreading this ticket existed to
+            // kill. Unsuffixed = cumulative over the process.
             "decision_latency": self.decision.summary(),
+            "queue_wait": self.queue_wait.summary(),
+            "tick_latency_window": self.tick.summary(),
+            "slowest_tick_window": {"arm": self.slowest_tick.0, "ns": self.slowest_tick.1},
             "exec_hop_latency": self.exec_stats.hop.summary(),
             "elapsed_s": (elapsed * 10.0).round() / 10.0,
             "eps": if elapsed > 0.0 { (self.n_ev as f64 / elapsed) as u64 } else { 0 },
         })
     }
 
+    /// Time one non-feed select arm, and remember the worst of the window by
+    /// NAME.
+    ///
+    /// `decision`/`queue_wait` describe the feed arm only. A timer handler that
+    /// blocked the loop would spread itself over the queue wait of every
+    /// message behind it and name nobody — which is precisely the reading
+    /// `decision_latency` alone could never give.
+    fn record_tick(&mut self, arm: &'static str, t: std::time::Instant) {
+        let ns = t.elapsed().as_nanos() as u64;
+        self.tick.record(ns);
+        // The name tracks the window's maximum, not its most recent sample.
+        if ns > self.slowest_tick.1 {
+            self.slowest_tick = (arm, ns);
+        }
+    }
+
     /// One line off the feed channel. `queued` is the channel depth behind it.
+    ///
+    /// The two clocks are split HERE, around one call, rather than at each
+    /// handler's last statement — so that the thirteen paths through
+    /// `on_feed_line` that return early are measured too. The one that does the
+    /// most work is `FEED_DOWN`: it pulls every quote and ENQUEUES a cancel per
+    /// resting order — 23 of them on the 2026-07-28T20:13:06 disconnect.
+    ///
+    /// Enqueues, and no more. `pull_quotes` writes an intent line and
+    /// `try_send`s; nothing on this path awaits a venue, so what this histogram
+    /// charges the handler is microseconds. The ~1.0s that disconnect took to
+    /// clear belongs to the EXECUTOR, which drains ONE per-venue channel at
+    /// `--rate-limit` (8/s/venue) awaiting each call inline — 23 cancels at
+    /// 11-12 per venue is ~1.4s by the arithmetic in `owe_sweeps`, and the
+    /// journal splits it cleanly: FEED DOWN logged 20:13:06.983350, first
+    /// cancel completed 97ms later at 20:13:07.080657, last at 20:13:08.113269.
+    ///
+    /// So a post-PR `decision_latency: {max_ns: 1e9}` is NOT "a FEED_DOWN,
+    /// known". This handler cannot spend a second; if the metric says it did,
+    /// something else did it. Attributing a stall is the whole job of the
+    /// number — do not hand it a pre-cooked excuse.
     fn on_feed(
         &mut self,
         m: FeedMsg,
@@ -1148,14 +1298,29 @@ impl Engine {
     ) {
         self.n_ev += 1;
         self.chan_hw = self.chan_hw.max(queued);
+        // THE clock this metric was missing. `m.t_read` is the PRODUCER's stamp
+        // (`feed`'s `tx.send(..).await`), so everything before this line is time
+        // the message spent in the channel and everything after it is this
+        // engine actually deciding. Recorded apart because summing them is what
+        // made a blocked handler and a quiet feed behind a backlog the same
+        // number.
+        self.queue_wait.record(m.t_read.elapsed().as_nanos() as u64);
+        let t_deq = std::time::Instant::now();
+        self.on_feed_line(&m.line, quoters, by_market);
+        self.decision.record(t_deq.elapsed().as_nanos() as u64);
+    }
+
+    /// Route one feed line to its handler. Split out of `on_feed` only so that
+    /// its early returns cannot escape the clock above.
+    fn on_feed_line(&mut self, line: &str, quoters: &mut [Quoter], by_market: &ByMarket) {
         // THE merge point: everything that reaches the engine passes
         // here exactly once, so this is where the WAL sequence is
         // assigned — before any parsing, so lines the engine skips are
         // still in the incident record verbatim.
         if let Some(w) = self.wal.as_mut() {
-            w.append(&m.line);
+            w.append(line);
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(&m.line) else { return };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { return };
         let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
         // Feed-CONNECTION control lines (crate::feed). They ride the
         // same ordered channel as book events precisely so the pull
@@ -1180,7 +1345,7 @@ impl Engine {
         // account-wide command and names no market. It is the only thing that
         // discharges a `sweeps_owed` entry.
         if kind == "sweep_result" {
-            self.on_sweep_result(&v, venue, m.t_read);
+            self.on_sweep_result(&v, venue);
             return;
         }
         let Some(market_id) = v.get("market_id").and_then(|x| x.as_str()).map(str::to_owned) else {
@@ -1252,7 +1417,7 @@ impl Engine {
             // (arb_core::fill). `order_id` is ours (the id in the place
             // intent). Unknown kinds keep being skipped.
             "order_ack" => {
-                self.on_order_ack(&v, ts_local_ns, m.t_read);
+                self.on_order_ack(&v, ts_local_ns);
                 return;
             }
             // ...and the venue's answer to a CANCEL:
@@ -1263,11 +1428,11 @@ impl Engine {
             // is the only way the engine can learn that a cancel it owes has
             // actually been carried out — or refused.
             "cancel_result" => {
-                self.on_cancel_result(&v, m.t_read);
+                self.on_cancel_result(&v);
                 return;
             }
             "fill" => {
-                self.on_fill(&v, venue, &market_id, ts_local_ns, m.t_read);
+                self.on_fill(&v, venue, &market_id, ts_local_ns);
                 return;
             }
             _ => return,
@@ -1284,7 +1449,6 @@ impl Engine {
                 self.take_take_scan(quoters, idxs, now);
             }
         }
-        self.decision.record(m.t_read.elapsed().as_nanos() as u64);
     }
 
     /// A feed-connection control line: our own subscription came up or went
@@ -1600,6 +1764,17 @@ impl Engine {
     /// The stats line, and the take-take bar it re-derives.
     fn stats_tick(&mut self) {
         println!("{}", self.summary());
+        // The tick window closes with the line that reports it. A
+        // `tokio::time::interval`'s first tick is ready immediately, so every
+        // timer arm does its most expensive work — a cold file read apiece —
+        // inside `run`'s first budget; a process-lifetime max would name that
+        // startup tick for the rest of the run and answer "what is slow now"
+        // with "something was slow at 09:24". That is the defect this whole
+        // ticket chased, and it is not worth reintroducing under a new name.
+        // `decision`/`queue_wait` stay cumulative: their pinning is the
+        // EVIDENCE (see `Engine::queue_wait`), not a bug to be windowed away.
+        self.tick = Hist::new();
+        self.slowest_tick = ("none", 0);
         if let Some(o) = self.out.as_mut() {
             o.flush().expect("flush");
         }
@@ -1660,16 +1835,36 @@ impl Engine {
 /// deadlines at all, they are when-idle callbacks. Backlogs are structural, not
 /// hypothetical: the recorder rebroadcasts a snapshot for every book it holds
 /// every 30s and sends a ~1.4MB burst on connect, and `socket_feed` pushes all
-/// of it into the 65536-deep channel unpaced. The armed engine reported
-/// `chan_high_water: 1036` and a `decision_latency` max of 6_496_952_349 ns on
-/// 2026-07-29 — 6.5 seconds in which `data/KILL` was never stat'ed,
-/// `health_tick` did not run, and no hedge retry or naked alarm could fire. The
-/// thing that stopped the naked alarm was the market feed misbehaving, which is
-/// the one condition it exists to survive (see `engine::hedge`).
+/// of it into the 65536-deep channel unpaced. Every armed start since
+/// 2026-07-28T19:41 has reported a `chan_high_water` between 1710 and 2377 at
+/// its FIRST stats line — a real queue, and without a budget it is that many
+/// events before `data/KILL` is stat'ed, `health_tick` runs, or a hedge retry
+/// or naked alarm can fire. What would stop the naked alarm is the market feed
+/// misbehaving, which is the one condition it exists to survive (see
+/// `engine::hedge`).
 ///
-/// 64 is small enough to bound the halt at well under its 1s interval even at
-/// the drain rate that 6.5s window implies, and costs one extra loop iteration
-/// and six timer polls per 64 events — noise against a JSON parse per event.
+/// The multi-second `decision_latency` maxima are NOT that queue and must not
+/// be quoted as evidence for this budget: they were never measured at dequeue.
+/// See `Engine::queue_wait`, which now measures the two separately and says
+/// what is still unexplained.
+///
+/// Sizing it, honestly. Every figure below is PRE-PR `decision_latency`, which
+/// carried the queue wait inside it — so each is an UPPER bound on the decision
+/// work this budget actually caps, which is the direction a safety bound may
+/// err in, and post-PR the same percentile can only fall. Across the armed runs
+/// since 2026-07-28T19:41, p50 is 24576ns (699 lines) or 49152ns (214) — 64
+/// events is ~2-3ms. The p99 is where the earlier draft of this comment cheated:
+/// it quoted 786us, which is the FLOOR of that distribution, not its shape. In
+/// steady state (`elapsed_s >= 3600`, 622 lines) p99 runs 196608ns x189,
+/// 393216 x286, 786432 x78, 3145728 x46 and 6291456 x23. At the WORST observed,
+/// 64 x 6.29ms = ~400ms against the kill switch's 1s interval.
+///
+/// That still holds — but it holds by a factor of two, not "orders of magnitude
+/// to spare". If this budget is ever raised, that is the number to raise it
+/// against, and it should be re-derived from a post-PR dequeue-to-complete p99
+/// rather than from this producer-stamped one. The cost stays one extra loop
+/// iteration and six timer polls per 64 events — noise against a JSON parse per
+/// event.
 const FEED_BUDGET: usize = 64;
 
 pub async fn run(
@@ -1722,34 +1917,39 @@ pub async fn run(
                 let queued = rx.len();
                 eng.on_feed(m, queued, &mut quoters, &by_market);
             }
-            _ = kill_iv.tick() => eng.kill_tick(&mut quoters),
-            _ = hedge_iv.tick(), if hedge_retry && !bench => eng.hedge_tick(),
+            // Each timer arm is timed and named. `decision_latency` describes
+            // the feed arm alone, so before this a handler that held the loop
+            // was visible only as everyone else's `queue_wait` — the exact
+            // "blocked or merely idle-then-busy" ambiguity this loop could not
+            // answer about itself.
+            _ = kill_iv.tick() => { let t = std::time::Instant::now(); eng.kill_tick(&mut quoters); eng.record_tick("kill", t); }
+            _ = hedge_iv.tick(), if hedge_retry && !bench => { let t = std::time::Instant::now(); eng.hedge_tick(); eng.record_tick("hedge", t); }
             // Fills held for an `order_ack` that has not come. Bench has no live
             // ack path at all and must stay byte-deterministic, so it relies on
             // the flush after the loop instead of this deadline.
-            _ = fill_iv.tick(), if !bench => eng.unclaimed_tick(),
+            _ = fill_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.unclaimed_tick(); eng.record_tick("fill", t); }
             // Cancels the engine owes but could not address when it decided on
             // them. Only an armed engine can ever learn a venue id, so only an
             // armed engine parks (see `resolve_cancel`) and only it has anything
             // to do here. `cancel_work` owns the policy — including the one
             // escalation per tick and none at all while killed.
-            _ = cancel_iv.tick(), if armed => eng.cancel_tick(),
+            _ = cancel_iv.tick(), if armed => { let t = std::time::Instant::now(); eng.cancel_tick(); eng.record_tick("cancel", t); }
             // Two independent facts, in order of locality: whether the engine's
             // own subscription can be trusted, then whether the recorder says
             // the venue sockets can be. Ungated by `--health` (only by bench)
             // because the FIRST of those is the engine's own business — a run
             // without a health file must still be able to notice, and clear, a
             // disconnect of its own feed.
-            _ = feed_iv.tick(), if !bench => eng.health_tick(&mut quoters),
+            _ = feed_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.health_tick(&mut quoters); eng.record_tick("health", t); }
             // Off in bench/replay for the same reason as the two above: it
             // re-reads a file another process rewrites, which no pinned tape
             // can reproduce. Bench keeps whatever `install_policy` installed.
-            _ = tox_iv.tick(), if !bench => eng.tox_tick(&mut quoters),
+            _ = tox_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.tox_tick(&mut quoters); eng.record_tick("tox", t); }
             // Same rule: `cfg.apr` is already None in bench, and re-sizing a
             // hurdle mid-replay off a moving utilization would break the
             // digest even if it were not.
-            _ = apr_iv.tick(), if !bench => eng.apr_tick(&mut quoters),
-            _ = stats_iv.tick(), if !bench => eng.stats_tick(),
+            _ = apr_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.apr_tick(&mut quoters); eng.record_tick("apr", t); }
+            _ = stats_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.stats_tick(); eng.record_tick("stats", t); }
             // The budget is spent and every deadline that was DUE has now had
             // its turn: the arms above are polled first and this one is always
             // ready, so it is reached only once none of them will fire. Refill
@@ -2749,9 +2949,12 @@ mod feed_wiring_tests {
     /// promise no timer arm fires: a pre-filled channel whose sender is dropped
     /// is ready at EVERY poll — message, then closed — so under `biased` alone
     /// the kill switch is never even looked at. That is not a test artifact.
-    /// Live on 2026-07-29 the armed engine reported `chan_high_water: 1036` and
-    /// a `decision_latency` max of 6_496_952_349 ns: 6.5 seconds of backlog in
-    /// which `data/KILL` — documented as a 1-second watch — was never stat'ed.
+    /// Live, this is the armed engine's own start: every armed run since
+    /// 2026-07-28T19:41 reports a `chan_high_water` between 1710 and 2377 at
+    /// its FIRST stats line, and under `biased` alone that is that many events
+    /// before `data/KILL` — documented as a 1-second watch — is first stat'ed.
+    /// (The multi-second `decision_latency` maxima are NOT this queue and were
+    /// never measured at dequeue; see `Engine::queue_wait`.)
     ///
     /// The kill file is in place before the first event, so the ONLY question
     /// the assert asks is whether the arm is ever polled. The backlog is many
@@ -2792,6 +2995,179 @@ mod feed_wiring_tests {
             summary["killed"],
             json!(true),
             "a feed backlog must not be able to hide the halt: {summary}"
+        );
+    }
+
+    /// **The ~3s `decision_latency` max was never a slow decision.**
+    ///
+    /// `t_read` is stamped by the PRODUCER in `feed`'s `tx.send(..).await`, so
+    /// every sample carried the message's channel wait inside it. Live,
+    /// `spawn_feed` (main.rs:1481) begins stamping the recorder's connect burst
+    /// while `engine::run` (main.rs:1551) is still behind `arm_venues` and
+    /// `startup_sweep().await` — so the first couple of thousand messages were
+    /// charged the whole of armed startup and the `max` pinned there for the
+    /// life of the process. Every armed run since 2026-07-28T19:41 shows it.
+    /// One of them: at `elapsed_s: 0.0`, after 2185 `events` (2184 of them
+    /// `book_events`), `max_ns` was already 3_004_381_840 — and at
+    /// `elapsed_s: 4620.0` and 1_014_270 `events` it was still exactly
+    /// 3_004_381_840. The two counters are named separately on purpose here:
+    /// `decision_latency.count` tracks `events`, not `book_events`.
+    ///
+    /// A backdated stamp is exactly that shape. The wait must land in
+    /// `queue_wait` and NOT in `decision_latency`, or the two causes the ticket
+    /// could not separate — a blocked handler and a quiet feed behind a
+    /// backlog — keep producing the identical number.
+    #[test]
+    fn a_message_that_waited_in_the_channel_is_not_a_slow_decision() {
+        let out = scratch("queue-wait-intents.jsonl");
+        let (mut quoters, by_market) = fixture();
+        let mut eng = test_engine(cfg(&out, None, None));
+        eng.on_feed(
+            FeedMsg {
+                line: snapshot("kalshi", "K", "0.03", "0.04", 1_785_211_200.0),
+                t_read: std::time::Instant::now() - std::time::Duration::from_secs(3),
+            },
+            0,
+            &mut quoters,
+            &by_market,
+        );
+        let s = eng.summary();
+        assert!(
+            s["queue_wait"]["max_ns"].as_u64().unwrap() >= 3_000_000_000,
+            "the 3s wait belongs to the channel, and must be reported: {s}"
+        );
+        assert!(
+            s["decision_latency"]["max_ns"].as_u64().unwrap() < 1_000_000_000,
+            "the decision itself parsed one snapshot; charging it the channel \
+             wait is the defect this whole ticket chased: {s}"
+        );
+    }
+
+    /// A histogram says A tick took 6s. Only the name says WHICH, and the name
+    /// has to follow the maximum rather than the most recent sample.
+    #[test]
+    fn the_slowest_tick_names_the_arm_that_set_it() {
+        let out = scratch("slowest-tick-intents.jsonl");
+        let mut eng = test_engine(cfg(&out, None, None));
+        let slow = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        eng.record_tick("tox", slow);
+        // Later, and faster: the name must not follow it.
+        eng.record_tick("kill", std::time::Instant::now());
+        let s = eng.summary();
+        assert_eq!(s["slowest_tick_window"]["arm"], json!("tox"), "{s}");
+        assert!(s["slowest_tick_window"]["ns"].as_u64().unwrap() >= 2_000_000_000, "{s}");
+        assert_eq!(s["tick_latency_window"]["count"], json!(2), "both arms timed: {s}");
+    }
+
+    /// ...and the arms in `run`'s select are actually wired to it. The
+    /// bookkeeping test above passes just as well against a `record_tick` no
+    /// select arm ever calls, which is the state this ticket found the loop in.
+    #[tokio::test]
+    async fn a_timer_arm_is_timed_at_all() {
+        const BACKLOG: usize = 128 * FEED_BUDGET;
+        let out = scratch("tick-wired-intents.jsonl");
+        let (quoters, by_market) = fixture();
+        let (tx, rx) = mpsc::channel(BACKLOG);
+        for _ in 0..BACKLOG {
+            tx.try_send(FeedMsg {
+                line: snapshot("kalshi", "K", "0.03", "0.04", 1_785_211_200.0),
+                t_read: std::time::Instant::now(),
+            })
+            .expect("test channel");
+        }
+        drop(tx);
+        let (txs, _rxs) = executors();
+        let summary = run(quoters, by_market, rx, txs, stats(), cfg(&out, None, None)).await;
+        assert_ne!(
+            summary["slowest_tick_window"]["arm"],
+            json!("none"),
+            "the backlog spends the budget, so a timer arm must have run AND \
+             been timed: {summary}"
+        );
+        assert!(summary["tick_latency_window"]["count"].as_u64().unwrap() > 0, "{summary}");
+    }
+
+    /// **The tick metrics must not reintroduce the defect above.**
+    ///
+    /// A `tokio::time::interval`'s first tick is ready immediately, so
+    /// `tox_tick`, `apr_tick` and `health_tick` all do their most expensive
+    /// first work — a file read apiece, cold — inside `run`'s first budget. A
+    /// process-lifetime running max would therefore pin to a startup tick and
+    /// name it forever, which is EXACTLY the reading `decision_latency` gave
+    /// for the whole of this ticket. Shipping that again under a new name is
+    /// worse than not shipping the metric.
+    ///
+    /// So the window is one stats interval: after a line is printed, the next
+    /// line describes the ticks since it. An operator asking "what is slow
+    /// NOW" gets an answer about now.
+    #[test]
+    fn the_slowest_tick_is_a_window_not_a_lifetime_max() {
+        let out = scratch("tick-window-intents.jsonl");
+        let mut eng = test_engine(cfg(&out, None, None));
+        // Startup: the first `tox_tick` reads its file cold.
+        eng.record_tick("tox", std::time::Instant::now() - std::time::Duration::from_secs(3));
+        eng.stats_tick();
+        // ...and hours later the loop is healthy. The line must say so.
+        eng.record_tick("kill", std::time::Instant::now());
+        let s = eng.summary();
+        assert_eq!(
+            s["slowest_tick_window"]["arm"],
+            json!("kill"),
+            "a startup tick must not still be named an interval later: {s}"
+        );
+        assert!(
+            s["slowest_tick_window"]["ns"].as_u64().unwrap() < 3_000_000_000,
+            "and its time must not survive the window either: {s}"
+        );
+        assert_eq!(
+            s["tick_latency_window"]["count"],
+            json!(1),
+            "the histogram is the same window as the name it sits next to: {s}"
+        );
+    }
+
+    /// **Every line off the channel is measured, including the ones the engine
+    /// skips.**
+    ///
+    /// `on_feed_line` has thirteen early returns: a control line, an
+    /// unparseable line, a line with no venue, a line with no market, a delta
+    /// whose book is not synced, and so on. The control line does the most
+    /// work of any of them: `FEED_DOWN` pulls every quote and enqueues a cancel
+    /// per resting order — 23 of them on the 2026-07-28T20:13:06 disconnect —
+    /// so leaving that path out of `decision_latency` would leave the busiest
+    /// of them invisible, in the one metric whose stated job is to make a stall
+    /// attributable. (Busiest, not slowest: those 23 are `try_send`s. The ~1.0s
+    /// that disconnect took to clear was the executor's rate-limited drain, not
+    /// this handler — see `on_feed` and `owe_sweeps`.)
+    ///
+    /// The invariant is the assert: `decision_latency.count == events`. It
+    /// costs nothing to hold and it is the difference between "the loop was
+    /// fast" and "the loop was fast on the paths I remembered to time".
+    #[test]
+    fn every_line_off_the_channel_is_timed_including_the_skipped_ones() {
+        let out = scratch("total-decision-intents.jsonl");
+        let (mut quoters, by_market) = fixture();
+        let mut eng = test_engine(cfg(&out, None, None));
+        let lines = [
+            json!({"kind": crate::feed::FEED_DOWN, "note": "test", "ts": 0.0}).to_string(),
+            "{not json".to_string(),
+            json!({"kind": "snapshot", "market_id": "K"}).to_string(),
+            snapshot("kalshi", "K", "0.03", "0.04", 1_785_211_200.0),
+        ];
+        for line in lines {
+            eng.on_feed(
+                FeedMsg { line, t_read: std::time::Instant::now() },
+                0,
+                &mut quoters,
+                &by_market,
+            );
+        }
+        let s = eng.summary();
+        assert_eq!(s["events"], json!(4), "{s}");
+        assert_eq!(
+            s["decision_latency"]["count"],
+            s["events"],
+            "a line the engine skipped still spent the loop's time: {s}"
         );
     }
 
