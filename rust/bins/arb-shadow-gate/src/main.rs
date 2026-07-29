@@ -423,10 +423,13 @@ fn tape_stage(a: &Args, fails: &mut Vec<String>) -> HashMap<&'static str, HashSe
                 ),
             );
         }
+        // Named per venue rather than as one sentence about kalshi. The old
+        // wording printed "python's kalshi tape carries the raw wire seq" under
+        // the `== polymarket` header, next to a non-zero python gap count it
+        // did not explain — an advisory that misattributes its own number.
         println!(
             "  note: python gaps={} is printed, NOT compared — the two recorders number their \
-             events differently (python's kalshi tape carries the raw per-subscription wire seq, \
-             replayed per market), so this counts renumbering, not loss [advisory]",
+             {venue} events differently, so this counts renumbering, not loss [advisory]",
             pys.gaps
         );
 

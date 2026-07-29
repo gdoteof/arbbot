@@ -27,7 +27,7 @@ const EXE: &str = env!("CARGO_BIN_EXE_arb-shadow-gate");
 /// runbook's soak grep is `grep 'SHADOW GATE' "$f" | tail -1`. This is that
 /// grep.
 fn last_verdict_line(stdout: &str) -> Option<&str> {
-    stdout.lines().filter(|l| l.contains("SHADOW GATE:")).next_back()
+    stdout.lines().rev().find(|l| l.contains("SHADOW GATE:"))
 }
 
 #[test]
