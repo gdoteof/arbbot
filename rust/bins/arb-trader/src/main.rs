@@ -43,6 +43,7 @@ mod orphan;
 mod risk;
 mod taketake;
 mod sink;
+mod unwind;
 mod wal;
 
 use arb_core::model::{BookSide, Venue};
@@ -140,6 +141,13 @@ struct Args {
     /// `--suppress market:side`, repeatable: (market, side) pairs some OTHER
     /// order-owner holds, which the quoter cancels out of and stays out of.
     suppress: Vec<(String, BookSide)>,
+    /// Run the opportunistic-unwind scan and REPORT what it would exit.
+    ///
+    /// There is no armed spelling, and that is not caution — `crate::unwind`
+    /// decides, and nothing in this workspace can act on the decision yet
+    /// (`Intent` has no exit and `book_basket` writes `status: "open"`). A
+    /// `--unwind` that placed would be a claim this binary cannot honour.
+    unwind_detect_only: bool,
 }
 
 /// The floating maker APR bar (Geoff 2026-07-22, card 80ff7987), port of
@@ -216,6 +224,7 @@ fn default_args() -> Args {
         apr_asof: None,
         toxgate: None,
         suppress: Vec::new(),
+        unwind_detect_only: false,
     }
 }
 
@@ -300,6 +309,7 @@ fn parse_args() -> Args {
                 let side = BookSide::parse(s).unwrap_or_else(|| panic!("bad suppress side {s}"));
                 a.suppress.push((m.to_string(), side));
             }
+            "--unwind-detect-only" => a.unwind_detect_only = true,
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(2);
@@ -1419,6 +1429,12 @@ fn run_cfg(
             // the log readable.
             cooldown_s: if args.tt_detect_only || !armed { 5.0 } else { args.hedge_alarm_s },
         }),
+        // Off in bench/replay for the same two reasons take-take is: it reads
+        // the wall clock and a marks file, and its hurdle is the floating one
+        // a bench run has no utilization to size.
+        unwind: (!bench && args.unwind_detect_only).then(|| engine::Unwind {
+            marks_path: args.marks.clone(),
+        }),
         armed,
     }
 }
@@ -2369,6 +2385,35 @@ relationships:
         let (mut oid, mut intents) = (0u64, Vec::new());
         quoters[0].on_book(&mut cx, &fees, &bb, 1_000.0, &mut oid, &mut intents);
         assert_eq!(place_on(&intents, "P").map(|p| p.price.as_str()), Some("0.56"));
+    }
+
+    fn no_policy() -> Policy {
+        Policy { toxgate_file: None, apr: None, apr_installed: (0.0, String::new()) }
+    }
+
+    /// **The unwind scan is a FLAG, and it defaults off.** A new strategy on
+    /// real money does not arrive by upgrading a binary — every existing
+    /// invocation, including the armed unit's, must be untouched by this
+    /// change until someone types the flag.
+    ///
+    /// And it is off in bench/replay whatever the flag says, for the same two
+    /// reasons take-take is: it reads the wall clock and a marks file, and a
+    /// pinned digest cannot survive either.
+    #[test]
+    fn the_unwind_scan_is_off_unless_the_flag_is_given() {
+        let off = run_cfg(default_args(), false, false, false, None, 0, no_policy());
+        assert!(off.unwind.is_none(), "the default must change nothing");
+
+        let mut a = default_args();
+        a.unwind_detect_only = true;
+        let on = run_cfg(a, false, false, false, None, 0, no_policy());
+        let u = on.unwind.expect("the flag must reach the engine");
+        assert_eq!(u.marks_path, default_args().marks, "and it reads the marks file");
+
+        let mut a = default_args();
+        a.unwind_detect_only = true;
+        let bench = run_cfg(a, true, false, false, None, 0, no_policy());
+        assert!(bench.unwind.is_none(), "a digest replay must not acquire a scan");
     }
 }
 

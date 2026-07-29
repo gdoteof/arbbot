@@ -833,6 +833,7 @@ mod hedge_deadline_tests {
                 alarm_after_s: 0.1,
             }),
             take_take: None,
+            unwind: None,
             armed: false,
             hedges_undischarged: 0,
         };
