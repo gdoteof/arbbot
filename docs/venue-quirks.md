@@ -293,10 +293,21 @@ double-entry books. Together they make the Kalshi account reconcile to
 
 ### `pmus-positions-dict-keyed-by-slug`
 - **Venue:** polymarket_us
-- **What the API does:** Positions come back as a DICT keyed by market slug with STRING fields (`netPosition: "-14"`, `avgPx.value`, `costPerShare.value`); `/v1/positions` 404s (the path is `/v1/portfolio/positions`). `costPerShare` for a short is the NO cost (1 - sold YES price).
-- **Failure it prevents:** list-shaped parsers or numeric-typed decoders fail on real payloads; misreading `costPerShare` misprices hedge-completion limits.
+- **What the API does:** Positions come back as a DICT keyed by market slug with STRING fields (`netPosition: "-100"`, `avgPx.value`, `costPerShare.value` — invented value, see the card below); `/v1/positions` 404s (the path is `/v1/portfolio/positions`).
+- **Failure it prevents:** list-shaped parsers or numeric-typed decoders fail on real payloads.
 - **Current handling:** `scripts/hedge_naked_legs.py:60-77` (+ basis math `:173-182`), `src/arbbot/exec/main.py:362-365`.
-- **Port requirement:** Parse the slug-keyed dict with string decimals; interpret short-position `costPerShare` on the NO axis.
+- **Port requirement:** Parse the slug-keyed dict with string decimals.
+- **What `costPerShare` MEANS is a separate quirk, and this card used to get it wrong** — see `pmus-cost-per-share-is-base-cost-over-net` below.
+
+### `pmus-cost-per-share-is-base-cost-over-net`
+- **Venue:** polymarket_us
+- **What the API does:** `costPerShare` is **exactly `baseCost / |netPosition|`** — a RESIDUAL cost basis divided by the CURRENT net. It is not a per-share entry price. The two coincide only for a position opened once and never traded back; a non-zero `qtyBought` alongside a short net is ordinary, not exotic, and for those the ratio is not a price at all. Verified on 2026-07-29 against every open PM-US position in one signed read-only `GET /v1/portfolio/positions`: the identity held to the reported precision in every case. **Every number in this card is invented** — a residual `baseCost` of 60.00 over a net of 100 reports `costPerShare 0.6000`. Nothing here is derived from a position we hold, and nothing here should be: this file is public.
+- **This card previously asserted "`costPerShare` for a short is the NO cost (1 - sold YES price)". That is WRONG.** It is a coincidence of the never-traded-back case. Do not port it, and do not reintroduce it from the Python that still applies it.
+- **It degenerates as `|net| -> 0`, which is exactly the naked-leg condition a hedger reads it under.** The denominator is the current net, so a position traded back to a net of ±1 reports its whole residual basis as the per-share cost — buy 50, sell 51, and a residual `baseCost` of 6.00 over a net of 1 reports `costPerShare 6.0000`, nonsense as a probability. The field is least trustworthy precisely where it is most consulted.
+- **The error is asymmetric, and only one direction is loud.** A hedge-completion limit is `1 − basis − fee − lock`. A basis reading HIGH drives the limit negative, no ask ever clears it, and nothing fills — it surfaces as "waiting for a better book", which is safe and visible. A basis reading LOW yields a too-generous limit, an IOC that fills at the ask, and a locked LOSS booked as a gain. A quiet wrong answer is the one to design against.
+- **Failure it prevents:** pricing a hedge-completion limit off a number that is not a price.
+- **Current handling:** the misreading is live in frozen Python, in two places. `scripts/hedge_naked_legs.py:70` (parse) and `:179-187`, where `pm_basis` is set from `cost_per_share` under the comment `# NO cost/ct = 1 - sold YES px` and then fed straight into the order limit — this is the one that can place a bad order. `scripts/reconcile_positions.py:122` and `:356`, where the same field becomes `pm_basis_ct` in `locked_ct = 1 - k_basis_ct - pm_basis_ct` — that one only misreports a locked profit. Cited as WHERE the bug is, not as a pattern to reproduce.
+- **Port requirement:** Do not price a hedge off `costPerShare`. The basis for completing a half-filled basket is OUR OWN recorded fill — `rust/bins/arb-trader/src/orphan.rs` already carries `maker_order_id`, `hedge_market` and `anchor_price` per undischarged mint. Treat `costPerShare` only as `baseCost/|net|`: a reconciliation input, never a per-share price, and never at small `|net|`.
 
 ## Polymarket US (QCX) — accounting / cash
 
