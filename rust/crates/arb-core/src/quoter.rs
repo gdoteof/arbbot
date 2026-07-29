@@ -1003,4 +1003,38 @@ mod crossed_book_tests {
             Some("0.1820")
         );
     }
+
+
+    /// The order `cancel_all` emits is ASK before BID, because it has always
+    /// sorted by the wire spelling and `"ask" < "bid"`.
+    ///
+    /// This is here because nothing else can catch it. `cancel_all` runs on the
+    /// kill switch and the feed-stale pull, and the bench replay that produces
+    /// the golden digest fires neither — so a reversal is invisible to the one
+    /// gate the campaign trusts. It was invisible to all 402 tests too: adding
+    /// `#[derive(Ord)]` to `BookSide` and letting `keys.sort()` use it reverses
+    /// this order (declaration order puts `Bid` first) with the whole suite
+    /// green. The missing derive and the comment above `sort_by` are the guard;
+    /// this is what makes the guard fail loudly instead of silently.
+    #[test]
+    fn cancel_all_emits_the_ask_before_the_bid() {
+        let (mut cx, _fees, _bb, mut q) = tests_support::fixture();
+        let px = cx.parse_exact("0.42");
+        for side in [BookSide::Bid, BookSide::Ask] {
+            q.resting.insert(
+                (0, side),
+                RestingQuote { order_id: format!("m-{}", side.as_str()), price: px, count: 1 },
+            );
+        }
+        let mut intents = Vec::new();
+        q.cancel_all(&mut cx, 1.0, &mut intents);
+        let sides: Vec<&str> = intents
+            .iter()
+            .filter_map(|i| match i {
+                Intent::Cancel(c) => Some(c.side.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sides, vec!["ask", "bid"], "cancel_all must emit ask before bid");
+    }
 }
