@@ -196,6 +196,22 @@ struct Engine {
     /// normal and healthy — it is the same standing crossing seen again.
     n_tt_gated: u64,
     n_tt_fired: u64,
+    /// Crossings refused because their whole net edge fitted inside what the
+    /// HEDGE is licensed to give away. Counted per book event, like
+    /// `take_take_found` and for the same reason: a crossing stands until
+    /// someone takes it, so this is "how often we saw one", not "how many".
+    ///
+    /// This is the only evidence that would ever calibrate `--hedge-max-slip`,
+    /// and without it the shadow run — whose whole job is to measure before
+    /// money is risked — cannot tell "no crossing existed" from "a crossing
+    /// was refused". `Skip::NetUnderSlip` is a PRICE fact that moves tick to
+    /// tick, unlike an infeasible pairing, which is a config fact and is
+    /// reported once at startup instead.
+    n_tt_under_slip: u64,
+    /// Per quoter index: may take-take pair this relationship's two legs at
+    /// all? `crate::taketake::pairing_pays`, asked once here because it is a
+    /// registry fact and answering it per book event allocates.
+    tt_feasible: Vec<bool>,
     tt_gate: crate::taketake::Gate,
     /// The bar is re-derived from marks on the stats tick: it moves as the book
     /// turns over, and a stale bar is a wrong bar in both directions.
@@ -267,9 +283,28 @@ impl Engine {
         exec_txs: HashMap<Venue, mpsc::Sender<ExecCmd>>,
         exec_stats: Arc<ExecStats>,
         by_market: &ByMarket,
+        quoters: &[Quoter],
     ) -> Engine {
         let mut cx = Cx::default();
         let fees = FeeSchedule::new(&mut cx);
+        // Which relationships take-take may pair at all. A registry fact, so it
+        // is settled here rather than re-derived per book event — and it is
+        // LOUD when it refuses one, because a rel that is quoted, vetted and
+        // permanently untradable by this path is something an operator has to
+        // know about. Nothing in today's registry trips it.
+        let tt_feasible: Vec<bool> =
+            quoters.iter().map(|q| crate::taketake::pairing_pays(&q.rel)).collect();
+        for (q, ok) in quoters.iter().zip(&tt_feasible) {
+            if !ok {
+                eprintln!(
+                    "[take-take] {} is `{}` and pays nothing in some feasible state with the \
+                     Kalshi leg long — never tradable by take-take, skipped for the life of \
+                     this process",
+                    q.rel.id,
+                    q.rel.rtype.as_str()
+                );
+            }
+        }
         // Order-id counters (m = maker, t = take-take, h = hedge). They must not
         // restart at 0 on a LIVE run: the id is sent as the venue's
         // client_order_id, and Kalshi rejects one it has seen before with
@@ -330,6 +365,8 @@ impl Engine {
             n_tt: 0,
             n_tt_gated: 0,
             n_tt_fired: 0,
+            n_tt_under_slip: 0,
+            tt_feasible,
             tt_gate: crate::taketake::Gate::default(),
             tt_bar,
             next_oid: id_base,
@@ -518,6 +555,7 @@ impl Engine {
             "events": self.n_ev, "book_events": self.n_book, "intents": self.n_int,
             "take_take_found": self.n_tt, "take_take_bar_apr": self.tt_bar,
             "take_take_gated": self.n_tt_gated, "take_take_fired": self.n_tt_fired,
+            "take_take_net_under_slip": self.n_tt_under_slip,
             "killed": self.killed,
             "feed_pulled": self.feed_reason.is_some(),
             "risk_allowed": self.cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
@@ -760,15 +798,33 @@ impl Engine {
     /// `marks.json` is present but stale or corrupt, and the bar IS the
     /// profitability test — a frozen one is wrong in both directions, so there
     /// is no substitute to fall back to.
+    ///
+    /// No HEDGE POLICY, no take-take either. Only leg 1 is placed here; leg 2
+    /// is a hedge, and `detect` now requires the net edge to outlast what that
+    /// hedge is licensed to give away. Without a policy there is no budget to
+    /// price against — and `first_attempt_acceptable` is UNGATED in that case,
+    /// so leg 2 could fill anywhere. `run_cfg` gates both on `!bench`, so this
+    /// refusal is unreachable in production and is here to stay that way.
     fn take_take_scan(&mut self, quoters: &mut [Quoter], idxs: &[usize], now: f64) {
-        let (Some(tt), Some(tt_bar)) = (self.cfg.take_take.as_ref(), self.tt_bar) else { return };
+        let (Some(tt), Some(tt_bar), Some(pol)) =
+            (self.cfg.take_take.as_ref(), self.tt_bar, self.cfg.hedge_retry.as_ref())
+        else {
+            return;
+        };
         // Copied out of the policy rather than held as a borrow of `self.cfg`:
         // the loop below drains intents, which needs `&mut self`. `marks_path`
         // is not read here — only the stats tick re-derives the bar.
         let (max_ct_per_rel, max_clip, detect_only, cooldown_s) =
             (tt.max_ct_per_rel, tt.max_clip, tt.detect_only, tt.cooldown_s);
+        let max_slip = pol.max_slip.clone();
         let today = crate::taketake::today_iso(now);
         for &qi in idxs {
+            // `detect` reads this relationship's two legs as two spellings of
+            // one claim, which is only true of some types. Settled at startup
+            // (and logged there) because it is a registry fact.
+            if !self.tt_feasible[qi] {
+                continue;
+            }
             let open =
                 self.cfg.risk.as_ref().map(|r| r.open_ct(&quoters[qi].rel.id)).unwrap_or(0.0) as i64;
             let found = crate::taketake::detect(
@@ -780,6 +836,7 @@ impl Engine {
                 max_ct_per_rel,
                 open,
                 max_clip,
+                &max_slip,
             );
             let c = match found {
                 // A venue offering below its own bid means
@@ -799,6 +856,14 @@ impl Engine {
                         ts: now,
                     }));
                     self.drain_intents(Some(&quoters[qi].rel));
+                    continue;
+                }
+                // A crossing that was real on screen and that the hedge could
+                // legally erase. The ONLY evidence that would ever calibrate
+                // `--hedge-max-slip`, and the detect-only shadow is blind
+                // without it, so it is counted where the rest are dropped.
+                Err(crate::taketake::Skip::NetUnderSlip { .. }) => {
+                    self.n_tt_under_slip += 1;
                     continue;
                 }
                 Err(_) => continue,
@@ -1038,7 +1103,7 @@ pub async fn run(
     let armed = cfg.armed;
     let hedge_retry = cfg.hedge_retry.is_some();
     let stats_every_s = cfg.stats_every_s;
-    let mut eng = Engine::new(cfg, exec_txs, exec_stats, &by_market);
+    let mut eng = Engine::new(cfg, exec_txs, exec_stats, &by_market, &quoters);
 
     let mut kill_iv = tokio::time::interval(std::time::Duration::from_secs(1));
     kill_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1151,6 +1216,9 @@ fn test_engine(cfg: RunCfg) -> Engine {
             failed: AtomicU64::new(0),
         }),
         &HashMap::new(),
+        // These tests drive the hedge and fill paths directly, never
+        // `take_take_scan`, which is the only reader of the feasibility table.
+        &[],
     )
 }
 
@@ -1299,7 +1367,14 @@ mod feed_wiring_tests {
             health_file,
             risk: None,
             ledger_path: None,
-            hedge_retry: None,
+            // Take-take now prices its net edge against the hedge's slip
+            // budget, so a take-take run needs the policy the real config
+            // always pairs it with — `run_cfg` gates both on `!bench`.
+            hedge_retry: take_take.is_some().then(|| HedgeRetry {
+                interval_s: 5.0,
+                max_slip: "0.01".into(),
+                alarm_after_s: 60.0,
+            }),
             take_take,
             armed: false,
             hedges_undischarged: 0,
@@ -1493,6 +1568,46 @@ mod feed_wiring_tests {
         let t = feed_tick(None, None, Some("kalshi-ws stale".into()));
         assert!(t.proven);
         assert_eq!(t.reason.as_deref(), Some("kalshi-ws stale"));
+    }
+
+    /// The slip gate, WIRED — and countable. `detect` builds a precise
+    /// `Skip::NetUnderSlip`, and the loop that consumes it drops every other
+    /// `Err` on the floor, so without a counter the shadow run whose entire
+    /// job is to measure before money is risked cannot tell "no crossing
+    /// existed" from "a crossing was refused by the new gate". That is the
+    /// difference between believing the gate only refuses negative-EV trades
+    /// and being able to show it.
+    #[tokio::test]
+    async fn a_crossing_inside_the_slip_budget_is_refused_and_counted() {
+        let ts = 1_785_211_200.0; // 2026-07-28T00:00:00Z
+        let marks = scratch("marks-slip.json");
+        std::fs::write(&marks, marks_at(wall_now())).unwrap();
+
+        // Kalshi ask 0.03 / PM-US bid 0.06 at clip 5: edge 0.03, real fee
+        // 0.007384/ct so the 0.02 floor binds, net EXACTLY the 0.01 budget.
+        let out = scratch("slip-intents.jsonl");
+        let feed = [
+            snapshot("kalshi", "K", "0.02", "0.03", ts),
+            snapshot("polymarket_us", "P", "0.06", "0.09", ts),
+        ];
+        let (summary, intents, _) =
+            drive(cfg(&out, None, Some(take_take(&marks))), &out, &feed).await;
+        assert_eq!(summary["take_take_net_under_slip"], json!(1), "{summary}");
+        assert_eq!(summary["take_take_found"], json!(0), "{summary}");
+        assert!(!intents.contains(r#""tag":"take-take""#), "{intents}");
+
+        // ...and the control: 2c more edge, nowhere near the budget, still
+        // fires and does NOT touch the counter. A gate that refused everything
+        // would pass the assertions above on its own.
+        let out_ok = scratch("slip-control-intents.jsonl");
+        let feed_ok = [
+            snapshot("kalshi", "K", "0.02", "0.03", ts),
+            snapshot("polymarket_us", "P", "0.08", "0.09", ts),
+        ];
+        let (sum_ok, int_ok, _) =
+            drive(cfg(&out_ok, None, Some(take_take(&marks))), &out_ok, &feed_ok).await;
+        assert_eq!(sum_ok["take_take_net_under_slip"], json!(0), "{sum_ok}");
+        assert!(int_ok.contains(r#""tag":"take-take""#), "{int_ok}");
     }
 
     /// C9's staleness half, wired. `marks.json` froze at 12:46:12 on 2026-07-28

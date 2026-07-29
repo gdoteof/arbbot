@@ -33,7 +33,7 @@
 use arb_core::book::BookBuilder;
 use arb_core::fees::{FeeSchedule, Role};
 use arb_core::model::{BookSide, Venue};
-use arb_core::scan::{Cx, Rel, D};
+use arb_core::scan::{feasible_min_payoff, Cx, Rel, Side, D};
 
 /// Policy FLOOR on the both-leg taker fee per contract — no longer the fee
 /// itself. Python's `FEE_CT` was the whole model; `arb_core::fees` is now, and
@@ -355,6 +355,11 @@ pub enum Skip {
     CrossedBook { venue: &'static str },
     NoResolveDate,
     EdgeUnderFees,
+    /// The net edge does not survive the slip the HEDGE is allowed to give
+    /// away. Distinct from `EdgeUnderFees`: this crossing is profitable at the
+    /// prices on screen and stops being profitable at prices leg 2 may legally
+    /// fill at.
+    NetUnderSlip { net: String, slip: String },
     ReverseDirection,
     BelowBar { apr: f64, bar: f64 },
     AtCap { open: i64 },
@@ -369,9 +374,47 @@ fn leg_market(rel: &Rel, venue: Venue) -> Option<&str> {
     rel.legs.iter().find(|l| l.venue == venue).map(|l| l.market_id.as_str())
 }
 
+/// Does the K->PM pairing pay AT LEAST its $1 back in every state this
+/// relationship allows? A `false` here is not a price problem: no price makes
+/// this pairing an arb, so `detect` must never be called on it.
+///
+/// `detect` picks its two legs by VENUE and every line of it assumes
+/// YES(kalshi) is the same claim as YES(pmus) — true of an equivalence and of
+/// nothing else. The take path never read `rel.rtype`; the MAKER path on the
+/// same `Rel` has refused on exactly this since scan.rs was written, and this
+/// is that check with the sides fixed by DIRECTION (we buy the Kalshi leg's
+/// YES and sell the PM-US leg's) instead of by which leg rests.
+///
+/// On a 2-leg `implies` whose ANTECEDENT is the Kalshi leg the minimum is 0:
+/// the state "consequent happens, antecedent does not" pays our long leg
+/// nothing while the short leg owes $1, so a basket logged as riskless is
+/// -$1.00/contract there, ledgered open+hedged and re-seeded as such on the
+/// next restart. Direction is the whole question and only the payoff model
+/// knows it — the same `implies` with the antecedent on PM-US buys the
+/// consequent and sells the antecedent, pays at least $1 in every state, and
+/// must still fire. A type blacklist would have refused a real arb.
+///
+/// ASKED ONCE PER RELATIONSHIP, at engine construction, because the answer is
+/// a registry fact that cannot change while the process runs — and
+/// `feasible_states` allocates a fresh `Vec<Vec<i64>>` per call, which is the
+/// same reason `schedule()` above is a `OnceLock` rather than a re-parse per
+/// book event.
+pub fn pairing_pays(rel: &Rel) -> bool {
+    let sides: Vec<Side> = rel
+        .legs
+        .iter()
+        .map(|l| if l.venue == Venue::Kalshi { Side::Yes } else { Side::No })
+        .collect();
+    feasible_min_payoff(rel.rtype, &sides) >= 1
+}
+
 /// Test one relationship against the live books. Pure: no I/O, no clock — the
-/// caller supplies `today_iso` and the bar, which is what makes this
-/// replayable through the WAL harness.
+/// caller supplies `today_iso`, the bar and the hedge's slip budget, which is
+/// what makes this replayable through the WAL harness.
+///
+/// PRECONDITION: `pairing_pays(rel)`. Everything below reads the two legs as
+/// two spellings of one claim, which is what that answers, and it is answered
+/// once at load rather than per book event.
 #[allow(clippy::too_many_arguments)]
 pub fn detect(
     cx: &mut Cx,
@@ -382,6 +425,7 @@ pub fn detect(
     max_ct_per_rel: i64,
     open_ct: i64,
     max_clip: i64,
+    max_slip: &str,
 ) -> Result<Candidate, Skip> {
     let (Some(kt), Some(ps)) = (leg_market(rel, Venue::Kalshi), leg_market(rel, Venue::PolymarketUs))
     else {
@@ -461,6 +505,58 @@ pub fn detect(
     if !cx.is_pos(net) {
         return Err(Skip::EdgeUnderFees);
     }
+    // AND THE EDGE MUST OUTLAST THE HEDGE'S OWN ALLOWANCE. `net > 0` was the
+    // only magnitude test here, but only leg 1 is placed at the price it was
+    // detected at; leg 2 is a hedge, and `hedge_price_acceptable` will fill it
+    // up to `max_slip` worse than the anchor — boundary INCLUDED. So the worst
+    // in-policy outcome of firing is `net - max_slip` per contract, and
+    // everything in `0 < net <= max_slip` is a trade the engine books as
+    // riskless and its own hedge policy is licensed to turn negative.
+    //
+    // Live shape at the default 0.01: a 10-day fedcut crossing at 0.49/0.526
+    // has edge 0.036 and both-leg fee 0.032459, so net 0.003541 -> 13.42%/yr,
+    // clears a ~10%/yr blended bar, FIRES. Depths tie at 20, so leg 1 is PM-US
+    // and lands on the PM-US bid — it cannot touch the Kalshi ask. What moves
+    // that ask is a THIRD PARTY lifting the 20-lot at 0.49 inside the window
+    // between our leg-1 fill and leg 2 arriving (`exec_hop_latency` is p50
+    // 100.7ms / p90 805.3ms), reprinting it at 0.50: exactly 1c, exactly
+    // acceptable, and realised net is 0.026 - 0.032459 = -0.006459/ct. Leg 2's
+    // own impact cannot be the source of leg 2's slip — by then it is already
+    // committed. At that horizon the bar only demands net >= ~0.0027, so the
+    // allowance was up to 2.8x the entire edge.
+    //
+    // The rule is `net > max_slip`, strictly: it is the weakest rule that makes
+    // the worst in-policy fill still profitable, and it is what makes hedge.rs's
+    // "max_slip is exactly how much of that edge we will surrender" true rather
+    // than aspirational. Two honest caveats about "weakest" and "sufficient":
+    //
+    //   * IT COMPOUNDS WITH `FEE_CT`, which is a floor on this very `net`, so
+    //     the test really is `edge - max(real_fee, 0.02) > max_slip` while the
+    //     rule argued for is `edge - real_fee > max_slip`. On the tail
+    //     crossings this engine actually fires that gap is larger than the
+    //     budget: nobel-peace-26-donaldtrump x5 at 0.04/0.08 pays a real
+    //     0.008416/ct (Kalshi ceil(0.07*5*0.04*0.96)=0.02 -> 0.004, PM-US
+    //     0.06*0.08*0.92 = 0.004416), so reported net 0.020000 understates true
+    //     net 0.031584 by 0.011584 — and the effective requirement in true-net
+    //     terms becomes 0.021584, i.e. 2.16x the nominal budget. Deliberate but
+    //     not free: the floor stands in for PM-US's per-market `feeCoefficient`
+    //     and for a clip that walks past its touch (see FEE_CT), and ten of the
+    //     sixteen baskets ever booked sit in that floor-bound region. This is
+    //     the margin, and it is why no second one is added on top.
+    //   * IT IS SUFFICIENT ONLY TO FIRST ORDER. `fee` is priced at the anchor,
+    //     and k*P*(1-P) rises toward P=0.5, so a slipped fill can cost up to
+    //     ~0.00025/ct more than charged here. Two orders of magnitude under the
+    //     floor's own cushion, but it is not zero.
+    //
+    // Not re-sized per basket from the edge either: that would push `max_slip`
+    // down into per-obligation state on the money path, and its failure mode is
+    // worse than this one's — a tighter budget makes the hedge WAIT, and
+    // waiting is naked, whereas refusing to fire costs only a trade we never
+    // had.
+    let slip = cx.parse_exact(max_slip);
+    if cx.cmp(net, slip) != std::cmp::Ordering::Greater {
+        return Err(Skip::NetUnderSlip { net: cx.emit_6dp(net), slip: max_slip.to_string() });
+    }
 
     // APR leaves exact arithmetic here, matching Python, which also floats at
     // this line. The comparison is a policy threshold, not money.
@@ -500,14 +596,19 @@ mod tests {
     }
 
     fn rel(id: &str) -> Rel {
+        rel_typed(id, RelType::CrossVenueEquivalent, Venue::Kalshi)
+    }
+
+    /// `first` is the venue of LEG 0, which is what fixes the direction of an
+    /// ordered type: `implies` and `date-ladder` read leg 0 as the antecedent.
+    fn rel_typed(id: &str, rtype: RelType, first: Venue) -> Rel {
+        let k = RelLeg { venue: Venue::Kalshi, market_id: "K".into() };
+        let p = RelLeg { venue: Venue::PolymarketUs, market_id: "P".into() };
         Rel {
             id: id.into(),
-            rtype: RelType::CrossVenueEquivalent,
+            rtype,
             tranche: "head".into(),
-            legs: vec![
-                RelLeg { venue: Venue::Kalshi, market_id: "K".into() },
-                RelLeg { venue: Venue::PolymarketUs, market_id: "P".into() },
-            ],
+            legs: if first == Venue::Kalshi { vec![k, p] } else { vec![p, k] },
         }
     }
 
@@ -650,7 +751,8 @@ mod tests {
         let r = rel("xvus-france-pres-27-jeanlucmelenchon");
         // PM bid 0.50, Kalshi ask 0.43 -> edge 7c, cost 0.93
         let b = books("0.40", "0.43", "20", "0.50", "20", "0.55");
-        let got = detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20).expect("clears a zero bar");
+        let got =
+            detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20, "0.01").expect("clears a zero bar");
         assert_eq!(got.edge, "0.070000");
         assert_eq!(got.fee, "0.032500", "0.0175 kalshi + 0.015 pmus, per contract");
         assert_eq!(got.net, "0.037500");
@@ -663,7 +765,7 @@ mod tests {
         let r = rel("xvus-france-pres-27-jeanlucmelenchon");
         let b = books("0.40", "0.43", "20", "0.50", "20", "0.55");
         // same crossing, 10%/yr bar -> the 5.43%/yr APR must not fire
-        match detect(&mut cx, &r, &b, "2026-07-28", 10.0, 50, 0, 20) {
+        match detect(&mut cx, &r, &b, "2026-07-28", 10.0, 50, 0, 20, "0.01") {
             Err(Skip::BelowBar { apr, bar }) => {
                 assert!(apr < bar, "{apr} should be under {bar}");
             }
@@ -688,13 +790,13 @@ mod tests {
         let b = books("0.48", "0.49", "20", "0.52", "20", "0.53");
         // the live bar the armed session was using
         assert_eq!(
-            detect(&mut cx, &r, &b, "2026-12-15", 10.0088, 50, 0, 20),
+            detect(&mut cx, &r, &b, "2026-12-15", 10.0088, 50, 0, 20, "0.01"),
             Err(Skip::EdgeUnderFees)
         );
         // and it is the FEE that refuses it, not the bar: a zero bar cannot
         // rescue a crossing whose net is negative
         assert_eq!(
-            detect(&mut cx, &r, &b, "2026-12-15", 0.0, 50, 0, 20),
+            detect(&mut cx, &r, &b, "2026-12-15", 0.0, 50, 0, 20, "0.01"),
             Err(Skip::EdgeUnderFees)
         );
     }
@@ -713,7 +815,7 @@ mod tests {
         let r = rel("xvus-nobel-peace-26-elonmusk");
         // Kalshi ask 0.03 / PM bid 0.08 -> 5c edge, 73 days to 2026-10-09
         let b = books("0.02", "0.03", "20", "0.08", "20", "0.09");
-        let got = detect(&mut cx, &r, &b, "2026-07-28", 10.0088, 50, 0, 20)
+        let got = detect(&mut cx, &r, &b, "2026-07-28", 10.0088, 50, 0, 20, "0.01")
             .expect("a 5c tail crossing must still clear the live bar");
         assert_eq!(got.fee, "0.020000", "real fee is 0.006916/ct — the floor binds");
         assert_eq!(got.net, "0.030000");
@@ -723,12 +825,129 @@ mod tests {
         // Where the band ENDS at this horizon: 4c clears the 10%/yr bar, 3c
         // does not. Nothing here is switched off, it is priced.
         let four = books("0.02", "0.03", "20", "0.07", "20", "0.09");
-        assert!(detect(&mut cx, &r, &four, "2026-07-28", 10.0088, 50, 0, 20).is_ok());
+        assert!(detect(&mut cx, &r, &four, "2026-07-28", 10.0088, 50, 0, 20, "0.01").is_ok());
         let three = books("0.02", "0.03", "20", "0.06", "20", "0.09");
+        // A 3c edge against the 2c floor is net EXACTLY the 1c slip budget, so
+        // the hedge could give the whole thing away and this is now refused one
+        // step before the bar gets to see it (it was `BelowBar` when `net > 0`
+        // was the only magnitude test). Same verdict, truer reason.
         assert!(matches!(
-            detect(&mut cx, &r, &three, "2026-07-28", 10.0088, 50, 0, 20),
+            detect(&mut cx, &r, &three, "2026-07-28", 10.0088, 50, 0, 20, "0.01"),
+            Err(Skip::NetUnderSlip { .. })
+        ));
+        // ...and with no budget to lose it is the BAR that refuses it, exactly
+        // as before: the new gate adds a floor, it does not move the bar.
+        assert!(matches!(
+            detect(&mut cx, &r, &three, "2026-07-28", 10.0088, 50, 0, 20, "0"),
             Err(Skip::BelowBar { .. })
         ));
+    }
+
+    /// A crossing whose ENTIRE net edge fits inside the hedge's slip budget.
+    ///
+    /// 10 days out from 2026-12-31, Kalshi ask 0.49 / PM-US bid 0.526, clip 20:
+    ///   edge 0.036
+    ///   fee  ceil_cents(0.07*20*0.49*0.51) = 0.35    -> 0.017500/ct
+    ///        + 0.06*0.526*0.474                      -> 0.014959/ct
+    ///                                                 = 0.032459/ct
+    ///   net  0.003541 -> 0.003541/0.964/(10/365.25) = 13.42%/yr
+    /// which clears the ~10%/yr blended bar and fires. Leg 1 takes PM-US; our
+    /// own take clears the 0.49 ask, it reprints at 0.50 — exactly the 1c
+    /// budget, which `hedge_price_acceptable` ACCEPTS — and the basket realises
+    /// 0.026 - 0.032459 = -0.006459/ct. A +$0.07 basket logged as riskless
+    /// settles as a -$0.13 loss, on a leg-2 move the engine itself licensed.
+    ///
+    /// At this horizon the bar only demands net >= ~0.0027, so the whole band
+    /// 0.0027..0.01 was fireable and negative-EV: the allowance could be 2.8x
+    /// the edge. This is the band the gate closes.
+    #[test]
+    fn refuses_a_crossing_the_hedge_is_licensed_to_erase() {
+        let mut cx = Cx::default();
+        let r = rel("xvus-fedcut-26-usfed-2026-cut");
+        let b = books("0.48", "0.49", "20", "0.526", "20", "0.53");
+
+        // what it is worth on screen — and that it does clear the bar, so the
+        // refusal below is the slip gate and nothing else
+        let priced = detect(&mut cx, &r, &b, "2026-12-21", 10.0, 50, 0, 20, "0")
+            .expect("with no budget to lose, this is a 13.4%/yr crossing");
+        assert_eq!(priced.edge, "0.036000");
+        assert_eq!(priced.fee, "0.032459", "0.0175 kalshi + 0.014959 pmus");
+        assert_eq!(priced.net, "0.003541");
+        assert!((priced.apr - 13.4165).abs() < 0.01, "got {}", priced.apr);
+
+        // at the live budget the hedge may give away 0.01 of a 0.003541 edge
+        assert_eq!(
+            detect(&mut cx, &r, &b, "2026-12-21", 10.0, 50, 0, 20, "0.01"),
+            Err(Skip::NetUnderSlip { net: "0.003541".into(), slip: "0.01".into() })
+        );
+
+        // The boundary is refused too, because `hedge_price_acceptable` accepts
+        // ITS boundary: at net == slip exactly, the worst in-policy fill nets
+        // zero. Net here is 0.036 - 0.03245944 exactly, so this is the real
+        // knife edge and not a rounded one.
+        assert!(matches!(
+            detect(&mut cx, &r, &b, "2026-12-21", 10.0, 50, 0, 20, "0.00354056"),
+            Err(Skip::NetUnderSlip { .. })
+        ));
+        assert!(detect(&mut cx, &r, &b, "2026-12-21", 10.0, 50, 0, 20, "0.00354055").is_ok());
+
+        // ...and this is not a switch that turns take-take off. The crossings
+        // the engine actually traded clear the budget several times over: the
+        // 4.2c fedcut of 2026-07-29 is 4.2x it, and melenchon 3.75x.
+        let fired = books("0.0830", "0.1080", "1", "0.1700", "476", "0.1800");
+        let got = detect(&mut cx, &r, &fired, "2026-07-29", 10.0, 50, 0, 20, "0.01")
+            .expect("a 4.2c net crossing is not near the 1c budget");
+        assert_eq!(got.net, "0.042000");
+    }
+
+    /// DEFECT B: `detect` picked its legs by VENUE and assumed YES(kalshi) was
+    /// the same claim as YES(pmus). That is true of an equivalence and of
+    /// nothing else, and the human-vetting gate says nothing about type.
+    ///
+    /// On a 2-leg `implies` whose ANTECEDENT is the Kalshi leg, take-take buys
+    /// the antecedent and sells the consequent: the state "B happens, A does
+    /// not" pays our long leg nothing while the short leg owes $1, so the
+    /// "riskless" basket is -$1.00/contract there — booked open+hedged and
+    /// re-seeded as such on the next restart.
+    ///
+    /// Latent, deliberately fixed anyway. The registry's one cross-venue
+    /// `implies` (`xv-hantavirus-implies-any-pandemic`) pairs Kalshi with
+    /// polymarket INTL, so it has no PM-US leg and stops at `NoBook`; its
+    /// antecedent is the PM leg in any case, which is the SAFE direction. But
+    /// it holds 15 two-leg `implies` and 17 two-leg `exclusive` rels already,
+    /// and one of those vetted cross-venue is all it takes.
+    ///
+    /// The guard is `feasible_min_payoff`, the maker path's own model
+    /// (scan.rs:648), not a type blacklist — because direction decides, and a
+    /// blacklist would refuse the half of `implies` that is a real arb.
+    #[test]
+    fn refuses_a_pairing_with_a_state_that_pays_nothing() {
+        let mut cx = Cx::default();
+        let id = "xvus-nobel-peace-26-elonmusk";
+        let b = books("0.02", "0.03", "20", "0.08", "20", "0.09");
+
+        // control: the equivalence this crossing has always been, unchanged —
+        // and it still fires, which is what makes the refusals below mean
+        // something.
+        let eq = rel(id);
+        assert!(pairing_pays(&eq));
+        assert!(detect(&mut cx, &eq, &b, "2026-07-28", 10.0088, 50, 0, 20, "0.01").is_ok());
+
+        // same legs, same venues — only `rtype` differs
+        assert!(!pairing_pays(&rel_typed(id, RelType::Implies, Venue::Kalshi)));
+
+        // ...and it is the PAYOFF that refuses, not the word `implies`: put the
+        // antecedent on PM-US and the same trade buys the consequent and sells
+        // the antecedent, which pays at least $1 in every feasible state.
+        let safe = rel_typed(id, RelType::Implies, Venue::PolymarketUs);
+        assert!(pairing_pays(&safe), "the safe direction of an implication is a genuine arb");
+        assert!(detect(&mut cx, &safe, &b, "2026-07-28", 10.0088, 50, 0, 20, "0.01").is_ok());
+
+        // `exclusive` has a state where BOTH legs lose, which pays nothing
+        // whichever leg we are long — so both orders are refused.
+        for first in [Venue::Kalshi, Venue::PolymarketUs] {
+            assert!(!pairing_pays(&rel_typed(id, RelType::Exclusive, first)), "{first:?} first");
+        }
     }
 
     /// Kalshi ceils its fee to the cent PER ORDER, so the per-contract fee is
@@ -748,7 +967,7 @@ mod tests {
         // 6c edge so every clip clears and a Candidate exists to inspect
         let b = books("0.46", "0.47", "500", "0.53", "500", "0.54");
         let f = |cx: &mut Cx, clip: i64| {
-            let got = detect(cx, &r, &b, "2026-12-15", 10.0, 50, 0, clip)
+            let got = detect(cx, &r, &b, "2026-12-15", 10.0, 50, 0, clip, "0.01")
                 .unwrap_or_else(|e| panic!("clip {clip} should fire, got {e:?}"));
             assert_eq!(got.size, clip);
             got.fee
@@ -767,7 +986,7 @@ mod tests {
         // fires first and we would not be testing the fee floor at all.
         let b = books("0.09", "0.10", "20", "0.12", "20", "0.20");
         assert_eq!(
-            detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20),
+            detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20, "0.01"),
             Err(Skip::EdgeUnderFees)
         );
     }
@@ -783,13 +1002,13 @@ mod tests {
         // ask 0.0730 sits UNDER the 0.1760 bid — impossible on a live venue
         let b = books("0.1760", "0.0730", "26", "0.1700", "330", "0.1800");
         assert_eq!(
-            detect(&mut cx, &r, &b, "2026-07-28", 10.0, 50, 0, 5),
+            detect(&mut cx, &r, &b, "2026-07-28", 10.0, 50, 0, 5, "0.01"),
             Err(Skip::CrossedBook { venue: "kalshi" })
         );
         // and with the REAL ask there is simply no trade, as it should be
         let good = books("0.1760", "0.1820", "305", "0.1700", "330", "0.1800");
         assert!(
-            detect(&mut cx, &r, &good, "2026-07-28", 10.0, 50, 0, 5).is_err(),
+            detect(&mut cx, &r, &good, "2026-07-28", 10.0, 50, 0, 5, "0.01").is_err(),
             "true book offers no crossing"
         );
     }
@@ -801,7 +1020,7 @@ mod tests {
         // PM cheap / Kalshi dear: the profitable pairing is PM->K, not auto-traded
         let b = books("0.50", "0.55", "20", "0.10", "20", "0.12");
         assert_eq!(
-            detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20),
+            detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20, "0.01"),
             Err(Skip::ReverseDirection)
         );
     }
@@ -812,7 +1031,7 @@ mod tests {
         let r = rel("xvus-mystery-99-somebody");
         let b = books("0.40", "0.43", "20", "0.50", "20", "0.55");
         assert_eq!(
-            detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20),
+            detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20, "0.01"),
             Err(Skip::NoResolveDate)
         );
     }
@@ -840,7 +1059,7 @@ mod tests {
         let r = rel("xvus-fedcut-26-usfed-2026-cut");
         let b = books("0.0830", "0.1080", "1", "0.1700", "476", "0.1800");
         // the bar the armed session was really running against
-        let got = detect(&mut cx, &r, &b, "2026-07-29", 10.058485370878834, 50, 0, 20)
+        let got = detect(&mut cx, &r, &b, "2026-07-29", 10.058485370878834, 50, 0, 20, "0.01")
             .expect("the crossing that fired must still fire");
         assert_eq!(got.size, 1, "the 1-lot ask is what bounds it");
         assert_eq!(got.edge, "0.062000");
@@ -867,7 +1086,8 @@ mod tests {
 
         // PM-US thin, Kalshi deep: the July-2026 shape.
         let pm_thin = books("0.0830", "0.1080", "476", "0.1700", "1", "0.1800");
-        let got = detect(&mut cx, &r, &pm_thin, "2026-07-29", 10.0, 50, 0, 20).expect("fires");
+        let got =
+            detect(&mut cx, &r, &pm_thin, "2026-07-29", 10.0, 50, 0, 20, "0.01").expect("fires");
         assert_eq!(got.lead, Venue::PolymarketUs);
         assert_eq!(
             got.leg1(),
@@ -877,12 +1097,13 @@ mod tests {
 
         // Equally covered: no reason to move, so nothing moves.
         let tie = books("0.0830", "0.1080", "20", "0.1700", "20", "0.1800");
-        let got = detect(&mut cx, &r, &tie, "2026-07-29", 10.0, 50, 0, 20).expect("fires");
+        let got = detect(&mut cx, &r, &tie, "2026-07-29", 10.0, 50, 0, 20, "0.01").expect("fires");
         assert_eq!(got.lead, Venue::PolymarketUs, "a tie keeps today's behaviour");
 
         // Coverage, not raw depth, is the question — but both ratios divide by
         // the same `size`, so the clip that binds both cannot reorder them.
-        let clipped = detect(&mut cx, &r, &pm_thin, "2026-07-29", 10.0, 50, 0, 1).expect("fires");
+        let clipped =
+            detect(&mut cx, &r, &pm_thin, "2026-07-29", 10.0, 50, 0, 1, "0.01").expect("fires");
         assert_eq!(clipped.size, 1);
         assert_eq!(clipped.lead, Venue::PolymarketUs, "still the thinner touch");
     }
@@ -895,15 +1116,15 @@ mod tests {
         let r = rel("xvus-france-pres-27-jeanlucmelenchon");
         // depth binds: PM bid only 3 deep
         let b = books("0.40", "0.43", "20", "0.50", "3", "0.55");
-        assert_eq!(detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20).unwrap().size, 3);
+        assert_eq!(detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20, "0.01").unwrap().size, 3);
         // clip binds
         let b2 = books("0.40", "0.43", "20", "0.50", "20", "0.55");
-        assert_eq!(detect(&mut cx, &r, &b2, "2026-07-28", 0.0, 50, 0, 5).unwrap().size, 5);
+        assert_eq!(detect(&mut cx, &r, &b2, "2026-07-28", 0.0, 50, 0, 5, "0.01").unwrap().size, 5);
         // headroom binds
-        assert_eq!(detect(&mut cx, &r, &b2, "2026-07-28", 0.0, 50, 48, 20).unwrap().size, 2);
+        assert_eq!(detect(&mut cx, &r, &b2, "2026-07-28", 0.0, 50, 48, 20, "0.01").unwrap().size, 2);
         // at cap
         assert_eq!(
-            detect(&mut cx, &r, &b2, "2026-07-28", 0.0, 50, 50, 20),
+            detect(&mut cx, &r, &b2, "2026-07-28", 0.0, 50, 50, 20, "0.01"),
             Err(Skip::AtCap { open: 50 })
         );
     }

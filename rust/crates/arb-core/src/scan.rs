@@ -276,7 +276,12 @@ pub fn feasible_states(rtype: RelType, n: usize) -> Vec<Vec<i64>> {
     }
 }
 
-fn feasible_min_payoff(rtype: RelType, sides: &[Side]) -> i64 {
+/// Worst-case payoff, in dollars per basket, of holding `sides[i]` on leg `i`
+/// across every state the relationship allows. `< 1` means some feasible state
+/// pays less than the basket costs to carry, i.e. the pairing is not an arb at
+/// any price. Public because the TAKE path has to ask the same question the
+/// maker path does, and two payoff models would be two answers.
+pub fn feasible_min_payoff(rtype: RelType, sides: &[Side]) -> i64 {
     feasible_states(rtype, sides.len())
         .iter()
         .map(|state| {
