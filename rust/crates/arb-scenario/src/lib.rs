@@ -222,7 +222,7 @@ pub fn price(
 
     // Spread on each leg we would rest on.
     let mut maker_spread: Option<D> = None;
-    let mut widest = |q: &Quote, cx: &mut Cx, cur: &mut Option<D>| {
+    let widest = |q: &Quote, cx: &mut Cx, cur: &mut Option<D>| {
         if let (Some(b), Some(ak)) = (q.bid.as_ref(), q.ask.as_ref()) {
             if let (Some(b), Some(ak)) = (cx.parse(b), cx.parse(ak)) {
                 let sp = cx.sub(ak, b);

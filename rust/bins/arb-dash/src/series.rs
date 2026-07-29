@@ -79,8 +79,8 @@ pub fn edge(a: &Args, rel: &Relationship) -> Vec<serde_json::Value> {
         let va_ask = ca.and_then(|s| s.ask.clone());
         let vb_bid = cb.and_then(|s| s.bid.clone());
         let mut row = serde_json::Map::new();
-        let mut push = |label: &str, ra: Role, rb: Role, ea: &Option<String>, eb: &Option<String>,
-                        cx: &mut Cx, row: &mut serde_json::Map<String, serde_json::Value>| {
+        let push = |label: &str, ra: Role, rb: Role, ea: &Option<String>, eb: &Option<String>,
+                    cx: &mut Cx, row: &mut serde_json::Map<String, serde_json::Value>| {
             if let (Some(ea), Some(eb)) = (ea, eb) {
                 if let Some(p) =
                     price_at(cx, &sched, "s", va, vb, ra, rb, ea, eb, clip, FEE_CATEGORY)

@@ -78,11 +78,11 @@ pub fn build_source(
     let mut state: HashMap<(String, String), MarketState> = HashMap::new();
     let mut st = Stats::default();
 
-    let mut on_event = |ev: TapeEvent,
-                        books: &mut BookBuilder,
-                        state: &mut HashMap<(String, String), MarketState>,
-                        st: &mut Stats,
-                        out: &mut dyn Write|
+    let on_event = |ev: TapeEvent,
+                    books: &mut BookBuilder,
+                    state: &mut HashMap<(String, String), MarketState>,
+                    st: &mut Stats,
+                    out: &mut dyn Write|
      -> Result<(), String> {
         st.events += 1;
         let venue = ev.venue();

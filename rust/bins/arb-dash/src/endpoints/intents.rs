@@ -117,12 +117,12 @@ fn routes_for(
     let (va, vb) = (p.va, p.vb);
     let mut routes = serde_json::Map::new();
     let mut best: Option<(f64, &'static str)> = None;
-    let mut consider = |label: &'static str,
-                        ra: Role, rb: Role,
-                        ea: Option<String>, eb: Option<String>,
-                        cx: &mut Cx,
-                        routes: &mut serde_json::Map<String, serde_json::Value>,
-                        best: &mut Option<(f64, &'static str)>| {
+    let consider = |label: &'static str,
+                    ra: Role, rb: Role,
+                    ea: Option<String>, eb: Option<String>,
+                    cx: &mut Cx,
+                    routes: &mut serde_json::Map<String, serde_json::Value>,
+                    best: &mut Option<(f64, &'static str)>| {
         let (Some(ea), Some(eb)) = (ea, eb) else { return };
         let Some(p) = price_at(cx, sched, label, va, vb, ra, rb, &ea, &eb, clip, FEE_CATEGORY)
         else {

@@ -135,7 +135,8 @@ fn main() {
     let us = |d: std::time::Duration| d.as_secs_f64() / n as f64 * 1e6;
     let total = t_parse + t_book;
     println!(
-        "{{\"events\":{n},\"snapshots\":{snaps},\"deltas\":{deltas},\"gap_or_notsynced\":{gaps},\
+        "{{\"events\":{n},\"parsed\":{parsed},\"snapshots\":{snaps},\"deltas\":{deltas},\
+         \"gap_or_notsynced\":{gaps},\
          \"stage_us_per_event\":{{\"readline\":{:.3},\"serde_parse\":{:.3},\"book_apply\":{:.3},\
          \"total_hot_path\":{:.3}}},\"throughput_eps\":{{\"hot_path\":{},\"parse_only\":{}}}}}",
         us(t_read),
