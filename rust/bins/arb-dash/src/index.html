@@ -322,8 +322,9 @@ function coveragePanel(iv){
       <thead><tr><th>stem</th><th>day</th><th class="num">jsonl</th>
         <th class="num">parquet</th><th class="num">state</th></tr></thead>
       <tbody>${rows}</tbody></table></div>
-    <div class="sub" style="margin-top:8px">A closed day with raw JSONL and no Parquet
-      failed to archive. Today is legitimately raw-only.</div>
+    <div class="sub" style="margin-top:8px">A closed day with no COMPLETE Parquet
+      failed to archive &mdash; a file that exists is not one that reads. Today is
+      legitimately raw-only.</div>
   </section>`);
 }
 
@@ -433,7 +434,10 @@ function pairPanels(d, root){
       <div class="kv"><span>minutes seen</span><b>${o.minutes_seen.toLocaleString()}</b></div>
       <div class="kv"><span>best edge / contract</span><b class="ok">${o.best_edge_per_contract.toFixed(4)}</b></div>
       <div class="kv"><span>best size</span><b>${Math.round(o.best_size).toLocaleString()}</b></div>`
-      : '<div class="dim">the scanner logged no opportunity for this pair in range</div>'}
+      : d.opportunity_error
+        ? `<div class="err">the scan tape for this range could not be READ, so
+             nothing here is evidence either way: ${esc(d.opportunity_error)}</div>`
+        : '<div class="dim">the scanner logged no opportunity for this pair in range</div>'}
   </section>`));
 }
 
