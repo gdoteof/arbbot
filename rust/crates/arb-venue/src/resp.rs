@@ -95,7 +95,7 @@ impl KalshiOrder {
     pub fn try_filled_qty(&self) -> Option<i64> {
         let raw = self.fill_count_fp.as_deref().or(self.fill_count.as_deref())?;
         let n = raw.trim().parse::<f64>().ok()?;
-        (n >= 0.0 && n.is_finite()).then(|| n as i64)
+        (n >= 0.0 && n.is_finite()).then_some(n as i64)
     }
 }
 
