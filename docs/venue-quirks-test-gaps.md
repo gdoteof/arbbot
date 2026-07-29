@@ -22,7 +22,7 @@ the core behavior is pinned but a load-bearing edge is not.
 - `kalshi-ws-delta-is-change-not-total` — pinned: `tests/test_kalshi_ws.py:22` (change -> total, level removal), `:47` (new level from zero).
 - `kalshi-ws-seq-per-subscription` — pinned: `tests/test_kalshi_ws.py:55` (regression for the 2026-07-20 11:45 incident).
 - `kalshi-trade-needs-own-seq-stream` — pinned: `tests/test_kalshi_ws.py:102` (regression for the traded-markets-die P1).
-- `kalshi-ws-snapshots-only-on-subscribe` — partial: `tests/test_kalshi_ws.py:143` pins gap -> `get_snapshot` request. **GAP**: no test of the REST-snapshot resync fallback (`recorder.py:298-305`) or the welcome/30s-rebroadcast heal.
+- `kalshi-ws-snapshots-only-on-subscribe` — partial: `tests/test_kalshi_ws.py:143` pins gap -> `get_snapshot` request, which pins the frozen PYTHON stack only, and pins behaviour the production Rust recorder deliberately does NOT have (#32 deleted the request — the venue never answered it). Rust side: `kalshi::tests::a_wire_gap_does_not_discard_the_next_tickers_delta` pins what the gap branch does instead. **GAP**: no test of the REST-snapshot resync fallback (`recorder.py:298-305`) or the welcome/30s-rebroadcast heal.
 - `kalshi-market-data-auth-split` — partial: the fake-WS tests exercise the signed handshake incidentally. **GAP**: no test asserting the recorder chooses WS-with-recorder-key vs credential-free REST poll.
 
 ## Polymarket US — order API

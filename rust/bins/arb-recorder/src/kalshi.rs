@@ -361,10 +361,17 @@ fn on_ws_message(
             // levels holding the SAME nonzero offset across >=3 consecutive
             // sweeps.
             //
-            // Skipping also bypassed the only per-market recovery this file
-            // has. Applying the delta is what makes the BookBuilder report a
-            // desync, and that is what triggers the targeted REST resnapshot
-            // the caller does. What the branch did instead was ask the WS for
+            // Applying is also the PRECONDITION for the one per-market recovery
+            // on this path — a narrower claim than "the gap triggers it", and
+            // the narrower one is the true one. The seq that reaches
+            // `apply_delta` is `SeqCounter::next(t)`, contiguous by
+            // construction, and a wire gap loses its frame BEFORE this function
+            // sees it, so no per-market hole exists and `GapDetected` cannot
+            // fire here. What CAN fire is `NotSynced`: the delta names a market
+            // with no book at all, which after a wire gap means the frame lost
+            // was that market's subscribe-time SNAPSHOT. Applying it is what
+            // rebuilds that market; skipping it left the market dark until the
+            // sweep reached it. What the branch did instead was ask the WS for
             // `get_snapshot`, which the 2026-07-20 note below records as having
             // produced zero snapshots in practice.
             //
@@ -547,6 +554,52 @@ mod tests {
         (Core::new(JsonlWriter::new(&dir).expect("writer"), Broadcaster::new(MAX_BUFFER)), dir)
     }
 
+    /// A local `/markets/{t}/orderbook` that answers every ticker with the same
+    /// book and records the request lines it was sent.
+    async fn stub_orderbook_endpoint() -> (KalshiCatalog, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let http = TcpListener::bind("127.0.0.1:0").await.expect("bind http");
+        let base = format!("http://{}", http.local_addr().expect("http addr"));
+        {
+            let asked = asked.clone();
+            tokio::spawn(async move {
+                while let Ok((mut s, _)) = http.accept().await {
+                    let asked = asked.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 2048];
+                        let n = s.read(&mut buf).await.unwrap_or(0);
+                        asked
+                            .lock()
+                            .expect("asked lock")
+                            .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                        let body = r#"{"orderbook_fp":{"yes_dollars":[["0.4300","697.00"]],"no_dollars":[]}}"#;
+                        let _ = s
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                    body.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                    });
+                }
+            });
+        }
+        let catalog = KalshiCatalog {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("client"),
+            base,
+        };
+        (catalog, asked)
+    }
+
     /// A wire-seq gap must not cost a SECOND delta.
     ///
     /// `seq` is per-SID and one sid carries the whole universe, so the lost
@@ -601,49 +654,8 @@ mod tests {
     /// eviction had a 30-second half-life.
     #[tokio::test]
     async fn the_sweep_does_not_resurrect_an_evicted_book() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-
-        // an /orderbook endpoint that records what it was asked for
-        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(vec![]));
-        let http = TcpListener::bind("127.0.0.1:0").await.expect("bind http");
-        let base = format!("http://{}", http.local_addr().expect("http addr"));
-        {
-            let asked = asked.clone();
-            tokio::spawn(async move {
-                while let Ok((mut s, _)) = http.accept().await {
-                    let asked = asked.clone();
-                    tokio::spawn(async move {
-                        let mut buf = [0u8; 2048];
-                        let n = s.read(&mut buf).await.unwrap_or(0);
-                        asked
-                            .lock()
-                            .expect("asked lock")
-                            .push(String::from_utf8_lossy(&buf[..n]).into_owned());
-                        let body = r#"{"orderbook_fp":{"yes_dollars":[["0.4300","697.00"]],"no_dollars":[]}}"#;
-                        let _ = s
-                            .write_all(
-                                format!(
-                                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
-                                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                                    body.len()
-                                )
-                                .as_bytes(),
-                            )
-                            .await;
-                    });
-                }
-            });
-        }
-
+        let (catalog, asked) = stub_orderbook_endpoint().await;
         let (core, dir) = test_core("evict");
-        let catalog = KalshiCatalog {
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("client"),
-            base,
-        };
         let tickers: Vec<String> = ["A", "B", "C"].iter().map(|t| (*t).to_owned()).collect();
         let mut book = KalshiWsBook::default();
         let mut mseq = SeqCounter::default();
@@ -651,7 +663,7 @@ mod tests {
         // B was live, then the venue stopped calling it active
         let fp = json!({"yes_dollars": [["0.4300", "697.00"]], "no_dollars": []});
         core.on_event(&normalize_orderbook("B", &fp, mseq.next("B")));
-        core.evict_book(Venue::Kalshi, "B");
+        core.evict_book(Venue::Kalshi, "B", "status \"settled\"");
 
         let mut cursor = 0usize;
         for _ in 0..RESNAP_CHUNKS {
@@ -673,6 +685,42 @@ mod tests {
         for t in ["A", "C"] {
             assert!(books.contains(&format!(r#""market_id":"{t}""#)), "{t} was never swept");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ...and a market the venue calls live again must REJOIN the sweep.
+    ///
+    /// Leaving the sweep is the expensive half of eviction: the only heal left
+    /// to a market outside it is the resnapshot a `NotSynced` delta triggers,
+    /// so its bound stretches from 300s to the universe poll's 1800s. The
+    /// predicate that evicts is a whitelist of live spellings, and Kalshi's
+    /// vocabulary is wider than the states that are terminal — `inactive`
+    /// appears in this repo's captured catalog on a market whose close time is
+    /// 2029 — so one poll returning an unlearned spelling must not cost that
+    /// market its heal cadence for the life of the process.
+    #[tokio::test]
+    async fn a_market_the_venue_calls_live_again_returns_to_the_sweep() {
+        let (catalog, asked) = stub_orderbook_endpoint().await;
+        let (core, dir) = test_core("restore");
+        let tickers: Vec<String> = vec!["B".to_owned()];
+        let mut book = KalshiWsBook::default();
+        let mut mseq = SeqCounter::default();
+
+        core.evict_book(Venue::Kalshi, "B", "status \"inactive\"");
+        resnap_slice(&core, &mut book, &mut mseq, &catalog, &tickers, 0).await;
+        assert!(core.snapshot_lines().is_empty(), "an evicted book must stay out of the sweep");
+
+        // the next 1800s poll: the venue reports it active again
+        core.restore_book(Venue::Kalshi, "B");
+        resnap_slice(&core, &mut book, &mut mseq, &catalog, &tickers, 0).await;
+        assert!(
+            core.snapshot_lines().iter().any(|l| l.contains(r#""market_id":"B""#)),
+            "a market the venue calls live again never rejoined the sweep"
+        );
+        assert!(
+            asked.lock().expect("asked lock").iter().any(|r| r.contains("/markets/B/")),
+            "the sweep never asked the venue for the restored ticker"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

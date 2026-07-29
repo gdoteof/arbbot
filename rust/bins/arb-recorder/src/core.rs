@@ -160,12 +160,52 @@ impl Core {
     /// venue status poll in `main`) instead of gaining a second copy next to
     /// each sweep.
     ///
-    /// One-way, for the process's lifetime. A settled Kalshi market does not
-    /// reopen; a restart rebuilds the universe from the registry.
-    pub fn evict_book(&self, venue: arb_core::model::Venue, market_id: &str) {
-        let mut inner = self.inner.lock().expect("core lock");
-        inner.books.remove(venue, market_id);
-        inner.evicted.insert((venue, market_id.to_owned()));
+    /// Loud, and REVERSIBLE, because it now costs more than a map entry.
+    /// Dropping a book is cheap — the next sweep rebuilds it. Leaving the sweep
+    /// is not: that market's only remaining heal is the REST resnapshot a
+    /// `NotSynced` delta triggers, so its bound goes from the sweep's 300s to
+    /// however often it is evicted again. Kalshi's status vocabulary is wider
+    /// than the terminal states — this repo's own captured catalog has 20
+    /// markets at `inactive`, one of them with a 2029 close time and no result
+    /// — and the caller's predicate is a whitelist, so an unrecognised spelling
+    /// evicts. That is the right direction to fail (a settled market must stop
+    /// being published), but only if it is announced and only if the venue can
+    /// take it back. Silent and one-way, it was a permanent 6x widening of the
+    /// very bound `resnap_slice` exists to hold.
+    ///
+    /// Logged on the TRANSITION only: the universe poll re-reports every
+    /// settled market every 1800s forever, and a line each would bury the one
+    /// that matters.
+    pub fn evict_book(&self, venue: arb_core::model::Venue, market_id: &str, why: &str) {
+        let first = {
+            let mut inner = self.inner.lock().expect("core lock");
+            inner.books.remove(venue, market_id);
+            inner.evicted.insert((venue, market_id.to_owned()))
+        };
+        if first {
+            eprintln!(
+                "[recorder] evicted {}/{market_id} ({why}): book dropped and OUT of the \
+                 integrity sweep until the venue reports it live again",
+                venue.as_str()
+            );
+        }
+    }
+
+    /// The venue says it is live after all. Only the eviction mark is lifted —
+    /// the book itself comes back on the next sweep.
+    pub fn restore_book(&self, venue: arb_core::model::Venue, market_id: &str) {
+        let was = self
+            .inner
+            .lock()
+            .expect("core lock")
+            .evicted
+            .remove(&(venue, market_id.to_owned()));
+        if was {
+            eprintln!(
+                "[recorder] {}/{market_id} is live again — back in the integrity sweep",
+                venue.as_str()
+            );
+        }
     }
 
     pub fn is_evicted(&self, venue: arb_core::model::Venue, market_id: &str) -> bool {
