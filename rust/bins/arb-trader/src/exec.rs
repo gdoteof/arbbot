@@ -1114,10 +1114,17 @@ async fn run_executor(
             Ok(Ok(Some(vid))) => {
                 st2.recovered.fetch_add(1, Ordering::Relaxed);
                 claimed.insert(vid.clone());
+                // NOT "is RESTING". Kalshi's recovery searches its whole order
+                // history, so an adopted order may already be EXECUTED — which
+                // is the case an operator reading this line most needs to know
+                // about, because it is the one where a duplicate hedge may be on
+                // the book. What every recovery does establish is that the venue
+                // HAS the order; whether it is still live is a separate read.
                 eprintln!(
-                    "[exec] {venue:?}: the place of {} ({} @{}) FAILED but order {vid} is \
-                     RESTING — the venue took it and we could not read the answer. Adopting \
-                     it, so it can be cancelled and its fills attributed.",
+                    "[exec] {venue:?}: the place of {} ({} @{}) FAILED but the venue HAS \
+                     order {vid} — it took the place and we could not read the answer. \
+                     Adopting it, so it can be cancelled if it is still resting and its \
+                     fills attributed if it is not.",
                     p.client_order_id, p.market, p.price
                 );
                 tell_engine(

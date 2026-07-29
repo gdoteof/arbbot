@@ -29,6 +29,14 @@ Venue values: `kalshi`, `polymarket_us` (QCX DCM), `polymarket_intl`
 - **Current handling:** `src/arbbot/exec/kalshi_gateway.py:85-104` (page all, hard cap 50 pages), `:119-129` (filter `status=="resting"` client-side before cancel-all).
 - **Port requirement:** Always page to cursor exhaustion and filter status client-side; a one-page read of open orders is a naked-fill bug.
 
+### `kalshi-order-visibility-lags-a-create`
+- **Venue:** kalshi
+- **What the API does:** A just-accepted order is not immediately visible to the query service. `GET /portfolio/orders/{id}` 404s for a beat — **observed live 2026-07-27, and that date attaches to this read only**. The paginated `GET /portfolio/orders` list is believed to lag further still; that half has **no capture behind it** and is inherited from a code comment (`Settle`, `gateway/mod.rs`), so it is recorded here as the conservative assumption it is, not as an observation.
+- **Failure it prevents:** reading absence as a fact. On the recovery path for a place whose RESPONSE was lost — the 15s HTTP timeout, or a 2xx body that will not parse — "not on the account" would mean the venue never took it, and the order then rests under an id this process never learned: no per-order cancel can address it, and a fill on it arrives unattributable.
+- **The likelier cause of an absence on this account is not the lag.** Nothing in this repo has ever demonstrated that the order LIST echoes `client_order_id` at all (see `Book::echoes_tags`), and a list that does not echo it answers "absent" to every lookup by our own id, for ever. That case is checked separately and reported as itself — see `kalshi-orders-list-history-paginated`.
+- **Current handling:** `rust/crates/arb-venue/src/gateway/mod.rs` (`Settle::retry_404` polls the single-order GET rather than sleeping once, and returns the last 404 rather than a synthesised "missing order"); `rust/crates/arb-venue/src/gateway/kalshi.rs` (`cancel` and `recover_place` both treat `Ours::Absent` as an ERROR — never as a successful cancel, never as "nothing to recover" — and `find_ours` refuses with the tag-echo premise instead when that is what actually failed).
+- **Port requirement:** Never let a not-found from either read stand as proof an order does not exist. Poll the single-order GET after a create, and on the lost-response path report absence as UNSETTLED — the safe default is that the venue has the order. Establish whether the LIST echoes the tag before trusting any lookup built on it.
+
 ### `kalshi-signature-path-only`
 - **Venue:** kalshi
 - **What the API does:** The RSA-PSS request signature covers `timestamp_ms + METHOD + path` ONLY — the query string is excluded and rides on the URL.

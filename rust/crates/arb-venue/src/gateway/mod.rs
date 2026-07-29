@@ -156,7 +156,15 @@ pub trait VenueGateway {
     fn place(&self, req: &PlaceRequest) -> Result<Self::Order, VenueError>;
     fn cancel(&self, req: &CancelRequest) -> Result<(), VenueError>;
     /// The venue's own id for an order this process PLACED but could not read
-    /// the answer for — `Ok(None)` when nothing matching it is resting.
+    /// the answer for — `Ok(None)` when the venue's own book offers nothing to
+    /// hand back.
+    ///
+    /// HOW MUCH OF THE BOOK that is depends on what the venue lets an
+    /// implementation ask. PM-US can only read `/v1/orders/open`, so `Ok(None)`
+    /// there means "nothing RESTING matches"; Kalshi's list is the full history
+    /// and it answers over all of it, because a fill also arrives under the
+    /// venue's id and an order that finished by EXECUTING is one the engine
+    /// still has to be able to name.
     ///
     /// A place that failed may still have REACHED the venue: the transport maps
     /// a timeout to [`VenueError::Transport`] after 15s, and a body we cannot
