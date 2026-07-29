@@ -31,9 +31,19 @@ socket; tape consumers are already format-gated by `--parse-check`
   the same window; subscriber stability post-broadcaster-fix (zero
   unexplained disconnects); parse-check PASS on every day in the window.
   The gate is now `arb-shadow-gate` (`systemd/arbbot-shadow-gate.{service,
-  timer}`), which checks all four in one run — the last two by ATTACHING a
-  subscriber, because the recorder hang of 2026-07-29 only ever appeared
-  under CPU contention and a tape diff would have been green through it.
+  timer}`). It checks subscriber stability by ATTACHING a subscriber, because
+  the recorder hang of 2026-07-29 only ever appeared under CPU contention and
+  a tape diff would have been green through it. Two of the four clauses above
+  it does NOT check, and no amount of green runs should be read as covering
+  them: **"7 consecutive days"** is a manual grep in §1 of the runbook, since
+  the binary judges one day and knows nothing about any other run; and
+  **"parse-check PASS on every day"** is only partly covered — the gate
+  decodes a byte-bounded trailing slice of the CURRENT day (~1% of a 6 GB
+  tape) and never invokes `arb-recorder --parse-check`. The "gap counter <=
+  Python's" clause is not checkable as written: the two recorders' sequence
+  numbers do not measure the same thing (Rust synthesizes a +1 per-market
+  counter, Python's Kalshi tape carries the raw per-subscription wire seq), so
+  the gate requires the Rust tape's own count to be ZERO instead.
 - Risk: none to positions (read-only key; no order code path in binary).
 - Rollback: **not a unit swap.** The flip is two flags on the armed engine
   (`--socket`, `--health`) and both recorders keep running, so rollback is
