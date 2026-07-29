@@ -256,10 +256,12 @@ fn load_quoters(
     // tradable only if it is HUMAN-vetted in the registry or explicitly
     // allowlisted in config/tradable.yaml. An agent verdict is not enough.
     // A missing allowlist file is an empty allowlist, which is the
-    // conservative direction — it never widens the gate.
+    // conservative direction — it never widens the gate. A registry veto
+    // (`Relationship::veto`) beats both halves.
     let allow = arb_registry::Allowlist::load(tradable);
     let total = reg.relationships.len();
     let mut n_gated = 0usize;
+    let mut n_vetoed = 0usize;
 
     // Metadata for the risk view, keyed by id: oracle_risk scales the per-rel
     // cap and the type is the class-exposure key, and neither is carried on
@@ -281,6 +283,19 @@ fn load_quoters(
         .into_iter()
         .filter(|r| r.legs.len() == 2)
         .filter(|r| {
+            // A veto is not just another blocked rel. If the id is ALSO
+            // allowlisted, this line is the only place the operator learns the
+            // revocation they wrote actually took effect — say it by name.
+            if let Some(v) = r.veto() {
+                n_vetoed += 1;
+                if allow.contains(&r.id) {
+                    eprintln!(
+                        "[gate] VETO {}: registry verdict {v:?} overrides its entry in \
+                         {tradable} — NOT quoting",
+                        r.id
+                    );
+                }
+            }
             let ok = r.tradable(&allow);
             if !ok {
                 n_gated += 1;
@@ -310,8 +325,8 @@ fn load_quoters(
         .collect();
 
     eprintln!(
-        "[gate] {total} relationships -> {} quoting; {n_gated} blocked (not human-vetted \
-         and not in {tradable}, which lists {} ids)",
+        "[gate] {total} relationships -> {} quoting; {n_gated} blocked ({n_vetoed} vetoed by \
+         registry verdict, rest not human-vetted and not in {tradable}, which lists {} ids)",
         quoters.len(),
         allow.len()
     );
@@ -1037,6 +1052,20 @@ relationships:
     legs:
       - {venue: kalshi, market_id: K4}
       - {venue: polymarket_us, market_id: P4}
+  - id: rejected-and-allowlisted
+    type: cross-venue-equivalent
+    verdict: rejected
+    vetted_by: agent
+    legs:
+      - {venue: kalshi, market_id: K5}
+      - {venue: polymarket_us, market_id: P5}
+  - id: unknown-verdict-and-allowlisted
+    type: cross-venue-equivalent
+    verdict: not-equivalent
+    vetted_by: agent
+    legs:
+      - {venue: kalshi, market_id: K6}
+      - {venue: polymarket_us, market_id: P6}
 "#;
 
     fn ids(reg: &str, allow: &str, prefixes: &[String]) -> Vec<String> {
@@ -1056,6 +1085,31 @@ relationships:
 
         let got = ids(reg.to_str().unwrap(), allow.to_str().unwrap(), &[]);
         assert_eq!(got, vec!["human-ok".to_string(), "allowlisted".to_string()]);
+    }
+
+    /// Revoking a pair must actually revoke it. Editing the entry to
+    /// `verdict: rejected` — the registry's only revocation — used to leave an
+    /// ALLOWLISTED rel quoting, because the allowlist half of the gate never
+    /// looked at the verdict. An unrecognised verdict fails the same way.
+    #[test]
+    fn a_rejected_verdict_vetoes_an_allowlisted_relationship() {
+        let d = scratch("veto");
+        let reg = d.join("registry.yaml");
+        std::fs::write(&reg, REGISTRY).unwrap();
+        let allow = d.join("tradable.yaml");
+        std::fs::write(
+            &allow,
+            "allow:\n  - allowlisted\n  - rejected-and-allowlisted\n  \
+             - unknown-verdict-and-allowlisted\n",
+        )
+        .unwrap();
+
+        let got = ids(reg.to_str().unwrap(), allow.to_str().unwrap(), &[]);
+        assert_eq!(
+            got,
+            vec!["human-ok".to_string(), "allowlisted".to_string()],
+            "the allowlist must still grant, and must never override a verdict"
+        );
     }
 
     /// A MISSING allowlist is an empty one — the gate narrows, never widens.
