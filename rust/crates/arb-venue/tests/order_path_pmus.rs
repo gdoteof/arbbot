@@ -83,7 +83,7 @@ fn signer() -> PmusSigner {
 fn gw(replies: Vec<(u16, &str)>) -> PmusGateway<MockTransport> {
     PmusGateway::with_transport(
         signer(),
-        RateLimiter::from_per_minute(600.0, 600.0, 0),
+        RateLimiter::from_per_minute(600.0, 0),
         MockTransport::new(replies),
     )
     .with_settle(std::time::Duration::ZERO, 1)
@@ -379,10 +379,47 @@ fn a_cancel_that_fails_says_check_the_venue() {
     }
 }
 
+/// `xv-shared-api-budget` is PM-US's quirk first — it is the metered venue
+/// (`BUDGET_PER_MIN = 30`), and the Python this ports never opened the budget
+/// for an order at all: "the order/hedge path must bypass it and never wait".
+/// A drained budget refuses a background READ and lets the order path through.
+#[test]
+fn a_drained_budget_refuses_a_read_but_never_the_order_path() {
+    let g = PmusGateway::with_transport(
+        signer(),
+        RateLimiter::from_per_minute(0.0, 0), // not one token, ever
+        MockTransport::new(vec![(200, CREATED), (200, "{}"), (200, "[]")]),
+    );
+    let hedge = PlaceRequest {
+        market: SLUG.into(),
+        side: Side::Ask,
+        price: "0.3000".into(),
+        qty: 5,
+        tif: Tif::Ioc,
+        post_only: false,
+        client_order_id: String::new(),
+    };
+    assert_eq!(g.place(&hedge).unwrap().id, "pm-1");
+    g.cancel(&CancelRequest {
+        by: CancelBy::VenueId("pm-1".into()),
+        market_slug: Some(SLUG.into()),
+    })
+    .unwrap();
+    assert_eq!(g.transport.sent().len(), 2, "hedge and cancel both went");
+
+    // ...as does the resting-order read the sweep's proof-of-clean depends on.
+    assert!(g.resting_order_ids().is_ok(), "a halt must not be refusable");
+    assert_eq!(g.transport.sent().len(), 3);
+
+    // The budget still exists, and still refuses what it is there to meter.
+    assert!(matches!(g.positions(), Err(VenueError::RateLimited { .. })));
+    assert_eq!(g.transport.sent().len(), 3, "the background read never reached the wire");
+}
+
 /// The inert default still cannot reach a venue.
 #[test]
 fn the_default_pmus_gateway_is_not_wired() {
-    let g = PmusGateway::new(signer(), RateLimiter::from_per_minute(60.0, 60.0, 0));
+    let g = PmusGateway::new(signer(), RateLimiter::from_per_minute(60.0, 0));
     assert_eq!(g.place(&place_req()).unwrap_err(), VenueError::NotWired);
     assert_eq!(
         g.cancel(&CancelRequest {

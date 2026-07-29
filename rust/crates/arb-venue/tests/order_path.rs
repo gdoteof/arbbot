@@ -83,7 +83,7 @@ fn signer() -> KalshiSigner {
 fn gw(replies: Vec<(u16, &str)>) -> KalshiGateway<MockTransport> {
     KalshiGateway::with_transport(
         signer(),
-        RateLimiter::from_per_minute(600.0, 600.0, 0),
+        RateLimiter::from_per_minute(600.0, 0),
         MockTransport::new(replies),
     )
     .with_settle(std::time::Duration::ZERO, 1)
@@ -356,16 +356,141 @@ fn a_missing_balance_field_is_a_typed_error() {
     assert!(matches!(g.balances(), Err(VenueError::MissingField { .. })));
 }
 
-/// The local budget refuses before the venue has to 429 us.
+/// The local budget refuses a background READ before the venue has to 429 us.
 #[test]
-fn an_exhausted_local_rate_budget_refuses_without_sending() {
+fn an_exhausted_local_rate_budget_refuses_a_read_without_sending() {
     let g = KalshiGateway::with_transport(
         signer(),
-        RateLimiter::from_per_minute(0.0, 0.0, 0),
+        RateLimiter::from_per_minute(0.0, 0),
         MockTransport::new(vec![]),
     );
-    assert!(matches!(g.place(&place_req()), Err(VenueError::RateLimited { .. })));
+    assert!(matches!(g.balances(), Err(VenueError::RateLimited { .. })));
+    assert!(matches!(g.order_status("o-1"), Err(VenueError::RateLimited { .. })));
     assert!(g.transport.sent().is_empty(), "nothing may reach the wire");
+}
+
+/// A hedge / take-take leg: IOC, not post-only. It is sent because a maker leg
+/// has ALREADY filled, so it is the one call that must never be refused.
+fn hedge_req() -> PlaceRequest {
+    PlaceRequest {
+        market: "KXTEST".into(),
+        side: Side::Ask,
+        price: "0.3000".into(),
+        qty: 5,
+        tif: Tif::Ioc,
+        post_only: false,
+        client_order_id: "h-1".into(),
+    }
+}
+
+/// `xv-shared-api-budget`: "the order/hedge path must bypass it and never
+/// wait." Before 2026-07-29 it did neither, and this is the hazard that left —
+/// a LATENT one, never yet fired: the busiest armed run wrote 417 orders in
+/// 5.2h (~1.3/min) against a bucket of 60, and no `exec_failed` on record is a
+/// rate-limit refusal (the only four, 2026-07-28 12:51, are Kalshi 409
+/// `order_already_exists`). The hazard: a drained bucket answers `RateLimited`
+/// before anything is signed or sent, `run_executor` logs FAILED and drops the
+/// command, and the maker leg that has ALREADY filled is left naked while the
+/// bucket refills at 1/s under a quoter that keeps spending it.
+#[test]
+fn a_drained_budget_does_not_refuse_the_hedge_or_its_cancel() {
+    let g = KalshiGateway::with_transport(
+        signer(),
+        RateLimiter::from_per_minute(0.0, 0), // not one token, ever
+        MockTransport::new(vec![(201, ORDER_RESTING), (200, "{}")]),
+    );
+    assert_eq!(g.place(&hedge_req()).unwrap().order_id, "o-1");
+    g.cancel(&CancelRequest { by: CancelBy::VenueId("o-1".into()), market_slug: None })
+        .unwrap();
+
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 2, "both reached the wire");
+    assert_eq!(sent[0].method, "POST");
+    assert_eq!(sent[1].method, "DELETE");
+}
+
+/// A reprice is a cancel plus a place, and both spend a CRITICAL token — two
+/// per quote update, against the 60 the live sinks are built with, refilling
+/// at 1/s. Ordinary quoting therefore draws down the budget a hedge would need,
+/// and a reprice rate above one every two seconds exhausts it. Neither half
+/// spends anything now, and the READ budget they were sharing is untouched.
+#[test]
+fn repricing_starves_neither_the_hedge_nor_the_read_budget() {
+    const REPRICES: usize = 200;
+    let mut replies: Vec<(u16, &str)> = Vec::new();
+    for _ in 0..REPRICES {
+        replies.push((200, "{}")); // cancel the resting quote
+        replies.push((201, ORDER_RESTING)); // ...and re-place it
+    }
+    replies.push((201, ORDER_RESTING)); // the hedge, after all that quoting
+    replies.push((200, ORDER_RESTING)); // and a background status poll
+
+    let g = KalshiGateway::with_transport(
+        signer(),
+        // A read budget of exactly ONE token: 200 reprices must not take it.
+        RateLimiter::from_per_minute(1.0, 0),
+        MockTransport::new(replies),
+    );
+    for _ in 0..REPRICES {
+        g.cancel(&CancelRequest { by: CancelBy::VenueId("o-1".into()), market_slug: None })
+            .unwrap();
+        g.place(&place_req()).unwrap(); // post-only GTC: a maker quote
+    }
+
+    assert!(g.place(&hedge_req()).is_ok(), "{REPRICES} reprices cost the hedge nothing");
+    assert!(g.order_status("o-1").is_ok(), "nor the read budget its only token");
+    assert_eq!(g.transport.sent().len(), REPRICES * 2 + 2);
+}
+
+/// The kill sweep is an order-path operation that begins with a READ: Kalshi's
+/// `cancel_all_open` pages `all_orders()` before it can cancel anything, and
+/// `resting_order_ids` — the only evidence `cancel_all_and_verify` accepts —
+/// is the same read. Metering those left the halt itself refusable by a token
+/// bucket, which is the hazard this whole change exists to remove.
+#[test]
+fn a_drained_budget_does_not_refuse_the_kill_sweep() {
+    let page = r#"{"orders":[{"order_id":"66e1c799-507b","status":"resting"}],"cursor":null}"#;
+    let g = KalshiGateway::with_transport(
+        signer(),
+        RateLimiter::from_per_minute(0.0, 0), // not one token, ever
+        MockTransport::new(vec![(200, page), (200, "{}")]),
+    );
+    assert_eq!(g.resting_order_ids().unwrap(), vec!["66e1c799-507b"], "the proof read goes");
+
+    let g = KalshiGateway::with_transport(
+        signer(),
+        RateLimiter::from_per_minute(0.0, 0),
+        MockTransport::new(vec![(200, page), (200, "{}")]),
+    );
+    g.cancel_all_open().expect("a halt must not be refusable by a local budget");
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 2, "the list read, then the DELETE");
+    assert_eq!(sent[1].method, "DELETE");
+}
+
+/// The other order-path call that must read first: a client-id cancel resolves
+/// OUR id against the venue's own order list (`find_ours`). The engine emits
+/// one on `CancelWork::Escalate` — a place whose ack never arrived — so this is
+/// an armed path, and refusing its read refuses the cancel.
+#[test]
+fn a_drained_budget_does_not_refuse_a_cancel_that_must_read_first() {
+    let page = r#"{"orders":[
+        {"order_id":"66e1c799-507b","status":"resting","client_order_id":"m1785257819045"}
+    ],"cursor":null}"#;
+    let g = KalshiGateway::with_transport(
+        signer(),
+        RateLimiter::from_per_minute(0.0, 0), // not one token, ever
+        MockTransport::new(vec![(200, page), (200, "{}")]),
+    );
+    g.cancel(&CancelRequest {
+        by: CancelBy::ClientId("m1785257819045".into()),
+        market_slug: None,
+    })
+    .expect("a resolvable client id must cancel on any budget");
+
+    let sent = g.transport.sent();
+    assert_eq!(sent.len(), 2, "one list read, one DELETE");
+    assert_eq!(sent[1].path, "/trade-api/v2/portfolio/events/orders/66e1c799-507b");
 }
 
 // ------------------------------------------- create-response shapes (live) ---
@@ -509,7 +634,7 @@ fn rehearse_passes_on_the_real_create_shape_via_the_status_get() {
 fn a_404_on_a_freshly_created_order_is_retried_not_believed() {
     let g = KalshiGateway::with_transport(
         signer(),
-        RateLimiter::from_per_minute(600.0, 600.0, 0),
+        RateLimiter::from_per_minute(600.0, 0),
         MockTransport::new(vec![
             (201, ORDER_RESTING),
             (404, r#"{"error":{"code":"not_found"}}"#), // query service lagging
@@ -531,7 +656,7 @@ fn a_404_on_a_freshly_created_order_is_retried_not_believed() {
 fn an_order_that_never_becomes_visible_fails_and_is_still_cancelled() {
     let g = KalshiGateway::with_transport(
         signer(),
-        RateLimiter::from_per_minute(600.0, 600.0, 0),
+        RateLimiter::from_per_minute(600.0, 0),
         MockTransport::new(vec![
             (201, ORDER_RESTING),
             (404, "{}"),
