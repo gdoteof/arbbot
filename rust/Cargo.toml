@@ -4,7 +4,16 @@ members = ["crates/arb-core", "crates/arb-tape", "crates/arb-venue", "crates/arb
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `float_roundtrip`, because serde_json's DEFAULT float parser is not exact: it
+# uses a fast path that can land one ULP away from the nearest double. Measured
+# 2026-07-28 while round-tripping the intent corpus through `arb_core::intent`
+# — 103,575 of 843,426 real lines came back with a different `ts`, e.g.
+# 1785179791.9926717 read back as ...15. Rust's own `str::parse::<f64>` gets it
+# right; this feature makes serde_json agree, at roughly 2x the cost on floats
+# alone. Nothing on the hot path parses one (feed timestamps are integer
+# nanoseconds and prices are strings all the way to `dec`), and the golden
+# digest is unchanged by it.
+serde_json = { version = "1", features = ["float_roundtrip"] }
 
 # Lint policy. All 16 members opt in with `[lints] workspace = true`.
 #
