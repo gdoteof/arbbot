@@ -755,6 +755,7 @@ mod hedge_deadline_tests {
             }),
             take_take: None,
             armed: false,
+            hedges_undischarged: 0,
         };
         // No executors: nothing can reach a venue from this test by construction.
         let handle = tokio::spawn(run(

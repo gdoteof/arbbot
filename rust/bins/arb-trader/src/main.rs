@@ -28,6 +28,7 @@ mod feed;
 mod fills;
 mod hist;
 mod ledger;
+mod orphan;
 mod risk;
 mod taketake;
 mod sink;
@@ -669,6 +670,66 @@ fn seed_exposure_from_ledger(
     }
 }
 
+/// Hedge obligations a PREVIOUS run of this unit minted and never booked.
+///
+/// `seed_exposure_from_ledger` above cannot see these: `book_basket` writes the
+/// ledger only when the hedge FILLS, so an obligation whose hedge never filled
+/// leaves the ledger empty while the OTHER leg is real at the venue. That is
+/// exactly what happened at 00:53:50 on 2026-07-29 — see `orphan`, which also
+/// explains why the census reads this engine's own `--out` stream instead of a
+/// venue position, and why it reports rather than hedges.
+///
+/// Returns the contract count for the standing `hedges_undischarged` gauge, so
+/// this is visible to a monitor every stats tick and not only in the scrollback
+/// of a startup nobody was watching.
+fn report_undischarged_hedges(
+    args: &Args,
+    quoters: &[Quoter],
+    armed: bool,
+    bench: bool,
+) -> u64 {
+    // bench/replay reads no ledger and must stay byte-deterministic; an
+    // offline tape has no previous run of its own to answer for.
+    if bench {
+        return 0;
+    }
+    // ONLY an armed run. `run_cfg` gives an unarmed engine `ledger_path: None`,
+    // so a shadow books nothing at all — every obligation it has ever minted
+    // would read as undischarged, forever, and the one line that matters would
+    // drown in them.
+    if !armed {
+        return 0;
+    }
+    let Some(out) = args.out.as_deref() else {
+        eprintln!(
+            "[hedge] no --out: this run cannot record its own hedge obligations, so a \
+             restart will not be able to see one it left naked. Pass --out."
+        );
+        return 0;
+    };
+    let Ok(ledger) = ledger::read(&args.ledger) else {
+        // `place_preconditions` already refuses to arm on this and names the
+        // damage; saying it twice here would only bury it.
+        return 0;
+    };
+    // Every leg of every relationship this run quotes: an obligation is owed on
+    // the OTHER leg, and either leg can be the other one.
+    let mut rel_of = std::collections::BTreeMap::new();
+    for q in quoters {
+        for l in &q.rel.legs {
+            rel_of.insert(
+                l.market_id.clone(),
+                (q.rel.id.clone(), l.venue.as_str().to_string()),
+            );
+        }
+    }
+    let found = orphan::undischarged(&std::fs::read_to_string(out).unwrap_or_default(), ledger);
+    for l in orphan::report(&found, &rel_of, arb_core::clock::now_s()) {
+        eprintln!("{l}");
+    }
+    found.iter().map(|u| u.missing() as u64).sum()
+}
+
 /// Start the single event source `parse_args` has already guaranteed: a tape, a
 /// WAL replay, or the live socket.
 fn spawn_feed(args: &Args, tx: tokio::sync::mpsc::Sender<feed::FeedMsg>) {
@@ -798,8 +859,10 @@ fn run_cfg(
     armed: bool,
     has_executors: bool,
     risk: Option<std::sync::Arc<risk::RiskView>>,
+    undischarged: u64,
 ) -> engine::RunCfg {
     engine::RunCfg {
+        hedges_undischarged: undischarged,
         out_path: args.out,
         kill_file: args.kill_file,
         stats_every_s: args.stats_every_s,
@@ -919,9 +982,11 @@ async fn main() {
     }
 
     let armed = !sinks.is_empty();
+    // Before the first quote: what did the LAST run of this unit leave naked?
+    let undischarged = report_undischarged_hedges(&args, &quoters, armed, bench);
     let acks = if sinks.is_empty() { None } else { tx_acks.clone() };
     let (exec_txs, exec_stats) = exec::spawn_executors(rate, sinks, acks);
-    let cfg = run_cfg(args, bench, armed, !exec_txs.is_empty(), risk);
+    let cfg = run_cfg(args, bench, armed, !exec_txs.is_empty(), risk, undischarged);
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;
     println!("{summary}");
     if armed {
