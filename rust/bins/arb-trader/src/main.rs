@@ -333,8 +333,8 @@ fn load_quoters(
     rel_prefixes: &[String],
 ) -> (Vec<Quoter>, MarketIndex, RelMeta) {
     let reg = arb_registry::Registry::load(registry).expect("read registry");
-    // THE GATE (card c9ac7d1d, exec/main.py:131-146): a relationship is
-    // tradable only if it is HUMAN-vetted in the registry or explicitly
+    // THE GATE (card c9ac7d1d, exec/main.py:131-146): this process QUOTES a
+    // relationship only if it is HUMAN-vetted in the registry or explicitly
     // allowlisted in config/tradable.yaml. An agent verdict is not enough.
     // A missing allowlist file is an empty allowlist, which is the
     // conservative direction — it never widens the gate. A registry veto
@@ -349,7 +349,14 @@ fn load_quoters(
     // `Rel`. Built from the FULL registry, not the quoting subset — a basket we
     // no longer quote still consumes capital.
     let mut rel_meta: RelMeta = HashMap::new();
+    // Which ids would survive `config/tradable.yaml` being emptied — i.e. the
+    // ones deleting a line does NOT revoke. Collected here because the registry
+    // is consumed below and `Rel` does not carry the verdict.
+    let mut human_vetted: std::collections::BTreeSet<String> = Default::default();
     for r in &reg.relationships {
+        if r.human_vetted() {
+            human_vetted.insert(r.id.clone());
+        }
         rel_meta.insert(
             r.id.clone(),
             (
@@ -367,12 +374,22 @@ fn load_quoters(
             // A veto is not just another blocked rel. If the id is ALSO
             // allowlisted, this line is the only place the operator learns the
             // revocation they wrote actually took effect — say it by name.
+            //
+            // SCOPE, and it is the dangerous half: this gate binds THIS PROCESS
+            // and nothing else. No other component reads the registry verdict or
+            // the allowlist — `arbbot-hedge.timer` fires the naked-leg hedger
+            // every 5 minutes and places live Kalshi orders without consulting
+            // either. So a revocation stops the quoter and does NOT stop the
+            // account from trading the pair, and a line that reads as
+            // account-wide tells the operator the risk is gone when it is not.
             if let Some(v) = r.veto() {
                 n_vetoed += 1;
                 if allow.contains(&r.id) {
                     eprintln!(
                         "[gate] VETO {}: registry verdict {v:?} overrides its entry in \
-                         {tradable} — NOT quoting",
+                         {tradable} — this process will not quote it. That is the whole \
+                         effect: the naked-leg hedger does not read this gate and can \
+                         still place orders on the pair.",
                         r.id
                     );
                 }
@@ -406,10 +423,34 @@ fn load_quoters(
         .collect();
 
     eprintln!(
-        "[gate] {total} relationships -> {} quoting; {n_gated} blocked ({n_vetoed} vetoed by \
-         registry verdict, rest not human-vetted and not in {tradable}, which lists {} ids)",
+        "[gate] {total} relationships -> {} quoting; {n_gated} not quoted ({n_vetoed} vetoed by \
+         registry verdict, rest not human-vetted and not in {tradable}, which lists {} ids). \
+         Quoting is the only thing this gate decides; it is not an account-wide halt.",
         quoters.len(),
         allow.len()
+    );
+
+    // The allowlist half of the gate is the half an operator revokes by DELETING
+    // a line, and a deletion is invisible from in here: this process holds no
+    // previous allowlist, so "removed" and "never listed" are the same state. It
+    // cannot report the removal. What it can report is the present set the
+    // removal is meant to shrink, which is what an operator checks a revoke
+    // against — and the absence of an id from this list is the confirmation the
+    // aggregate census above can only hint at with a changed number.
+    //
+    // One line, listing ids, and only these ids: bounded by `tradable.yaml`, a
+    // file a human writes, and emitted ONCE at startup. Naming the not-quoted
+    // set instead would be a line per relationship over most of the registry —
+    // volume that scales with the registry is how #41 got to 355k lines.
+    let allow_only: Vec<&str> = quoters
+        .iter()
+        .map(|q| q.rel.id.as_str())
+        .filter(|id| !human_vetted.contains(*id))
+        .collect();
+    eprintln!(
+        "[gate] quoting on {tradable} alone (deleting the line stops the quoter, and \
+         nothing else): {}",
+        if allow_only.is_empty() { "(none)".into() } else { allow_only.join(", ") }
     );
 
     let mut by_market: MarketIndex = HashMap::new();

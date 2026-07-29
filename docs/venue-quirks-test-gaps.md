@@ -44,6 +44,7 @@ the core behavior is pinned but a load-bearing edge is not.
 - `pmus-positions-empty-glitch` — **GAP**. Suggested: unit test that an empty positions read with prior held state keeps previous state (`main.py:365-374`) / raises for retry (`reconcile_positions.py:71-75`).
 - `pmus-positions-partial-stale-sticky` — **GAP**. Suggested: recon test feeding a partial positions fixture (missing a ledger-expected slug) and asserting DEGRADED + no NAKED output; plus the two-consecutive-runs alert rule.
 - `pmus-positions-dict-keyed-by-slug` — pinned: `tests/test_venue_contracts.py:175` (P5).
+- `pmus-cost-per-share-is-base-cost-over-net` — **GAP**. Suggested (Rust, with the #59 hedge-sweep port): a positions fixture whose `costPerShare` is `baseCost/|net|` at a net of ±1, asserting the hedge basis comes from the recorded fill (`orphan.rs` `anchor_price`) and that no limit is priced off `costPerShare`.
 
 ## Polymarket US — market data / WS
 
