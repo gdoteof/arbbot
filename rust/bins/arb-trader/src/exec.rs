@@ -101,6 +101,14 @@ pub const EXIT_ORDERS_LEFT_RESTING: i32 = 17;
 /// the code changes nothing about whether orders rest, only whether the alarm
 /// fires. Fail-closed here has zero outage risk. Noisy, never an outage — and
 /// that noise is precisely how the missing observation finally gets made.
+///
+/// This constant exists because the first cut of it did not, and the result was
+/// BACKWARDS: it PAGED WHEN IT REFUSED and stayed SILENT WHEN IT PROCEEDED
+/// UNPROVEN. The refusal path already exits 10 and trips `is-failed`, so the
+/// outcome a human was told about was the one where nothing had been left
+/// resting, while the outcome where the book was genuinely unknown looked like
+/// a clean stop. Whenever a new "we could not tell" case is added here, check
+/// which way round it pages.
 pub const EXIT_BOOK_UNCONFIRMED: i32 = 18;
 
 /// Wall-clock budget for in-flight PLACES to settle before we verify.
