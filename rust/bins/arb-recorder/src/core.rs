@@ -395,12 +395,18 @@ mod tests {
     /// That is the whole of the 2026-07-29 "deadlock": no lock was ever held by
     /// anyone. Waiting on the registration is the difference between a test that
     /// hangs at 0% CPU and one that cannot.
+    ///
+    /// BOUNDED, because the whole point of this PR is that an unbounded
+    /// test-side wait wedges the gate instead of failing it.
     async fn subscribed(dir: &Path, core: &Core) -> tokio::io::BufReader<UnixStream> {
         let reader = subscribe(dir).await;
-        while core.broadcaster.subscriber_count() == 0 {
+        for _ in 0..5_000 {
+            if core.broadcaster.subscriber_count() > 0 {
+                return reader;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        reader
+        panic!("the acceptor never registered the subscriber within 5s");
     }
 
     /// Everything the subscriber saw, in wire order, up to the sentinel.
@@ -543,10 +549,22 @@ mod tests {
                 // true BY CONSTRUCTION rather than by winning a race, and it
                 // cannot deadlock: the accept task needs only the core lock,
                 // which this loop releases between every event.
+                //
+                // BOUNDED. `tmpdir()` is under `std::env::temp_dir()`, which is
+                // tmpfs on this box, so every event here is an unbuffered
+                // `write_all` into RAM — an unbounded spin would burn a core and
+                // tens of GB of it against `T_TEST=900`, and `subscribe`'s
+                // `.expect("connect")` can panic while this closure is still
+                // running, at which point dropping the runtime waits forever for
+                // a `spawn_blocking` that never ends. Swapping a bounded hang
+                // for an unbounded one is the defect this PR exists to remove.
+                // Panicking here instead ends the closure, so `feed.await`
+                // returns `Err` and the runtime drops cleanly.
                 let mut seq = 2;
                 while core.broadcaster.subscriber_count() == 0 {
                     core.on_event(&delta(seq));
                     seq += 1;
+                    assert!(seq < 10 * DELTAS, "the acceptor never registered after {seq} events");
                 }
                 for _ in 0..DELTAS {
                     core.on_event(&delta(seq));

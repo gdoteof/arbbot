@@ -112,10 +112,22 @@ is_timeout() { [ "$1" = 124 ] || [ "$1" = 125 ]; }
 #
 # Hence both halves: a FILE instead of a pipe, so no survivor can hold the
 # capture open, and a group kill after `wait` returns, so no survivor outlives
-# the stage. `setsid` does not fork when the caller is not already a process
-# group leader (a script's background job is not), so `$!` is the group leader —
-# but the pgid is read back from `ps` rather than assumed, because if that ever
-# changed, `kill -- -$!` would signal the WRONG GROUP.
+# the stage.
+#
+# `setsid -w`, and the `-w` is load-bearing. setsid FORKS when its caller is
+# already a process group leader; the parent then exits 0 immediately and `wait`
+# reports THAT, not the stage's status. Measured 2026-07-29 under `set -m`:
+#
+#   run_stage 2 sleep 10  -> rc=0   (want 124)
+#   run_stage 5 false     -> rc=0   (want 1)
+#
+# which is precisely "the stage that cannot fail prints green" — the defect the
+# commit immediately before this one was written to remove — reintroduced on a
+# condition (job control) that this script does not currently meet but does not
+# check either. `-w` waits for the child and returns its status, and is a no-op
+# in the non-forking case, so it costs nothing and closes the conditional hole.
+# The pgid is read back from `ps` and then CHECKED to be the child's, because a
+# read-back that is never verified is not a guard.
 #
 # What it does NOT do is bound a DIRECT child that ignores TERM: `timeout` waits
 # for that child, so `wait` here does too, and the reap only runs afterwards.
@@ -136,9 +148,13 @@ run_stage() {
   local secs="$1"; shift
   local f pid pgid rc
   f=$(mktemp)
-  setsid timeout "$secs" "$@" > "$f" 2>&1 &
+  setsid -w timeout "$secs" "$@" > "$f" 2>&1 &
   pid=$!
   pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  # Only trust a pgid that IS the child's. `ps` can lose the race and report the
+  # SCRIPT's group, and `kill -9 -- -$pgid` would then SIGKILL gate.sh and
+  # everything sharing its group. Empty simply skips the reap.
+  [ "$pgid" = "$pid" ] || pgid=
   wait "$pid"; rc=$?
   STAGE_OUT=$(cat "$f")
   rm -f "$f"
