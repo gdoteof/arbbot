@@ -1454,3 +1454,265 @@ mod hedge_accounting_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// The hedge TICK, as opposed to the hedge POLICY.
+///
+/// `hedge_plan` has been a pure function since the audit, and the tests above
+/// pin it exhaustively. Everything AROUND it was still reachable only through a
+/// `tokio::select!` arm over live channels: which side of which book the touch
+/// is read from, whether an unattributed fill can plausibly be this
+/// obligation's own, what the naked alarm says, and what the act half does to
+/// the obligation afterwards. Those are `hedge_tick_plans` and
+/// `Engine::apply_hedge_plans` now, and this is them.
+#[cfg(test)]
+mod hedge_tick_tests {
+    use super::*;
+    use crate::engine::{test_cfg, test_engine, RunCfg};
+    use arb_core::model::Level;
+
+    fn pol() -> HedgeRetry {
+        HedgeRetry { interval_s: 5.0, max_slip: "0.01".into(), alarm_after_s: 60.0 }
+    }
+
+    fn t0() -> std::time::Instant {
+        std::time::Instant::now()
+    }
+
+    fn after(t: std::time::Instant, secs: f64) -> std::time::Instant {
+        t + std::time::Duration::from_secs_f64(secs)
+    }
+
+    /// An obligation for 5 lots on the PM-US bid, placed at `at`. `attempt` is
+    /// `None` when the slip gate refused the first attempt — the case that has
+    /// NOTHING at the venue.
+    fn pending(attempt: Option<&str>, at: std::time::Instant) -> PendingHedge {
+        PendingHedge {
+            maker_order_id: "m1".into(),
+            owed: 5,
+            filled: 0,
+            anchor: HedgeAnchor {
+                venue: "polymarket_us",
+                market_id: "P".into(),
+                side: "bid",
+                price: "0.40".into(),
+                ts: 1.0,
+            },
+            first_at: at,
+            last_try_at: at,
+            latest_attempt: attempt.map(str::to_string),
+            tries: u32::from(attempt.is_some()),
+            alarmed: false,
+            hold_logged: false,
+        }
+    }
+
+    fn books(bid: &str, ask: &str) -> BookBuilder {
+        let mut b = BookBuilder::new();
+        b.apply_snapshot(
+            Venue::PolymarketUs,
+            "P",
+            vec![Level { price: bid.into(), size: "50".into() }],
+            vec![Level { price: ask.into(), size: "50".into() }],
+            1,
+            0,
+            None,
+        );
+        b
+    }
+
+    /// One fill on `market` that no order of ours claims.
+    fn unclaimed(market: &str, at: std::time::Instant) -> HashMap<String, UnclaimedFill> {
+        HashMap::from([(
+            "BH9NNPGFA9SX".to_string(),
+            UnclaimedFill {
+                venue: Venue::PolymarketUs,
+                market_id: market.into(),
+                cum: 5,
+                since: at,
+            },
+        )])
+    }
+
+    /// THE narrowing that makes the ack-hold worth having. A fill we cannot
+    /// attribute on this obligation's own market holds its retry ONLY while an
+    /// attempt of its own is still waiting for an `order_ack`.
+    ///
+    /// The predicate used to be venue+market alone, so one foreign fill held
+    /// every obligation in that market — including obligations whose first
+    /// attempt the slip gate refused, which have nothing at the venue at all and
+    /// where the fill provably cannot be theirs. On a shared account (the Python
+    /// stack, hand trades) that was up to 59.9s of added naked time on a 60s
+    /// horizon, bought for nothing.
+    #[test]
+    fn only_an_obligation_with_an_unacked_attempt_holds_for_a_foreign_fill() {
+        let mut cx = Cx::default();
+        let (p, t) = (pol(), t0());
+        let due = after(t, 6.0);
+        let bk = books("0.40", "0.41");
+        let park = unclaimed("P", t);
+        let no_acks = HashMap::new();
+
+        // an attempt of ours is out and its ack has not landed: this fill may be
+        // that attempt's own, so do not re-place over it
+        let mut pend = HashMap::from([("h1".to_string(), pending(Some("h1"), t))]);
+        let plans = hedge_tick_plans(&mut cx, &p, &pend, &bk, &no_acks, &park, due);
+        assert_eq!(plans[0].1, HedgePlan::HoldForAck);
+
+        // the SAME fill, but this obligation's first attempt was refused, so it
+        // has nothing at the venue that could have produced it
+        pend.insert("h1".to_string(), pending(None, t));
+        let plans = hedge_tick_plans(&mut cx, &p, &pend, &bk, &no_acks, &park, due);
+        assert_eq!(
+            plans[0].1,
+            HedgePlan::Retry { qty: 5, price: "0.40".into() },
+            "an obligation with nothing at the venue must not wait on a foreign fill"
+        );
+
+        // ...and once the attempt's ack HAS landed, the fill is not its own
+        // either: we would have recognised it.
+        pend.insert("h1".to_string(), pending(Some("h1"), t));
+        let acked = HashMap::from([("h1".to_string(), "venue-side-id".to_string())]);
+        let plans = hedge_tick_plans(&mut cx, &p, &pend, &bk, &acked, &park, due);
+        assert_eq!(plans[0].1, HedgePlan::Retry { qty: 5, price: "0.40".into() });
+
+        // ...and a fill on a DIFFERENT market was never ambiguous at all
+        pend.insert("h1".to_string(), pending(Some("h1"), t));
+        let elsewhere = unclaimed("SOME-OTHER-MARKET", t);
+        let plans = hedge_tick_plans(&mut cx, &p, &pend, &bk, &no_acks, &elsewhere, due);
+        assert_eq!(plans[0].1, HedgePlan::Retry { qty: 5, price: "0.40".into() });
+    }
+
+    /// The naked alarm has to say WHY the leg will not clear. A crossed hedge
+    /// book is honoured for the touch — refusing to DISCHARGE an obligation on
+    /// corrupt data strands real directional exposure to resolution — but it is
+    /// REPORTED, so an operator learns that the price being waited on is a
+    /// phantom. `KXRATECUT-26DEC31` sat inverted for a 441-minute unbroken run
+    /// on 2026-07-28.
+    #[test]
+    fn the_naked_alarm_reports_a_crossed_hedge_book() {
+        let mut cx = Cx::default();
+        let t = t0();
+        let bk = books("0.50", "0.40"); // bid >= ask: OUR book is corrupt
+        let pend = HashMap::from([("h1".to_string(), pending(Some("h1"), t))]);
+        let plans = hedge_tick_plans(
+            &mut cx,
+            &pol(),
+            &pend,
+            &bk,
+            &HashMap::new(),
+            &HashMap::new(),
+            after(t, 61.0),
+        );
+        let alarm = plans[0].2.as_deref().expect("61s naked on a 60s horizon must alarm");
+        assert!(alarm.contains("NAKED 5x P on polymarket_us"), "{alarm}");
+        assert!(alarm.contains("after 1 tries"), "{alarm}");
+        assert!(alarm.contains("anchor 0.40 on the bid side, budget 0.01"), "{alarm}");
+        assert!(alarm.contains("CROSSED (bid 0.50 >= ask 0.40)"), "{alarm}");
+        assert!(alarm.contains("phantom"), "{alarm}");
+
+        // ...and a sane book alarms without the crossed clause
+        let sane = books("0.40", "0.41");
+        let pend = HashMap::from([("h1".to_string(), pending(Some("h1"), t))]);
+        let plans = hedge_tick_plans(
+            &mut cx,
+            &pol(),
+            &pend,
+            &sane,
+            &HashMap::new(),
+            &HashMap::new(),
+            after(t, 61.0),
+        );
+        let alarm = plans[0].2.as_deref().expect("still naked, still alarmed");
+        assert!(!alarm.contains("CROSSED"), "{alarm}");
+    }
+
+    /// Dispatch order is by chain id and nothing else. `pending_hedges` is a
+    /// `HashMap`, so without the sort the same tape would act on the same
+    /// retries in a different order on every run — and this arm PLACES.
+    #[test]
+    fn plans_come_back_in_chain_id_order_not_hash_order() {
+        let mut cx = Cx::default();
+        let t = t0();
+        let pend: HashMap<String, PendingHedge> = ["h3", "h1", "h2", "h10"]
+            .iter()
+            .map(|id| (id.to_string(), pending(Some(id), t)))
+            .collect();
+        let plans = hedge_tick_plans(
+            &mut cx,
+            &pol(),
+            &pend,
+            &books("0.40", "0.41"),
+            &HashMap::new(),
+            &HashMap::new(),
+            after(t, 6.0),
+        );
+        let ids: Vec<&str> = plans.iter().map(|(c, _, _)| c.as_str()).collect();
+        assert_eq!(ids, ["h1", "h10", "h2", "h3"], "byte order, deterministically");
+    }
+
+    /// The ACT half. A retry mints a NEW attempt id, but the OBLIGATION's key —
+    /// its chain id — does not move: that is what makes a late fill on any
+    /// attempt in the chain credit the right obligation. It re-arms the ack hold
+    /// too, because a new attempt is a new ack that can go missing.
+    #[test]
+    fn a_retry_mints_a_new_attempt_under_the_same_chain_id() {
+        let mut e = test_engine(RunCfg { hedge_retry: Some(pol()), ..test_cfg() });
+        let t = t0();
+        // attempt h1 is already out, and its hold has already been logged
+        e.next_hedge_oid = 1;
+        e.pending_hedges
+            .insert("h1".into(), PendingHedge { hold_logged: true, ..pending(Some("h1"), t) });
+
+        let mono = after(t, 6.0);
+        e.apply_hedge_plans(
+            vec![("h1".into(), HedgePlan::Retry { qty: 5, price: "0.40".into() }, None)],
+            mono,
+        );
+
+        let p = &e.pending_hedges["h1"];
+        assert_eq!(p.tries, 2);
+        assert_eq!(p.latest_attempt.as_deref(), Some("h2"), "a new attempt");
+        assert_eq!(p.last_try_at, mono, "and `interval_s` runs from this placement");
+        assert!(!p.hold_logged, "a new attempt is a new ack that can go missing");
+        assert_eq!((p.owed, p.filled), (5, 0), "the obligation itself is unchanged");
+
+        let ho = &e.hedge_orders["h2"];
+        assert_eq!(ho.chain_id, "h1", "the obligation's name does not move across retries");
+        assert_eq!((ho.qty, ho.cum_filled), (5, 0));
+        assert_eq!(ho.side, "ask", "taking a bid SELLS");
+        assert_eq!(e.n_retry, 1);
+
+        // ...and a Retire really retires, while leaving the attempts behind
+        e.apply_hedge_plans(vec![("h1".into(), HedgePlan::Retire, None)], mono);
+        assert!(e.pending_hedges.is_empty());
+        assert!(
+            e.hedge_orders.contains_key("h2"),
+            "a late frame on a retired obligation's attempt must stay recognisable"
+        );
+    }
+
+    /// The alarm is a side effect of the ACT half, and it fires once. `alarmed`
+    /// is what stops the second one, and `hedges_naked` is the gauge it feeds.
+    #[test]
+    fn an_alarm_is_recorded_on_the_obligation_and_counted_once() {
+        let mut e = test_engine(RunCfg { hedge_retry: Some(pol()), ..test_cfg() });
+        let t = t0();
+        e.pending_hedges.insert("h1".into(), pending(Some("h1"), t));
+
+        e.apply_hedge_plans(vec![("h1".into(), HedgePlan::Wait, Some("naked".into()))], t);
+        assert!(e.pending_hedges["h1"].alarmed);
+        assert_eq!(e.n_naked, 1);
+        // the decide half will not offer a second one for the same obligation
+        let plans = hedge_tick_plans(
+            &mut e.cx,
+            &pol(),
+            &e.pending_hedges,
+            &books("0.30", "0.31"),
+            &HashMap::new(),
+            &HashMap::new(),
+            after(t, 600.0),
+        );
+        assert_eq!(plans[0].2, None, "an obligation alarms exactly once");
+        assert_eq!(plans[0].1, HedgePlan::Wait, "and waiting is still the policy");
+    }
+}

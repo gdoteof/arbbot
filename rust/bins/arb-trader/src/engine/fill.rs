@@ -649,3 +649,212 @@ mod ledger_write_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// `attribute_fill` itself, driven directly.
+///
+/// It was `attribute_fill!` — a macro body, so the only way to reach it was to
+/// spawn `run()` over a real channel and infer what had happened from the
+/// summary. Every arithmetic rule underneath it was pinned (`hedge_credit`,
+/// `unclaimed_expired`); the WIRING between them was not, and the wiring is
+/// where the audit's defects actually lived: an attempt retired on its first
+/// frame, a held fill dropped instead of replayed, a foreign fill counted as
+/// ours.
+#[cfg(test)]
+mod attribute_fill_tests {
+    use super::*;
+    use crate::engine::{test_cfg, test_engine};
+    use arb_core::fill::HedgeAnchor;
+    use std::time::Instant;
+
+    /// The hedge leg: PM-US's bid, i.e. the maker leg filled long and the hedge
+    /// sells into it.
+    fn anchor() -> HedgeAnchor {
+        HedgeAnchor {
+            venue: "polymarket_us",
+            market_id: "P".into(),
+            side: "bid",
+            price: "0.40".into(),
+            ts: 1.0,
+        }
+    }
+
+    fn maker_order() -> MakerOrder {
+        MakerOrder {
+            rel_id: "synth-attribution-rel".into(),
+            class: "cross-venue-equivalent",
+            venue: "kalshi".into(),
+            market_id: "K".into(),
+            side: "bid".into(),
+            price: "0.31".into(),
+            strategy: "maker-hedge",
+        }
+    }
+
+    fn hedge_order(qty: i64) -> HedgeOrder {
+        HedgeOrder {
+            maker_order_id: "m1".into(),
+            chain_id: "h1".into(),
+            market_id: "P".into(),
+            venue: "polymarket_us",
+            side: "ask",
+            price: "0.40".into(),
+            qty,
+            cum_filled: 0,
+        }
+    }
+
+    fn pending(owed: i64) -> PendingHedge {
+        let at = Instant::now();
+        PendingHedge {
+            maker_order_id: "m1".into(),
+            owed,
+            filled: 0,
+            anchor: anchor(),
+            first_at: at,
+            last_try_at: at,
+            latest_attempt: Some("h1".into()),
+            tries: 1,
+            alarmed: false,
+            hold_logged: false,
+        }
+    }
+
+    /// THE reason this is one function and not two: both of its callers, in the
+    /// order the ack race actually produces them.
+    ///
+    /// The `fill` arm cannot name the order — the venue reports its own id and
+    /// no ack has mapped it yet — so the frame is HELD. The `order_ack` arm
+    /// then learns the mapping and replays the SAME frame through the SAME
+    /// function, which is the only way the two can be guaranteed to agree about
+    /// what it means. Dropping it there left the basket unbooked, the
+    /// obligation credited 0, and the 5-second retry bought the hedge twice.
+    #[test]
+    fn a_fill_that_beat_its_ack_is_held_and_the_ack_replays_it() {
+        let mut e = test_engine(test_cfg());
+        e.fills.register_order("m1", "K", 5, Some(anchor()));
+        e.order_rel.insert("m1".into(), maker_order());
+
+        let arm = e.attribute_fill("BH8H83AY09NG", 5, Venue::Kalshi, "K", 1.0, Instant::now());
+        assert!(
+            matches!(arm, FillArm::Unattributed),
+            "a frame we cannot name is NOT a maker frame — counting it is what made \
+             `fills` over-report by every foreign fill on the account"
+        );
+        assert_eq!(e.unclaimed_fills.len(), 1, "held, not dropped");
+        assert!(
+            e.pending_hedges.is_empty(),
+            "and nothing may be hedged off a frame we cannot attribute"
+        );
+
+        // ...and now the ack that names it lands.
+        e.on_order_ack(
+            &json!({"order_id": "m1", "venue_order_id": "BH8H83AY09NG"}),
+            2_000_000_000,
+            Instant::now(),
+        );
+        assert!(e.unclaimed_fills.is_empty(), "the held frame was claimed by its ack");
+        assert_eq!(e.pending_hedges.len(), 1, "and minted the obligation it always owed");
+        let p = e.pending_hedges.values().next().expect("the obligation");
+        assert_eq!((p.owed, p.filled), (5, 0));
+        assert_eq!(p.maker_order_id, "m1", "credited to the maker order, not to the venue id");
+        assert_eq!(e.venue_oid.get("BH8H83AY09NG").map(String::as_str), Some("m1"));
+    }
+
+    /// I1/I2 through the engine rather than through the arithmetic. A 10-lot
+    /// hedge filling 4 then 10 credits the ATTEMPT (so its own later frames are
+    /// deltas) and the OBLIGATION (so the retry knows what is left), separately,
+    /// and retires the obligation only once it is really covered.
+    ///
+    /// `hedge_credit` has pinned the numbers since the audit. The defect was in
+    /// the wiring above it: `hedge_orders.remove(oid)` on the FIRST frame, so
+    /// frame two matched no hedge at all, fell through to the maker path, found
+    /// nothing in the FillLedger and was dropped — 10 lots booked as 4.
+    #[test]
+    fn a_hedge_filling_four_then_ten_credits_both_and_retires_once() {
+        let mut e = test_engine(test_cfg());
+        e.order_rel.insert("m1".into(), maker_order());
+        e.hedge_orders.insert("h1".into(), hedge_order(10));
+        e.pending_hedges.insert("h1".into(), pending(10));
+
+        let arm = e.attribute_fill("h1", 4, Venue::PolymarketUs, "P", 1.0, Instant::now());
+        assert!(matches!(arm, FillArm::Hedge));
+        assert_eq!(e.hedge_orders["h1"].cum_filled, 4, "the attempt");
+        assert_eq!(e.pending_hedges["h1"].filled, 4, "and the obligation, separately");
+
+        e.attribute_fill("h1", 10, Venue::PolymarketUs, "P", 2.0, Instant::now());
+        assert_eq!(e.hedge_orders["h1"].cum_filled, 10, "cumulative, so the delta was 6");
+        assert!(!e.pending_hedges.contains_key("h1"), "covered now, so retired now");
+        assert!(
+            e.hedge_orders.contains_key("h1"),
+            "...but the ATTEMPT stays, so a further frame on it is an over-fill rather \
+             than money we cannot explain"
+        );
+        assert_eq!(e.n_overhedge, 0, "nothing was filled beyond what was owed");
+    }
+
+    /// I2's deliberate edge: contracts past what the obligation owed are filled
+    /// and NOT booked. There is no maker fill to pair them with, so a basket
+    /// record would invent one — they are alarmed for a human instead.
+    #[test]
+    fn a_fill_past_a_retired_obligation_is_alarmed_not_booked() {
+        let mut e = test_engine(test_cfg());
+        e.order_rel.insert("m1".into(), maker_order());
+        // the attempt is still known; its obligation is already retired
+        e.hedge_orders.insert("h1".into(), hedge_order(10));
+
+        let arm = e.attribute_fill("h1", 6, Venue::PolymarketUs, "P", 1.0, Instant::now());
+        assert!(matches!(arm, FillArm::Hedge), "a superseded attempt is still ours");
+        assert_eq!(e.n_overhedge, 1);
+        assert_eq!(
+            e.summary()["hedges_overfilled"],
+            serde_json::json!(1),
+            "and it must reach the gauge a human watches"
+        );
+    }
+
+    /// The two gauges the `FillArm` return exists for, which ask different
+    /// questions: `fills` counts maker frames ONLY, and tape time advances for
+    /// anything that is not a hedge frame. Returning a bool conflated them.
+    #[test]
+    fn a_hedge_frame_moves_neither_the_fills_gauge_nor_tape_time() {
+        let mut e = test_engine(test_cfg());
+        e.order_rel.insert("m1".into(), maker_order());
+        e.hedge_orders.insert("h1".into(), hedge_order(5));
+        e.pending_hedges.insert("h1".into(), pending(5));
+
+        e.on_fill(
+            &json!({"order_id": "h1", "cum": 5}),
+            Venue::PolymarketUs,
+            "P",
+            9_000_000_000,
+            Instant::now(),
+        );
+        assert_eq!(e.n_fill, 0, "a hedge fill is not a maker fill");
+        assert_eq!(e.last_now, 0.0, "and a hedge frame has never advanced tape time");
+
+        // a maker frame moves both
+        e.fills.register_order("m2", "K", 5, Some(anchor()));
+        e.order_rel.insert("m2".into(), maker_order());
+        e.on_fill(
+            &json!({"order_id": "m2", "cum": 5}),
+            Venue::Kalshi,
+            "K",
+            9_000_000_000,
+            Instant::now(),
+        );
+        assert_eq!(e.n_fill, 1);
+        assert_eq!(e.last_now, 9.0);
+
+        // ...and a frame we cannot attribute moves tape time but is NOT counted
+        e.on_fill(
+            &json!({"order_id": "nobody-we-know", "cum": 3}),
+            Venue::Kalshi,
+            "K",
+            10_000_000_000,
+            Instant::now(),
+        );
+        assert_eq!(e.n_fill, 1, "a foreign fill is not ours to count");
+        assert_eq!(e.last_now, 10.0);
+        assert_eq!(e.unclaimed_fills.len(), 1, "it is held for the ack that might name it");
+    }
+}

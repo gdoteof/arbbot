@@ -1037,6 +1037,57 @@ pub async fn run(
     eng.finish()
 }
 
+/// A `RunCfg` for a unit test: nothing that could reach a venue, write the
+/// accounting ledger, read a health file, or consult a risk view.
+///
+/// `bench: true` is here for the id seed and nothing else. `id_base` is 0 in
+/// bench, so the order ids a test asserts on are `h1`, `h2`, ... rather than a
+/// wall-clock offset no test can predict. Every deadline a test drives is
+/// called directly, so the `if !cfg.bench` guards in `run()`'s select do not
+/// apply to it.
+#[cfg(test)]
+fn test_cfg() -> RunCfg {
+    RunCfg {
+        out_path: None,
+        kill_file: "/nonexistent/KILL".into(),
+        stats_every_s: 86_400,
+        bench: true,
+        wal_path: None,
+        health_file: None,
+        risk: None,
+        ledger_path: None,
+        hedge_retry: None,
+        take_take: None,
+        armed: false,
+    }
+}
+
+/// An `Engine` with no executors at all, so nothing a test does can reach a
+/// venue by construction.
+///
+/// This exists because `attribute_fill` and the hedge tick are ordinary
+/// methods now. While they were macro bodies the only way to reach them was to
+/// spawn `run()` over a real channel and infer what had happened from the
+/// summary — which is why the two of them between them carried seven defects
+/// into production with a green test suite.
+#[cfg(test)]
+fn test_engine(cfg: RunCfg) -> Engine {
+    use std::sync::atomic::AtomicU64;
+    Engine::new(
+        cfg,
+        HashMap::new(),
+        Arc::new(ExecStats {
+            hop: Hist::new(),
+            placed: AtomicU64::new(0),
+            cancelled: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+        }),
+        &HashMap::new(),
+    )
+}
+
 #[cfg(test)]
 mod take_take_wiring_tests {
     use super::*;
