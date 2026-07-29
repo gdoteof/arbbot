@@ -554,6 +554,20 @@ mod tests {
         (Core::new(JsonlWriter::new(&dir).expect("writer"), Broadcaster::new(MAX_BUFFER)), dir)
     }
 
+    /// The books as lines, for assertions.
+    ///
+    /// `Core::snapshot_lines()` was replaced by `with_snapshot_lines`, which
+    /// hands the lines to a callback WHILE HOLDING the core lock — that is the
+    /// whole point of #27, since capturing them and releasing the lock let a
+    /// delta interleave and publish ahead of the snapshot it superseded. Tests
+    /// only ever want the Vec, so they collect it here rather than each one
+    /// spelling out a closure.
+    fn snapshot_lines(core: &Core) -> Vec<String> {
+        let mut out = Vec::new();
+        core.with_snapshot_lines(&mut |lines| out = lines);
+        out
+    }
+
     /// A local `/markets/{t}/orderbook` that answers every ticker with the same
     /// book and records the request lines it was sent.
     async fn stub_orderbook_endpoint() -> (KalshiCatalog, Arc<std::sync::Mutex<Vec<String>>>) {
@@ -630,7 +644,7 @@ mod tests {
             None,
             "a wire gap is not a per-market desync — there is nothing named to resnapshot"
         );
-        let lines = core.snapshot_lines();
+        let lines = snapshot_lines(&core);
         let b = lines.iter().find(|l| l.contains(r#""market_id":"B""#)).expect("B has a book");
         assert!(b.contains("597.00"), "B's change was discarded with A's gap: {b}");
         assert_eq!(core.gap_count(), 0, "a wire gap must not be reported as a per-market gap");
@@ -639,7 +653,7 @@ mod tests {
                         "msg": {"market_ticker": "B", "side": "yes",
                                 "price_dollars": "0.4300", "delta_fp": "-97.00"}});
         on_ws_message(&core, &mut book, &mut sid_seq, &mut mseq, &d2);
-        let lines = core.snapshot_lines();
+        let lines = snapshot_lines(&core);
         let b = lines.iter().find(|l| l.contains(r#""market_id":"B""#)).expect("B has a book");
         assert!(b.contains("500.00"), "the delta after the gapped one was discarded: {b}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -672,7 +686,7 @@ mod tests {
             assert_eq!(advance, resnap_batch(tickers.len(), RESNAP_CHUNKS));
             cursor = (cursor + advance) % tickers.len();
         }
-        let books = core.snapshot_lines().join("");
+        let books = snapshot_lines(&core).join("");
         assert!(
             !books.contains(r#""market_id":"B""#),
             "the sweep resurrected an evicted book: {books}"
@@ -708,13 +722,13 @@ mod tests {
 
         core.evict_book(Venue::Kalshi, "B", "status \"inactive\"");
         resnap_slice(&core, &mut book, &mut mseq, &catalog, &tickers, 0).await;
-        assert!(core.snapshot_lines().is_empty(), "an evicted book must stay out of the sweep");
+        assert!(snapshot_lines(&core).is_empty(), "an evicted book must stay out of the sweep");
 
         // the next 1800s poll: the venue reports it active again
         core.restore_book(Venue::Kalshi, "B");
         resnap_slice(&core, &mut book, &mut mseq, &catalog, &tickers, 0).await;
         assert!(
-            core.snapshot_lines().iter().any(|l| l.contains(r#""market_id":"B""#)),
+            snapshot_lines(&core).iter().any(|l| l.contains(r#""market_id":"B""#)),
             "a market the venue calls live again never rejoined the sweep"
         );
         assert!(
