@@ -138,6 +138,18 @@ pub fn replay(
     tail_bytes: u64,
     sample_ns: i64,
 ) -> std::io::Result<(TapeStats, Samples)> {
+    // `sample_ns` is a DIVISOR (`ts / sample_ns`, the TOB bucket). At zero the
+    // replay panics, which fails safe but reports as a killed run rather than
+    // as a bad flag. Refused here rather than in `parse_args` so every caller
+    // is covered, and it surfaces as the ordinary "reading <path>: <why>"
+    // failure — a red gate with a reason, which is the shape the rest of this
+    // binary uses.
+    if sample_ns <= 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--sample-s must be > 0: it is the TOB sample bucket divisor",
+        ));
+    }
     let mut stats = TapeStats::default();
     let mut samples: Samples = BTreeMap::new();
     let mut books = BookBuilder::new();
@@ -354,6 +366,19 @@ mod tests {
         // one unsynced, which is what a real hole looks like downstream.
         let (win, _) = replay(&p, (150, 250), u64::MAX, 1_000_000_000).expect("win");
         assert_eq!(win.in_window, 1, "the time window bounds what is compared");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `--sample-s 0` used to panic on `ts / sample_ns`. It failed safe, but a
+    /// panic reports as a killed run, not as a bad flag.
+    #[test]
+    fn a_zero_sample_interval_is_refused_rather_than_dividing_by_it() {
+        let dir = tmpdir("samplezero");
+        let p = write(&dir, "t.jsonl", &[&snap("A", 1, 10, "0.40", "0.60")]);
+        let e = replay(&p, (0, i64::MAX), u64::MAX, 0).expect_err("must refuse");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+        assert!(e.to_string().contains("--sample-s"), "name the flag: {e}");
+        assert!(replay(&p, (0, i64::MAX), u64::MAX, 1).is_ok(), "1ns buckets are still fine");
         std::fs::remove_dir_all(dir).ok();
     }
 

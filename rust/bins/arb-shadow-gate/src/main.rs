@@ -189,11 +189,28 @@ fn socket_refusal(socket: &Path) -> Option<String> {
     None
 }
 
-/// `slice/total` MiB for one tape, so the report says how much of the day the
+/// `slice/total` BYTES for one tape, so the report says how much of the day the
 /// parse-compat verdict actually covers.
-fn slice_mib(path: &Path, tail_bytes: u64) -> (u64, u64) {
+///
+/// Bytes, not MiB. It used to divide integer MiB and print `slice: python 0/0
+/// MiB` for any tape under a megabyte, which reads identically to "nothing was
+/// measured" — the same shape as the `0/0 = 0.0%` TOB line already fixed here,
+/// and a quiet venue, an early-morning run and a venue that has just
+/// reconnected all produce sub-MiB tapes. `human_bytes` keeps the unit
+/// readable without a unit that can round a real file to zero.
+fn slice_bytes(path: &Path, tail_bytes: u64) -> (u64, u64) {
     let total = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    (total.min(tail_bytes) / 1_048_576, total / 1_048_576)
+    (total.min(tail_bytes), total)
+}
+
+/// A byte count a human can read, exact below a kibibyte so nothing non-empty
+/// can print as `0`.
+fn human_bytes(n: u64) -> String {
+    match n {
+        n if n >= 1_048_576 => format!("{:.1} MiB", n as f64 / 1_048_576.0),
+        n if n >= 1024 => format!("{:.1} KiB", n as f64 / 1024.0),
+        n => format!("{n} B"),
+    }
 }
 
 /// Returns, per venue, the markets the PYTHON recorder published in the window —
@@ -263,11 +280,15 @@ fn tape_stage(a: &Args, fails: &mut Vec<String>) -> HashMap<&'static str, HashSe
                 s.covered_s(),
             );
         }
-        let (pslice, ptotal) = slice_mib(&py, a.tail_bytes);
-        let (rslice, rtotal) = slice_mib(&rs, a.tail_bytes);
+        let (pslice, ptotal) = slice_bytes(&py, a.tail_bytes);
+        let (rslice, rtotal) = slice_bytes(&rs, a.tail_bytes);
         println!(
-            "  slice: python {pslice}/{ptotal} MiB, rust {rslice}/{rtotal} MiB — parse-compat \
-             below is judged on THAT SLICE, not on the whole day"
+            "  slice: python {}/{}, rust {}/{} — parse-compat below is judged on THAT SLICE, \
+             not on the whole day",
+            human_bytes(pslice),
+            human_bytes(ptotal),
+            human_bytes(rslice),
+            human_bytes(rtotal),
         );
 
         // NOTHING COMPARED IS NOT A COMPARISON THAT PASSED. Every counter below
@@ -478,6 +499,54 @@ fn tape_stage(a: &Args, fails: &mut Vec<String>) -> HashMap<&'static str, HashSe
     python_universe
 }
 
+/// The welcome burst against the python universe, one venue at a time.
+///
+/// Split out of `live_stage` so it is reachable from a test without a socket,
+/// a recorder and 120 seconds. The `Venue::parse` arm below was the last silent
+/// `continue` in the verdict path and there was no way to drive it.
+fn coverage_checks(
+    c: &live::StreamCheck,
+    python_universe: &HashMap<&'static str, HashSet<String>>,
+    fails: &mut Vec<String>,
+) {
+    for (venue, py_markets) in python_universe {
+        if py_markets.is_empty() {
+            continue; // already failed above; a set difference against it says nothing
+        }
+        // NOT a `continue`. Dead today — `tape::VENUES` and `Venue` agree on all
+        // three — and the day a fourth venue is added to one and not the other,
+        // a `continue` here drops that venue's coverage check with no line on
+        // the report at all. Silently checking less than the report implies is
+        // the failure mode this whole gate is a rewrite of.
+        let Some(v) = arb_core::model::Venue::parse(venue) else {
+            fail(
+                fails,
+                format!(
+                    "coverage {venue}: NOT CHECKED — `Venue::parse` does not know this venue, so \
+                     the welcome burst was never asked about it. `tape::VENUES` and \
+                     `arb_core::model::Venue` have diverged."
+                ),
+            );
+            continue;
+        };
+        let welcome = c.welcome_for(v);
+        let gap = live::welcome_coverage_gap(&welcome, py_markets);
+        if gap.is_empty() {
+            println!("  coverage {venue}: welcome has all {} python markets", py_markets.len());
+        } else {
+            fail(
+                fails,
+                format!(
+                    "coverage {venue}: {} market(s) python published in the window are NOT in the \
+                     rust recorder's welcome burst, e.g. {:?}",
+                    gap.len(),
+                    &gap[..gap.len().min(5)]
+                ),
+            );
+        }
+    }
+}
+
 fn live_stage(
     a: &Args,
     python_universe: &HashMap<&'static str, HashSet<String>>,
@@ -571,27 +640,7 @@ fn live_stage(
         Ok(()) => println!("  live: ok"),
         Err(e) => fail(fails, e),
     }
-    for (venue, py_markets) in python_universe {
-        if py_markets.is_empty() {
-            continue; // already failed above; a set difference against it says nothing
-        }
-        let Some(v) = arb_core::model::Venue::parse(venue) else { continue };
-        let welcome = c.welcome_for(v);
-        let gap = live::welcome_coverage_gap(&welcome, py_markets);
-        if gap.is_empty() {
-            println!("  coverage {venue}: welcome has all {} python markets", py_markets.len());
-        } else {
-            fail(
-                fails,
-                format!(
-                    "coverage {venue}: {} market(s) python published in the window are NOT in the \
-                     rust recorder's welcome burst, e.g. {:?}",
-                    gap.len(),
-                    &gap[..gap.len().min(5)]
-                ),
-            );
-        }
-    }
+    coverage_checks(c, python_universe, fails);
     if r.workers == 0 {
         println!("  note: ZERO load workers ran, so this was not a contention test.");
     }
@@ -918,6 +967,43 @@ mod tests {
             fails.iter().any(|f| f.contains("COVERAGE WAS NOT CHECKED for kalshi")),
             "an empty market set must fail: {fails:?}"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A venue in `tape::VENUES` that `arb_core::model::Venue` does not know
+    /// used to `continue` — dropping that venue's coverage check with nothing
+    /// on the report. Dead today; the day a fourth venue lands in one list and
+    /// not the other it is a silent loss of coverage in the verdict path.
+    #[test]
+    fn a_venue_the_model_does_not_know_is_a_failure_not_a_skip() {
+        let c = live::StreamCheck::new();
+        let universe: HashMap<&'static str, HashSet<String>> =
+            [("not_a_venue", ["M".to_owned()].into_iter().collect())].into_iter().collect();
+        let mut fails = Vec::new();
+        coverage_checks(&c, &universe, &mut fails);
+        assert_eq!(fails.len(), 1, "{fails:?}");
+        assert!(fails[0].contains("Venue::parse"), "{fails:?}");
+        assert!(fails[0].contains("NOT CHECKED"), "{fails:?}");
+    }
+
+    /// A sub-megabyte tape printed `slice: python 0/0 MiB`, which reads as
+    /// "nothing was measured" and is the same shape as the `0/0 = 0.0%` TOB
+    /// line already fixed here. Only a genuinely empty file may print `0`.
+    #[test]
+    fn a_sub_megabyte_tape_does_not_report_itself_as_zero() {
+        let dir = tmpdir("submib");
+        let p = dir.join("small.jsonl");
+        std::fs::write(&p, vec![b'x'; 4096]).expect("write");
+        let (slice, total) = slice_bytes(&p, u64::MAX);
+        assert_eq!((slice, total), (4096, 4096), "the whole file is inside the slice");
+        assert_eq!(human_bytes(slice), "4.0 KiB", "a 4 KiB tape must not print as 0");
+        // the tail bound still bites when the file is bigger than it
+        let (slice, total) = slice_bytes(&p, 1024);
+        assert_eq!((human_bytes(slice), human_bytes(total)), ("1.0 KiB".into(), "4.0 KiB".into()));
+        // and the readable unit never rounds a non-empty file away
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1), "1 B");
+        assert_eq!(human_bytes(1_048_576), "1.0 MiB");
         std::fs::remove_dir_all(dir).ok();
     }
 
