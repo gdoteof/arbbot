@@ -119,6 +119,28 @@ impl KalshiWsBook {
         Some(normalize_orderbook(&ticker, &Value::Object(fp), seq))
     }
 
+    /// A REST orderbook heals the accumulator, not just the published book.
+    ///
+    /// `sizes` is the only place a level's true total lives, and `on_snapshot`
+    /// is its only reset — which the venue sends once per ticker per SESSION
+    /// (kalshi-ws-snapshots-only-on-subscribe). So a REST refresh that went
+    /// straight to `Core::on_event` handed truth to the BookBuilder and left
+    /// `sizes` accumulating from a total the venue had already stopped agreeing
+    /// with: the next delta on that level republished the poisoned running sum
+    /// and undid the heal. Through this the same reset runs, and a change lost
+    /// to a dropped frame survives one sweep instead of the whole session.
+    ///
+    /// Only the two ladders `normalize_orderbook` reads are carried over, so the
+    /// event published here is exactly the one the REST path built for itself.
+    pub fn on_rest_snapshot(&mut self, ticker: &str, fp: &Value, seq: u64) -> Option<TapeEvent> {
+        self.on_snapshot(
+            &json!({"market_ticker": ticker,
+                    "yes_dollars": fp.get("yes_dollars").cloned().unwrap_or(Value::Array(vec![])),
+                    "no_dollars": fp.get("no_dollars").cloned().unwrap_or(Value::Array(vec![]))}),
+            seq,
+        )
+    }
+
     pub fn on_delta(&mut self, msg: &Value, seq: u64) -> Option<TapeEvent> {
         let ticker = msg.get("market_ticker")?.as_str()?.to_owned();
         let side = msg.get("side")?.as_str()?.to_owned();
@@ -170,7 +192,12 @@ impl KalshiCatalog {
         }
     }
 
-    pub async fn orderbook(&self, ticker: &str, seq: u64) -> Result<TapeEvent> {
+    /// Raw `orderbook_fp` ladders. Deliberately NOT a ready-made `TapeEvent`:
+    /// this call returned one for the credential-free poller, the WS paths
+    /// reused it for their heals, and a heal that publishes without telling
+    /// `KalshiWsBook` about it is the whole defect. Each caller now says what
+    /// the snapshot means for its own state.
+    pub async fn orderbook_fp(&self, ticker: &str) -> Result<Value> {
         let r = self
             .client
             .get(format!("{}/markets/{ticker}/orderbook", self.base))
@@ -179,8 +206,7 @@ impl KalshiCatalog {
             .await?
             .error_for_status()?;
         let v: Value = r.json().await?;
-        let fp = v.get("orderbook_fp").cloned().unwrap_or(Value::Object(Default::default()));
-        Ok(normalize_orderbook(ticker, &fp, seq))
+        Ok(v.get("orderbook_fp").cloned().unwrap_or(Value::Object(Default::default())))
     }
 
     /// ticker -> status string, in batches of 50 (for universe eviction).
@@ -295,16 +321,19 @@ async fn ws_session(
         // The integrity sweep. Gated on `tickers`, not `sid_seq`: a book that
         // never got a subscription confirmation is exactly the one that needs
         // refreshing, and keying off sids meant the markets in the worst shape
-        // were the ones the sweep skipped.
+        // were the ones the sweep skipped. It refreshes THROUGH `book`, which is
+        // what bounds the damage of a dropped delta — see `on_rest_snapshot`.
         if last_resnap.elapsed() > Duration::from_secs(RESNAP_TICK_S) && !tickers.is_empty() {
             let batch = resnap_batch(tickers.len(), RESNAP_CHUNKS);
             let mut failed = 0usize;
             for i in 0..batch {
                 let t = &tickers[(resnap_cursor + i) % tickers.len()];
                 let s = mseq.next(t);
-                match catalog.orderbook(t, s).await {
-                    Ok(snap) => {
-                        core.on_event(&snap);
+                match catalog.orderbook_fp(t).await {
+                    Ok(fp) => {
+                        if let Some(snap) = book.on_rest_snapshot(t, &fp, s) {
+                            core.on_event(&snap);
+                        }
                     }
                     Err(_) => failed += 1,
                 }
@@ -385,8 +414,10 @@ async fn ws_session(
                             // the WS get_snapshot path produced zero
                             // snapshots in practice, 2026-07-20)
                             let s2 = mseq.next(&t);
-                            if let Ok(snap) = catalog.orderbook(&t, s2).await {
-                                core.on_event(&snap);
+                            if let Ok(fp) = catalog.orderbook_fp(&t).await {
+                                if let Some(snap) = book.on_rest_snapshot(&t, &fp, s2) {
+                                    core.on_event(&snap);
+                                }
                             }
                         }
                     }
@@ -415,9 +446,11 @@ pub async fn poll_task(
     let mut seq = SeqCounter::default();
     loop {
         for ticker in &tickers {
-            match catalog.orderbook(ticker, seq.next(ticker)).await {
-                Ok(snap) => {
-                    core.on_event(&snap);
+            let s = seq.next(ticker);
+            // No accumulator on this path: REST totals ARE the book.
+            match catalog.orderbook_fp(ticker).await {
+                Ok(fp) => {
+                    core.on_event(&normalize_orderbook(ticker, &fp, s));
                     liveness.beat("kalshi-rest");
                 }
                 Err(e) => {
@@ -472,6 +505,64 @@ mod tests {
                 assert_eq!(price, "0.5000");
                 assert_eq!(size, "0"); // clamped, level removed
             }
+            _ => panic!(),
+        }
+    }
+
+    /// A change lost to a dropped frame must not outlive the sweep.
+    ///
+    /// `delta_fp` is a CHANGE, so `sizes` is the only record of a level's true
+    /// total and one missed frame offsets it forever: the wire seq is per-sid
+    /// over all ~191 tickers, so the gap handler cannot even name the ticker
+    /// whose change it lost, and the venue re-snapshots only on subscribe. The
+    /// offset is invisible to `crossing()` — an inflated bid SIZE does not
+    /// invert the touch — and surfaces as depth that is not there when the maker
+    /// clip or a take-take walks the book, so the fill comes back short and the
+    /// cross-venue leg is left naked. Periodic REST truth is the only thing that
+    /// ends it, and only if it reaches the accumulator.
+    #[test]
+    fn a_rest_heal_ends_a_dropped_delta() {
+        let mut b = KalshiWsBook::default();
+        b.on_snapshot(
+            &json!({"market_ticker": "T",
+                    "yes_dollars_fp": [["0.4300", "697.00"]],
+                    "no_dollars_fp": [["0.5000", "600.00"]]}),
+            1,
+        );
+        // The venue takes 100 off the yes level (697 -> 597) and we never see
+        // that frame. `sizes` still says 697.00; nothing in the feed disagrees.
+        // The sweep pulls REST truth for the ticker.
+        let fp = json!({"yes_dollars": [["0.4300", "597.00"]],
+                        "no_dollars": [["0.5000", "600.00"]]});
+        match b.on_rest_snapshot("T", &fp, 2).unwrap() {
+            TapeEvent::Snapshot { bids, .. } => assert_eq!(bids[0].size, "597.00"),
+            _ => panic!(),
+        }
+        // The next change lands on venue truth: 597 - 97 = 500. When the sweep
+        // published without telling the accumulator, this one delta undid the
+        // heal and republished 697 - 97 = 600 — phantom depth, permanently.
+        let d = json!({"market_ticker": "T", "side": "yes",
+                       "price_dollars": "0.4300", "delta_fp": "-97.00"});
+        match b.on_delta(&d, 3).unwrap() {
+            TapeEvent::Delta { size, .. } => {
+                assert_eq!(size, "500.00", "the accumulator kept the change it had lost")
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// Healing must not change what the sweep PUBLISHES. The REST path's own
+    /// event is the reference; `on_rest_snapshot` only adds the reset behind it.
+    #[test]
+    fn a_healed_snapshot_publishes_what_the_rest_path_published() {
+        let fp = json!({"yes_dollars": [["0.4100", "10.00"], ["0.4300", "597.00"]],
+                        "no_dollars": [["0.5000", "600.00"]]});
+        let mut b = KalshiWsBook::default();
+        match (normalize_orderbook("T", &fp, 7), b.on_rest_snapshot("T", &fp, 7).unwrap()) {
+            (
+                TapeEvent::Snapshot { market_id: m1, bids: b1, asks: a1, seq: s1, .. },
+                TapeEvent::Snapshot { market_id: m2, bids: b2, asks: a2, seq: s2, .. },
+            ) => assert_eq!((m1, b1, a1, s1), (m2, b2, a2, s2)),
             _ => panic!(),
         }
     }
