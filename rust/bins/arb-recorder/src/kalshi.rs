@@ -215,6 +215,37 @@ fn ws_subscribe_frame(tickers: &[String]) -> String {
         .to_string()
 }
 
+/// How long a Kalshi book may go without a REST refresh, and in how many
+/// slices that refresh is spread.
+///
+/// The periodic resnapshot used to ask the WS for `action: get_snapshot` over
+/// every sid at once. That call does not work — the gap handler below moved off
+/// it in 2026-07-20 and says so in its own comment, "the WS get_snapshot path
+/// produced zero snapshots in practice" — so the periodic has been a no-op ever
+/// since, and Kalshi books were healed only when a gap happened to be detected.
+/// Measured on both recorders 2026-07-29: median book age 292s, p90 2,293s,
+/// 49% of books past the 300s this interval claims to guarantee, one at 74,082s.
+///
+/// It sweeps by REST now, the same call the gap handler uses. Doing all 191
+/// tickers in one burst would block the WS read for ~19s, so the universe is
+/// covered a slice at a time: every `RESNAP_TICK_S` a tenth of it is refreshed,
+/// which keeps the blocking window ~2s while still bounding every book's age at
+/// `RESNAP_FULL_S`. Same reasoning as pacing the broadcaster's rebroadcast —
+/// a periodic burst sized like the whole universe is a burst that hurts.
+const RESNAP_FULL_S: u64 = 300;
+const RESNAP_CHUNKS: usize = 10;
+const RESNAP_TICK_S: u64 = RESNAP_FULL_S / RESNAP_CHUNKS as u64;
+
+/// How many tickers one resnapshot tick refreshes. Rounds UP, so `RESNAP_CHUNKS`
+/// ticks always cover the whole universe rather than leaving a remainder that
+/// never gets swept.
+fn resnap_batch(total: usize, chunks: usize) -> usize {
+    if total == 0 {
+        return 0;
+    }
+    total.div_ceil(chunks.max(1))
+}
+
 fn ws_snapshot_request(sids: &[i64]) -> String {
     json!({"id": 99, "cmd": "update_subscription",
            "params": {"sids": sids, "action": "get_snapshot"}})
@@ -258,11 +289,36 @@ async fn ws_session(
     let mut mseq = SeqCounter::default();
     let mut last_resnap = tokio::time::Instant::now();
     let mut last_frame = tokio::time::Instant::now();
+    let mut resnap_cursor = 0usize;
 
     loop {
-        if last_resnap.elapsed() > Duration::from_secs(300) && !sid_seq.is_empty() {
-            let sids: Vec<i64> = sid_seq.keys().copied().collect();
-            ws.send(Message::Text(ws_snapshot_request(&sids))).await?;
+        // The integrity sweep. Gated on `tickers`, not `sid_seq`: a book that
+        // never got a subscription confirmation is exactly the one that needs
+        // refreshing, and keying off sids meant the markets in the worst shape
+        // were the ones the sweep skipped.
+        if last_resnap.elapsed() > Duration::from_secs(RESNAP_TICK_S) && !tickers.is_empty() {
+            let batch = resnap_batch(tickers.len(), RESNAP_CHUNKS);
+            let mut failed = 0usize;
+            for i in 0..batch {
+                let t = &tickers[(resnap_cursor + i) % tickers.len()];
+                let s = mseq.next(t);
+                match catalog.orderbook(t, s).await {
+                    Ok(snap) => {
+                        core.on_event(&snap);
+                    }
+                    Err(_) => failed += 1,
+                }
+            }
+            resnap_cursor = (resnap_cursor + batch) % tickers.len();
+            // A silent failure here is a book that keeps whatever state it was
+            // left in, which is how one reached 74,082s old against a 300s
+            // interval. Counted, not logged per ticker.
+            if failed > 0 {
+                eprintln!(
+                    "[kalshi-ws] resnapshot slice: {failed}/{batch} books did NOT refresh — \
+                     their age is now unbounded"
+                );
+            }
             last_resnap = tokio::time::Instant::now();
         }
         let frame = match tokio::time::timeout(Duration::from_secs(5), ws.next()).await {
@@ -418,5 +474,43 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    /// One full cycle must touch EVERY ticker, remainder included.
+    ///
+    /// The point of slicing the sweep is to bound each book's age at
+    /// `RESNAP_FULL_S`. That guarantee only holds if `RESNAP_CHUNKS` ticks
+    /// cover the universe — a batch that rounds DOWN leaves a tail that is
+    /// never swept, which is the same "healed only by luck" state this change
+    /// exists to end. 191 tickers over 10 chunks is 20 per tick, not 19.
+    #[test]
+    fn a_full_cycle_refreshes_every_ticker() {
+        for total in [1usize, 7, 10, 11, 191, 1109] {
+            let batch = resnap_batch(total, RESNAP_CHUNKS);
+            let mut seen = vec![false; total];
+            let mut cursor = 0usize;
+            for _ in 0..RESNAP_CHUNKS {
+                for i in 0..batch {
+                    seen[(cursor + i) % total] = true;
+                }
+                cursor = (cursor + batch) % total;
+            }
+            assert!(
+                seen.iter().all(|s| *s),
+                "total={total} batch={batch}: {} ticker(s) never swept in a full cycle",
+                seen.iter().filter(|s| !**s).count()
+            );
+        }
+        assert_eq!(resnap_batch(191, 10), 20, "must round up, not down");
+        assert_eq!(resnap_batch(0, 10), 0, "an empty universe asks for nothing");
+    }
+
+    /// The blocking window is what makes this safe to run inline in the WS read
+    /// loop: one slice, not the whole universe.
+    #[test]
+    fn a_slice_is_a_small_fraction_of_the_universe() {
+        let batch = resnap_batch(191, RESNAP_CHUNKS);
+        assert!(batch <= 191 / 5, "a slice of {batch} is too much to block the reader on");
+        assert_eq!(RESNAP_TICK_S * RESNAP_CHUNKS as u64, RESNAP_FULL_S);
     }
 }
