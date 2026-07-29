@@ -44,15 +44,6 @@ struct LegDoc {
     market_id: String,
 }
 
-fn parse_venue(s: &str) -> Option<Venue> {
-    Some(match s {
-        "kalshi" => Venue::Kalshi,
-        "polymarket" => Venue::Polymarket,
-        "polymarket_us" => Venue::PolymarketUs,
-        _ => return None,
-    })
-}
-
 fn levels_of(v: Option<&serde_json::Value>) -> Option<Vec<Level>> {
     let mut out = Vec::new();
     for l in v?.as_array()? {
@@ -140,7 +131,7 @@ fn main() {
                     .legs
                     .into_iter()
                     .map(|l| {
-                        Some(RelLeg { venue: parse_venue(&l.venue)?, market_id: l.market_id })
+                        Some(RelLeg { venue: Venue::parse(&l.venue)?, market_id: l.market_id })
                     })
                     .collect::<Option<Vec<_>>>()?,
             }))
@@ -183,7 +174,7 @@ fn main() {
             Err(_) => continue,
         };
         let kind = v.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-        let venue = match v.get("venue").and_then(|x| x.as_str()).and_then(parse_venue) {
+        let venue = match v.get("venue").and_then(|x| x.as_str()).and_then(Venue::parse) {
             Some(x) => x,
             None => continue,
         };

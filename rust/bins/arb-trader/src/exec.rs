@@ -12,19 +12,13 @@
 use crate::hist::Hist;
 use crate::sink::{OrderSink, SweepPolicy};
 use arb_venue::gateway::{CancelRequest, PlaceRequest};
+use arb_core::clock::now_ns;
 use arb_core::model::Venue;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-
-fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
-}
 
 /// The effect, carrying the ORDER — not just its shape.
 ///

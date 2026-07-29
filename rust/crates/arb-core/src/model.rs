@@ -26,6 +26,21 @@ impl Venue {
             Venue::PolymarketUs => "polymarket_us",
         }
     }
+
+    /// Inverse of [`Venue::as_str`], and the ONLY one — six hand-written copies
+    /// of this match lived in six files (the trader engine, the intent replayer,
+    /// the golden harness, the tob reader and both halves of the dash), so
+    /// adding a venue meant finding all six and a venue string that reached the
+    /// wrong copy parsed as `None`, which every one of those call sites reads as
+    /// "skip this line".
+    pub fn parse(s: &str) -> Option<Venue> {
+        Some(match s {
+            "kalshi" => Venue::Kalshi,
+            "polymarket" => Venue::Polymarket,
+            "polymarket_us" => Venue::PolymarketUs,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,13 +125,7 @@ impl TapeEvent {
     }
 }
 
-pub fn now_local_ns() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock before epoch")
-        .as_nanos() as i64
-}
+pub use crate::clock::now_local_ns;
 
 #[cfg(test)]
 mod tests {
@@ -134,5 +143,16 @@ mod tests {
             let ev: TapeEvent = serde_json::from_str(line).unwrap();
             assert_eq!(ev.to_json_line(), line);
         }
+    }
+
+    /// `as_str` and `parse` are two matches over the same table, and the whole
+    /// point of having one copy is that they cannot drift apart.
+    #[test]
+    fn every_venue_survives_a_string_round_trip() {
+        for v in [Venue::Kalshi, Venue::Polymarket, Venue::PolymarketUs] {
+            assert_eq!(Venue::parse(v.as_str()), Some(v));
+        }
+        assert_eq!(Venue::parse("polymarket_uk"), None);
+        assert_eq!(Venue::parse(""), None);
     }
 }

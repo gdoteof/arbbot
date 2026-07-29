@@ -9,8 +9,7 @@
 //! stall unrelated tasks, which is precisely the reader-never-stalls property
 //! the shell exists to preserve.
 
-use arb_venue::gateway::{CancelRequest, KalshiGateway, PlaceRequest, PmusGateway, VenueGateway};
-use arb_venue::transport::Transport;
+use arb_venue::gateway::{CancelRequest, PlaceRequest, VenueGateway};
 use arb_venue::VenueError;
 
 /// How hard a sweep tries before it gives up and says so.
@@ -205,35 +204,29 @@ pub trait OrderSink: Send + Sync {
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError>;
 }
 
-// Generic over the transport, not pinned to HTTP: a gateway carrying the
-// NotWired transport is still a valid (inert) sink, and tests drive a mock.
-impl<T: Transport + Send + Sync> OrderSink for KalshiGateway<T> {
+/// Every gateway is a sink. The adapter is the same four delegations for both
+/// venues, and the one place they used to differ — Kalshi's response spells the
+/// id `order_id`, PM-US spells it `id` — is what `VenueGateway::order_id`
+/// already exists to hide, so a per-venue impl was reaching around the trait to
+/// re-answer a question the trait answers.
+///
+/// Generic over the transport, not pinned to HTTP: a gateway carrying the
+/// `NotWired` transport is still a valid (inert) sink, and tests drive a mock.
+impl<G> OrderSink for G
+where
+    G: VenueGateway + Send + Sync,
+{
+    fn place(&self, req: &PlaceRequest) -> Result<String, VenueError> {
+        VenueGateway::place(self, req).map(|o| G::order_id(&o))
+    }
+    fn cancel(&self, req: &CancelRequest) -> Result<(), VenueError> {
+        VenueGateway::cancel(self, req)
+    }
     fn cancel_all_open(&self) -> Result<(), VenueError> {
         VenueGateway::cancel_all_open(self)
     }
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
         VenueGateway::resting_order_ids(self)
-    }
-    fn place(&self, req: &PlaceRequest) -> Result<String, VenueError> {
-        VenueGateway::place(self, req).map(|o| o.order_id)
-    }
-    fn cancel(&self, req: &CancelRequest) -> Result<(), VenueError> {
-        VenueGateway::cancel(self, req)
-    }
-}
-
-impl<T: Transport + Send + Sync> OrderSink for PmusGateway<T> {
-    fn cancel_all_open(&self) -> Result<(), VenueError> {
-        VenueGateway::cancel_all_open(self)
-    }
-    fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
-        VenueGateway::resting_order_ids(self)
-    }
-    fn place(&self, req: &PlaceRequest) -> Result<String, VenueError> {
-        VenueGateway::place(self, req).map(|o| o.id)
-    }
-    fn cancel(&self, req: &CancelRequest) -> Result<(), VenueError> {
-        VenueGateway::cancel(self, req)
     }
 }
 
@@ -485,7 +478,7 @@ mod sweep_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arb_venue::gateway::{Side, Tif};
+    use arb_venue::gateway::{KalshiGateway, Side, Tif};
     use arb_venue::ratelimit::RateLimiter;
     use arb_venue::transport::{Response, Transport};
     use arb_venue::KalshiSigner;

@@ -63,15 +63,6 @@ use std::collections::{HashMap, HashSet};
 /// float in half this file (`2.0`, `5.0`).
 const EPS: f64 = 1e-9;
 
-fn venue_of(s: &str) -> Option<Venue> {
-    match s {
-        "kalshi" => Some(Venue::Kalshi),
-        "polymarket_us" => Some(Venue::PolymarketUs),
-        "polymarket" => Some(Venue::Polymarket),
-        _ => None,
-    }
-}
-
 fn num(v: Option<&serde_json::Value>) -> Option<f64> {
     let v = v?;
     v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))
@@ -387,7 +378,7 @@ pub fn build(ledger_text: &str, fee_category: &str, now_s: f64) -> serde_json::V
                     // own costs is the safe direction for an accounting view,
                     // and defaulting the other way would quietly flatter it.
                     let role = if role_s == "maker" { Role::Maker } else { Role::Taker };
-                    match (venue_of(&venue_s), px) {
+                    match (Venue::parse(&venue_s), px) {
                         (Some(v), Some(px)) => {
                             let p = cx.parse_exact(&format!("{px}"));
                             let sz = cx.parse_exact(&format!("{lqty}"));

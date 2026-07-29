@@ -131,6 +131,78 @@ fn ts_ms() -> String {
         .unwrap_or_else(|_| "0".into())
 }
 
+/// Spend one token of `priority` before a venue call. An exhausted LOCAL budget
+/// refuses here rather than earning a venue-side 429.
+///
+/// Shared because both gateways opened every call with the same sixteen lines,
+/// and a rate limit that is enforced in two places is a rate limit that can be
+/// relaxed in one of them.
+fn spend_token(limiter: &Mutex<RateLimiter>, priority: Priority) -> Result<(), VenueError> {
+    let mut lim = limiter.lock().expect("rate limiter mutex");
+    if lim.try_acquire(priority, now_ns()) {
+        return Ok(());
+    }
+    Err(VenueError::RateLimited {
+        priority: match priority {
+            Priority::Critical => "critical",
+            Priority::Background => "background",
+        },
+    })
+}
+
+/// How long to keep asking a venue about an order it has just accepted.
+///
+/// Neither venue's create is read-your-writes: Kalshi 404s a GET on a
+/// just-placed order for a beat (observed live 2026-07-27) and its order LIST
+/// lags further still. Python papered over this with a flat `time.sleep(1.0)`;
+/// poll instead, so a fast venue costs nothing and a slow one still succeeds.
+/// Zero delay in tests.
+#[derive(Clone, Copy)]
+struct Settle {
+    delay: std::time::Duration,
+    attempts: u32,
+}
+
+impl Default for Settle {
+    fn default() -> Self {
+        Settle { delay: std::time::Duration::from_millis(500), attempts: 8 }
+    }
+}
+
+impl Settle {
+    /// Run `read` until it answers something other than 404, or the attempts are
+    /// spent. A 404 in this window means "not yet", NOT "no such order" — the
+    /// create already told us it exists, so the last 404 is what is returned
+    /// rather than a synthesised error that would read as a missing order.
+    ///
+    /// `endpoint` names the caller for the give-up error only.
+    fn retry_404<R>(
+        &self,
+        endpoint: &'static str,
+        order_id: &str,
+        read: impl Fn() -> Result<R, VenueError>,
+    ) -> Result<R, VenueError> {
+        let attempts = self.attempts.max(1);
+        let mut last = None;
+        for attempt in 0..attempts {
+            match read() {
+                Err(VenueError::Status { status: 404, endpoint, body }) => {
+                    last = Some(VenueError::Status { status: 404, endpoint, body });
+                    if attempt + 1 < attempts && !self.delay.is_zero() {
+                        std::thread::sleep(self.delay);
+                    }
+                }
+                other => return other,
+            }
+        }
+        Err(last.unwrap_or(VenueError::Status {
+            endpoint,
+            status: 404,
+            body: format!("order {order_id} never became visible"),
+        }))
+    }
+}
+
 /// Kalshi gateway. Generic over its [`Transport`]; the default is
 /// [`NotWired`], so a gateway built with [`KalshiGateway::new`] still cannot
 /// reach a venue — the inert seam is preserved, and reaching a venue is an
@@ -139,13 +211,7 @@ pub struct KalshiGateway<T: Transport = NotWired> {
     pub signer: KalshiSigner,
     pub limiter: Mutex<RateLimiter>,
     pub transport: T,
-    /// Kalshi's create and query services are NOT read-your-writes: a GET on a
-    /// just-placed order 404s for a beat (observed live 2026-07-27), and the
-    /// order LIST lags further still. Python papered over this with a flat
-    /// `time.sleep(1.0)`; poll instead, so a fast venue costs nothing and a
-    /// slow one still succeeds. Zero delay in tests.
-    settle_delay: std::time::Duration,
-    settle_attempts: u32,
+    settle: Settle,
 }
 
 impl KalshiGateway<NotWired> {
@@ -162,39 +228,20 @@ impl<T: Transport> KalshiGateway<T> {
             signer,
             limiter: Mutex::new(limiter),
             transport,
-            settle_delay: std::time::Duration::from_millis(500),
-            settle_attempts: 8,
+            settle: Settle::default(),
         }
     }
 
     /// Override the create-visibility poll (tests use a zero delay).
     pub fn with_settle(mut self, delay: std::time::Duration, attempts: u32) -> Self {
-        self.settle_delay = delay;
-        self.settle_attempts = attempts;
+        self.settle = Settle { delay, attempts };
         self
     }
 
     /// `order_status`, tolerating the window where a just-created order is not
-    /// yet visible to the query service. A 404 here means "not yet", NOT "no
-    /// such order" — the create already told us it exists.
+    /// yet visible to the query service. See [`Settle::retry_404`].
     fn order_status_settled(&self, order_id: &str) -> Result<resp::KalshiOrder, VenueError> {
-        let mut last = None;
-        for attempt in 0..self.settle_attempts.max(1) {
-            match self.order_status(order_id) {
-                Err(VenueError::Status { status: 404, endpoint, body }) => {
-                    last = Some(VenueError::Status { status: 404, endpoint, body });
-                    if attempt + 1 < self.settle_attempts.max(1) && !self.settle_delay.is_zero() {
-                        std::thread::sleep(self.settle_delay);
-                    }
-                }
-                other => return other,
-            }
-        }
-        Err(last.unwrap_or(VenueError::Status {
-            endpoint: "kalshi order_status",
-            status: 404,
-            body: format!("order {order_id} never became visible"),
-        }))
+        self.settle.retry_404("kalshi order_status", order_id, || self.order_status(order_id))
     }
 
     /// Sign `path` (never the query — quirk K2) and send. Spends one token of
@@ -208,17 +255,7 @@ impl<T: Transport> KalshiGateway<T> {
         query: Option<&str>,
         body: Option<&Value>,
     ) -> Result<crate::transport::Response, VenueError> {
-        {
-            let mut lim = self.limiter.lock().expect("rate limiter mutex");
-            if !lim.try_acquire(priority, now_ns()) {
-                return Err(VenueError::RateLimited {
-                    priority: match priority {
-                        Priority::Critical => "critical",
-                        Priority::Background => "background",
-                    },
-                });
-            }
-        }
+        spend_token(&self.limiter, priority)?;
         let ts = ts_ms();
         let headers = self.signer.headers(&ts, method, path);
         self.transport.send(method, path, query, &headers, body)
@@ -549,8 +586,7 @@ pub struct PmusGateway<T: Transport = NotWired> {
     pub signer: PmusSigner,
     pub limiter: Mutex<RateLimiter>,
     pub transport: T,
-    settle_delay: std::time::Duration,
-    settle_attempts: u32,
+    settle: Settle,
 }
 
 impl PmusGateway<NotWired> {
@@ -565,14 +601,12 @@ impl<T: Transport> PmusGateway<T> {
             signer,
             limiter: Mutex::new(limiter),
             transport,
-            settle_delay: std::time::Duration::from_millis(500),
-            settle_attempts: 8,
+            settle: Settle::default(),
         }
     }
 
     pub fn with_settle(mut self, delay: std::time::Duration, attempts: u32) -> Self {
-        self.settle_delay = delay;
-        self.settle_attempts = attempts;
+        self.settle = Settle { delay, attempts };
         self
     }
 
@@ -583,17 +617,7 @@ impl<T: Transport> PmusGateway<T> {
         path: &str,
         body: Option<&Value>,
     ) -> Result<crate::transport::Response, VenueError> {
-        {
-            let mut lim = self.limiter.lock().expect("rate limiter mutex");
-            if !lim.try_acquire(priority, now_ns()) {
-                return Err(VenueError::RateLimited {
-                    priority: match priority {
-                        Priority::Critical => "critical",
-                        Priority::Background => "background",
-                    },
-                });
-            }
-        }
+        spend_token(&self.limiter, priority)?;
         let ts = ts_ms();
         let headers = self.signer.headers(&ts, method, path);
         self.transport.send(method, path, None, &headers, body)
@@ -652,23 +676,7 @@ impl<T: Transport> PmusGateway<T> {
 
     /// `order_status` tolerating the not-yet-visible window after a create.
     fn order_status_settled(&self, order_id: &str) -> Result<resp::PmOrder, VenueError> {
-        let mut last = None;
-        for attempt in 0..self.settle_attempts.max(1) {
-            match self.order_status(order_id) {
-                Err(VenueError::Status { status: 404, endpoint, body }) => {
-                    last = Some(VenueError::Status { status: 404, endpoint, body });
-                    if attempt + 1 < self.settle_attempts.max(1) && !self.settle_delay.is_zero() {
-                        std::thread::sleep(self.settle_delay);
-                    }
-                }
-                other => return other,
-            }
-        }
-        Err(last.unwrap_or(VenueError::Status {
-            endpoint: "pmus order_status",
-            status: 404,
-            body: format!("order {order_id} never became visible"),
-        }))
+        self.settle.retry_404("pmus order_status", order_id, || self.order_status(order_id))
     }
 }
 

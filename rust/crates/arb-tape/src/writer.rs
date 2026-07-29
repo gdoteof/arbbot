@@ -68,40 +68,14 @@ fn heal_torn_tail(fh: &mut File) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Current UTC day as YYYY-MM-DD (no chrono: civil-date math from epoch days).
+/// Current UTC day as YYYY-MM-DD — the file this tape line belongs in.
 pub fn utc_day() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock before epoch")
-        .as_secs() as i64;
-    let days = secs.div_euclid(86_400);
-    civil_from_days(days)
-}
-
-/// Howard Hinnant's civil_from_days algorithm.
-fn civil_from_days(z: i64) -> String {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
+    arb_core::resolve::iso_from_day(arb_core::clock::now_secs() as i64 / 86_400)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn civil_dates() {
-        assert_eq!(civil_from_days(0), "1970-01-01");
-        assert_eq!(civil_from_days(20_657), "2026-07-23");
-    }
 
     #[test]
     fn writes_per_venue_day_files() {

@@ -10,7 +10,9 @@
 //!   for the shared BookBuilder (2026-07-20 incident).
 //! - trades get their own `|tape` seq stream (traded-markets-die bug).
 
-use crate::core::{dec_string, stall_reconnect_s, ws_url, Core, SeqCounter};
+use crate::core::{
+    dec_string, reconnect_forever, stall_reconnect_s, ws_url, Core, SeqCounter,
+};
 use crate::health::Liveness;
 use crate::sign::KalshiSigner;
 use anyhow::Result;
@@ -226,12 +228,8 @@ pub async fn ws_task(
     signer: KalshiSigner,
     catalog: Arc<KalshiCatalog>,
 ) {
-    loop {
-        if let Err(e) = ws_session(&core, &liveness, &tickers, &signer, &catalog).await {
-            eprintln!("[kalshi-ws] session ended: {e:#}");
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    reconnect_forever("kalshi-ws", || ws_session(&core, &liveness, &tickers, &signer, &catalog))
+        .await
 }
 
 async fn ws_session(

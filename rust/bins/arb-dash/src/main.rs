@@ -35,7 +35,9 @@ use std::sync::{Arc, Mutex};
 use std::process::exit;
 use std::time::{Duration, UNIX_EPOCH};
 
+use arb_core::clock::now_secs;
 use arb_core::fees::FeeSchedule;
+use arb_core::resolve::{iso_from_day, parse_iso};
 use arb_core::model::Venue;
 use arb_core::scan::Cx;
 use arb_ledger::kalshi::{Deposit, Fill, KalshiImport, Settlement};
@@ -432,13 +434,6 @@ fn age_secs(path: &str) -> Option<u64> {
     Some(now_secs().saturating_sub(mtime))
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// A venue snapshot older than this is not evidence of anything current. The
 /// 2026-07-28 audit found both reconciliation rows reading EXACT over snapshots
 /// 20.2 hours old, which is a third state — frozen — not a pass.
@@ -820,7 +815,7 @@ fn intents_json(a: &Args) -> String {
     for rel_id in rels {
         let Some(r) = reg.get(&rel_id) else { continue };
         let (la, lb) = (&r.legs[0], &r.legs[1]);
-        let (Some(va), Some(vb)) = (venue_of(&la.venue), venue_of(&lb.venue)) else { continue };
+        let (Some(va), Some(vb)) = (Venue::parse(&la.venue), Venue::parse(&lb.venue)) else { continue };
 
         let get = |l: &arb_registry::Leg, side: &str| {
             ours.get(&(l.venue.clone(), l.market_id.clone(), side.to_string())).copied()
@@ -1012,7 +1007,7 @@ fn intents_json(a: &Args) -> String {
 /// rather than a snapshot.
 fn edge_series(a: &Args, rel: &arb_registry::Relationship) -> Vec<serde_json::Value> {
     let (la, lb) = (&rel.legs[0], &rel.legs[1]);
-    let (Some(va), Some(vb)) = (venue_of(&la.venue), venue_of(&lb.venue)) else { return vec![] };
+    let (Some(va), Some(vb)) = (Venue::parse(&la.venue), Venue::parse(&lb.venue)) else { return vec![] };
 
     let day = integrity::build(&a.data_dir).today;
     let path = |v: &str| format!("{}/tob-{v}-{day}.jsonl", a.rollup_dir);
@@ -1250,15 +1245,6 @@ fn pair_json(a: &Args, query: &str) -> String {
     .to_string()
 }
 
-fn venue_of(s: &str) -> Option<Venue> {
-    match s {
-        "kalshi" => Some(Venue::Kalshi),
-        "polymarket" => Some(Venue::Polymarket),
-        "polymarket_us" => Some(Venue::PolymarketUs),
-        _ => None,
-    }
-}
-
 /// Top N baskets by edge under a chosen execution style.
 ///
 /// Ranked on CURRENT quotes — the latest sample in the ToB rollup — so every
@@ -1324,7 +1310,7 @@ fn current_json(a: &Args, query: &str) -> String {
             continue;
         }
         let (la, lb) = (&r.legs[0], &r.legs[1]);
-        let (Some(va), Some(vb)) = (venue_of(&la.venue), venue_of(&lb.venue)) else { continue };
+        let (Some(va), Some(vb)) = (Venue::parse(&la.venue), Venue::parse(&lb.venue)) else { continue };
         let ka = (la.venue.clone(), la.market_id.clone());
         let kb = (lb.venue.clone(), lb.market_id.clone());
         let (Some(sa), Some(sb)) = (latest.get(&ka), latest.get(&kb)) else { continue };
@@ -1419,61 +1405,16 @@ fn current_json(a: &Args, query: &str) -> String {
 /// Inclusive YYYY-MM-DD range. Capped so a careless URL cannot ask the server
 /// to stat thousands of files.
 fn day_range(from: &str, to: &str) -> Vec<String> {
-    let parse = |s: &str| -> Option<(i32, u32, u32)> {
-        let b = s.as_bytes();
-        if s.len() != 10 || b[4] != b'-' || b[7] != b'-' {
-            return None;
-        }
-        Some((s[0..4].parse().ok()?, s[5..7].parse().ok()?, s[8..10].parse().ok()?))
-    };
-    let (Some(f), Some(t)) = (parse(from), parse(to)) else { return vec![] };
-    // Days from an arbitrary epoch (Hinnant's short form) — only ever used for
-    // the difference between two dates, so the epoch does not matter. `parse`
-    // accepts a leading '-' in the year field ("-123-01-01" is 10 chars with
-    // dashes in the right places), and `/` on a negative i64 truncates toward
-    // zero where this formula needs floor. The effect is small and bounded: a
-    // miscount of at most one day per negative-year division, so a range
-    // spanning year 0 could slip one day past the 400-day cap — not a broken
-    // calculation. `div_euclid` floors and removes it. Verified identical to the
-    // old expression for every date 0001-01-01 through 3000-12-31.
-    let to_days = |(y, m, d): (i32, u32, u32)| -> i64 {
-        let (y, m) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
-        let y = y as i64;
-        365 * y + y.div_euclid(4) - y.div_euclid(100) + y.div_euclid(400)
-            + (153 * (m as i64 - 3) + 2) / 5
-            + d as i64
-    };
-    let (a0, b0) = (to_days(f), to_days(t));
+    // Epoch days in, ISO strings out. This used to carry its own ISO parser,
+    // its own days-from-civil, and a month-length table with the leap-year rule
+    // written out — a fourth calendar in a workspace that already had one, and
+    // the only one whose off-by-one on negative years needed a paragraph of
+    // comment to explain away. `arb_core::resolve` is that one calendar.
+    let (Some(a0), Some(b0)) = (parse_iso(from), parse_iso(to)) else { return vec![] };
     if b0 < a0 || b0 - a0 > 400 {
         return vec![];
     }
-    // Walk calendar days without a date library: increment and normalise.
-    let mut out = Vec::new();
-    let (mut y, mut m, mut d) = f;
-    for _ in 0..=(b0 - a0) {
-        out.push(format!("{y:04}-{m:02}-{d:02}"));
-        d += 1;
-        let dim = match m {
-            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-            4 | 6 | 9 | 11 => 30,
-            _ => {
-                if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
-                    29
-                } else {
-                    28
-                }
-            }
-        };
-        if d > dim {
-            d = 1;
-            m += 1;
-            if m > 12 {
-                m = 1;
-                y += 1;
-            }
-        }
-    }
-    out
+    (a0..=b0).map(iso_from_day).collect()
 }
 
 fn respond(mut s: TcpStream, status: &str, ctype: &str, body: &str) {

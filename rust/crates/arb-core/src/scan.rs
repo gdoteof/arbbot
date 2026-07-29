@@ -109,8 +109,10 @@ impl Cx {
         !v.is_zero() && !v.is_negative()
     }
 
-    /// x.quantize(Decimal("0.01"), ROUND_CEILING) — ceil_cents; `dp` fixed 2.
-    pub fn quantize_ceil(&mut self, mut x: D, _dp: u8) -> D {
+    /// x.quantize(Decimal("0.01"), ROUND_CEILING) — ceil_cents. The precision is
+    /// fixed at 2: this carried a `dp` argument its one caller passed `2` to and
+    /// the body never read.
+    pub fn quantize_ceil(&mut self, mut x: D) -> D {
         let q = self.q_cent;
         self.ceil.quantize(&mut x, &q);
         x

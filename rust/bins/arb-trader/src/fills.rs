@@ -11,6 +11,7 @@
 //! the same fill and `arb_core::fill` mints the hedge obligation once.
 
 use crate::feed::FeedMsg;
+use arb_core::clock::now_ns;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::time::Instant;
@@ -18,13 +19,6 @@ use tokio::sync::mpsc::Sender;
 
 const PMUS_WS: &str = "wss://api.polymarket.us/v1/ws/private";
 const PMUS_WS_PATH: &str = "/v1/ws/private";
-
-fn now_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
-}
 
 /// Translate one PM-US private frame into a `fill` line, or `None` if it is not
 /// a fill we can act on.

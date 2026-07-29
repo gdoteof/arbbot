@@ -293,7 +293,7 @@ fn load_quoters(
                     .into_iter()
                     .map(|l| {
                         Some(RelLeg {
-                            venue: engine::parse_venue(&l.venue)?,
+                            venue: Venue::parse(&l.venue)?,
                             market_id: l.market_id,
                         })
                     })

@@ -3,11 +3,12 @@
 //! chunked 150-slug subscriptions, or credential-free REST polling.
 //! Transliteration of record/polymarket_us.py + the recorder tasks.
 
-use crate::core::{dec_string, stall_reconnect_s, ws_url, Core, SeqCounter};
+use crate::core::{
+    dec_string, reconnect_forever, sorted_levels, stall_reconnect_s, ws_url, Core, SeqCounter,
+};
 use crate::health::Liveness;
 use crate::sign::PmusSigner;
 use anyhow::Result;
-use arb_core::dec::Dec;
 use arb_core::model::{now_local_ns, Level, TakerSide, TapeEvent, Venue};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -19,27 +20,9 @@ pub const WS_MARKETS_URL: &str = "wss://api.polymarket.us/v1/ws/markets";
 pub const WS_MARKETS_PATH: &str = "/v1/ws/markets";
 
 fn levels(raw: Option<&Value>, descending: bool) -> Vec<Level> {
-    let mut lv: Vec<Level> = raw
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|l| {
-                    let px = dec_string(l.get("px")?.get("value")?);
-                    let sz = dec_string(l.get("qty")?);
-                    Dec::parse(&sz).ok().filter(Dec::is_positive)?;
-                    Some(Level { price: px, size: sz })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    lv.sort_by(|a, b| {
-        let (pa, pb) = (
-            Dec::parse(&a.price).unwrap_or(Dec::ZERO),
-            Dec::parse(&b.price).unwrap_or(Dec::ZERO),
-        );
-        if descending { pb.cmp_num(&pa) } else { pa.cmp_num(&pb) }
-    });
-    lv
+    sorted_levels(raw, descending, |l| {
+        Some((dec_string(l.get("px")?.get("value")?), dec_string(l.get("qty")?)))
+    })
 }
 
 pub fn normalize_book(slug: &str, md: &Value, seq: u64) -> TapeEvent {
@@ -156,12 +139,7 @@ pub async fn ws_task(
     slugs: Vec<String>,
     signer: PmusSigner,
 ) {
-    loop {
-        if let Err(e) = ws_session(&core, &liveness, &slugs, &signer).await {
-            eprintln!("[pmus-ws] session ended: {e:#}");
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    reconnect_forever("pmus-ws", || ws_session(&core, &liveness, &slugs, &signer)).await
 }
 
 async fn ws_session(

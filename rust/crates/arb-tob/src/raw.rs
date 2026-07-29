@@ -17,15 +17,6 @@ use arb_core::model::{BookSide, Level, TakerSide, TapeEvent, Venue};
 use parquet::file::reader::SerializedFileReader;
 use parquet::record::{Field, Row};
 
-fn venue_of(s: &str) -> Option<Venue> {
-    match s {
-        "kalshi" => Some(Venue::Kalshi),
-        "polymarket" => Some(Venue::Polymarket),
-        "polymarket_us" => Some(Venue::PolymarketUs),
-        _ => None,
-    }
-}
-
 fn str_field(row: &Row, name: &str) -> Option<String> {
     for (n, f) in row.get_column_iter() {
         if n == name {
@@ -77,7 +68,7 @@ fn levels(row: &Row, name: &str) -> Vec<Level> {
 
 fn to_event(row: &Row) -> Option<TapeEvent> {
     let kind = str_field(row, "kind")?;
-    let venue = venue_of(&str_field(row, "venue")?)?;
+    let venue = Venue::parse(&str_field(row, "venue")?)?;
     let market_id = str_field(row, "market_id")?;
     let seq = i64_field(row, "seq").unwrap_or(0).max(0) as u64;
     let ts_local_ns = i64_field(row, "ts_local_ns").unwrap_or(0);
@@ -148,9 +139,9 @@ mod tests {
 
     #[test]
     fn venue_names_match_the_tape_vocabulary() {
-        assert_eq!(venue_of("kalshi"), Some(Venue::Kalshi));
-        assert_eq!(venue_of("polymarket"), Some(Venue::Polymarket));
-        assert_eq!(venue_of("polymarket_us"), Some(Venue::PolymarketUs));
-        assert_eq!(venue_of("nope"), None);
+        assert_eq!(Venue::parse("kalshi"), Some(Venue::Kalshi));
+        assert_eq!(Venue::parse("polymarket"), Some(Venue::Polymarket));
+        assert_eq!(Venue::parse("polymarket_us"), Some(Venue::PolymarketUs));
+        assert_eq!(Venue::parse("nope"), None);
     }
 }

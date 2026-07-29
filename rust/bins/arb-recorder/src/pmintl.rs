@@ -3,10 +3,11 @@
 //! REST re-snapshot, periodic 300s integrity re-snapshot.
 //! Transliteration of record/polymarket.py + polymarket_ws_task.
 
-use crate::core::{dec_string, stall_reconnect_s, ws_url, Core, SeqCounter};
+use crate::core::{
+    dec_string, reconnect_forever, sorted_levels, stall_reconnect_s, ws_url, Core, SeqCounter,
+};
 use crate::health::Liveness;
 use anyhow::Result;
-use arb_core::dec::Dec;
 use arb_core::model::{now_local_ns, BookSide, Level, TakerSide, TapeEvent, Venue};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
@@ -18,27 +19,9 @@ pub const GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
 pub const WS_MARKET_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 fn levels(raw: Option<&Value>, descending: bool) -> Vec<Level> {
-    let mut lv: Vec<Level> = raw
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|l| {
-                    let price = dec_string(l.get("price")?);
-                    let size = dec_string(l.get("size")?);
-                    Dec::parse(&size).ok().filter(Dec::is_positive)?;
-                    Some(Level { price, size })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    lv.sort_by(|a, b| {
-        let (pa, pb) = (
-            Dec::parse(&a.price).unwrap_or(Dec::ZERO),
-            Dec::parse(&b.price).unwrap_or(Dec::ZERO),
-        );
-        if descending { pb.cmp_num(&pa) } else { pa.cmp_num(&pb) }
-    });
-    lv
+    sorted_levels(raw, descending, |l| {
+        Some((dec_string(l.get("price")?), dec_string(l.get("size")?)))
+    })
 }
 
 fn ts_venue_of(msg: &Value) -> Option<String> {
@@ -202,12 +185,7 @@ pub async fn ws_task(
     token_ids: Vec<String>,
     clob: Arc<ClobRest>,
 ) {
-    loop {
-        if let Err(e) = ws_session(&core, &liveness, &token_ids, &clob).await {
-            eprintln!("[pm-ws] session ended: {e:#}");
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
+    reconnect_forever("pm-ws", || ws_session(&core, &liveness, &token_ids, &clob)).await
 }
 
 async fn ws_session(
