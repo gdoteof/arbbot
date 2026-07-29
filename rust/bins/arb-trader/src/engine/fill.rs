@@ -51,6 +51,28 @@ impl MakerOrder {
             "maker"
         }
     }
+
+    /// Did this order REST at the venue, and so reserve capital in the risk
+    /// view? Only the maker path does.
+    ///
+    /// This is not cosmetic. The reservation key is `(rel_id, market, side)`
+    /// and take-take leg 1 SHARES one with the maker: a Kalshi-lead crossing is
+    /// a BID on the Kalshi market (`Candidate::leg1`), the maker quotes both
+    /// legs of the same relationship (`maker_leg_indices`), and take-take is
+    /// placed through `drain_intents(Some(rel))`, so `order_rel` carries the
+    /// identical triple. A take-take fill calling `consume` therefore deletes
+    /// the MAKER's reservation for a quote that is still resting at the venue —
+    /// `record_open` books the crossing's contracts and the same call frees the
+    /// maker's, so the gate's total does not move while real committed capital
+    /// rose. If the maker's target price has not changed, `Quoter::on_book`
+    /// takes the hysteresis `continue` and never re-reserves.
+    ///
+    /// It does not RESERVE either, and must not: reserving would overwrite the
+    /// maker's slot with the same collision, and an IOC that does not fill dies
+    /// at the venue with no cancel to release it.
+    fn rested(&self) -> bool {
+        self.strategy != "take-take"
+    }
 }
 
 /// Book a completed basket: the maker leg filled and its hedge filled, so the
@@ -259,6 +281,45 @@ impl Engine {
                     if let (Some(rv), Some(mo)) = (self.cfg.risk.as_ref(), self.order_rel.get(oid))
                     {
                         rv.record_open(&mo.rel_id, mo.class, ob.qty() as f64);
+                        // ...and if the order RESTED, those contracts are no
+                        // longer capital merely COMMITTED, so the reservation
+                        // gives up exactly what filled. Counting it in both
+                        // places would refuse the same dollars twice; releasing
+                        // the whole slot would free the part still resting.
+                        //
+                        // Only a maker order, though. Take-take leg 1 reserved
+                        // nothing and SHARES a slot key with the maker quote on
+                        // the same leg — see `MakerOrder::rested`.
+                        //
+                        // KNOWN, BOUNDED, AND NOT GATED: a SUPERSEDED order's
+                        // fill consumes the slot its replacement now owns. The
+                        // key is `(rel, market, side)`, and an amend rewrites
+                        // that slot for the new order before the old one is
+                        // cancelled — `drain_intents` says in its own words
+                        // that a fill can still race the cancel. So Q1 rests
+                        // holding 5, the book moves, Q2's check overwrites the
+                        // slot, Q1 then fills: `record_open` books 5 and this
+                        // zeroes the slot while Q2 rests unreserved.
+                        //
+                        // Left alone on purpose, and the reason rules out one
+                        // DESIGN rather than the problem: gating it by passing
+                        // the order id to `check` is impossible, because the
+                        // quoter allocates no id until after the gate allows
+                        // (a refused quote must not consume one). It is NOT
+                        // ungatable — a `claim(rel, market, side, order_id)`
+                        // where `resting.insert` already runs unconditionally
+                        // would stamp the owning id into the reservation, and
+                        // this call has the filling `oid` in hand to compare.
+                        // That is one trait method and one write on a path that
+                        // already writes. It is not done here because the
+                        // residual needs a race, is bounded by one clip,
+                        // self-heals on the next reprice or cancel of that
+                        // slot, and is PERMISSIVE — strictly better than a gate
+                        // that reserves nothing at all, which is what this
+                        // replaces. Whoever needs it tighter has the shape.
+                        if mo.rested() {
+                            rv.consume(&mo.rel_id, &mo.market_id, mo.side, ob.qty() as f64);
+                        }
                     }
                     // No anchor => no hedge target. The obligation is
                     // deliberately left unconsumed so the ledger's
@@ -877,5 +938,138 @@ mod attribute_fill_tests {
         assert_eq!(e.n_fill, 1, "a foreign fill is not ours to count");
         assert_eq!(e.last_now, 10.0);
         assert_eq!(e.unclaimed_fills.len(), 1, "it is held for the ack that might name it");
+    }
+
+    /// RELEASE ON FILL, through the engine rather than through `RiskView`.
+    ///
+    /// A resting quote holds its clip against the caps from the moment the gate
+    /// allows it. When it fills, those contracts become real exposure — so the
+    /// fill path owes BOTH calls: `record_open` for the new exposure and
+    /// `consume` for the reservation it replaces. Only `record_open` would
+    /// refuse the same dollars twice, in a gate that refuses on the total;
+    /// only `consume` would lose them.
+    #[test]
+    fn a_maker_fill_books_its_exposure_and_gives_up_the_capital_it_reserved() {
+        use arb_core::model::Venue as V;
+        use arb_core::quoter::RiskGate;
+        use arb_core::scan::{RelLeg, RelType};
+
+        let dir = std::env::temp_dir().join(format!("arb-fill-risk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exec = dir.join("exec.yaml");
+        std::fs::write(&exec, "bankroll_usd: 980\nper_class_cap: 0.35\n").unwrap();
+        let rv = std::sync::Arc::new(crate::risk::RiskView::load(
+            exec.to_str().unwrap(),
+            "/nonexistent/topics.yaml",
+            vec![
+                ("kalshi".to_string(), "1000".to_string()),
+                ("polymarket_us".to_string(), "1000".to_string()),
+            ],
+            HashMap::from([("synth-attribution-rel".to_string(), "low".to_string())]),
+        ));
+        // The relationship `maker_order()` names, quoting Kalshi market "K".
+        let rel = Rel {
+            id: "synth-attribution-rel".into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: V::Kalshi, market_id: "K".into() },
+                RelLeg { venue: V::PolymarketUs, market_id: "P".into() },
+            ],
+        };
+        assert!(rv.check(&rel, V::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
+        assert_eq!(rv.reserved_ct(), 5.0, "the quote rests holding its clip");
+
+        let mut cfg = test_cfg();
+        cfg.risk = Some(rv.clone());
+        let mut e = test_engine(cfg);
+        e.fills.register_order("m1", "K", 5, Some(anchor()));
+        e.order_rel.insert("m1".into(), maker_order());
+
+        e.attribute_fill("m1", 3, Venue::Kalshi, "K", 1.0, Instant::now());
+        assert_eq!(
+            (rv.open_ct("synth-attribution-rel"), rv.reserved_ct()),
+            (3.0, 2.0),
+            "3 of 5 filled: 3 are exposure, 2 are still resting"
+        );
+
+        e.attribute_fill("m1", 5, Venue::Kalshi, "K", 2.0, Instant::now());
+        assert_eq!(
+            (rv.open_ct("synth-attribution-rel"), rv.reserved_ct()),
+            (5.0, 0.0),
+            "and the whole clip has moved from committed to spent, once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A TAKE-TAKE FILL MUST NOT RELEASE THE MAKER'S RESERVATION.**
+    ///
+    /// The two share a slot key. A Kalshi-lead crossing places leg 1 as a BID
+    /// on the Kalshi market (`Candidate::leg1`); the maker quoter for the same
+    /// relationship quotes BOTH legs (`maker_leg_indices`), so it reserves
+    /// `(rel, kalshi_market, Bid)`; and take-take is placed through
+    /// `drain_intents(Some(rel))`, so `order_rel` carries the identical triple
+    /// — unlike a hedge, which goes through `drain_intents(None)` and is never
+    /// registered at all.
+    ///
+    /// So an unguarded `consume` books the crossing's contracts with
+    /// `record_open` and frees the maker's whole reservation in the same
+    /// breath: the gate's total does not move while real committed capital rose
+    /// by a clip, and a 5-lot is still resting at the venue. That is the
+    /// N-quotes-one-headroom defect this whole change exists to close,
+    /// reintroduced on the armed take-take path.
+    #[test]
+    fn a_take_take_fill_does_not_free_the_maker_quote_resting_on_the_same_leg() {
+        use arb_core::model::Venue as V;
+        use arb_core::quoter::RiskGate;
+        use arb_core::scan::{RelLeg, RelType};
+
+        let dir = std::env::temp_dir().join(format!("arb-tt-risk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exec = dir.join("exec.yaml");
+        std::fs::write(&exec, "bankroll_usd: 980\nper_class_cap: 0.35\n").unwrap();
+        let rv = std::sync::Arc::new(crate::risk::RiskView::load(
+            exec.to_str().unwrap(),
+            "/nonexistent/topics.yaml",
+            vec![
+                ("kalshi".to_string(), "1000".to_string()),
+                ("polymarket_us".to_string(), "1000".to_string()),
+            ],
+            HashMap::from([("synth-attribution-rel".to_string(), "low".to_string())]),
+        ));
+        let rel = Rel {
+            id: "synth-attribution-rel".into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: V::Kalshi, market_id: "K".into() },
+                RelLeg { venue: V::PolymarketUs, market_id: "P".into() },
+            ],
+        };
+        // The MAKER rests a Kalshi bid on this relationship.
+        assert!(rv.check(&rel, V::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
+        assert_eq!(rv.reserved_ct(), 5.0);
+
+        let mut cfg = test_cfg();
+        cfg.risk = Some(rv.clone());
+        let mut e = test_engine(cfg);
+        // ...and take-take fires leg 1 on the SAME market and side.
+        let mut tt = maker_order();
+        tt.strategy = "take-take";
+        e.fills.register_order("t1", "K", 5, Some(anchor()));
+        e.order_rel.insert("t1".into(), tt);
+
+        e.attribute_fill("t1", 5, Venue::Kalshi, "K", 1.0, Instant::now());
+        assert_eq!(
+            rv.open_ct("synth-attribution-rel"),
+            5.0,
+            "the crossing's contracts are real exposure"
+        );
+        assert_eq!(
+            rv.reserved_ct(),
+            5.0,
+            "and the maker's quote is STILL resting, so its capital is still committed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

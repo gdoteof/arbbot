@@ -5,11 +5,25 @@
 //! whole-book quantity: a per-quoter copy would let each relationship spend the
 //! same headroom.
 //!
+//! SHARING THE MAP WAS NEVER ENOUGH, though, and that sentence used to stop
+//! here. Exposure moved only in [`RiskView::record_open`], whose only live
+//! caller is the FILL path, so the shared view was a shared SNAPSHOT: the
+//! quoter consulted it once per (leg, side), rested the order, and every other
+//! quoting relationship consulted the identical number. Let a class hold one
+//! clip of headroom: the first quote passes, rests, and every other quoting
+//! relationship x 2 legs x 2 sides passes against that same unchanged figure —
+//! and all those orders are live at the venue at the same time. The cap
+//! bounded the ORDER ENTRY RATE, not the capital. So an
+//! allowed check now RESERVES its clip against the (market, side) the order
+//! rests on, and the reservation is folded into the exposure the NEXT check
+//! sees. Every way one is given back is enumerated on the `reserved` field
+//! below — not linked, because it is private and the link would be dead.
+//!
 //! Config comes from the same files the Python runner used (`config/exec.yaml`,
 //! `config/topics.yaml`) so the caps are one source of truth, not a second
 //! transcription.
 
-use arb_core::model::Venue;
+use arb_core::model::{BookSide, Venue};
 use arb_core::quoter::{RiskGate, RiskVerdict};
 use arb_core::risk::{check_order, ConfigIn, ExposureIn, Input, RelIn, TopicIn};
 use arb_core::scan::Rel;
@@ -31,6 +45,11 @@ struct Exposure {
     by_class: HashMap<String, f64>,
     by_topic: HashMap<String, f64>,
 }
+
+/// The (relationship, market, side) one resting quote sits on. There is at most
+/// one of ours per slot — that is what `Quoter::resting` is keyed by — so a
+/// reprice REPLACES its own reservation rather than stacking a second one.
+type Slot = (String, String, BookSide);
 
 pub struct RiskView {
     bankroll: String,
@@ -61,6 +80,52 @@ pub struct RiskView {
     /// is not carried on `Rel`, so it is looked up by id.
     oracle_risk: HashMap<String, String>,
     exposure: Mutex<Exposure>,
+    /// Capital COMMITTED by a quote that is resting and has not filled, by the
+    /// slot it rests on -> (class, contracts). Folded into the exposure every
+    /// `check` sees, so headroom can be spent only once.
+    ///
+    /// EVERY WAY A RESTING QUOTE GOES AWAY, and which of them releases:
+    ///   * FILLED — `consume`, from the engine's fill path, moves the filled
+    ///     contracts out of the reservation and into real exposure
+    ///     (`record_open`). A partial fill leaves the remainder reserved,
+    ///     because the remainder is still resting.
+    ///   * CANCELLED — `Quoter::on_book`'s cancel arm calls `release` as it
+    ///     drops its `resting` entry. YES.
+    ///   * PULLED FOR A STALE CAP REFUSAL — `CAP_REFUSAL_PULL_S` (#35) takes a
+    ///     quote off when the caps have refused its replacement for long
+    ///     enough. YES, and it is the release that matters most: the quote is
+    ///     coming off BECAUSE capital is scarce, so leaking it there ratchets
+    ///     the cap shut exactly when it is already jammed.
+    ///   * REPLACED (an amend) — the new check writes the SAME slot, so the
+    ///     old reservation is overwritten rather than leaked, and the check
+    ///     that authorises the amend does not count the quote it is replacing
+    ///     against itself. YES.
+    ///   * SWEPT AT A HALT — `Quoter::cancel_all` releases every slot it pulls,
+    ///     and it has exactly two callers: `kill_tick` and `pull_quotes` (the
+    ///     feed-stale pull). YES, and they are what drains this map several
+    ///     times an hour on a live feed. The SHUTDOWN sweep is not one of them
+    ///     — `spawn_shutdown_sweep` is a venue-level cancel that touches no
+    ///     quoter — but the process is exiting, so the map goes with it. The
+    ///     venue `SweepAndVerify` that follows a halt reaches orders we hold no
+    ///     id for; those were released when the quoter last dropped them, or
+    ///     belong to a previous process.
+    ///   * REJECTED BY THE VENUE — NO, and this one cannot be closed here. A
+    ///     rejected place produces no engine event at all (`exec.rs` counts
+    ///     `exec_failed` and tells the engine nothing), so the QUOTER still
+    ///     believes it rests. The reservation therefore lasts exactly as long
+    ///     as that belief and is released by the cancel or the amend the next
+    ///     book event on that market produces. It over-reserves, which refuses
+    ///     rather than permits; it is unbounded only for a market whose feed
+    ///     goes silent forever, which is the pre-existing "market goes quietly
+    ///     dark" defect and not a new one.
+    ///   * ORPHANED BY A LOST ACK — `recover_place` adopts the order and emits
+    ///     an `order_ack`, so the order really is resting and the reservation
+    ///     is correct. A recovery that finds nothing is the rejected case.
+    ///
+    /// A marketable IOC reserves NOTHING (`rests_on: None`): it does not rest,
+    /// there is no cancel to release it, and take-take's own cooldown gate is
+    /// what bounds re-firing in the window before its fill books.
+    reserved: Mutex<HashMap<Slot, (&'static str, f64)>>,
     /// Counts, for the stats line. Rejections are not errors — a gate that
     /// never fires is a gate nobody can see working.
     pub checked: Mutex<(u64, u64)>, // (allowed, rejected)
@@ -343,6 +408,7 @@ impl RiskView {
             balances,
             oracle_risk,
             exposure: Mutex::new(Exposure::default()),
+            reserved: Mutex::new(HashMap::new()),
             checked: Mutex::new((0, 0)),
         }
     }
@@ -378,9 +444,43 @@ impl RiskView {
         *e.by_topic.entry(topic).or_default() += qty;
     }
 
+    /// `qty` of the quote resting on this slot has FILLED, so it is no longer a
+    /// reservation — the caller has just booked it as real exposure through
+    /// `record_open`, and counting it in both places would refuse capital twice.
+    ///
+    /// The remainder stays reserved: a 5-lot that fills 3 is still resting 2.
+    /// A slot with nothing left is dropped, and a slot that was never reserved
+    /// (a take-take IOC, or a fill on an order this run inherited) is a no-op.
+    pub fn consume(&self, rel_id: &str, market_id: &str, side: BookSide, qty: f64) {
+        let mut r = self.reserved.lock().expect("reserved");
+        let key = (rel_id.to_string(), market_id.to_string(), side);
+        if let Some((_, left)) = r.get_mut(&key) {
+            *left -= qty;
+            if *left <= 0.0 {
+                r.remove(&key);
+            }
+        }
+    }
+
+    /// Contracts currently held against the caps by quotes that are resting and
+    /// have not filled.
+    ///
+    /// In the stats line because a cap that refuses on invisible state cannot be
+    /// debugged: `risk_rejected` rising with `risk_reserved` is the caps working,
+    /// and `risk_reserved` that only ever rises is a reservation leak — the one
+    /// failure of this mechanism that is worse than the bug it fixes.
+    pub fn reserved_ct(&self) -> f64 {
+        self.reserved.lock().expect("reserved").values().map(|(_, q)| q).sum()
+    }
+
     /// Open contracts on one relationship. The take-take concentration cap is
     /// measured against this, so it must see the SAME exposure the caps do —
     /// including what the startup ledger seed put there.
+    ///
+    /// Reservations are deliberately NOT included: this is the take-take
+    /// CONCENTRATION cap, which asks how much of one relationship we are
+    /// holding, not how much capital is committed. The capital question is the
+    /// `check` below, and take-take asks that one too.
     pub fn open_ct(&self, rel_id: &str) -> f64 {
         self.exposure.lock().expect("exposure").by_rel.get(rel_id).copied().unwrap_or(0.0)
     }
@@ -397,6 +497,12 @@ impl RiskView {
     /// ~$1-a-contract equivalence `RiskGate::check` is built on and `risk.rs`
     /// already divides by. A cap of zero reads as FULL, not empty: it is the
     /// direction that demands more of a new quote rather than less.
+    ///
+    /// RESERVATIONS ARE NOT COUNTED HERE. This is what the maker APR hurdle
+    /// rides on (`Engine::apr_tick`), and floating that bar on capital that is
+    /// only committed is a policy change, not a fix. The undischarged-hedge
+    /// seed DOES move it, though, because that seed is a `record_open` — today
+    /// with no effect, since the live book already clamps this to 1.000.
     pub fn utilization(&self) -> f64 {
         let cap = self.bankroll.parse::<f64>().unwrap_or(0.0)
             * self.per_class_cap.parse::<f64>().unwrap_or(0.0);
@@ -493,9 +599,39 @@ impl RiskGate for RiskView {
     /// this check on the take-take ENTRY), and it must stay that way. Gating
     /// both legs' cash here is what keeps that honest: the hedge's venue is
     /// proven fundable BEFORE the entry that obliges us to hedge.
-    fn check(&self, rel: &Rel, venue: Venue, notional: i64) -> RiskVerdict {
+    fn check(
+        &self,
+        rel: &Rel,
+        venue: Venue,
+        notional: i64,
+        rests_on: Option<(&str, BookSide)>,
+    ) -> RiskVerdict {
         let n = notional.to_string();
         let e = self.exposure.lock().expect("exposure");
+        let mut by_rel = e.by_rel.clone();
+        let mut by_class = e.by_class.clone();
+        let mut by_topic = e.by_topic.clone();
+        drop(e);
+        // Capital already committed by quotes that are RESTING. Without this
+        // the gate is a pure read and every resting quote in the process spends
+        // the same headroom — see the module header.
+        //
+        // This slot's own reservation is skipped, because a reprice on it
+        // REPLACES that quote: charging the amend for the order it is about to
+        // cancel would refuse repricing exactly when the book is fullest, which
+        // is when a stale quote is most dangerous.
+        let mine = rests_on.map(|(m, s)| (rel.id.clone(), m.to_string(), s));
+        {
+            let r = self.reserved.lock().expect("reserved");
+            for (slot, (class, qty)) in r.iter() {
+                if Some(slot) == mine.as_ref() {
+                    continue;
+                }
+                *by_rel.entry(slot.0.clone()).or_default() += qty;
+                *by_class.entry((*class).to_string()).or_default() += qty;
+                *by_topic.entry(topic_of(&slot.0, &self.topics)).or_default() += qty;
+            }
+        }
         let pairs = |m: &HashMap<String, f64>| -> Vec<(String, String)> {
             m.iter().map(|(k, v)| (k.clone(), v.to_string())).collect()
         };
@@ -513,9 +649,9 @@ impl RiskGate for RiskView {
                     .unwrap_or_else(|| "high".to_string()),
             },
             exposure: ExposureIn {
-                by_relationship: pairs(&e.by_rel),
-                by_class: pairs(&e.by_class),
-                by_topic: pairs(&e.by_topic),
+                by_relationship: pairs(&by_rel),
+                by_class: pairs(&by_class),
+                by_topic: pairs(&by_topic),
             },
             balances: self.balances.clone(),
             notional: n.clone(),
@@ -529,8 +665,19 @@ impl RiskGate for RiskView {
             // everything rather than merely refusing new orders.
             kill: false,
         };
-        drop(e);
         let d = check_order(&inp);
+        // RESERVE. The quoter rests the order the instant this returns allowed
+        // — there is no branch between them — so this is the moment the capital
+        // is committed, and it stays committed until the quote fills or comes
+        // off. An amend overwrites its own slot rather than adding to it.
+        if d.allowed {
+            if let Some(slot) = mine {
+                self.reserved
+                    .lock()
+                    .expect("reserved")
+                    .insert(slot, (rel.rtype.as_str(), notional as f64));
+            }
+        }
         let mut c = self.checked.lock().expect("checked");
         if d.allowed {
             c.0 += 1;
@@ -538,6 +685,13 @@ impl RiskGate for RiskView {
             c.1 += 1;
         }
         RiskVerdict { allowed: d.allowed, reasons: d.reasons }
+    }
+
+    fn release(&self, rel_id: &str, market_id: &str, side: BookSide) {
+        self.reserved
+            .lock()
+            .expect("reserved")
+            .remove(&(rel_id.to_string(), market_id.to_string(), side));
     }
 }
 
@@ -623,7 +777,7 @@ mod tests {
     #[test]
     fn no_balance_configured_refuses_every_order() {
         let v = view(vec![], "low");
-        let d = v.check(&rel("r1"), Venue::Kalshi, 5);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
         assert!(!d.allowed);
         assert!(d.reasons.iter().any(|r| r.contains("insufficient kalshi balance")), "{:?}", d.reasons);
     }
@@ -631,7 +785,7 @@ mod tests {
     #[test]
     fn a_funded_venue_within_caps_is_allowed() {
         let v = funded("low");
-        let d = v.check(&rel("r1"), Venue::Kalshi, 5);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
         assert!(d.allowed, "{:?}", d.reasons);
     }
 
@@ -642,7 +796,7 @@ mod tests {
     #[test]
     fn the_hedge_legs_venue_is_cash_gated_too() {
         let v = view(vec![("kalshi", "340")], "low"); // PM-US starved
-        let d = v.check(&rel("r1"), Venue::Kalshi, 5);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
         assert!(!d.allowed, "a basket we cannot hedge must not be opened");
         assert!(
             d.reasons.iter().any(|r| r.contains("insufficient polymarket_us balance")),
@@ -657,7 +811,7 @@ mod tests {
     #[test]
     fn a_take_take_entry_is_refused_when_the_kalshi_hedge_is_unfunded() {
         let v = view(vec![("polymarket_us", "349")], "low");
-        let d = v.check(&rel("r1"), Venue::PolymarketUs, 5);
+        let d = v.check(&rel("r1"), Venue::PolymarketUs, 5, None);
         assert!(!d.allowed, "leg 1 must not fire without cash for leg 2");
         assert!(
             d.reasons.iter().any(|r| r.contains("insufficient kalshi balance")),
@@ -671,11 +825,11 @@ mod tests {
     #[test]
     fn cash_is_checked_on_every_venue_the_basket_spends_on() {
         let v = view(vec![("kalshi", "340")], "low");
-        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5).allowed);
-        assert!(!v.check(&rel("r1"), Venue::PolymarketUs, 5).allowed);
+        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
+        assert!(!v.check(&rel("r1"), Venue::PolymarketUs, 5, None).allowed);
         let both = funded("low");
-        assert!(both.check(&rel("r1"), Venue::Kalshi, 5).allowed);
-        assert!(both.check(&rel("r1"), Venue::PolymarketUs, 5).allowed);
+        assert!(both.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
+        assert!(both.check(&rel("r1"), Venue::PolymarketUs, 5, None).allowed);
     }
 
     /// Two legs on ONE venue cost ~$1.00 between them, not $1.00 each, so the
@@ -706,9 +860,9 @@ mod tests {
     #[test]
     fn accumulated_exposure_eventually_refuses() {
         let v = funded("low");
-        assert!(v.check(&rel("r1"), Venue::Kalshi, 5).allowed);
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
         v.record_open("r1", "cross-venue-equivalent", 150.0);
-        let d = v.check(&rel("r1"), Venue::Kalshi, 5);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
         assert!(!d.allowed, "150 open against a 150 cap leaves no headroom");
         assert!(d.reasons.iter().any(|r| r.contains("per-relationship")), "{:?}", d.reasons);
     }
@@ -724,7 +878,7 @@ mod tests {
             let v = funded(oracle);
             v.record_open("r1", "cross-venue-equivalent", open);
             assert_eq!(
-                v.check(&rel("r1"), Venue::Kalshi, 5).allowed,
+                v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed,
                 want_allowed,
                 "oracle_risk={oracle} open={open}"
             );
@@ -737,17 +891,177 @@ mod tests {
     fn an_unclassified_relationship_gets_the_tightest_cap() {
         let v = funded("low");
         v.record_open("unknown-rel", "cross-venue-equivalent", 30.0);
-        let d = v.check(&rel("unknown-rel"), Venue::Kalshi, 10);
+        let d = v.check(&rel("unknown-rel"), Venue::Kalshi, 10, None);
         assert!(!d.allowed, "unknown => high risk => 0.25x cap: {:?}", d.reasons);
     }
 
     #[test]
     fn allowed_and_rejected_are_counted_for_the_stats_line() {
         let v = funded("low");
-        v.check(&rel("r1"), Venue::Kalshi, 5);
+        v.check(&rel("r1"), Venue::Kalshi, 5, None);
         v.record_open("r1", "cross-venue-equivalent", 150.0); // fills the per-rel cap
-        v.check(&rel("r1"), Venue::Kalshi, 5); // => refused
+        v.check(&rel("r1"), Venue::Kalshi, 5, None); // => refused
         assert_eq!(v.stats(), (1, 1));
+    }
+
+    // ---- committed-but-unfilled capital: the cap bounded the order entry
+    //      RATE, not the money ----
+    //
+    // Every test above this line hands `rests_on: None`, which is the gate as a
+    // pure read — the take-take path's shape, and what the whole gate used to
+    // be. The maker path passes a slot, because a quote that RESTS commits
+    // capital from the moment it is allowed.
+
+    /// **N QUOTES CANNOT EACH SPEND THE SAME HEADROOM.**
+    ///
+    /// The class cap is $343 (980 x 0.35) and 335 contracts are already open,
+    /// so there is room for exactly ONE clip of 5. `check` was a pure read, so
+    /// the first quote passed at 335+5, rested — and the second saw the same
+    /// 335, as did the third, and every (leg, side) of every quoting
+    /// relationship. All of them were live at the venue simultaneously, so one
+    /// wide move filled a cap's worth of orders through a cap that had refused
+    /// nothing.
+    #[test]
+    fn a_second_quote_cannot_spend_the_headroom_the_first_is_holding() {
+        let v = funded("low");
+        v.record_open("already-open", "cross-venue-equivalent", 335.0);
+        let first = v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid)));
+        assert!(first.allowed, "{:?}", first.reasons);
+        assert_eq!(v.reserved_ct(), 5.0, "an allowed quote holds its clip");
+
+        let second = v.check(&rel("r2"), Venue::Kalshi, 5, Some(("K", BookSide::Bid)));
+        assert!(!second.allowed, "335 open + 5 RESTING + 5 > 343: {:?}", second.reasons);
+        assert!(
+            second.reasons.iter().any(|r| r.contains("class cap")),
+            "{:?}",
+            second.reasons
+        );
+        assert_eq!(v.reserved_ct(), 5.0, "and a refusal reserves nothing");
+    }
+
+    /// ...and the four (leg, side) quotes of ONE relationship are four quotes
+    /// too. This is the same defect inside a single `Quoter::on_book` call,
+    /// where nothing between the checks could ever have moved the exposure —
+    /// there is no fill in that window by construction.
+    ///
+    /// Clip 40 against the $150 per-relationship cap: three fit, the fourth
+    /// does not.
+    #[test]
+    fn the_four_sides_of_one_relationship_cannot_each_spend_the_per_rel_cap() {
+        let v = funded("low");
+        let r = rel("r1");
+        for (market, side) in
+            [("K", BookSide::Bid), ("K", BookSide::Ask), ("P", BookSide::Bid)]
+        {
+            let d = v.check(&r, Venue::Kalshi, 40, Some((market, side)));
+            assert!(d.allowed, "{market}/{}: {:?}", side.as_str(), d.reasons);
+        }
+        let fourth = v.check(&r, Venue::Kalshi, 40, Some(("P", BookSide::Ask)));
+        assert!(!fourth.allowed, "3x40 resting + 40 > 150: {:?}", fourth.reasons);
+        assert!(
+            fourth.reasons.iter().any(|r| r.contains("per-relationship")),
+            "{:?}",
+            fourth.reasons
+        );
+        assert_eq!(v.reserved_ct(), 120.0);
+    }
+
+    /// RELEASE ON CANCEL — the path the quoter drives. A cap that never gives
+    /// capital back ratchets shut and silently stops all trading, which is
+    /// worse than the overshoot the reservation exists to stop.
+    #[test]
+    fn a_released_slot_gives_its_capital_back() {
+        let v = funded("low");
+        v.record_open("r1", "cross-venue-equivalent", 145.0); // 5 of headroom left
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
+        assert!(
+            !v.check(&rel("r1"), Venue::Kalshi, 5, Some(("P", BookSide::Bid))).allowed,
+            "the first quote is holding the last of the headroom"
+        );
+
+        v.release("r1", "K", BookSide::Bid);
+        assert_eq!(v.reserved_ct(), 0.0);
+        assert!(
+            v.check(&rel("r1"), Venue::Kalshi, 5, Some(("P", BookSide::Bid))).allowed,
+            "the headroom must come back when the quote does not"
+        );
+    }
+
+    /// RELEASE ON REPRICE. An amend replaces the quote on its own slot, so the
+    /// cap must not be asked for both. Charging it twice would refuse repricing
+    /// exactly when the book is fullest — which is when a stale resting quote is
+    /// most dangerous — and would leak a reservation per reprice besides.
+    #[test]
+    fn repricing_is_not_charged_for_the_quote_it_replaces() {
+        let v = funded("low");
+        v.record_open("r1", "cross-venue-equivalent", 145.0);
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
+
+        let amend = v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid)));
+        assert!(amend.allowed, "an amend replaces its own quote: {:?}", amend.reasons);
+        assert_eq!(v.reserved_ct(), 5.0, "and does not stack a second reservation");
+
+        // ...while a DIFFERENT slot is a genuinely second quote.
+        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Ask))).allowed);
+    }
+
+    /// RELEASE ON FILL. Filled contracts stop being capital merely COMMITTED
+    /// and become real exposure, so `consume` gives up exactly what filled —
+    /// counting it in both places would refuse the same dollars twice, and
+    /// releasing the whole slot would free the part still resting.
+    #[test]
+    fn a_fill_moves_capital_from_reserved_to_open_and_only_once() {
+        let v = funded("low");
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
+        assert_eq!(v.reserved_ct(), 5.0);
+
+        // 3 of 5 fill: 3 are open, 2 are still resting.
+        v.record_open("r1", "cross-venue-equivalent", 3.0);
+        v.consume("r1", "K", BookSide::Bid, 3.0);
+        assert_eq!((v.open_ct("r1"), v.reserved_ct()), (3.0, 2.0));
+
+        // ...and then the rest. Nothing is double counted at either step.
+        v.record_open("r1", "cross-venue-equivalent", 2.0);
+        v.consume("r1", "K", BookSide::Bid, 2.0);
+        assert_eq!((v.open_ct("r1"), v.reserved_ct()), (5.0, 0.0));
+    }
+
+    /// A slot holding nothing is released harmlessly, and that is load-bearing
+    /// rather than defensive: a fully filled quote's slot is already gone when
+    /// the quoter next cancels it (the quoter has no fill path and still
+    /// believes it rests), so this is the ordinary sequence, not an edge.
+    #[test]
+    fn releasing_a_slot_that_holds_nothing_is_harmless() {
+        let v = funded("low");
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
+        v.consume("r1", "K", BookSide::Bid, 5.0);
+        assert_eq!(v.reserved_ct(), 0.0);
+        v.release("r1", "K", BookSide::Bid);
+        v.release("r1", "never-quoted", BookSide::Ask);
+        assert_eq!(v.reserved_ct(), 0.0);
+    }
+
+    /// A REFUSED check reserves nothing. The quoter consults the gate on every
+    /// book event, so a refusal that reserved would ratchet a full cap shut in
+    /// seconds and never reopen it.
+    #[test]
+    fn a_refused_check_reserves_nothing_so_a_full_cap_does_not_ratchet() {
+        let v = funded("low");
+        v.record_open("r1", "cross-venue-equivalent", 150.0); // per-rel cap, exactly
+        for _ in 0..10 {
+            assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
+        }
+        assert_eq!(v.reserved_ct(), 0.0);
+    }
+
+    /// A marketable IOC does not rest, so it reserves nothing — nothing would
+    /// ever release it. An IOC that does not fill dies at the venue and produces
+    /// no cancel; take-take's own cooldown gate bounds the window instead.
+    #[test]
+    fn a_marketable_ioc_reserves_nothing() {
+        let v = funded("low");
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
+        assert_eq!(v.reserved_ct(), 0.0);
     }
 
     // ---- C11: config/topics.yaml must not widen a cap when it breaks ----
@@ -764,7 +1078,7 @@ mod tests {
             vec![("kalshi", "1000"), ("polymarket_us", "1000")],
             "low",
         );
-        let d = v.check(&rel("r1"), Venue::Kalshi, 5);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
         assert!(!d.allowed, "a damaged cap file must refuse, not wave through");
         assert!(d.reasons.iter().any(|r| r.contains("topic budget")), "{:?}", d.reasons);
         assert!(v.describe().contains("UNUSABLE"), "and say so: {}", v.describe());
@@ -792,7 +1106,7 @@ mod tests {
         );
         let r = rel("xvus-france-pres-27-djt");
         v.record_open("xvus-france-pres-27-djt", "cross-venue-equivalent", 40.0);
-        assert!(!v.check(&r, Venue::Kalshi, 25).allowed, "40+25 > 60");
+        assert!(!v.check(&r, Venue::Kalshi, 25, None).allowed, "40+25 > 60");
 
         // Same file, cut after the last topic: the list still parses.
         let cut = write_topics(
@@ -805,11 +1119,11 @@ mod tests {
             "low",
         );
         v.record_open("xvus-france-pres-27-djt", "cross-venue-equivalent", 40.0);
-        let d = v.check(&r, Venue::Kalshi, 25);
+        let d = v.check(&r, Venue::Kalshi, 25, None);
         assert!(!d.allowed, "a dropped default must not widen the cap: {:?}", d.reasons);
         assert!(v.describe().contains("default_topic_budget"), "{}", v.describe());
         // and the catch-all `other` — where everything unlisted lands — too
-        assert!(!v.check(&rel("xvus-unlisted-thing"), Venue::Kalshi, 5).allowed);
+        assert!(!v.check(&rel("xvus-unlisted-thing"), Venue::Kalshi, 5, None).allowed);
         let _ = std::fs::remove_dir_all(intact.parent().unwrap());
         let _ = std::fs::remove_dir_all(cut.parent().unwrap());
     }
@@ -824,7 +1138,7 @@ mod tests {
             vec![("kalshi", "1000"), ("polymarket_us", "1000")],
             "low",
         );
-        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5).allowed);
+        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
@@ -843,7 +1157,7 @@ mod tests {
             "low",
         );
         assert!(v.describe().contains("france-pres-27"), "{}", v.describe());
-        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5).allowed);
+        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
@@ -854,7 +1168,7 @@ mod tests {
     #[test]
     fn an_absent_topics_file_is_a_legitimate_no_budget_config() {
         let v = funded("low");
-        assert!(v.check(&rel("r1"), Venue::Kalshi, 5).allowed);
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
         assert!(!v.describe().contains("UNUSABLE"), "{}", v.describe());
     }
 
@@ -875,9 +1189,9 @@ mod tests {
         );
         assert!(v.describe().contains("topics 2"), "{}", v.describe());
         let r = rel("xvus-nobel-peace-26-djt");
-        assert!(v.check(&r, Venue::Kalshi, 5).allowed);
+        assert!(v.check(&r, Venue::Kalshi, 5, None).allowed);
         v.record_open("xvus-nobel-peace-26-djt", "cross-venue-equivalent", 80.0);
-        let d = v.check(&r, Venue::Kalshi, 5);
+        let d = v.check(&r, Venue::Kalshi, 5, None);
         assert!(!d.allowed, "80 open against an $80 family budget: {:?}", d.reasons);
         assert!(
             d.reasons.iter().any(|r| r.contains("topic budget [nobel-peace-26]")),
@@ -900,7 +1214,7 @@ mod tests {
             vec![("kalshi", "1000"), ("polymarket_us", "1000")],
             "low",
         );
-        let d = v.check(&rel("r1"), Venue::Kalshi, 5);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
         assert!(!d.allowed, "a cap that did not load must refuse: {:?}", d.reasons);
         assert!(d.reasons.iter().any(|r| r.contains("class cap")), "{:?}", d.reasons);
         let desc = v.describe();
@@ -972,7 +1286,7 @@ mod tests {
             // 500 * 0.35 = 175, so 170 open in the class leaves no room for 10.
             // The silently-kept 980 default would have allowed it: 343.
             v.record_open("other-rel", "cross-venue-equivalent", 170.0);
-            let d = v.check(&rel("r1"), Venue::Kalshi, 10);
+            let d = v.check(&rel("r1"), Venue::Kalshi, 10, None);
             assert!(!d.allowed, "the cap must be the file's: {:?}", d.reasons);
             assert!(
                 d.reasons.iter().any(|r| r.contains("class cap") && r.contains("175")),
@@ -1016,7 +1330,7 @@ mod tests {
         assert!(v.describe().contains("bankroll $500 per_class 0.35"), "{}", v.describe());
         // The check itself is the assertion: an untrimmed "500 " panics here.
         v.record_open("other-rel", "cross-venue-equivalent", 170.0);
-        let d = v.check(&rel("r1"), Venue::Kalshi, 10);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 10, None);
         assert!(d.reasons.iter().any(|r| r.contains("class cap") && r.contains("175")), "{:?}", d.reasons);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
@@ -1041,7 +1355,7 @@ mod tests {
             "low",
         );
         assert!(v.describe().contains("only_below_util"), "{}", v.describe());
-        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5).allowed);
+        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
@@ -1060,7 +1374,7 @@ mod tests {
             "low",
         );
         assert!(v.describe().contains("default_only_below_util"), "{}", v.describe());
-        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5).allowed);
+        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
@@ -1078,7 +1392,7 @@ mod tests {
             "low",
         );
         assert!(!v.describe().contains("UNUSABLE"), "{}", v.describe());
-        assert!(v.check(&rel("xvus-nobel-peace-26-djt"), Venue::Kalshi, 5).allowed);
+        assert!(v.check(&rel("xvus-nobel-peace-26-djt"), Venue::Kalshi, 5, None).allowed);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }

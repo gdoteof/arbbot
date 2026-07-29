@@ -65,7 +65,31 @@ pub trait RiskGate: Send + Sync {
     /// contracts and dollars are the same number — Python passes
     /// `Decimal(q)`). `venue` is the leg being quoted, which is the venue whose
     /// cash the order would spend.
-    fn check(&self, rel: &Rel, venue: Venue, notional: i64) -> RiskVerdict;
+    ///
+    /// `rests_on` is the (market, side) the order would REST on, and an ALLOWED
+    /// check RESERVES `notional` against it. Without that this call is a pure
+    /// read: the quoter consults the gate once per (leg, side) and then rests
+    /// the order, and every other resting quote in the process consults the
+    /// same unchanged number — so a cap with headroom for one clip authorises
+    /// one clip per quoting side, all live at the venue at once. `None` is an
+    /// order that does NOT rest (a marketable IOC), which reserves nothing.
+    ///
+    /// A slot that already holds a reservation does not count against itself:
+    /// an amend replaces the quote on its own slot rather than adding to it.
+    fn check(
+        &self,
+        rel: &Rel,
+        venue: Venue,
+        notional: i64,
+        rests_on: Option<(&str, BookSide)>,
+    ) -> RiskVerdict;
+
+    /// The quote reserved on this (market, side) is no longer resting, so give
+    /// its capital back. A slot holding no reservation is a no-op, which is
+    /// what makes this safe to call from every path a quote can leave by — a
+    /// reservation that leaks is a cap that ratchets shut and silently stops
+    /// all trading, which is worse than the bug it fixes.
+    fn release(&self, rel_id: &str, market_id: &str, side: BookSide);
 }
 
 pub struct RiskVerdict {
@@ -487,6 +511,14 @@ impl Quoter {
         keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.as_str().cmp(b.1.as_str())));
         for key in keys {
             let curq = self.resting.remove(&key).expect("key from keys()");
+            // RELEASE. This has exactly two production callers — the kill
+            // switch and the feed-stale pull — and capital reserved for a quote
+            // either of them is pulling is capital nothing will ever spend. NOT
+            // the shutdown sweep, which is venue-level and reaches no quoter;
+            // there the process is exiting and the map goes with it.
+            if let Some(gate) = &self.risk {
+                gate.release(&self.rel.id, &self.rel.legs[key.0].market_id, key.1);
+            }
             let leg = &self.rel.legs[key.0];
             intents.push(Intent::Cancel(intent::Cancel {
                 cancel: leg.market_id.clone(),
@@ -577,6 +609,13 @@ impl Quoter {
                 }
                 let Some(target) = target else {
                     if let Some(curq) = self.resting.remove(&key) {
+                        // RELEASE. This is the ordinary way a quote goes away —
+                        // the book moved, the hedge thinned, the side went
+                        // toxic — and it is the release path everything else
+                        // funnels through, `cancel_all` included.
+                        if let Some(gate) = &self.risk {
+                            gate.release(&self.rel.id, &leg_market, side);
+                        }
                         intents.push(Intent::Cancel(intent::Cancel {
                             cancel: leg_market,
                             order_id: curq.order_id,
@@ -665,7 +704,14 @@ impl Quoter {
                 // the duration measures. A cancel is a REDUCTION of exposure,
                 // which no cap has an interest in refusing.
                 if let Some(gate) = &self.risk {
-                    let v = gate.check(&self.rel, self.rel.legs[i].venue, self.clip);
+                    let v = gate.check(
+                        &self.rel,
+                        self.rel.legs[i].venue,
+                        self.clip,
+                        // What this quote will rest on, so the gate can hold
+                        // the capital until it fills or comes off.
+                        Some((&leg_market, side)),
+                    );
                     if !v.allowed {
                         intents.push(Intent::Skip(intent::Skip { skip: v.reasons, ts: now }));
                         let since = *self.refused_since.entry(key).or_insert(now);
@@ -677,6 +723,14 @@ impl Quoter {
                         // many events it spans.
                         if now - since >= CAP_REFUSAL_PULL_S {
                             if let Some(curq) = self.resting.remove(&key) {
+                                // RELEASE, and this is the release path that
+                                // matters most: the quote is being pulled
+                                // BECAUSE the caps are jammed, so its capital
+                                // is the headroom the next quote needs. The
+                                // refusal above reserved nothing (only an
+                                // ALLOWED check does), so what comes back here
+                                // is the reservation the PLACE took.
+                                gate.release(&self.rel.id, &leg_market, side);
                                 intents.push(Intent::Cancel(intent::Cancel {
                                     cancel: leg_market,
                                     order_id: curq.order_id,
@@ -1070,13 +1124,60 @@ mod risk_gate_tests {
     use super::tests_support::*;
     use super::*;
 
-    struct Always(bool);
+    /// Allows or refuses unconditionally, and RECORDS what was reserved and
+    /// released against it — the quoter owns both calls, so this is where the
+    /// pairing is pinned.
+    struct Always {
+        allow: std::sync::atomic::AtomicBool,
+        slots: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Always {
+        fn new(allow: bool) -> std::sync::Arc<Always> {
+            std::sync::Arc::new(Always {
+                allow: std::sync::atomic::AtomicBool::new(allow),
+                slots: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn allows(&self) -> bool {
+            self.allow.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        /// Flip the verdict on a gate the quoter already holds — the caps
+        /// filling up under a quote that is already resting, which is the only
+        /// way to reserve first and refuse afterwards.
+        fn set(&self, allow: bool) {
+            self.allow.store(allow, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.slots.lock().expect("slots").clone()
+        }
+    }
+
     impl RiskGate for Always {
-        fn check(&self, _rel: &Rel, _venue: Venue, _notional: i64) -> RiskVerdict {
-            RiskVerdict {
-                allowed: self.0,
-                reasons: if self.0 { vec![] } else { vec!["per-relationship tail cap".into()] },
+        fn check(
+            &self,
+            _rel: &Rel,
+            _venue: Venue,
+            _notional: i64,
+            rests_on: Option<(&str, BookSide)>,
+        ) -> RiskVerdict {
+            let allow = self.allows();
+            if allow {
+                if let Some((m, s)) = rests_on {
+                    self.slots.lock().expect("slots").push(format!("+{m}/{}", s.as_str()));
+                }
             }
+            RiskVerdict {
+                allowed: allow,
+                reasons: if allow { vec![] } else { vec!["per-relationship tail cap".into()] },
+            }
+        }
+
+        fn release(&self, _rel_id: &str, market_id: &str, side: BookSide) {
+            self.slots.lock().expect("slots").push(format!("-{market_id}/{}", side.as_str()));
         }
     }
 
@@ -1097,7 +1198,7 @@ mod risk_gate_tests {
     #[test]
     fn a_refused_entry_emits_a_skip_naming_the_reasons() {
         let (mut cx, fees, mut bb, mut q) = fixture();
-        q.set_risk(Some(std::sync::Arc::new(Always(false))));
+        q.set_risk(Some(Always::new(false)));
         let mut oid = 0;
         let mut intents = Vec::new();
         pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
@@ -1127,7 +1228,7 @@ mod risk_gate_tests {
         assert!(place_on(&intents, "P").is_some(), "{intents:?}");
 
         // now risk refuses, and the book moves enough to want a reprice
-        q.set_risk(Some(std::sync::Arc::new(Always(false))));
+        q.set_risk(Some(Always::new(false)));
         intents.clear();
         pm_bid(&mut bb, "0.34", 2, 130_000_000_000);
         q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
@@ -1168,7 +1269,7 @@ mod risk_gate_tests {
         };
 
         // capital is now fully deployed: the class cap refuses everything
-        q.set_risk(Some(std::sync::Arc::new(Always(false))));
+        q.set_risk(Some(Always::new(false)));
 
         // the hedge drifts and the resting price stops clearing the edge. The
         // FIRST refusal could still be a blip between a fill and its offset, so
@@ -1206,7 +1307,7 @@ mod risk_gate_tests {
         pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
         q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
         assert!(place_on(&intents, "P").is_some(), "{intents:?}");
-        q.set_risk(Some(std::sync::Arc::new(Always(false))));
+        q.set_risk(Some(Always::new(false)));
 
         // mispriced and refused: the clock starts here
         intents.clear();
@@ -1258,7 +1359,7 @@ mod risk_gate_tests {
         pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
         q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
         assert!(place_on(&intents, "P").is_some(), "{intents:?}");
-        q.set_risk(Some(std::sync::Arc::new(Always(false))));
+        q.set_risk(Some(Always::new(false)));
 
         // 500 book events over 5000s of jam, all wanting the same wrong price
         intents.clear();
@@ -1285,7 +1386,7 @@ mod risk_gate_tests {
         q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
         assert!(place_on(&intents, "P").is_some(), "{intents:?}");
 
-        q.set_risk(Some(std::sync::Arc::new(Always(false))));
+        q.set_risk(Some(Always::new(false)));
         intents.clear();
         // K collapses => the PM quote is unviable
         bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.30", "500")],
@@ -1296,6 +1397,152 @@ mod risk_gate_tests {
             cancel_on(&intents, "P").is_some(),
             "an unviable quote must still cancel: {intents:?}"
         );
+    }
+
+    // ---- the two release paths the QUOTER owns ----
+    //
+    // A quote reserves capital when it is allowed and rests. Everything below
+    // is about giving it back: a reservation that leaks is a cap that ratchets
+    // shut and silently stops all trading, which is worse than the overshoot it
+    // exists to bound.
+
+    /// RELEASE ON CANCEL. The book stops funding the quote, the quoter pulls
+    /// it, and the capital it was holding goes back — reserved and released
+    /// name the same slot.
+    #[test]
+    fn a_cancelled_quote_releases_the_slot_it_reserved() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let gate = Always::new(true);
+        q.set_risk(Some(gate.clone()));
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(gate.log(), vec!["+P/bid"], "the resting quote reserves its slot");
+
+        // K collapses => the PM quote is unviable => prompt cancel
+        intents.clear();
+        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.30", "500")],
+                          vec![lvl("0.99", "1")], 2, 131_000_000_000, None);
+        q.on_book(&mut cx, &fees, &bb, 131.0, &mut oid, &mut intents);
+        assert!(cancel_on(&intents, "P").is_some(), "{intents:?}");
+        assert_eq!(gate.log(), vec!["+P/bid", "-P/bid"], "and gives it back");
+    }
+
+    /// RELEASE ON THE HALT PATHS. `cancel_all` has exactly two production
+    /// callers — the kill switch and the feed-stale pull — and both pull quotes
+    /// the engine will not re-place until the condition clears. Holding their
+    /// capital would leave a killed engine unable to quote once the kill was
+    /// lifted. (The shutdown sweep is NOT one of them: it is venue-level and
+    /// touches no quoter.)
+    #[test]
+    fn cancel_all_releases_every_slot_it_pulls() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let gate = Always::new(true);
+        q.set_risk(Some(gate.clone()));
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(gate.log(), vec!["+P/bid"]);
+
+        intents.clear();
+        q.cancel_all(&mut cx, 200.0, &mut intents);
+        assert!(cancel_on(&intents, "P").is_some(), "{intents:?}");
+        assert_eq!(gate.log(), vec!["+P/bid", "-P/bid"]);
+    }
+
+    /// RELEASE ON REPRICE, and the one release path that is really a rewrite:
+    /// an amend names the SAME slot, so the gate replaces that quote's
+    /// reservation instead of stacking a second one.
+    ///
+    /// This is also what makes a place the VENUE REJECTED self-heal. The engine
+    /// is never told about a rejection (`exec.rs` counts `exec_failed` and emits
+    /// nothing), so the quoter goes on believing it rests — and the reservation
+    /// lasts exactly as long as that belief, until the next book event on the
+    /// market reprices the slot or cancels it.
+    #[test]
+    fn a_reprice_names_the_slot_it_already_reserved() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let gate = Always::new(true);
+        q.set_risk(Some(gate.clone()));
+        let mut oid = 0;
+        let mut intents = Vec::new();
+
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert!(place_on(&intents, "P").is_some(), "{intents:?}");
+
+        // past min_requote_s, with a book that wants a different price
+        intents.clear();
+        pm_bid(&mut bb, "0.34", 2, 130_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        let reprice = place_on(&intents, "P").expect("the reprice");
+        assert!(reprice.replaces.is_some(), "{intents:?}");
+        assert_eq!(
+            gate.log(),
+            vec!["+P/bid", "+P/bid"],
+            "the same slot twice — never a cancel of the old and a second holding"
+        );
+    }
+
+    /// RELEASE ON THE STALE-CAP PULL, and this is the release that matters
+    /// most.
+    ///
+    /// `CAP_REFUSAL_PULL_S` (#35) pulls a quote whose price the quoter has
+    /// rejected while the caps refuse the replacement — so the quote is coming
+    /// off precisely BECAUSE capital is scarce, and its reservation is the
+    /// headroom the next quote needs. Leaking it there would be the worst
+    /// possible place to leak: the cap ratchets shut exactly when it is already
+    /// jammed, and nothing short of a kill or a feed-stale pull reopens it.
+    ///
+    /// This path did not exist when the reservation was written; it arrived on
+    /// main in #35 and is reachable only by reserving first and refusing after.
+    #[test]
+    fn a_quote_pulled_for_a_stale_cap_refusal_gives_its_capital_back() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let gate = Always::new(true);
+        q.set_risk(Some(gate.clone()));
+        let mut oid = 0;
+        let mut intents = Vec::new();
+
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(gate.log(), vec!["+P/bid"], "the quote rests holding its clip");
+
+        // the caps fill up under the resting quote, and the book moves enough
+        // to want a reprice the gate will not allow
+        gate.set(false);
+        intents.clear();
+        pm_bid(&mut bb, "0.34", 2, 130_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        assert!(cancel_on(&intents, "P").is_none(), "the FIRST refusal holds it: {intents:?}");
+        assert_eq!(gate.log(), vec!["+P/bid"], "and releases nothing");
+
+        // ...past CAP_REFUSAL_PULL_S the stale quote comes off
+        intents.clear();
+        pm_bid(&mut bb, "0.34", 3, 200_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 200.0, &mut oid, &mut intents);
+        assert!(cancel_on(&intents, "P").is_some(), "expected the pull: {intents:?}");
+        assert_eq!(
+            gate.log(),
+            vec!["+P/bid", "-P/bid"],
+            "a quote pulled BECAUSE capital is scarce must hand its capital back"
+        );
+    }
+
+    /// A REFUSED quote reserves nothing, so a cap that is already full does not
+    /// fill itself further every time it says no.
+    #[test]
+    fn a_refused_quote_reserves_nothing() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let gate = Always::new(false);
+        q.set_risk(Some(gate.clone()));
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert!(gate.log().is_empty(), "{:?}", gate.log());
     }
 }
 
