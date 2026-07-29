@@ -504,13 +504,26 @@ impl RiskView {
     /// seed DOES move it, though, because that seed is a `record_open` — today
     /// with no effect, since the live book already clamps this to 1.000.
     pub fn utilization(&self) -> f64 {
-        let cap = self.bankroll.parse::<f64>().unwrap_or(0.0)
-            * self.per_class_cap.parse::<f64>().unwrap_or(0.0);
+        let cap = self.class_cap_usd();
         if cap <= 0.0 {
             return 1.0;
         }
         let total: f64 = self.exposure.lock().expect("exposure").by_rel.values().sum();
         (total / cap).clamp(0.0, 1.0)
+    }
+
+    /// The dollar denominator [`Self::utilization`] divides by: bankroll times
+    /// the per-class cap.
+    ///
+    /// Extracted so a caller can ask whether that denominator is REAL before
+    /// trusting a number derived from it. `utilization` answers a cap of zero
+    /// with `1.0` — full — which is the safe direction for an ENTRY (demand
+    /// more of a new quote) and the unsafe one for an EXIT (charge the ceiling
+    /// hurdle, so liquidate everything): see `crate::unwind`. One definition,
+    /// because two would drift.
+    pub fn class_cap_usd(&self) -> f64 {
+        self.bankroll.parse::<f64>().unwrap_or(0.0)
+            * self.per_class_cap.parse::<f64>().unwrap_or(0.0)
     }
 
     pub fn stats(&self) -> (u64, u64) {

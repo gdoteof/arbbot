@@ -80,6 +80,9 @@ pub struct RunCfg {
     pub hedge_retry: Option<HedgeRetry>,
     /// Take-take policy. `None` = the detector never runs.
     pub take_take: Option<TakeTake>,
+    /// Opportunistic-unwind policy. `None` = the scan never runs, which is the
+    /// default: this is a new strategy on real money, not a defect fix.
+    pub unwind: Option<Unwind>,
     /// Whether the venue order path is live. Reported in the stats `mode`.
     ///
     /// This existed only as an inference before (`ledger_path.is_some()`), so
@@ -126,6 +129,28 @@ pub struct TakeTake {
     /// detect-only run on 2026-07-28 logged one fedcut crossing ~10x in
     /// seconds, which is exactly that failure with the orders removed.
     pub cooldown_s: f64,
+}
+
+/// Baskets whose remaining forward APR no longer clears the hurdle the capital
+/// they lock would face if it were freed (`crate::unwind`).
+///
+/// DETECT ONLY, and there is no other mode to configure: the decision is what
+/// this ships, and nothing in this workspace can act on it yet. See the module
+/// header for why an exit is not expressible as an `Intent` today.
+#[derive(Clone)]
+pub struct Unwind {
+    /// `data/exec/marks.json` — the SAME file the take-take bar is derived
+    /// from, and the same staleness rule applies to it. It is read a SECOND
+    /// time here, one call after `stats_tick`'s, so across a two-minute rewrite
+    /// the two reads can briefly be adjacent versions of the file. Neither can
+    /// act on a stale one, which is the property that matters.
+    pub marks_path: String,
+    /// The process's `--rel-prefix` scope. It does not filter the scan — it
+    /// annotates each candidate with whether THIS engine holds a quoter for it,
+    /// because today the candidates and the owned families are disjoint sets
+    /// and a report that hid that would be a work queue of things that cannot
+    /// be worked. See `crate::unwind` §1.
+    pub owned_prefixes: Vec<String>,
 }
 
 /// What the maker APR hurdle is sized from, kept so it can be re-sized.
@@ -183,6 +208,16 @@ fn levels_of(v: Option<&serde_json::Value>) -> Option<Vec<Level>> {
 /// The quoter index a book event is looked up in: (venue, market) -> the
 /// quoters that quote it.
 type ByMarket = HashMap<(Venue, String), Vec<usize>>;
+
+/// What one unwind report was ABOUT: the candidate set as sorted
+/// `(rel_id, opened_ts)` (`unwind::identity_set`) AND the skip breakdown's five
+/// counts (`unwind::SkipTally::counts`). Two scans that compare equal here are
+/// the same finding, and the second one is not worth printing.
+///
+/// BOTH HALVES, because on the live book the first half is EMPTY: no candidate
+/// selects at either floor, so a trigger keyed on candidates alone is a trigger
+/// that never fires. See `Engine::unwind_seen`.
+type UnwindReport = (Vec<(String, u64)>, (usize, usize, usize, usize, usize));
 
 /// Everything the engine knows: the books, the id counters, the order and fill
 /// maps, the outstanding hedge obligations, the parked cancels, the gauges.
@@ -404,6 +439,47 @@ struct Engine {
     /// says nothing. Reported in the summary: the bar in force was invisible.
     apr_bar: f64,
     apr_asof: String,
+    /// Last unwind scan: how many baskets it would exit, and the contracts
+    /// they would free. Both are gauges rather than counters — they describe
+    /// the book as of the last scan, so they come DOWN as positions converge.
+    n_unwind: usize,
+    n_unwind_ct: i64,
+    /// ...of which THIS process holds a quoter for, and ...of which clear the
+    /// exit floor by less than one tick. Both are the difference between a
+    /// finding and a work queue: today the first is 0 on the live book and the
+    /// second is how much of the rest is inside its own noise.
+    n_unwind_actionable: usize,
+    n_unwind_near_floor: usize,
+    /// The near-miss population: baskets that cleared the APR test and failed
+    /// ONLY the exit floor, and what forcing them out at today's marks would
+    /// cost. Without this every one of `crate::unwind::Skip`'s five causes
+    /// renders as `unwind_candidates: 0`, which is five different findings
+    /// wearing one number.
+    n_unwind_near_miss: usize,
+    unwind_near_miss_usd: f64,
+    /// What the last unwind report was ABOUT, so an unchanged book says nothing
+    /// twice. `None` = nothing has been reported yet.
+    ///
+    /// IT USED TO BE A BARE `Vec` OF THE CANDIDATE SET, AND THAT SILENCED THE
+    /// WHOLE FEATURE ON TODAY'S BOOK. `unwind::identity_set(&[])` is `[]`, and
+    /// the field started `Vec::new()` — so on a book that selects no candidate
+    /// (which the live marks have not, at either floor) the trigger compared
+    /// EQUAL on the first tick and on every tick after, and the skip breakdown
+    /// never printed at all. A scan whose entire book flipped from
+    /// hold-is-better to unpriceable emitted one startup banner and then
+    /// nothing, forever. `Option` is what makes the first scan speak, and the
+    /// skip counts are what make a change of CAUSE a change.
+    ///
+    /// The tally's counts and not the tally: `exit_unprofitable_usd` is a price
+    /// that moves every tick (`SkipTally::counts`). The candidate half is
+    /// SORTED, because `select`'s display order ties on both its keys for
+    /// identically-sized baskets on one relationship and a reorder is not a
+    /// change.
+    unwind_seen: Option<UnwindReport>,
+    /// Why the last scan refused to decide, when it did. Same shape and same
+    /// reason as `tox_reason`: a subsystem that has gone quiet must be able to
+    /// say what silenced it.
+    unwind_refused: Option<String>,
     /// The engine's own subscription to the recorder, tracked separately from
     /// what the recorder says about the venues: a bench tape cannot disconnect,
     /// a socket can and did (ten times on 2026-07-28).
@@ -582,6 +658,13 @@ impl Engine {
                 tt.max_clip
             );
         }
+        if let Some(u) = cfg.unwind.as_ref() {
+            eprintln!(
+                "[unwind] DETECT ONLY (places nothing) — exits below the maker hurdle, \
+                 marks {}",
+                u.marks_path
+            );
+        }
         let feed_reason: Option<String> =
             cfg.health_file.is_some().then(|| "startup — feeds not yet proven healthy".to_string());
         // Same read `install_policy` just made, for the other half of the
@@ -642,6 +725,14 @@ impl Engine {
             tox_reason,
             apr_bar,
             apr_asof,
+            n_unwind: 0,
+            n_unwind_ct: 0,
+            n_unwind_actionable: 0,
+            n_unwind_near_floor: 0,
+            n_unwind_near_miss: 0,
+            unwind_near_miss_usd: 0.0,
+            unwind_seen: None,
+            unwind_refused: None,
             link,
             stale_seen: HashMap::new(),
             last_now: 0.0,
@@ -1097,6 +1188,38 @@ impl Engine {
             // not answerable from anything this process emitted.
             "toxgate_stale": self.tox_reason.is_some(),
             "maker_apr_bar": self.apr_bar,
+            // Baskets the unwind scan would exit, and the contracts they hold.
+            // GAUGES, not counters: they describe the book as of the last scan.
+            // A standing non-zero `unwind_contracts` against a refusing class
+            // cap is the capital loop being unable to turn — the engine cannot
+            // quote because the capital is committed, and this is how much of
+            // it the book is currently offering to give back. 0 while
+            // `unwind` is off, which is the default.
+            "unwind_candidates": self.n_unwind,
+            "unwind_contracts": self.n_unwind_ct,
+            // ...of which this process could act on. `unwind_candidates` high
+            // and this pinned at 0 is the finding that blocks arming: what the
+            // recycler selects and what this engine quotes are disjoint sets
+            // (`crate::unwind` §1). It is the FIRST number to read, not a
+            // footnote to the one above.
+            "unwind_actionable": self.n_unwind_actionable,
+            // ...of which clear the exit floor by less than one tick, so one
+            // tick of book movement unmakes them.
+            "unwind_near_floor": self.n_unwind_near_floor,
+            // Baskets that cleared the APR test and failed ONLY the exit floor,
+            // and what forcing them out at today's marks would cost (negative).
+            // The APR test alone selects most of the book; this is the number
+            // that says why selecting on it would be a losing strategy.
+            "unwind_near_miss": self.n_unwind_near_miss,
+            "unwind_near_miss_usd": self.unwind_near_miss_usd,
+            // ...and WHY the scan decided nothing, when it refused to decide at
+            // all. `null` = it ran. Every gauge above reads zero on a converged
+            // book AND on a degenerate class cap, an off-band hurdle and torn
+            // marks — four findings wearing one shape — and the monitors read
+            // THIS JSON, not stderr (PR #46). Same contract as `toxgate_stale`,
+            // one level more informative: a subsystem that has gone quiet must
+            // be able to say what silenced it, in the file that is read.
+            "unwind_refused": self.unwind_refused.as_deref(),
             "risk_allowed": self.cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
             "risk_rejected": self.cfg.risk.as_ref().map(|r| r.stats().1).unwrap_or(0),
             // Contracts held against the caps by quotes that are RESTING and
@@ -1795,6 +1918,135 @@ impl Engine {
             }
             self.tt_bar = now_bar;
         }
+        for line in self.unwind_tick() {
+            eprintln!("{line}");
+        }
+    }
+
+    /// The opportunistic-unwind scan: which open baskets have stopped being the
+    /// best use of the capital they lock.
+    ///
+    /// DETECT ONLY. It moves gauges and RETURNS the lines the operator should
+    /// see; it places nothing, and nothing it produces reaches an executor —
+    /// see `crate::unwind` for why an exit is not an `Intent` yet, and for the
+    /// five things that must be true before one could be.
+    ///
+    /// It returns the report rather than printing it because the report IS the
+    /// deliverable of a detect-only feature, and a feature whose only output is
+    /// `eprintln!` has nothing a test can assert on. The caller prints.
+    ///
+    /// It rides the stats tick because both of its inputs move on that
+    /// timescale and neither moves on a book event: `arbbot-marks.timer`
+    /// rewrites the forward APRs every two minutes, and the hurdle is
+    /// `apr_tick`'s, which floats with utilization as baskets book. Putting it
+    /// on the book-event path — where take-take lives, because a crossing is
+    /// gone in milliseconds — would re-derive the same answer thousands of
+    /// times a second from files that had not changed.
+    fn unwind_tick(&mut self) -> Vec<String> {
+        let Some(u) = self.cfg.unwind.as_ref() else { return Vec::new() };
+        // NOT EXEMPT FROM THE HALT PATH. A killed or feed-pulled engine has
+        // cancelled its book and is trying to stop; an exit is still an order,
+        // so it stops too. Today that silences only a log line — the gate is
+        // here because it belongs with the DECISION, and a placer added later
+        // must not have to remember to add it.
+        if self.killed || self.feed_reason.is_some() {
+            self.clear_unwind_gauges();
+            return Vec::new();
+        }
+        let marks = std::fs::read_to_string(&u.marks_path).unwrap_or_default();
+        // The cap `utilization()` divides by, straight from the risk view — NOT
+        // re-derived. `select` refuses when it is not a real number, because
+        // `utilization()` answers a degenerate cap with 1.0 and that pins the
+        // exit hurdle at its CEILING. No risk view at all (bench/replay) is the
+        // same refusal for the same reason: there is no cap, so there is no
+        // opportunity cost to charge.
+        let cap = self.cfg.risk.as_ref().map_or(0.0, |r| r.class_cap_usd());
+        // `self.apr_bar` and not a fresh `apr_bar(utilization())`: the exit is
+        // measured against the hurdle a fresh quote is ACTUALLY being held to
+        // right now, which is the one `apr_tick` installed on the quoters. Two
+        // derivations of "the bar" could disagree about the NUMBER. They cannot
+        // disagree about its safe DIRECTION, which is why the guard above is
+        // not redundant with entry's — see `crate::unwind` §4.
+        let sel = crate::unwind::select(&marks, self.apr_bar, cap, &u.owned_prefixes, wall_now());
+        let refused = sel.as_ref().err().cloned();
+        let mut out = Vec::new();
+        // Edge-triggered, like the take-take bar: the reason carries an age
+        // that moves every tick.
+        if refused.is_some() != self.unwind_refused.is_some() {
+            out.push(match &refused {
+                Some(why) => format!("[unwind] NO SCAN — cannot decide: {why}"),
+                None => "[unwind] inputs usable again — scanning".to_string(),
+            });
+        }
+        self.unwind_refused = refused;
+        let Ok((exits, skips)) = sel else {
+            self.clear_unwind_gauges();
+            return out;
+        };
+        let tally = crate::unwind::SkipTally::of(&skips);
+        self.n_unwind = exits.len();
+        self.n_unwind_ct = exits.iter().map(|e| e.qty).sum();
+        self.n_unwind_actionable = exits.iter().filter(|e| e.actionable).count();
+        self.n_unwind_near_floor = exits.iter().filter(|e| e.near_floor).count();
+        self.n_unwind_near_miss = tally.exit_unprofitable;
+        self.unwind_near_miss_usd = tally.exit_unprofitable_usd;
+        // THE CANDIDATE SET **AND** THE SKIP BREAKDOWN. Keying on the candidate
+        // set alone made this whole report unreachable on a book that selects
+        // nothing — which is every book the live marks have produced — because
+        // `identity_set(&[])` equals the empty state it starts in. The counts
+        // are what make "the whole book went dark" a change; the set is
+        // canonically ordered because `select`'s display order ties on both its
+        // keys for identically-sized baskets and a reorder is not a change.
+        let report: UnwindReport = (crate::unwind::identity_set(&exits), tally.counts());
+        if self.unwind_seen.as_ref() == Some(&report) {
+            return out;
+        }
+        self.unwind_seen = Some(report);
+        // The skips go out with the candidates, not instead of them: "nothing
+        // selected" has five causes and they are not the same finding.
+        if exits.is_empty() {
+            out.push(format!(
+                "[unwind] nothing to exit at the {:.2}%/yr hurdle — {}",
+                self.apr_bar,
+                tally.describe()
+            ));
+            return out;
+        }
+        for e in &exits {
+            let (market, side) = e.suppress_key();
+            out.push(format!(
+                "[unwind] WOULD EXIT {} x{} fwd={:.1}%/yr (hurdle {:.2}%/yr) \
+                 exit={:+.4}/ct — rest {market}:{}{}{}{} [DETECT ONLY — nothing sent]",
+                e.rel_id,
+                e.qty,
+                e.fwd_apr,
+                self.apr_bar,
+                e.exit_ct,
+                side.as_str(),
+                // The three things that make a candidate less than a decision.
+                if e.actionable { "" } else { " [NOT OURS — outside --rel-prefix]" },
+                if e.near_floor { " [NOISE — within one tick of the floor]" } else { "" },
+                if e.resolves_estimated { " [APR rests on an ESTIMATED resolve date]" } else { "" },
+            ));
+        }
+        out.push(format!("[unwind] skipped: {}", tally.describe()));
+        out
+    }
+
+    /// Every unwind gauge back to zero, for the paths that decide nothing: the
+    /// halt gates and a refusal. A gauge left at its last value would report a
+    /// candidate set the engine has stopped standing behind.
+    fn clear_unwind_gauges(&mut self) {
+        self.n_unwind = 0;
+        self.n_unwind_ct = 0;
+        self.n_unwind_actionable = 0;
+        self.n_unwind_near_floor = 0;
+        self.n_unwind_near_miss = 0;
+        self.unwind_near_miss_usd = 0.0;
+        // `None` and not an empty report: when the halt clears, the next scan
+        // must SPEAK rather than compare equal to whatever it happened to be
+        // holding. That equality is exactly what silenced this feature.
+        self.unwind_seen = None;
     }
 
     /// The feed has closed: flush, alarm on anything still held, and report.
@@ -1988,6 +2240,7 @@ fn test_cfg() -> RunCfg {
         ledger_path: None,
         hedge_retry: None,
         take_take: None,
+        unwind: None,
         armed: false,
         hedges_undischarged: 0,
     }
@@ -2180,6 +2433,7 @@ mod feed_wiring_tests {
                 alarm_after_s: 60.0,
             }),
             take_take,
+            unwind: None,
             armed: false,
             hedges_undischarged: 0,
         }
@@ -3507,5 +3761,304 @@ mod apr_refresh_tests {
         let mut eng = test_engine(test_cfg()); // apr: None
         eng.apr_tick(&mut quoters);
         assert_eq!(eng.apr_bar, 0.0, "bench must not acquire a hurdle mid-replay");
+    }
+}
+
+/// **The opportunistic-unwind scan.** Off by default, detect-only when on, and
+/// silent while the engine is halted — see `Engine::unwind_tick`.
+#[cfg(test)]
+mod unwind_scan_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("arb-trader-uw-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join(name)
+    }
+
+    /// A marks file stamped NOW, because `unwind_tick` ages it against the real
+    /// wall clock (`bar_from_marks`) and a fixed timestamp would go stale.
+    ///
+    /// TWO POSITIONS, in the live book's shapes on 2026-07-29:
+    ///   * `xvus-france-pres-27-…` x26 at forward 12.6%/yr, maker exit
+    ///     +3.12c/ct — the one candidate the live marks actually select, and
+    ///     one this engine's `--rel-prefix` scope does NOT cover;
+    ///   * `xvus-france-pres-27-…` x30 at forward 13.8%/yr, maker exit
+    ///     −4.97c/ct — the near-miss shape: under the hurdle, and getting out
+    ///     costs more than it frees.
+    fn marks_file(name: &str) -> String {
+        write_marks(
+            name,
+            r#"{"relationship_id":"xvus-france-pres-27-mel",
+                 "ts":1784646659.716,"kalshi_ticker":"KXFRENCHPRES-27-JMEL","qty":26,
+                 "cost_usd":10.0,"locked_profit_usd":1.0,"resolves_by":"2027-04-25",
+                 "resolves_estimated":true,
+                 "forward_hold_apr":12.6,"maker_exit_ct":0.0312},
+               {"relationship_id":"xvus-france-pres-27-hol",
+                 "ts":1784726835.109,"kalshi_ticker":"KXFRENCHPRES-27-FHOL","qty":30,
+                 "cost_usd":10.0,"locked_profit_usd":1.0,"resolves_by":"2027-04-25",
+                 "resolves_estimated":true,
+                 "forward_hold_apr":13.8,"maker_exit_ct":-0.0497}"#,
+        )
+    }
+
+    /// A marks file stamped NOW around arbitrary positions, so a test can
+    /// REWRITE the book under a live engine and watch what the next scan says.
+    fn write_marks(name: &str, positions: &str) -> String {
+        let now = wall_now();
+        let s = (now as i64).rem_euclid(86_400);
+        let stamp = format!(
+            "{}T{:02}:{:02}:{:02}Z",
+            crate::taketake::today_iso(now),
+            s / 3600,
+            (s % 3600) / 60,
+            s % 60
+        );
+        let p = scratch(name);
+        std::fs::write(&p, format!(r#"{{"generated_at":"{stamp}","positions":[{positions}]}}"#))
+            .unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    /// A risk view whose class cap is a REAL number, which is what `select`
+    /// refuses without. Read from a written file because `RiskView::load`
+    /// answers a missing one with a $0 bankroll — and a $0 bankroll is exactly
+    /// the degenerate cap under test in
+    /// [`a_degenerate_class_cap_refuses_the_scan_instead_of_liquidating`].
+    fn risk_with_cap(name: &str) -> Arc<crate::risk::RiskView> {
+        let p = scratch(name);
+        std::fs::write(&p, "bankroll_usd: 1000\nper_class_cap: 0.35\n").unwrap();
+        Arc::new(crate::risk::RiskView::load(
+            &p.to_string_lossy(),
+            "/nonexistent/topics.yaml",
+            vec![("kalshi".into(), "1000".into())],
+            HashMap::new(),
+        ))
+    }
+
+    fn engine_with_marks(name: &str) -> Engine {
+        let mut cfg = test_cfg();
+        // The live hurdle: a book at (or over) its class budget clamps
+        // utilization to 1.0, so `apr_bar` is at its ceiling.
+        cfg.apr_installed = (crate::APR_CEIL, "2026-07-29".into());
+        cfg.risk = Some(risk_with_cap(&format!("{name}.exec.yaml")));
+        // The armed unit's scope — which covers NEITHER position in the
+        // fixture, exactly as it covers neither live candidate.
+        cfg.unwind = Some(Unwind {
+            marks_path: marks_file(name),
+            owned_prefixes: vec!["xvus-nobel-peace-26".into()],
+        });
+        test_engine(cfg)
+    }
+
+    /// The scan finds the basket, counts the contracts it would free, and says
+    /// so in gauges a monitor can read.
+    ///
+    /// AND IT REPORTS THAT IT CANNOT ACT ON IT. `unwind_candidates` non-zero
+    /// with `unwind_actionable` pinned at 0 is the standing signal that the
+    /// recycler and the engine are looking at different books — the thing that
+    /// blocks arming, in one line of the stats tick.
+    #[test]
+    fn the_scan_reports_the_contracts_an_exit_would_free_and_whether_it_owns_them() {
+        let mut eng = engine_with_marks("uw-found.json");
+        eng.unwind_tick();
+        assert_eq!(eng.n_unwind, 1, "12.6%/yr does not clear a 16%/yr hurdle");
+        assert_eq!(eng.n_unwind_ct, 26);
+        let s = eng.summary();
+        assert_eq!(s["unwind_candidates"], serde_json::json!(1));
+        assert_eq!(s["unwind_contracts"], serde_json::json!(26));
+        assert_eq!(
+            s["unwind_actionable"],
+            serde_json::json!(0),
+            "france-pres-27 is outside this process's --rel-prefix scope"
+        );
+    }
+
+    /// **THE NEAR-MISS IS EMITTED.** The basket that cleared the APR test and
+    /// failed only the exit floor is the most useful thing this scan produces,
+    /// and it used to be dropped on the floor (`let Ok((exits, _skips))`), so
+    /// all five skip causes rendered as `unwind_candidates: 0`.
+    #[test]
+    fn the_baskets_that_almost_cleared_reach_the_stats_line() {
+        let mut eng = engine_with_marks("uw-nearmiss.json");
+        eng.unwind_tick();
+        let s = eng.summary();
+        assert_eq!(s["unwind_near_miss"], serde_json::json!(1), "{s}");
+        // 30 x -0.0497 = -1.491: what forcing that one out would cost.
+        let usd = s["unwind_near_miss_usd"].as_f64().unwrap();
+        assert!((usd - -1.491).abs() < 1e-9, "{usd}");
+    }
+
+    /// **A SCAN THAT SELECTS NOTHING STILL HAS TO SAY WHY — AND THAT IS THE
+    /// LIVE CASE.** No candidate selects on today's marks at either the old
+    /// half-cent floor or the new two-tick one, so this is the ONLY path a
+    /// freshly-flagged process takes.
+    ///
+    /// It used to take it in total silence. `unwind_seen` started `Vec::new()`
+    /// and `unwind::identity_set(&[])` is `[]`, so the edge-trigger compared
+    /// EQUAL on the first tick and on every tick after: the "nothing to exit"
+    /// line and the `[unwind] skipped:` breakdown were unreachable, and a book
+    /// whose entire contents flipped from hold-is-better to unpriceable printed
+    /// nothing at all. A detect-only feature that detects silently has no
+    /// deliverable.
+    #[test]
+    fn a_book_that_selects_no_candidate_still_reports_its_skip_breakdown() {
+        let mut cfg = test_cfg();
+        cfg.apr_installed = (crate::APR_CEIL, "2026-07-29".into());
+        cfg.risk = Some(risk_with_cap("uw-quiet.exec.yaml"));
+        // Every position holds: forward 22.2%/yr clears the ceiling hurdle.
+        cfg.unwind = Some(Unwind {
+            marks_path: write_marks(
+                "uw-quiet.json",
+                r#"{"relationship_id":"xvus-nobel-peace-26-a","ts":1.0,
+                     "kalshi_ticker":"KX-A","qty":10,"resolves_by":"2027-04-25",
+                     "forward_hold_apr":22.2,"maker_exit_ct":0.30}"#,
+            ),
+            owned_prefixes: Vec::new(),
+        });
+        let mut eng = test_engine(cfg);
+
+        let first = eng.unwind_tick();
+        assert_eq!(eng.n_unwind, 0, "22.2%/yr beats the hurdle — nothing to exit");
+        assert!(
+            first.iter().any(|l| l.contains("nothing to exit") && l.contains("hold-is-better 1")),
+            "the FIRST scan of an empty candidate set has to speak: {first:?}"
+        );
+
+        // ...and it does not repeat itself while the book does not change.
+        assert!(eng.unwind_tick().is_empty(), "an unchanged book is not news");
+
+        // ...but the SAME empty candidate set arrived at for a different reason
+        // is a different finding, and the trigger keyed on candidates alone
+        // could not see it: `[]` before, `[]` after.
+        write_marks(
+            "uw-quiet.json",
+            r#"{"relationship_id":"xvus-nobel-peace-26-a","ts":1.0,
+                 "kalshi_ticker":"KX-A","qty":10,"resolves_by":"2027-04-25",
+                 "forward_hold_apr":null,"maker_exit_ct":null}"#,
+        );
+        let flipped = eng.unwind_tick();
+        assert_eq!(eng.n_unwind, 0, "still nothing to exit");
+        assert!(
+            flipped.iter().any(|l| l.contains("unpriceable 1")),
+            "a book the marks writer has gone dark on is not the same silence: {flipped:?}"
+        );
+    }
+
+    /// **A DEGENERATE CLASS CAP REFUSES THE SCAN.** `utilization()` answers a
+    /// cap of zero with `1.0`, which is fail-closed for an entry and fail-OPEN
+    /// for an exit: it pins the liquidation hurdle at its ceiling. A missing or
+    /// corrupt `exec.yaml` — or no risk view at all — must therefore select
+    /// NOTHING and name the reason, not liquidate the book.
+    #[test]
+    fn a_degenerate_class_cap_refuses_the_scan_instead_of_liquidating() {
+        let mut eng = engine_with_marks("uw-cap.json");
+        eng.unwind_tick();
+        assert_eq!(eng.n_unwind, 1, "control: a real cap selects");
+        assert_eq!(
+            eng.summary()["unwind_refused"],
+            serde_json::json!(null),
+            "control: null means the scan RAN"
+        );
+
+        // `RiskView::load` on a file that is not there: bankroll 0, cap 0.
+        eng.cfg.risk = Some(Arc::new(crate::risk::RiskView::load(
+            "/nonexistent/exec.yaml",
+            "/nonexistent/topics.yaml",
+            vec![("kalshi".into(), "1000".into())],
+            HashMap::new(),
+        )));
+        eng.unwind_tick();
+        assert_eq!(eng.n_unwind, 0, "a fabricated utilization decides nothing");
+        assert!(
+            eng.unwind_refused.as_deref().unwrap_or_default().contains("class cap"),
+            "and it says which input: {:?}",
+            eng.unwind_refused
+        );
+        // ...AND THE MONITORS CAN SEE IT. Every unwind gauge now reads zero,
+        // exactly as it does on a converged book; the reason is the only thing
+        // that tells the two apart, and PR #46 established that the monitors
+        // read this JSON and not stderr.
+        let s = eng.summary();
+        assert_eq!(s["unwind_candidates"], serde_json::json!(0), "{s}");
+        assert!(
+            s["unwind_refused"].as_str().unwrap_or_default().contains("class cap"),
+            "a refusal that is invisible in the summary is a subsystem that went quiet: {s}"
+        );
+
+        // ...and no risk view at all is the same refusal for the same reason.
+        eng.cfg.risk = None;
+        eng.unwind_tick();
+        assert_eq!(eng.n_unwind, 0);
+        assert!(eng.unwind_refused.is_some());
+        assert!(eng.summary()["unwind_refused"].is_string());
+    }
+
+    /// **OFF BY DEFAULT.** `cfg.unwind: None` is not "scan and find nothing" —
+    /// the scan does not run at all, which is what makes this a flag rather
+    /// than a behaviour change to every existing run.
+    #[test]
+    fn the_scan_does_not_run_unless_it_is_asked_for() {
+        let mut cfg = test_cfg();
+        cfg.apr_installed = (crate::APR_CEIL, "2026-07-29".into());
+        cfg.risk = Some(risk_with_cap("uw-off.exec.yaml"));
+        cfg.unwind = None; // ...but the same marks are on disk
+        let _ = marks_file("uw-off.json");
+        let mut eng = test_engine(cfg);
+        eng.unwind_tick();
+        assert_eq!(eng.n_unwind, 0);
+        assert_eq!(eng.summary()["unwind_candidates"], serde_json::json!(0));
+    }
+
+    /// **AN UNWIND IS NOT EXEMPT FROM THE HALT PATH.** A killed engine has
+    /// cancelled its book and is trying to stop; a feed-pulled one cannot see
+    /// the prices it would quote against. An exit is still an order, so it
+    /// stops on both — and the gate lives with the DECISION so that the placer
+    /// this is the first half of cannot be written without it.
+    #[test]
+    fn a_halted_engine_selects_nothing_to_unwind() {
+        let mut eng = engine_with_marks("uw-halted.json");
+        eng.unwind_tick();
+        assert_eq!(eng.n_unwind, 1, "control: the candidate is there");
+
+        eng.killed = true;
+        eng.unwind_tick();
+        assert_eq!(eng.n_unwind, 0, "the kill switch stops the unwind too");
+        assert_eq!(eng.n_unwind_ct, 0);
+
+        eng.killed = false;
+        eng.feed_reason = Some("stale feed".into());
+        eng.unwind_tick();
+        assert_eq!(eng.n_unwind, 0, "so does the feed-stale pull");
+
+        eng.feed_reason = None;
+        eng.unwind_tick();
+        assert_eq!(eng.n_unwind, 1, "and it comes back when the halt clears");
+    }
+
+    /// A marks file the scan cannot trust decides NOTHING, and says which.
+    /// `unwind_candidates: 0` alone would read identically to a converged book.
+    #[test]
+    fn unusable_marks_refuse_rather_than_reporting_an_empty_book() {
+        let mut cfg = test_cfg();
+        cfg.apr_installed = (crate::APR_CEIL, "2026-07-29".into());
+        cfg.risk = Some(risk_with_cap("uw-torn.exec.yaml"));
+        cfg.unwind = Some(Unwind {
+            marks_path: "/nonexistent/marks.json".into(),
+            owned_prefixes: Vec::new(),
+        });
+        let mut eng = test_engine(cfg);
+        eng.unwind_tick();
+        assert!(eng.unwind_refused.is_none(), "an ABSENT file is a cold start, not a fault");
+
+        let torn = scratch("uw-torn.json");
+        std::fs::write(&torn, r#"{"generated_at":"2026-07-2"#).unwrap();
+        eng.cfg.unwind = Some(Unwind {
+            marks_path: torn.to_string_lossy().into_owned(),
+            owned_prefixes: Vec::new(),
+        });
+        eng.unwind_tick();
+        assert!(eng.unwind_refused.is_some(), "a torn write is a fault and must be named");
+        assert_eq!(eng.n_unwind, 0);
     }
 }
