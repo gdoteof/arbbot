@@ -94,10 +94,18 @@ const SLUG: &str = "will-x-happen";
 /// A create response: an id and `executions: []`, and NO fill data.
 const CREATED: &str = r#"{"id":"pm-1","marketSlug":"will-x-happen","state":"STATE_OPEN","executions":[]}"#;
 const OPEN_ORDER: &str = r#"{"id":"pm-1","marketSlug":"will-x-happen","state":"STATE_OPEN","cumQuantity":0}"#;
-/// A row from `/v1/orders/open` in the live-captured shape (`resp_parity.rs`):
-/// `quantity` is the ORIGINAL size, and there is no limit price on it at all.
+/// A row from `/v1/orders/open`, in the live-captured field shape
+/// (`resp_parity.rs::PM_ORDER_FILLED`, recorded 2026-07-22): `quantity` is the
+/// ORIGINAL size, and there is no limit price on the row at all.
+///
+/// `side` is deliberately ABSENT rather than invented. The only live capture of
+/// that field is `ORDER_SIDE_SELL`, from an order placed as
+/// `ORDER_INTENT_BUY_SHORT`; what PM-US reports for a `BUY_LONG` has never been
+/// recorded here. `recover_place` does not match on it for exactly that reason,
+/// so a fixture asserting a spelling nobody has seen would be inventing wire
+/// data in the file whose job is pinning it.
 const OPEN_ORDER_5: &str =
-    r#"{"id":"pm-lost","marketSlug":"will-x-happen","side":"ORDER_SIDE_BUY","quantity":5,"cumQuantity":0,"leavesQuantity":5}"#;
+    r#"{"id":"pm-lost","marketSlug":"will-x-happen","quantity":5,"cumQuantity":0,"leavesQuantity":5}"#;
 
 fn place_req() -> PlaceRequest {
     PlaceRequest {

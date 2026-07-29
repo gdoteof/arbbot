@@ -232,6 +232,12 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
     ///     mapping a new order to that id would cancel the wrong one;
     ///   * and EXACTLY ONE candidate. Two indistinguishable orders is a refusal
     ///     with a name, never a coin flip.
+    ///
+    /// The matching rule is NOT the whole guard, and must not be asked to be:
+    /// the caller may only reach here when the place's answer was LOST. Called
+    /// on a place the venue REJECTED — a routine 400 for a post-only that would
+    /// cross — nothing of ours is resting, so the single candidate it finds can
+    /// only be somebody else's. `exec::place_answer_was_lost` is that gate.
     fn recover_place(
         &self,
         req: &PlaceRequest,

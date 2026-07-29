@@ -466,7 +466,7 @@ impl Engine {
                     &mut self.parked_cancels,
                     now,
                 ) {
-                    let is_cancel = matches!(action, Action::Cancel(_));
+                    let is_cancel = matches!(action, Action::Cancel { .. });
                     let queued = self.dispatch(venue, action);
                     if is_cancel {
                         if let Some(oid) = owed.as_deref() {

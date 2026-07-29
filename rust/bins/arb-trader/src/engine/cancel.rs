@@ -54,15 +54,40 @@ pub(super) struct ParkedCancel {
     /// Kalshi, and repeating it would be the 429 shape `PmusGateway::cancel`
     /// documents refusing.
     pub(super) escalated: bool,
-    /// Venue-addressed cancels DISPATCHED for this order. Bounded by
-    /// [`MAX_CANCEL_TRIES`]: a retry that never gives up against a venue that
-    /// keeps refusing is a self-inflicted 429, and the sweep is the remedy that
-    /// does not need this order's id at all.
-    pub(super) tries: u32,
-    /// When the last one went, or `None` when none is outstanding — either
-    /// because none has been sent yet or because the venue has already REFUSED
-    /// the last one, which re-arms it for the next tick.
-    pub(super) last_try: Option<std::time::Instant>,
+    /// Venue-addressed cancels DISPATCHED for this order, and the ATTEMPT
+    /// NUMBER stamped on the command so the venue's answer can be matched to
+    /// the attempt it answers.
+    ///
+    /// A dispatch is not evidence of anything: `dispatch` puts the command in a
+    /// 1024-slot channel drained by a strictly serial loop, so it may still be
+    /// QUEUED when [`CANCEL_RESULT_GRACE`] expires. That is why the budget is
+    /// [`Self::refused`] and not this — bounding on dispatches let two timed-out
+    /// commands ahead of a cancel disarm the whole retry in about forty seconds,
+    /// in exactly the venue incident the retry exists for.
+    /// [`MAX_CANCEL_SENDS`] bounds it anyway, for a venue that never answers.
+    pub(super) sent: u32,
+    /// Venue REFUSALS: answers that reached us for the attempt that was
+    /// outstanding when they arrived. THE budget ([`MAX_CANCEL_REFUSALS`]) — a
+    /// venue that has said no three times is not going to take the fourth, and
+    /// an unbounded retry there is a self-inflicted 429 against the budget the
+    /// hedge path needs.
+    pub(super) refused: u32,
+    /// When the outstanding attempt was dispatched, or `None` when none is —
+    /// either because none has gone yet or because the venue has answered the
+    /// last one, which re-arms it for the next tick.
+    pub(super) outstanding: Option<std::time::Instant>,
+    /// Whether this entry has already told a human it gave up. The transition is
+    /// announced exactly once; the entry then stays parked forever, because a
+    /// cancel we could not carry out is one we still owe.
+    pub(super) gave_up_logged: bool,
+}
+
+impl ParkedCancel {
+    /// Nothing left to try: the venue keeps refusing, or it never answers.
+    /// Either way only a sweep reaches this order now.
+    fn spent(&self) -> bool {
+        self.refused >= MAX_CANCEL_REFUSALS || self.sent >= MAX_CANCEL_SENDS
+    }
 }
 
 /// How long a cancel waits for its order's `order_ack` before the engine stops
@@ -75,34 +100,70 @@ pub(super) struct ParkedCancel {
 /// longer than that, which is its own alarm (`exec_dropped`, `chan_high_water`).
 const CANCEL_ACK_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// How long a DISPATCHED cancel waits for the venue's answer before the engine
-/// stops expecting one and offers the cancel again.
+/// How long a DISPATCHED cancel waits for an answer before the engine stops
+/// assuming one is coming and offers the cancel again.
 ///
-/// Strictly LONGER than the transport's own 15s timeout (`main.rs`), for the
-/// reason `exec::QUIESCE_BUDGET` is: a cancel still on the wire at 15s will
-/// answer by itself, and sending it again before then is a duplicate we
-/// inflicted on ourselves. This deadline is the backstop for an answer that
-/// never comes at all (an executor that died, a dry-run channel) — the normal
-/// path is the `cancel_result` the executor emits either way.
-const CANCEL_RESULT_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+/// The normal path is the `cancel_result` the executor emits for every cancel it
+/// dequeues, whatever the venue said. This is the backstop for an answer that
+/// never comes at all, and it is measured from the ENQUEUE, which is the only
+/// clock the engine has — the command may still be sitting in the executor's
+/// 1024-slot channel behind a serial drain, so what it measures is queue time
+/// plus venue time.
+///
+/// 60s, not 20: two commands ahead of it that time out at the transport's 15s
+/// are 30s of queue latency by themselves, and expiring inside that is a
+/// duplicate DELETE for nothing. It no longer disarms the retry either —
+/// [`ParkedCancel::refused`] is the budget — so a longer grace costs only how
+/// fast a genuinely wedged executor is noticed.
+const CANCEL_RESULT_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How many times ONE order's cancel may be put on the wire before the engine
-/// stops. A venue that has refused three targeted cancels is not going to take
-/// the fourth, and an unbounded retry there is a self-inflicted 429 against the
-/// same budget the hedge path needs. What is left after that is the sweep, which
-/// reaches the order without needing its id and PROVES the outcome — and the
-/// entry stays parked, so `cancels_unresolved` keeps saying it is owed.
-const MAX_CANCEL_TRIES: u32 = 3;
+/// How many times the VENUE may refuse one order's cancel before the engine
+/// stops asking. What is left after that is the sweep, which reaches the order
+/// without needing its id and PROVES the outcome — and the entry stays parked,
+/// so `cancels_unresolved` keeps saying it is owed.
+const MAX_CANCEL_REFUSALS: u32 = 3;
+
+/// ...and how many times it may be DISPATCHED, whatever came back.
+///
+/// A separate bound because a dispatch answers no question: it may still be
+/// queued. This one exists only so an entry cannot re-send forever into an
+/// executor that never answers at all — 6 sends against a 60s grace is five
+/// minutes of trying before the engine gives up and says so.
+const MAX_CANCEL_SENDS: u32 = 6;
 
 /// The one place a cancel command is built. `venue_oid` is the venue's OWN id.
-fn cancel_by_venue_id(venue_oid: &str, market: &str) -> Action {
-    Action::Cancel(CancelRequest {
-        // PM-US REQUIRES the market slug in the cancel body and we refuse to
-        // self-resolve it (that hammered the API into 429s); the intent carries
-        // it, so it rides along here. Kalshi ignores it.
-        market_slug: Some(market.to_string()),
-        by: CancelBy::VenueId(venue_oid.to_string()),
-    })
+///
+/// `attempt` is engine bookkeeping, not venue data — it never reaches a wire. It
+/// rides on the executor command so the `cancel_result` can echo it, which is
+/// what lets a LATE answer be told from the answer to the attempt currently
+/// outstanding. Without it, an answer to attempt 1 arriving after attempt 2 had
+/// gone re-armed the entry and put attempt 3 on the wire beside 2.
+fn cancel_by_venue_id(venue_oid: &str, market: &str, attempt: u32) -> Action {
+    Action::Cancel {
+        req: CancelRequest {
+            // PM-US REQUIRES the market slug in the cancel body and we refuse to
+            // self-resolve it (that hammered the API into 429s); the intent
+            // carries it, so it rides along here. Kalshi ignores it.
+            market_slug: Some(market.to_string()),
+            by: CancelBy::VenueId(venue_oid.to_string()),
+        },
+        attempt,
+    }
+}
+
+/// A cancel addressed by OUR id: the escalation, and the dry run. Deliberately
+/// UNNUMBERED (`attempt: 0`) — it is gated by `ParkedCancel::escalated`, not by
+/// the send budget, and its answer must never be mistaken for the answer to a
+/// numbered attempt. On PM-US that answer is always a local refusal, so a
+/// matching one would have been a free re-arm of the real cancel's guard.
+fn cancel_by_client_id(oid: &str, market: &str) -> Action {
+    Action::Cancel {
+        req: CancelRequest {
+            by: CancelBy::ClientId(oid.to_string()),
+            market_slug: Some(market.to_string()),
+        },
+        attempt: 0,
+    }
 }
 
 /// The venue-addressed cancel for OUR order id `oid`, or `None` when the venue's
@@ -133,20 +194,29 @@ fn resolve_cancel(
     now: std::time::Instant,
 ) -> Option<Action> {
     if !armed {
-        return Some(Action::Cancel(CancelRequest {
-            by: CancelBy::ClientId(oid.to_string()),
-            market_slug: Some(market.to_string()),
-        }));
+        // Unchanged from before the park existed, deliberately: address it with
+        // whatever this run knows. A replay of an armed session's WAL DOES learn
+        // venue ids from its `order_ack` lines, and it should keep emitting the
+        // same command it emitted then, even though the inert executor drops it.
+        return Some(match oid_venue.get(oid) {
+            Some(vid) => cancel_by_venue_id(vid, market, 0),
+            None => cancel_by_client_id(oid, market),
+        });
     }
-    parked.entry(oid.to_string()).or_insert(ParkedCancel {
+    let p = parked.entry(oid.to_string()).or_insert(ParkedCancel {
         venue,
         market: market.to_string(),
         since: now,
         escalated: false,
-        tries: 0,
-        last_try: None,
+        sent: 0,
+        refused: 0,
+        outstanding: None,
+        gave_up_logged: false,
     });
-    oid_venue.get(oid).map(|vid| cancel_by_venue_id(vid, market))
+    // `sent + 1` is the attempt this dispatch WILL be — `mark_sent` performs the
+    // increment, and only if the command was really queued.
+    let attempt = p.sent + 1;
+    oid_venue.get(oid).map(|vid| cancel_by_venue_id(vid, market, attempt))
 }
 
 /// The order whose cancel this intent implies, so the caller that DISPATCHES
@@ -167,7 +237,7 @@ pub(super) fn cancel_target(intent: &Intent) -> Option<&str> {
 pub(super) enum CancelWork {
     /// The venue's id is known now, so send the real cancel. The entry STAYS
     /// parked until the venue answers — see [`on_venue_answer`].
-    Send { oid: String, venue: Venue, market: String, venue_order_id: String },
+    Send { oid: String, venue: Venue, market: String, venue_order_id: String, attempt: u32 },
     /// The ack never came. Escalate to a client-id cancel, which Kalshi resolves
     /// against its own order list and PM-US refuses locally. The entry STAYS
     /// parked: a late ack must still be able to send the real cancel.
@@ -183,13 +253,10 @@ impl CancelWork {
 
     pub(super) fn action(&self) -> Action {
         match self {
-            CancelWork::Send { venue_order_id, market, .. } => {
-                cancel_by_venue_id(venue_order_id, market)
+            CancelWork::Send { venue_order_id, market, attempt, .. } => {
+                cancel_by_venue_id(venue_order_id, market, *attempt)
             }
-            CancelWork::Escalate { oid, market, .. } => Action::Cancel(CancelRequest {
-                by: CancelBy::ClientId(oid.clone()),
-                market_slug: Some(market.clone()),
-            }),
+            CancelWork::Escalate { oid, market, .. } => cancel_by_client_id(oid, market),
         }
     }
 }
@@ -198,7 +265,7 @@ impl CancelWork {
 ///
 /// `queued` is `dispatch!`'s return: a `try_send` into a full channel LOSES the
 /// command. Every state change therefore hangs off it —
-///   * a `Send` counts as an ATTEMPT only when the cancel is really on its way.
+///   * a `Send` counts as a DISPATCH only when the cancel is really on its way.
 ///     It does not retire anything: the executor's channel accepting a command
 ///     is not the venue accepting a cancel, and treating the two as one answer
 ///     is how a refused cancel became an order nothing would ever try again;
@@ -220,57 +287,85 @@ pub(super) fn settle(parked: &mut HashMap<String, ParkedCancel>, work: &CancelWo
 
 /// Record that a venue-addressed cancel for `oid` really went out.
 ///
-/// Not a discharge — an ATTEMPT. The entry stops being offered while the answer
-/// is outstanding (so the retry is not a duplicate), and it is spent against
-/// [`MAX_CANCEL_TRIES`]. A cancel the channel LOST (`queued` false) never
-/// happened and costs nothing.
+/// Not a discharge — a DISPATCH. The entry stops being offered while an answer
+/// is outstanding (so the retry is not a duplicate). A cancel the channel LOST
+/// (`queued` false) never happened, costs nothing, and keeps its attempt number
+/// for the next tick.
 pub(super) fn mark_sent(parked: &mut HashMap<String, ParkedCancel>, oid: &str, queued: bool) {
     if !queued {
         return;
     }
     if let Some(p) = parked.get_mut(oid) {
-        p.tries += 1;
-        p.last_try = Some(std::time::Instant::now());
+        p.sent += 1;
+        p.outstanding = Some(std::time::Instant::now());
     }
 }
 
 /// What the VENUE said about a cancel we sent — the only thing that retires a
 /// cancel the engine owes.
 ///
-/// Success is a discharge: the order is gone (both gateways answer `Ok` only for
-/// that, Kalshi's 404-means-already-gone included). A REFUSAL re-arms the entry
-/// so the next tick sends it again, which is the whole of the 2026-07-29 defect:
-/// a 502 on a cancel used to be one `exec_failed` counter and one log line, with
-/// every record that the order existed already retired.
+/// Success is a discharge whichever attempt it answers: the order is gone (both
+/// gateways answer `Ok` only for that, Kalshi's 404-means-already-gone
+/// included). A REFUSAL re-arms the entry so the next tick sends it again, which
+/// is the whole of the 2026-07-29 defect: a 502 on a cancel used to be one
+/// `exec_failed` counter and one log line, with every record that the order
+/// existed already retired.
 ///
-/// Returns true when this refusal was the one that spent the order's last try —
-/// the single case a human has to be told about, because from then on only the
-/// sweep can reach that order.
+/// `attempt` is what makes the re-arm safe. Only the answer to the attempt
+/// currently OUTSTANDING clears the guard and spends a refusal; a late answer to
+/// a superseded attempt, or an escalation's (unnumbered) refusal, changes
+/// nothing. Without the match, an answer to attempt 1 arriving after attempt 2
+/// had gone would send attempt 3 while 2 was still on the wire — and spend the
+/// budget on our own duplicates.
 pub(super) fn on_venue_answer(
     parked: &mut HashMap<String, ParkedCancel>,
     oid: &str,
+    attempt: u32,
     ok: bool,
-) -> bool {
+) {
     if ok {
         parked.remove(oid);
-        return false;
+        return;
     }
-    match parked.get_mut(oid) {
-        Some(p) => {
+    if let Some(p) = parked.get_mut(oid) {
+        if p.outstanding.is_some() && attempt > 0 && attempt == p.sent {
             // No longer waiting on an answer: it came, and it was no.
-            p.last_try = None;
-            p.tries >= MAX_CANCEL_TRIES
+            p.outstanding = None;
+            p.refused += 1;
         }
-        None => false,
     }
+}
+
+/// Entries that have JUST run out of ways to be sent, marked so each is
+/// announced exactly once.
+///
+/// The announcement lives on the TICK rather than on the refusal path, because a
+/// cancel can run out either way: the venue refuses it three times, or nothing
+/// ever answers and the sends run out. The second is the case
+/// [`CANCEL_RESULT_GRACE`] exists as a backstop for, and it used to terminate in
+/// a permanently parked, permanently SILENT entry — a human-read gauge that
+/// never came back to zero, with nothing anywhere saying why.
+pub(super) fn newly_exhausted(parked: &mut HashMap<String, ParkedCancel>) -> Vec<String> {
+    let mut out: Vec<String> = parked
+        .iter()
+        .filter(|(_, p)| p.spent() && !p.gave_up_logged)
+        .map(|(k, _)| k.clone())
+        .collect();
+    out.sort(); // deterministic, like the work order
+    for oid in &out {
+        if let Some(p) = parked.get_mut(oid) {
+            p.gave_up_logged = true;
+        }
+    }
+    out
 }
 
 /// What the cancel deadline should do this tick, in dispatch order.
 ///
 /// `Send` is offered for every cancel we owe that is addressable, is not already
-/// waiting on the venue's answer, and has tries left. It is not rate-capped the
-/// way an escalation is — each is one targeted DELETE for a cancel we already
-/// owe — but it IS bounded per order ([`MAX_CANCEL_TRIES`]).
+/// waiting on an answer, and has budget left. It is not rate-capped the way an
+/// escalation is — each is one targeted DELETE for a cancel we already owe — but
+/// it IS bounded per order ([`ParkedCancel::spent`]).
 /// `Escalate` is capped at ONE per tick, and skipped entirely while killed:
 ///   * a client-id cancel costs `all_orders()`, a paginated read of the FULL
 ///     order history, taken inside the venue executor's one-command-at-a-time
@@ -297,19 +392,20 @@ fn cancel_work(
         let p = &parked[oid];
         if let Some(vid) = oid_venue.get(oid) {
             // A cancel already on the wire is not a cancel to send again; only
-            // a refusal (which clears `last_try`) or the grace expiring makes
-            // it due. Saturating, so a `now` from before the dispatch — the
-            // clock-step test's shape — reads as "still waiting", never as a
-            // licence to duplicate.
+            // the venue answering it (which clears `outstanding`) or the grace
+            // expiring makes it due. Saturating, so a `now` from before the
+            // dispatch — the clock-step test's shape — reads as "still
+            // waiting", never as a licence to duplicate.
             let waiting = p
-                .last_try
+                .outstanding
                 .is_some_and(|t| now.saturating_duration_since(t) < CANCEL_RESULT_GRACE);
-            if !waiting && p.tries < MAX_CANCEL_TRIES {
+            if !waiting && !p.spent() {
                 out.push(CancelWork::Send {
                     oid: oid.clone(),
                     venue: p.venue,
                     market: p.market.clone(),
                     venue_order_id: vid.clone(),
+                    attempt: p.sent + 1,
                 });
             }
             continue;
@@ -438,6 +534,23 @@ impl Engine {
                 );
             }
         }
+        // ...and the cancels that have just run out of ways to be sent. On the
+        // TICK rather than on the refusal, because an entry can run out either
+        // way: the venue refused it, or nothing ever answered and the sends ran
+        // out. The second was silent, and it is the one the grace exists for.
+        for oid in newly_exhausted(&mut self.parked_cancels) {
+            let p = &self.parked_cancels[&oid];
+            eprintln!(
+                "[engine] ### cancel {oid} ({} on {}) is OWED and UNDELIVERABLE: \
+                 {} send(s), {} venue refusal(s), nothing left to try. If that order is \
+                 still RESTING it is live at a price this engine has already rejected, \
+                 and only a sweep reaches it now. CHECK THE VENUE.",
+                p.market,
+                p.venue.as_str(),
+                p.sent,
+                p.refused,
+            );
+        }
     }
 
     /// The venue's answer to a cancel this engine sent (`exec::cancel_result`).
@@ -460,19 +573,11 @@ impl Engine {
                 .and_then(|x| x.as_str())
                 .and_then(|theirs| self.venue_oid.get(theirs).cloned()),
         };
+        // Which ATTEMPT this answers. 0 is "unnumbered" — an escalation, or a
+        // dry run — and never matches a numbered attempt.
+        let attempt = v.get("attempt").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
         if let Some(oid) = oid {
-            if on_venue_answer(&mut self.parked_cancels, &oid, ok) {
-                let p = &self.parked_cancels[&oid];
-                eprintln!(
-                    "[engine] cancel {oid} ({} on {}) has now been REFUSED by the venue \
-                     {MAX_CANCEL_TRIES} times ({}) — this engine will not send it again. \
-                     If that order is still RESTING it is live at a price this engine has \
-                     already rejected, and only a sweep reaches it now. CHECK THE VENUE.",
-                    p.market,
-                    p.venue.as_str(),
-                    v.get("error").and_then(|x| x.as_str()).unwrap_or("no reason given"),
-                );
-            }
+            on_venue_answer(&mut self.parked_cancels, &oid, attempt, ok);
         }
         self.decision.record(t_read.elapsed().as_nanos() as u64);
     }
@@ -496,7 +601,7 @@ mod cancel_addressing_tests {
     fn describe(a: &Action) -> String {
         match a {
             Action::Place(p) => format!("place {} @{} as {}", p.market, p.price, p.client_order_id),
-            Action::Cancel(c) => format!("cancel {:?}", c.by),
+            Action::Cancel { req, .. } => format!("cancel {:?}", req.by),
             Action::SweepAndVerify => "sweep".to_string(),
         }
     }
@@ -562,7 +667,7 @@ mod cancel_addressing_tests {
              forgotten in the same statement that sent it, so a venue that refused it left \
              an order resting that nothing still knew it owed a cancel for"
         );
-        let Action::Cancel(c) = &acts[0] else { panic!("expected a cancel") };
+        let Action::Cancel { req: c, .. } = &acts[0] else { panic!("expected a cancel") };
         assert_eq!(
             c.market_slug.as_deref(),
             Some("KXNOBELPEACE-27-STC"),
@@ -720,6 +825,7 @@ mod cancel_addressing_tests {
                 venue: Venue::PolymarketUs,
                 market: "slug".into(),
                 venue_order_id: "BH8H83AY09NG".into(),
+                attempt: 1,
             }],
             "an escalated entry is not a retired entry"
         );
@@ -749,21 +855,21 @@ mod cancel_addressing_tests {
             1,
             "and the next tick retries it"
         );
-        assert_eq!(parked["m1"].tries, 0, "a command that was lost cost no attempt");
+        assert_eq!(parked["m1"].sent, 0, "a command that was lost cost no attempt");
 
         settle(&mut parked, w, true); // this one really went out
         assert!(
             parked.contains_key("m1"),
             "STILL owed: the executor took the command, the VENUE has not answered"
         );
-        assert_eq!(parked["m1"].tries, 1);
+        assert_eq!(parked["m1"].sent, 1);
         assert!(
             cancel_work(&parked, &oid_venue, t, false).is_empty(),
             "and it is not sent twice while that answer is outstanding"
         );
 
         // ...and now the venue says the order is gone. Only this retires it.
-        assert!(!on_venue_answer(&mut parked, "m1", true), "a success is not an exhaustion");
+        on_venue_answer(&mut parked, "m1", 1, true);
         assert!(parked.is_empty(), "retired by the VENUE, and by nothing else");
     }
 
@@ -786,13 +892,13 @@ mod cancel_addressing_tests {
         intent_actions(&cancel_of("K", "m1", Venue::Kalshi), true, &oid_venue, &mut parked, t);
         oid_venue.insert("m1".to_string(), "v-1".to_string());
 
-        for n in 1..=MAX_CANCEL_TRIES {
+        for n in 1..=MAX_CANCEL_REFUSALS {
             let work = cancel_work(&parked, &oid_venue, t, false);
-            assert_eq!(work.len(), 1, "try {n}: the cancel is still owed, so it goes again");
+            assert_eq!(work.len(), 1, "refusal {n}: the cancel is still owed, so it goes again");
+            let CancelWork::Send { attempt, .. } = work[0] else { panic!("a real cancel") };
             settle(&mut parked, &work[0], true);
             // 502 / reset / refusal: the venue did NOT cancel it.
-            let exhausted = on_venue_answer(&mut parked, "m1", false);
-            assert_eq!(exhausted, n == MAX_CANCEL_TRIES, "only the last one is the alarm");
+            on_venue_answer(&mut parked, "m1", attempt, false);
             assert!(parked.contains_key("m1"), "a refused cancel is not a discharged one");
         }
         assert!(
@@ -800,17 +906,139 @@ mod cancel_addressing_tests {
             "BOUNDED: an unbounded retry against a venue that keeps refusing is a \
              self-inflicted 429, and the sweep is what reaches the order after this"
         );
-        assert_eq!(parked["m1"].tries, MAX_CANCEL_TRIES);
+        assert_eq!(parked["m1"].refused, MAX_CANCEL_REFUSALS);
+        assert_eq!(
+            newly_exhausted(&mut parked),
+            vec!["m1".to_string()],
+            "and giving up is ANNOUNCED, once"
+        );
+        assert!(newly_exhausted(&mut parked).is_empty(), "once, not every tick");
     }
 
-    /// The backstop for an answer that never arrives at all — an executor that
-    /// died, or a `cancel_result` lost with the channel. The entry must not
-    /// wedge waiting forever; it becomes due again after the grace, still inside
-    /// the same try budget.
+    /// **BLOCKER 2(a).** The budget is spent on the VENUE's answers, never on
+    /// our own dispatches.
     ///
-    /// The grace is longer than the transport's own 15s timeout on purpose: a
-    /// cancel still on the wire will answer by itself, and re-sending it before
-    /// then is a duplicate we inflicted on ourselves.
+    /// `mark_sent` stamps when the mpsc accepts the command, not when the venue
+    /// call starts — and that channel is 1024 slots drained by a strictly serial
+    /// loop that awaits each blocking call inline. During a venue incident two
+    /// timed-out commands ahead of a cancel are already 30s of queue latency, so
+    /// bounding the retry on DISPATCHES disarmed it in about forty seconds on
+    /// commands that had not touched the venue — in exactly the conditions it
+    /// exists for. `MAX_CANCEL_SENDS` still bounds the duplicates.
+    #[test]
+    fn queue_latency_cannot_spend_the_venue_refusal_budget() {
+        let mut oid_venue = HashMap::new();
+        let mut parked = HashMap::new();
+        let t = t0();
+        intent_actions(&cancel_of("K", "m1", Venue::Kalshi), true, &oid_venue, &mut parked, t);
+        oid_venue.insert("m1".to_string(), "v-1".to_string());
+
+        // Three graces pass with the commands still queued: nothing answers.
+        for n in 1..=3u32 {
+            let work = cancel_work(&parked, &oid_venue, t + CANCEL_RESULT_GRACE * n, false);
+            assert_eq!(work.len(), 1, "grace {n}: still owed, still unanswered");
+            settle(&mut parked, &work[0], true);
+        }
+        assert_eq!(parked["m1"].sent, 3);
+        assert_eq!(parked["m1"].refused, 0, "not one of those was a venue answer");
+
+        // The venue finally answers — and the full refusal budget is intact.
+        for _ in 0..MAX_CANCEL_REFUSALS {
+            let work = cancel_work(&parked, &oid_venue, after(t, 1e6), false);
+            assert_eq!(work.len(), 1, "a real refusal still buys a real retry");
+            let CancelWork::Send { attempt, .. } = work[0] else { panic!("a real cancel") };
+            settle(&mut parked, &work[0], true);
+            on_venue_answer(&mut parked, "m1", attempt, false);
+        }
+        assert_eq!(parked["m1"].refused, MAX_CANCEL_REFUSALS, "three REAL tries, as promised");
+    }
+
+    /// **BLOCKER 2(b).** A LATE answer must not un-gate a cancel that is already
+    /// on the wire.
+    ///
+    /// `cancel_result` carries the attempt it answers precisely for this: try 1
+    /// goes at t=0, the grace expires and try 2 goes, and only then does the
+    /// answer to try 1 arrive. Without the match it cleared the guard and put
+    /// try 3 on the wire beside try 2 — spending the budget on our own
+    /// duplicates. An escalation's answer is unnumbered and did the same thing
+    /// for free, and on PM-US the escalation ALWAYS refuses locally.
+    #[test]
+    fn a_late_answer_does_not_un_gate_the_attempt_still_on_the_wire() {
+        let mut oid_venue = HashMap::new();
+        let mut parked = HashMap::new();
+        let t = t0();
+        intent_actions(&cancel_of("K", "m1", Venue::Kalshi), true, &oid_venue, &mut parked, t);
+        oid_venue.insert("m1".to_string(), "v-1".to_string());
+
+        let first = cancel_work(&parked, &oid_venue, t, false);
+        settle(&mut parked, &first[0], true); // attempt 1 on the wire
+        let second = cancel_work(&parked, &oid_venue, t + CANCEL_RESULT_GRACE * 2, false);
+        assert_eq!(second.len(), 1, "the grace expired, so a second went");
+        settle(&mut parked, &second[0], true); // attempt 2 on the wire
+        assert_eq!(parked["m1"].sent, 2);
+
+        // ...and NOW attempt 1's refusal lands. `settle` stamps the real clock,
+        // so `t` is "just dispatched": attempt 2 is inside its grace, and the
+        // ONLY thing that could send a third is the guard being cleared.
+        on_venue_answer(&mut parked, "m1", 1, false);
+        assert!(
+            cancel_work(&parked, &oid_venue, t, false).is_empty(),
+            "attempt 2 is still outstanding; a stale answer is not a reason to send a third"
+        );
+        assert_eq!(parked["m1"].refused, 0, "and it did not spend the budget either");
+
+        // An escalation's unnumbered refusal is the same non-event.
+        on_venue_answer(&mut parked, "m1", 0, false);
+        assert!(cancel_work(&parked, &oid_venue, t, false).is_empty());
+
+        // The answer to the attempt actually outstanding does re-arm it, at
+        // once — a refusal is an answer, not something to wait out.
+        on_venue_answer(&mut parked, "m1", 2, false);
+        assert_eq!(parked["m1"].refused, 1);
+        assert_eq!(cancel_work(&parked, &oid_venue, t, false).len(), 1);
+    }
+
+    /// **BLOCKER 3.** A cancel nothing ever answers must give up, and must SAY
+    /// SO.
+    ///
+    /// This is the case `CANCEL_RESULT_GRACE` is a backstop for — an executor
+    /// that died, a result lost with the channel — and it used to terminate in a
+    /// permanently parked, permanently SILENT entry: the give-up line was on the
+    /// refusal path only, so `cancels_unresolved` never came back to zero and
+    /// nothing anywhere said why.
+    #[test]
+    fn a_cancel_nothing_ever_answers_gives_up_and_says_so() {
+        let mut oid_venue = HashMap::new();
+        let mut parked = HashMap::new();
+        let t = t0();
+        intent_actions(&cancel_of("K", "m1", Venue::Kalshi), true, &oid_venue, &mut parked, t);
+        oid_venue.insert("m1".to_string(), "v-1".to_string());
+
+        for n in 1..=MAX_CANCEL_SENDS {
+            let work = cancel_work(&parked, &oid_venue, t + CANCEL_RESULT_GRACE * n, false);
+            assert_eq!(work.len(), 1, "send {n} of {MAX_CANCEL_SENDS}");
+            assert!(newly_exhausted(&mut parked).is_empty(), "not given up yet");
+            settle(&mut parked, &work[0], true);
+        }
+        assert!(
+            cancel_work(&parked, &oid_venue, after(t, 1e6), false).is_empty(),
+            "a venue that never answers does not get sent to forever"
+        );
+        assert_eq!(
+            newly_exhausted(&mut parked),
+            vec!["m1".to_string()],
+            "and the SILENT exhaustion is announced too — it was not, and it is the \
+             one the grace exists for"
+        );
+        assert!(parked.contains_key("m1"), "still owed; only a sweep reaches it now");
+    }
+
+    /// The grace itself: a cancel on the wire is not re-sent, and silence past
+    /// the grace is not an answer.
+    ///
+    /// It has to outlast far more than the transport's 15s timeout, because it
+    /// is measured from the ENQUEUE and the command may still be queued behind a
+    /// serial drain — expiring inside that is a duplicate DELETE for nothing.
     #[test]
     fn a_cancel_the_venue_never_answers_is_sent_again_after_the_grace() {
         let mut oid_venue = HashMap::new();
@@ -826,8 +1054,10 @@ mod cancel_addressing_tests {
             "a cancel on the wire is not a cancel to send again"
         );
         assert!(
-            CANCEL_RESULT_GRACE > std::time::Duration::from_secs(15),
-            "the grace must outlast the transport timeout, or it duplicates a live call"
+            CANCEL_RESULT_GRACE >= std::time::Duration::from_secs(45),
+            "the grace must outlast the transport timeout SEVERAL times over: it is \
+             measured from the enqueue, and two timed-out commands ahead of this one \
+             are 30s of queue latency by themselves"
         );
         assert_eq!(
             cancel_work(&parked, &oid_venue, t + CANCEL_RESULT_GRACE * 2, false).len(),
@@ -867,6 +1097,7 @@ mod cancel_addressing_tests {
             Venue::PolymarketUs,
             &CancelBy::VenueId("BH8H83AY09NG".into()),
             "slug",
+            1,
             Some("pmus cancel: HTTP 502: bad gateway"),
         );
         e.on_feed(
@@ -889,6 +1120,7 @@ mod cancel_addressing_tests {
             Venue::PolymarketUs,
             &CancelBy::VenueId("BH8H83AY09NG".into()),
             "slug",
+            2,
             None,
         );
         e.on_feed(
@@ -906,8 +1138,8 @@ mod cancel_addressing_tests {
     #[test]
     fn a_venue_answer_for_an_unowed_cancel_is_a_no_op() {
         let mut parked: HashMap<String, ParkedCancel> = HashMap::new();
-        assert!(!on_venue_answer(&mut parked, "m-nobody", false));
-        assert!(!on_venue_answer(&mut parked, "m-nobody", true));
+        on_venue_answer(&mut parked, "m-nobody", 1, false);
+        on_venue_answer(&mut parked, "m-nobody", 1, true);
         assert!(parked.is_empty());
     }
 
@@ -944,6 +1176,7 @@ mod cancel_addressing_tests {
             venue: Venue::Kalshi,
             market: "K".into(),
             venue_order_id: "66e1c799".into(),
+            attempt: 1,
         };
         assert_eq!(describe(&send.action()), r#"cancel VenueId("66e1c799")"#);
         let esc =
@@ -1007,7 +1240,7 @@ mod cancel_addressing_tests {
             &mut parked,
             t0(),
         );
-        let Action::Cancel(c) = &acts[0] else { panic!("expected the cancel first") };
+        let Action::Cancel { req: c, .. } = &acts[0] else { panic!("expected the cancel first") };
         assert_eq!(c.by, CancelBy::VenueId("old-venue-id".into()));
     }
 
