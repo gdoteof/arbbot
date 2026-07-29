@@ -76,10 +76,19 @@ pub fn parse_iso(s: &str) -> Option<i64> {
     Some(days_from_civil(y, m, d))
 }
 
+/// `YYYY-MM-DD` for an epoch DAY (days since 1970-01-01). The inverse of
+/// [`parse_iso`], and the piece that was missing: without it, three other files
+/// wrote out `civil_from_days` again to turn a day number back into a string,
+/// and a fourth re-derived the whole calendar (leap years included) to walk a
+/// date range.
+pub fn iso_from_day(day: i64) -> String {
+    let (y, m, d) = civil_from_days(day);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// `YYYY-MM-DD` in UTC for an epoch-seconds instant.
 pub fn today_iso(epoch_s: f64) -> String {
-    let (y, m, d) = civil_from_days((epoch_s / 86400.0).floor() as i64);
-    format!("{y:04}-{m:02}-{d:02}")
+    iso_from_day((epoch_s / 86400.0).floor() as i64)
 }
 
 /// Years until the family's resolve date. Python floors the day count at 1
@@ -124,6 +133,21 @@ mod tests {
         assert_eq!(today_iso(d + 86399.0), "2026-07-28");
         assert_eq!(today_iso(d + 86400.0), "2026-07-29");
         assert_eq!(today_iso(0.0), "1970-01-01");
+    }
+
+    /// The property the three deleted re-implementations were each relied on
+    /// for: `parse_iso` and `iso_from_day` are inverses over every day the
+    /// dashboard can be asked to render, leap days and century rules included.
+    #[test]
+    fn epoch_days_and_iso_strings_are_inverses() {
+        for day in [0, 1, -1, 20_657, 21_915, 25_567] {
+            assert_eq!(parse_iso(&iso_from_day(day)), Some(day));
+        }
+        assert_eq!(iso_from_day(0), "1970-01-01");
+        assert_eq!(iso_from_day(20_657), "2026-07-23");
+        // 2028 is a leap year, 2100 is not.
+        assert_eq!(iso_from_day(parse_iso("2028-02-28").unwrap() + 1), "2028-02-29");
+        assert_eq!(iso_from_day(parse_iso("2100-02-28").unwrap() + 1), "2100-03-01");
     }
 
     #[test]

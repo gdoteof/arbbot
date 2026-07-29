@@ -7,8 +7,9 @@
 //! because `arbbot-report.service` pipes the ETL to /dev/null.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
+use arb_core::clock::now_secs;
 use serde::Serialize;
 
 const STEMS: [&str; 3] = ["kalshi", "polymarket", "polymarket_us"];
@@ -70,26 +71,6 @@ const DERIVED: [(&str, &str, u64); 1] = [(
     600,
 )];
 
-fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-
-/// UTC day as YYYY-MM-DD, from epoch seconds. Civil-from-days (Howard Hinnant).
-fn utc_day(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
 fn scan_dir(dir: &str, suffix: &str) -> BTreeMap<(String, String), u64> {
     let mut out = BTreeMap::new();
     let rd = match std::fs::read_dir(dir) {
@@ -116,7 +97,7 @@ fn scan_dir(dir: &str, suffix: &str) -> BTreeMap<(String, String), u64> {
 
 pub fn build(data_dir: &str) -> Integrity {
     let now = now_secs();
-    let today = utc_day(now);
+    let today = arb_core::resolve::iso_from_day(now as i64 / 86_400);
     let raw = scan_dir(&format!("{data_dir}/raw"), ".jsonl");
     let pq = scan_dir(&format!("{data_dir}/parquet"), ".parquet");
 

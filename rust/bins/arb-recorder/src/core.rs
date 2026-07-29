@@ -31,6 +31,58 @@ pub fn dec_string(v: &serde_json::Value) -> String {
     }
 }
 
+/// One side of a book from a venue's raw level array: drop non-positive sizes,
+/// then sort by price (`descending` for bids).
+///
+/// `pick` is the only venue-specific part. Both Polymarket feeds carried a
+/// verbatim copy of everything around it, differing on four characters — INTL
+/// spells a level `{"price","size"}`, US spells it `{"px":{"value"},"qty"}` —
+/// so the drop-and-sort rule that decides what the book looks like was defined
+/// twice and could be corrected in one of them.
+pub fn sorted_levels(
+    raw: Option<&serde_json::Value>,
+    descending: bool,
+    pick: impl Fn(&serde_json::Value) -> Option<(String, String)>,
+) -> Vec<arb_core::model::Level> {
+    use arb_core::dec::Dec;
+    let mut lv: Vec<arb_core::model::Level> = raw
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| {
+                    let (price, size) = pick(l)?;
+                    Dec::parse(&size).ok().filter(Dec::is_positive)?;
+                    Some(arb_core::model::Level { price, size })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    lv.sort_by(|a, b| {
+        let (pa, pb) =
+            (Dec::parse(&a.price).unwrap_or(Dec::ZERO), Dec::parse(&b.price).unwrap_or(Dec::ZERO));
+        if descending { pb.cmp_num(&pa) } else { pa.cmp_num(&pb) }
+    });
+    lv
+}
+
+/// Run a WS session, and when it ends — cleanly or not — say why and start
+/// another two seconds later. Never returns.
+///
+/// All three feed tasks were this same loop written out, which meant three
+/// copies of the reconnect delay.
+pub async fn reconnect_forever<F, Fut>(tag: &str, mut session: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    loop {
+        if let Err(e) = session().await {
+            eprintln!("[{tag}] session ended: {e:#}");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// Synthesized per-market monotonic sequence (mirrors SeqCounter).
 #[derive(Default)]
 pub struct SeqCounter(std::collections::HashMap<String, u64>);

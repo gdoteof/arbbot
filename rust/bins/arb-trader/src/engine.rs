@@ -11,6 +11,7 @@ use crate::feed::FeedMsg;
 use crate::hist::Hist;
 use crate::wal::Wal;
 use arb_core::book::{ApplyError, BookBuilder};
+use arb_core::clock::now_s as wall_now;
 use arb_core::fees::FeeSchedule;
 use arb_core::fill::{dropped_unconsumed, FillLedger, HedgeAnchor};
 use arb_core::model::{BookSide, Level, Venue};
@@ -792,22 +793,6 @@ fn unclaimed_expired(
     out
 }
 
-fn wall_now() -> f64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
-}
-
-pub fn parse_venue(s: &str) -> Option<Venue> {
-    Some(match s {
-        "kalshi" => Venue::Kalshi,
-        "polymarket" => Venue::Polymarket,
-        "polymarket_us" => Venue::PolymarketUs,
-        _ => return None,
-    })
-}
-
 fn levels_of(v: Option<&serde_json::Value>) -> Option<Vec<Level>> {
     let mut out = Vec::new();
     for l in v?.as_array()? {
@@ -1357,7 +1342,7 @@ pub async fn run(
                     // `intent_actions`: an amend is a cancel AND a place, in
                     // that order).
                     if let Some(venue) =
-                        v.get("venue").and_then(|x| x.as_str()).and_then(parse_venue)
+                        v.get("venue").and_then(|x| x.as_str()).and_then(Venue::parse)
                     {
                         // Only the park reads this clock, and only an armed engine
                         // parks, so a replay's determinism cannot depend on it.
@@ -1541,7 +1526,7 @@ pub async fn run(
                             // place time precisely because the burst that fills
                             // you is the burst that gaps your book, so a missing
                             // level here is exactly when it is needed.
-                            let px = parse_venue(a.venue)
+                            let px = Venue::parse(a.venue)
                                 .and_then(|vn| books.get(vn, &a.market_id))
                                 .and_then(|b| {
                                     if a.side == "bid" { b.bids.first() } else { b.asks.first() }
@@ -1783,7 +1768,7 @@ pub async fn run(
                     }
                     continue;
                 }
-                let Some(venue) = v.get("venue").and_then(|x| x.as_str()).and_then(parse_venue)
+                let Some(venue) = v.get("venue").and_then(|x| x.as_str()).and_then(Venue::parse)
                 else { continue };
                 let Some(market_id) = v.get("market_id").and_then(|x| x.as_str()).map(str::to_owned)
                 else { continue };
@@ -2126,7 +2111,7 @@ pub async fn run(
                     // OBLIGATION's anchor, not off the last attempt: the anchor
                     // is the one thing about this obligation that never moves.
                     let book_side = p.anchor.side;
-                    let hedge_book = parse_venue(p.anchor.venue)
+                    let hedge_book = Venue::parse(p.anchor.venue)
                         .and_then(|vn| books.get(vn, &p.anchor.market_id));
                     // The touch is read even off a CROSSED book, unlike
                     // `hedge_anchor`, and the asymmetry is deliberate. Refusing to
@@ -2164,7 +2149,7 @@ pub async fn run(
                         .is_some_and(|a| !oid_venue.contains_key(a))
                         && unclaimed_fills.values().any(|u| {
                             u.market_id == p.anchor.market_id
-                                && parse_venue(p.anchor.venue) == Some(u.venue)
+                                && Venue::parse(p.anchor.venue) == Some(u.venue)
                         });
                     let plan = hedge_plan(
                         &mut cx,

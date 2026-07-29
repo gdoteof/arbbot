@@ -68,7 +68,7 @@ impl FeeSchedule {
                 let b = cx.mul(a, price);
                 let omp = cx.one_minus(price);
                 let x = cx.mul(b, omp);
-                cx.quantize_ceil(x, 2)
+                cx.quantize_ceil(x)
             }
             Venue::PolymarketUs => {
                 if role == Role::Maker {

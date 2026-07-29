@@ -3,6 +3,7 @@
 //! depends only on serde/serde_json.
 
 pub mod book;
+pub mod clock;
 pub mod fees;
 pub mod fill;
 pub mod scan;
