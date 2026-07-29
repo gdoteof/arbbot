@@ -170,6 +170,13 @@ double-entry books. Together they make the Kalshi account reconcile to
 - **Current handling:** `src/arbbot/record/kalshi.py:1-16`, `:106-129` (auth-free REST), `:115-118` (batch 50), `src/arbbot/record/main.py:99-110` (WS only when the READ-ONLY recorder key exists — trade key never enters the recorder process).
 - **Port requirement:** Support both paths (authed WS, credential-free REST poll) and keep the trade-capable key out of the data-plane process.
 
+### `kalshi-count-fp-is-fractional`
+- **Venue:** kalshi
+- **What the API does:** `count_fp` is a plain contract count (see `kalshi-fill-count-fp-plain-count`) but **it is not always an integer.** 22 of the 217 live fills in `data/venue/kalshi_fills.json` are fractional, and they pair up inside one order: `2.13` + `1.87` on a 4-lot, `0.98` + `4.02` on a 5-lot, `0.01` + `4.99` on another 5-lot. Kalshi splits a fill across price levels and the pieces sum to the order's size. Exactly two decimals on all 217 rows. An order can also END fractional — four in the history do, one having filled `0.41` and nothing else — so a fractional POSITION is real, not just a fractional print.
+- **Failure it caused:** reading the field as `as f64 as i64` truncates each piece independently — 2.13 -> 2 and 1.87 -> 1 is three contracts on an order the venue filled four. A piece below 1.00 truncated to 0, hit the non-positive arm and was SKIPPED, bumping a gauge documented "must stay 0" while its contracts went to the venue unhedged. Replaying the live history through that parser loses **11.27 contracts** (9 of them whole and recoverable; the remaining 2.27 is sub-contract dust) and skips 5 frames, across **~6.6% of orders**. No gap, no reconnect and no alarm involved.
+- **Current handling:** `rust/bins/arb-trader/src/fills.rs::count_fp_hundredths` — exact string arithmetic to hundredths (never f64; a third decimal truncates DOWN), accumulated per order, floored to whole contracts once at emission. Banked-but-not-whole fractions are reported by `kalshi_fill_dust_hundredths`.
+- **Port requirement:** Accumulate `count_fp` in fixed-point and round DOWN once, at the end. Never truncate a single fill, never treat a sub-contract piece as a malformed payload, and keep the running total a FLOOR on venue truth — a count above what the venue filled is the one direction that mints a hedge for a contract that does not exist.
+
 ---
 
 ## Polymarket US (QCX) — order API

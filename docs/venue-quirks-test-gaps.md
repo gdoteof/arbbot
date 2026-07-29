@@ -24,6 +24,7 @@ the core behavior is pinned but a load-bearing edge is not.
 - `kalshi-trade-needs-own-seq-stream` — pinned: `tests/test_kalshi_ws.py:102` (regression for the traded-markets-die P1).
 - `kalshi-ws-snapshots-only-on-subscribe` — partial: `tests/test_kalshi_ws.py:143` pins gap -> `get_snapshot` request, which pins the frozen PYTHON stack only, and pins behaviour the production Rust recorder deliberately does NOT have (#32 deleted the request — the venue never answered it). Rust side: `kalshi::tests::a_wire_gap_does_not_discard_the_next_tickers_delta` pins what the gap branch does instead. **GAP**: no test of the REST-snapshot resync fallback (`recorder.py:298-305`) or the welcome/30s-rebroadcast heal.
 - `kalshi-market-data-auth-split` — partial: the fake-WS tests exercise the signed handshake incidentally. **GAP**: no test asserting the recorder chooses WS-with-recorder-key vs credential-free REST poll.
+- `kalshi-count-fp-is-fractional` — pinned: `fills::kalshi_tests::a_fractional_fill_pair_sums_to_the_venues_whole_contract` (the real `2.13`+`1.87` 4-lot), `:a_sub_contract_piece_is_banked_not_called_unreadable` (the real `0.98`+`4.02` 5-lot), `:fractional_pieces_floor_the_same_total_in_either_order` (arrival order cannot change the total), `:banked_dust_is_visible_and_falls_when_its_sibling_lands`, `:count_fp_is_parsed_as_exact_hundredths` and `:a_numeric_count_fp_floors_rather_than_rounds` (no f64, third decimal truncates down on both branches).
 
 ## Polymarket US — order API
 
@@ -71,5 +72,5 @@ the core behavior is pinned but a load-bearing edge is not.
 
 ## Totals
 
-- Entries: 44 — Kalshi 15 (9 order + 6 market data), Polymarket US 17 (9 order + 3 positions + 5 market data), Polymarket intl 5, cross-venue 7.
-- Fully pinned: 18. Partial: 10. Full GAP: 16. (Every partial carries at least one untested load-bearing edge listed above.)
+- Entries: 45 — Kalshi 16 (9 order + 7 market data), Polymarket US 17 (9 order + 3 positions + 5 market data), Polymarket intl 5, cross-venue 7.
+- Fully pinned: 19. Partial: 10. Full GAP: 16. (Every partial carries at least one untested load-bearing edge listed above.)

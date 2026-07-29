@@ -835,6 +835,12 @@ impl Engine {
             // 0: while it is rising, `fills` reads 0 and every other gauge
             // here looks healthy.
             "kalshi_fills_unreadable": crate::fills::kalshi_fills_unreadable(),
+            // Fractional contracts filled but not yet whole, across orders, in
+            // HUNDREDTHS. Kalshi splits a fill across price levels and the
+            // pieces are fractional, so this is normally a transient single
+            // digit while an order's pieces land. A number that sits high is
+            // dust nothing will ever hedge — see `fills::kalshi_fill_dust_hundredths`.
+            "kalshi_fill_dust_hundredths": crate::fills::kalshi_fill_dust_hundredths(),
             "would_place": self.exec_stats.placed.load(std::sync::atomic::Ordering::Relaxed),
             "would_cancel": self.exec_stats.cancelled.load(std::sync::atomic::Ordering::Relaxed),
             "exec_dropped": self.exec_stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
