@@ -34,10 +34,10 @@ mod taketake;
 mod sink;
 mod wal;
 
-use arb_core::model::Venue;
-use arb_core::quoter::Quoter;
-use arb_core::scan::{Rel, RelLeg, RelType};
-use std::collections::HashMap;
+use arb_core::model::{BookSide, Venue};
+use arb_core::quoter::{Quoter, Toxgate};
+use arb_core::scan::{Cx, Rel, RelLeg, RelType};
+use std::collections::{HashMap, HashSet};
 
 struct Args {
     socket: Option<String>,
@@ -111,7 +111,25 @@ struct Args {
     tt_max_clip: i64,
     /// Marks file the blended-APR bar is derived from.
     marks: String,
+    /// MAKER APR hurdle, %/yr: the extra per-contract lock a resting quote must
+    /// carry so that a fill annualizes to at least this over the hold to
+    /// resolution (`Quoter::set_apr`). Negative is the sentinel for "default by
+    /// mode" — see `install_policy`. 0 disables the hurdle.
+    min_apr: f64,
+    /// The day the hold is measured FROM, `YYYY-MM-DD`. Defaults to today UTC;
+    /// pin it to make a bench replay reproducible, because the hurdle shrinks
+    /// as the resolve date approaches and so would the digest.
+    apr_asof: Option<String>,
+    /// Research toxicity feed. `None` = default by mode; an empty string turns
+    /// the gate off explicitly.
+    toxgate: Option<String>,
+    /// `--suppress market:side`, repeatable: (market, side) pairs some OTHER
+    /// order-owner holds, which the quoter cancels out of and stays out of.
+    suppress: Vec<(String, BookSide)>,
 }
+
+/// Where the research toxicity feed is written.
+const DEFAULT_TOXGATE: &str = "data/exec/toxgate.json";
 
 /// The default Args, factored out of `parse_args` so the precondition tests can
 /// build one without going through the command line.
@@ -148,6 +166,10 @@ fn default_args() -> Args {
         tt_max_ct_per_rel: 50,
         tt_max_clip: 20,
         marks: "data/exec/marks.json".into(),
+        min_apr: -1.0, // sentinel: default by mode in `install_policy`
+        apr_asof: None,
+        toxgate: None,
+        suppress: Vec::new(),
     }
 }
 
@@ -219,6 +241,16 @@ fn parse_args() -> Args {
                 a.tt_max_clip = it.next().and_then(|v| v.parse().ok()).expect("--tt-max-clip value")
             }
             "--marks" => a.marks = it.next().expect("--marks value"),
+            "--min-apr" => a.min_apr = it.next().expect("pct").parse().expect("float"),
+            "--apr-asof" => a.apr_asof = it.next(),
+            "--toxgate" => a.toxgate = it.next(),
+            "--suppress" => {
+                // "market_id:side" — side must be bid|ask, as arb-intent.
+                let v = it.next().expect("--suppress market:side");
+                let (m, s) = v.rsplit_once(':').expect("--suppress wants market:side");
+                let side = BookSide::parse(s).unwrap_or_else(|| panic!("bad suppress side {s}"));
+                a.suppress.push((m.to_string(), side));
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(2);
@@ -601,6 +633,126 @@ fn build_pmus_sink(
     )))
 }
 
+/// Read the research toxicity feed. `Err` is the reason it may not be gated
+/// behind, and there is no fourth answer: unreadable, unparseable and stale all
+/// mean the same thing to a caller that has to decide whether to quote.
+///
+/// FAIL CLOSED. Every one of these used to be indistinguishable from "the gate
+/// says fine" — the file was read once at startup or not at all, and a feed
+/// past `TOXGATE_MAX_AGE` scored nothing while blocking nothing.
+fn load_toxgate(path: &str, now: f64) -> Result<std::sync::Arc<Toxgate>, String> {
+    let doc = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let gate = Toxgate::from_json(&doc).ok_or_else(|| format!("{path}: not a toxgate document"))?;
+    let age = now - gate.ts;
+    if age > arb_core::quoter::TOXGATE_MAX_AGE {
+        return Err(format!(
+            "{path}: feed is {age:.0}s old (max {:.0}s) — the research writer is not running",
+            arb_core::quoter::TOXGATE_MAX_AGE
+        ));
+    }
+    Ok(std::sync::Arc::new(gate))
+}
+
+/// The three quoter policies this binary knew how to build and never installed.
+///
+/// `Quoter::new` hardcodes `apr_margin: None`, an empty `suppress` and
+/// `toxgate: None`, and until now `arb-trader` called only `set_risk` — so the
+/// APR hurdle at quoter.rs:213/:244 and the toxicity skip at :413 were
+/// unreachable in the live process. `bins/arb-intent`, a replay tool, was the
+/// only caller of the other three setters in the workspace. The engine
+/// therefore rested maker quotes locking as little as one tick — 0.27%/yr on
+/// france-pres-27 money committed until 2027 — while take-take in the SAME
+/// process refused anything under its ~12%/yr blended bar, and quoted sides the
+/// research feed scored at up to 7x `TOXGATE_MAX`.
+///
+/// Returns the resolved toxgate path (`None` = gate off) for `RunCfg`, which
+/// is what reloads it; see `Engine::tox_tick`.
+fn install_policy(args: &Args, quoters: &mut [Quoter], bench: bool) -> Option<String> {
+    // Bench/replay pins a decision digest against a fixed tape, and BOTH of
+    // these read state that tape cannot pin: the hurdle shrinks every day as
+    // the resolve date approaches, and the toxgate file is rewritten by another
+    // process and carries a wall-clock `ts`. Off by default there for the same
+    // reason `health_file`, `take_take` and `risk` are. An explicit flag still
+    // wins, so either can be replayed against a pinned value.
+    let min_apr = if args.min_apr >= 0.0 {
+        args.min_apr
+    } else if bench {
+        0.0
+    } else {
+        crate::taketake::DEFAULT_BAR_APR
+    };
+    let asof = args
+        .apr_asof
+        .clone()
+        .unwrap_or_else(|| arb_core::resolve::today_iso(arb_core::clock::now_s()));
+    let mut cx = Cx::default();
+    let mut undated: Vec<String> = Vec::new();
+    for q in quoters.iter_mut() {
+        // Per relationship, not one global constant: these resolve on dates
+        // seventeen months apart, and one shared `resolve_years` would size the
+        // hurdle wrong for every family but one.
+        let years = arb_core::resolve::years_to(&q.rel.id, &asof);
+        if years.is_none() {
+            undated.push(q.rel.id.clone());
+        }
+        q.set_apr(&mut cx, min_apr, years);
+    }
+    if min_apr > 0.0 {
+        eprintln!("[apr] maker hurdle {min_apr}%/yr, holds measured from {asof}");
+        if !undated.is_empty() {
+            // Not a refusal — `arb_core::resolve` has no date for these
+            // families, and inventing one would size a real hurdle off a
+            // guess. It IS a fail-open, so it is named rather than silent.
+            eprintln!(
+                "[apr] NO RESOLVE DATE, so NO HURDLE, for {} relationship(s): {}",
+                undated.len(),
+                undated.join(" ")
+            );
+        }
+    } else {
+        eprintln!("[apr] maker hurdle OFF — quotes may lock as little as one tick");
+    }
+
+    // `--suppress` is a STATIC operator declaration and nothing more. Python's
+    // runner mutates this set as its maker-unwind rests and pulls exit asks
+    // (exec/main.py:726 adds, :572 discards); this binary has no maker-unwind,
+    // so nothing populates it dynamically and no code here pretends otherwise.
+    let suppress: HashSet<(String, BookSide)> = args.suppress.iter().cloned().collect();
+    if !suppress.is_empty() {
+        let mut names: Vec<String> =
+            suppress.iter().map(|(m, s)| format!("{m}:{}", s.as_str())).collect();
+        names.sort();
+        eprintln!("[quoter] suppressed, another owner holds these sides: {}", names.join(" "));
+    }
+    for q in quoters.iter_mut() {
+        q.set_suppress(suppress.clone());
+    }
+
+    let path = match args.toxgate.as_deref() {
+        Some("") => None,
+        Some(p) => Some(p.to_string()),
+        None if bench => None,
+        None => Some(DEFAULT_TOXGATE.to_string()),
+    };
+    let Some(path) = path else {
+        eprintln!("[toxgate] OFF — no adverse-selection gate on maker quotes");
+        return None;
+    };
+    match load_toxgate(&path, arb_core::clock::now_s()) {
+        Ok(gate) => {
+            eprintln!("[toxgate] {} markets scored, gate at {}/ct",
+                      gate.markets.len(), arb_core::quoter::TOXGATE_MAX);
+            for q in quoters.iter_mut() {
+                q.set_toxgate(Some(gate.clone()));
+            }
+        }
+        // The engine starts pulled on this (`Engine::new`) and clears it when a
+        // reload succeeds, so an unusable feed is not merely logged here.
+        Err(why) => eprintln!("[toxgate] UNUSABLE ({why}) — maker quoting is BLOCKED"),
+    }
+    Some(path)
+}
+
 /// The capital gate every quoter consults, sized from `--exec-config` /
 /// `--topics` and seeded with the exposure already on the book.
 fn build_risk_view(
@@ -875,6 +1027,7 @@ fn run_cfg(
     has_executors: bool,
     risk: Option<std::sync::Arc<risk::RiskView>>,
     undischarged: u64,
+    toxgate_file: Option<String>,
 ) -> engine::RunCfg {
     engine::RunCfg {
         hedges_undischarged: undischarged,
@@ -885,6 +1038,7 @@ fn run_cfg(
         wal_path: args.wal,
         // bench/replay must stay byte-deterministic and have no live feed.
         health_file: (!bench && !args.health.is_empty()).then(|| args.health.clone()),
+        toxgate_file,
         risk,
         // Only an ARMED engine books baskets. A dry run writing here would
         // invent exposure that the next startup would seed from as if real.
@@ -949,6 +1103,7 @@ async fn main() {
 
     let (mut quoters, by_market, rel_meta) =
         load_quoters(&args.registry, &args.tradable, &args.rel_prefixes);
+    let toxgate_file = install_policy(&args, &mut quoters, bench);
     // Risk is OFF in bench/replay: those pin a decision digest, and a capital
     // gate is not part of that contract.
     let risk = (!bench).then(|| build_risk_view(&args, &mut quoters, &rel_meta));
@@ -1001,7 +1156,7 @@ async fn main() {
     let undischarged = report_undischarged_hedges(&args, &quoters, armed, bench);
     let acks = if sinks.is_empty() { None } else { tx_acks.clone() };
     let (exec_txs, exec_stats) = exec::spawn_executors(rate, sinks, acks);
-    let cfg = run_cfg(args, bench, armed, !exec_txs.is_empty(), risk, undischarged);
+    let cfg = run_cfg(args, bench, armed, !exec_txs.is_empty(), risk, undischarged, toxgate_file);
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;
     println!("{summary}");
     if armed {
@@ -1357,5 +1512,257 @@ mod precondition_tests {
             Err(m) => m.join("\n"),
         };
         assert!(err.contains("bench/replay"), "{err}");
+    }
+}
+
+/// **The three quoter policies this binary built and never installed.**
+///
+/// `Quoter::new` hardcodes `apr_margin: None`, an empty `suppress` and
+/// `toxgate: None`. `arb-trader` called `set_risk` and nothing else, so all
+/// three survived into every armed session — `bins/arb-intent`, a replay tool,
+/// was the only caller of the other three setters in the entire workspace.
+///
+/// The quoter's policy fields are private, and left that way on purpose: what
+/// is asserted here is what an operator would see — the same relationship, the
+/// same book, and a DIFFERENT decision once the policy is installed. A test
+/// that read the fields would pass against a quoter that stored them and then
+/// ignored them.
+#[cfg(test)]
+mod policy_wiring_tests {
+    use super::*;
+    use arb_core::book::BookBuilder;
+    use arb_core::fees::FeeSchedule;
+    use arb_core::intent::Intent;
+    use arb_core::model::Level;
+
+    /// Deliberately in a family `arb_core::resolve` has a date for:
+    /// `xvus-france-pres-27` resolves 2027-04-25, so the hurdle has a real hold
+    /// to annualize over. It is also the family the defect was measured on.
+    const REGISTRY: &str = r#"
+relationships:
+  - id: xvus-france-pres-27-test
+    type: cross-venue-equivalent
+    verdict: equivalent
+    vetted_by: human
+    legs:
+      - {venue: kalshi, market_id: K}
+      - {venue: polymarket_us, market_id: P}
+"#;
+
+    /// The as-of day every APR assertion here is measured from. Pinned: the
+    /// hurdle shrinks as 2027-04-25 approaches, so a test reading the wall
+    /// clock would start failing on its own one day.
+    const ASOF: &str = "2026-07-29";
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("arb-trader-policy-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn lvl(p: &str, s: &str) -> Level {
+        Level { price: p.into(), size: s.into() }
+    }
+
+    /// Kalshi bid 0.60 funds a PM-US maker YES bid (hedging NO costs 0.40);
+    /// PM-US is already bid `pm_bid`, so the quote we would rest sits one tick
+    /// inside it.
+    fn books(pm_bid: &str) -> BookBuilder {
+        let mut bb = BookBuilder::new();
+        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.60", "500")],
+                          vec![lvl("0.99", "1")], 1, 1_000_000_000, None);
+        bb.apply_snapshot(Venue::PolymarketUs, "P", vec![lvl(pm_bid, "500")],
+                          vec![lvl("0.99", "1")], 1, 1_000_000_000, None);
+        bb
+    }
+
+    /// Args that reach the quoter through the REAL path — `load_quoters` then
+    /// `install_policy` — with every mode default pinned, so a test asserts on
+    /// what it set and nothing else.
+    fn args(dir: &std::path::Path) -> Args {
+        let reg = dir.join("registry.yaml");
+        std::fs::write(&reg, REGISTRY).unwrap();
+        let mut a = default_args();
+        a.registry = reg.to_string_lossy().into_owned();
+        a.tradable = "/nonexistent/tradable.yaml".into(); // registry vetting alone
+        a.apr_asof = Some(ASOF.into());
+        a.min_apr = 0.0;
+        a.toxgate = Some(String::new());
+        a
+    }
+
+    /// Wire the policy onto real quoters and decide ONE book event with them.
+    fn decide(a: &Args, pm_bid: &str, now: f64) -> Vec<Intent> {
+        let (mut quoters, _, _) = load_quoters(&a.registry, &a.tradable, &[]);
+        assert_eq!(quoters.len(), 1, "the fixture relationship must survive the gate");
+        install_policy(a, &mut quoters, false);
+
+        let bb = books(pm_bid);
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let mut oid = 0u64;
+        let mut intents = Vec::new();
+        quoters[0].on_book(&mut cx, &fees, &bb, now, &mut oid, &mut intents);
+        intents
+    }
+
+    fn place_on<'a>(intents: &'a [Intent], market: &str) -> Option<&'a arb_core::intent::Place> {
+        intents.iter().find_map(|i| match i {
+            Intent::Place(p) if p.place == market => Some(p),
+            _ => None,
+        })
+    }
+
+    fn skips(intents: &[Intent]) -> Vec<String> {
+        intents
+            .iter()
+            .filter_map(|i| match i {
+                Intent::Skip(s) => Some(s.skip.join("; ")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// THE hurdle, on the family it was measured on. With none, the engine
+    /// rests a quote one tick inside the touch — on france-pres-27 that locks
+    /// $0.01 on $4.99 committed until 2027-04-25, which is 0.27%/yr, while
+    /// take-take in the same process refuses anything under ~12%/yr.
+    #[test]
+    fn the_apr_hurdle_reaches_the_live_quoter() {
+        let d = scratch("apr");
+        let mut a = args(&d);
+
+        let off = decide(&a, "0.55", 1_000.0);
+        let p = place_on(&off, "P").expect("with no hurdle the tick-lock quote rests");
+        assert_eq!(p.price, "0.56", "one tick inside the 0.55 touch");
+
+        // Same book, same relationship, hurdle at the take-take bar.
+        a.min_apr = crate::taketake::DEFAULT_BAR_APR;
+        let on = decide(&a, "0.55", 1_000.0);
+        assert!(
+            place_on(&on, "P").is_none(),
+            "a 0.27%/yr lock must not rest under a 12%/yr hurdle: {on:?}"
+        );
+
+        // ...and the hurdle narrows the quote rather than switching the maker
+        // off: a book that leaves room still gets one.
+        let wide = decide(&a, "0.30", 1_000.0);
+        assert!(
+            place_on(&wide, "P").is_some(),
+            "the hurdle must not silence a genuinely profitable book: {wide:?}"
+        );
+    }
+
+    /// `--suppress market:side`, the same spelling `arb-intent` takes. Nothing
+    /// in this binary populates it dynamically (see `install_policy`), so the
+    /// property is only that an operator's declaration reaches the quoter.
+    #[test]
+    fn the_suppress_set_reaches_the_live_quoter() {
+        let d = scratch("suppress");
+        let mut a = args(&d);
+        assert!(place_on(&decide(&a, "0.30", 1_000.0), "P").is_some(), "control");
+
+        a.suppress = vec![("P".into(), BookSide::Bid)];
+        let held = decide(&a, "0.30", 1_000.0);
+        assert!(
+            place_on(&held, "P").is_none(),
+            "a side another owner holds must not be quoted: {held:?}"
+        );
+    }
+
+    /// The toxicity gate. `TOXGATE_MAX` is 0.03/ct and the research feed was
+    /// scoring live sides at 0.0822-0.2199 — up to 7x — while the skip at
+    /// quoter.rs:413 was unreachable in this process.
+    #[test]
+    fn the_toxgate_reaches_the_live_quoter() {
+        let d = scratch("toxgate");
+        let mut a = args(&d);
+        assert!(place_on(&decide(&a, "0.30", 1_000.0), "P").is_some(), "control");
+
+        // The feed's clock and the quoter's are both epoch seconds, so a
+        // fixture has to be stamped NOW to be current.
+        let now = arb_core::clock::now_s();
+        let f = d.join("toxgate.json");
+        std::fs::write(&f, format!(r#"{{"ts": {now}, "markets": {{"P": {{"bid": 0.0822}}}}}}"#))
+            .unwrap();
+        a.toxgate = Some(f.to_string_lossy().into_owned());
+
+        let gated = decide(&a, "0.30", now);
+        assert_eq!(skips(&gated), vec!["toxgate bid 0.082 > 0.03"]);
+        assert!(place_on(&gated, "P").is_none(), "a toxic side rests nothing: {gated:?}");
+    }
+
+    /// A feed that cannot be READ is not a feed that said yes. The file on disk
+    /// when this was written was stamped 2026-07-26 and nothing had reloaded it
+    /// since, so the gate an armed run installed was three days past
+    /// `TOXGATE_MAX_AGE` — and answered every consultation with a free pass.
+    #[test]
+    fn a_stale_toxgate_file_does_not_silently_permit() {
+        let d = scratch("stale");
+        let now = arb_core::clock::now_s();
+        let f = d.join("toxgate.json");
+        let path = f.to_string_lossy().into_owned();
+        std::fs::write(&f, format!(r#"{{"ts": {}, "markets": {{}}}}"#, now - 3.0 * 86_400.0))
+            .unwrap();
+
+        let why = load_toxgate(&path, now).err().expect("3 days old must not load");
+        assert!(why.contains("old"), "it must say the AGE refused it: {why}");
+        // A MISSING file is the same answer, not a quieter one.
+        assert!(load_toxgate("/nonexistent/toxgate.json", now).is_err());
+        // ...and so is a document that cannot say how old it is.
+        std::fs::write(&f, r#"{"markets": {}}"#).unwrap();
+        assert!(load_toxgate(&path, now).is_err(), "no ts is not a fresh ts");
+
+        // Installing it is still reported to the engine, which is what starts
+        // it pulled — an unusable feed is refused, never skipped over.
+        let mut a = args(&d);
+        a.toxgate = Some(path.clone());
+        assert_eq!(install_policy(&a, &mut [], false), Some(path));
+    }
+
+    /// bench/replay pins a decision digest against a fixed tape, and both new
+    /// policies read state a tape cannot pin: the hurdle shrinks every day, and
+    /// the toxgate file is rewritten by another process with a wall-clock `ts`.
+    /// Off there by default for the same reason `health_file`, `take_take` and
+    /// `risk` are — and an explicit flag still wins, so either can be replayed
+    /// against a pinned value.
+    #[test]
+    fn bench_defaults_both_new_gates_off_but_honors_an_explicit_flag() {
+        let d = scratch("bench");
+        let mut a = args(&d);
+        a.min_apr = -1.0; // the sentinel: "default by mode"
+        a.toxgate = None;
+
+        assert_eq!(install_policy(&a, &mut [], true), None, "no toxgate in bench by default");
+        assert_eq!(
+            install_policy(&a, &mut [], false),
+            Some(DEFAULT_TOXGATE.to_string()),
+            "live defaults the gate ON"
+        );
+
+        a.toxgate = Some("/pinned/toxgate.json".into());
+        assert_eq!(
+            install_policy(&a, &mut [], true),
+            Some("/pinned/toxgate.json".to_string()),
+            "an explicit --toxgate is honored in bench too"
+        );
+
+        // The hurdle half, asserted through the decision rather than a return
+        // value: the tick-lock quote of the first test still rests in bench.
+        a.min_apr = -1.0;
+        let (mut quoters, _, _) = load_quoters(&a.registry, &a.tradable, &[]);
+        install_policy(&a, &mut quoters, true);
+        let bb = books("0.55");
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        quoters[0].on_book(&mut cx, &fees, &bb, 1_000.0, &mut oid, &mut intents);
+        assert_eq!(
+            place_on(&intents, "P").map(|p| p.price.as_str()),
+            Some("0.56"),
+            "bench must decide as it always has: {intents:?}"
+        );
     }
 }

@@ -18,13 +18,16 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// Mirror of quoter.py TOXGATE_MAX / TOXGATE_MAX_AGE.
-const TOXGATE_MAX: f64 = 0.03;
-const TOXGATE_MAX_AGE: f64 = 120.0;
+/// Mirror of quoter.py TOXGATE_MAX / TOXGATE_MAX_AGE. Public because the
+/// binary that loads the feed decides whether it is usable BEFORE installing
+/// it, and both halves must answer to the same numbers.
+pub const TOXGATE_MAX: f64 = 0.03;
+pub const TOXGATE_MAX_AGE: f64 = 120.0;
 
 /// The research toxicity shadow feed (data/exec/toxgate.json), loaded by the
-/// caller (file I/O stays outside arb-core). Mirrors quoter.py `_toxgate`:
-/// stale feed (doc ts older than TOXGATE_MAX_AGE vs `now`) fails open.
+/// caller (file I/O stays outside arb-core). Mirrors quoter.py `_toxgate`
+/// EXCEPT that a stale feed (doc ts older than TOXGATE_MAX_AGE vs `now`) no
+/// longer fails open — see [`ToxVerdict::Untrusted`].
 /// One risk consultation per would-be place.
 ///
 /// The engine implements this: it owns the exposure fold, the balances and the
@@ -56,12 +59,66 @@ pub struct Toxgate {
     pub markets: HashMap<String, HashMap<String, f64>>,
 }
 
+/// What the toxicity feed says about one (market, side) — including the case
+/// where it can say nothing at all.
+#[derive(Debug, PartialEq)]
+pub enum ToxVerdict {
+    /// Scored at or under `TOXGATE_MAX`, or carried by a current feed that
+    /// simply does not list this market. Absence from a CURRENT feed is not
+    /// evidence of toxicity; absence of the feed is a different answer.
+    Clear,
+    /// Expected adverse cost per contract, above `TOXGATE_MAX`.
+    Toxic(f64),
+    /// The feed is `age_s` behind the caller's clock and cannot score anything.
+    ///
+    /// This used to be `None` — indistinguishable from "not listed", i.e. a
+    /// free pass. `Toxgate` carries ONE `ts`, captured when the file was read,
+    /// so a gate nothing reloads goes permanently open TOXGATE_MAX_AGE after
+    /// startup: two minutes of gating and then silence. The caller that owns
+    /// the file owns reloading it; what this type owes is refusing to pretend
+    /// a feed it cannot read said "fine".
+    Untrusted { age_s: f64 },
+}
+
 impl Toxgate {
-    fn score(&self, market_id: &str, side: BookSide, now: f64) -> Option<f64> {
-        if now - self.ts > TOXGATE_MAX_AGE {
-            return None; // stale — fail open
+    /// Parse `data/exec/toxgate.json`. `None` is a document this gate cannot
+    /// read at all — including one with no numeric `ts`, because a feed that
+    /// cannot say how old it is cannot be trusted to be current.
+    pub fn from_json(doc: &str) -> Option<Toxgate> {
+        let v: serde_json::Value = serde_json::from_str(doc).ok()?;
+        let ts = v.get("ts")?.as_f64()?;
+        let mut markets: HashMap<String, HashMap<String, f64>> = HashMap::new();
+        if let Some(ms) = v.get("markets").and_then(|x| x.as_object()) {
+            for (mid, sides) in ms {
+                let mut by_side = HashMap::new();
+                if let Some(so) = sides.as_object() {
+                    for (side, score) in so {
+                        if let Some(f) = score.as_f64() {
+                            by_side.insert(side.clone(), f);
+                        }
+                    }
+                }
+                markets.insert(mid.clone(), by_side);
+            }
         }
-        self.markets.get(market_id)?.get(side.as_str()).copied()
+        Some(Toxgate { ts, markets })
+    }
+
+    /// One consultation. `now` is the caller's clock in the feed's own units
+    /// (epoch seconds).
+    ///
+    /// A feed stamped in the FUTURE stays usable: the research writer and this
+    /// engine share a machine, so a fractionally-ahead `ts` is float rounding,
+    /// and pulling the whole book over it would be the wrong failure.
+    pub fn verdict(&self, market_id: &str, side: BookSide, now: f64) -> ToxVerdict {
+        let age_s = now - self.ts;
+        if age_s > TOXGATE_MAX_AGE {
+            return ToxVerdict::Untrusted { age_s };
+        }
+        match self.markets.get(market_id).and_then(|m| m.get(side.as_str())).copied() {
+            Some(v) if v > TOXGATE_MAX => ToxVerdict::Toxic(v),
+            _ => ToxVerdict::Clear,
+        }
     }
 }
 
@@ -412,24 +469,32 @@ impl Quoter {
                 }
                 // toxgate (card 059ce700): a toxic (market, side) is unviable —
                 // emit the skip record, cancel any resting quote, rest nothing.
-                // Advisory + fail-open: missing/stale feed never blocks.
+                // A feed too old to score gets the SAME answer: an installed
+                // gate that has gone dark is a reason not to quote, not a
+                // reason to quote unchecked (`ToxVerdict::Untrusted`). No gate
+                // installed at all is still off, which is what the golden and
+                // intent replays pin.
                 if target.is_some() {
-                    if let Some(tox) =
-                        self.toxgate.as_ref().and_then(|t| t.score(&leg_market, side, now))
-                    {
-                        if tox > TOXGATE_MAX {
-                            intents.push(Intent::Skip(intent::Skip {
-                                // `as_str`, not `{side:?}`: this reason string
-                                // reaches the intents file and the digest, and
-                                // Debug would spell it `Bid`.
-                                skip: vec![format!(
-                                    "toxgate {} {tox:.3} > {TOXGATE_MAX}",
-                                    side.as_str()
-                                )],
-                                ts: now,
-                            }));
-                            target = None;
-                        }
+                    let why = match self.toxgate.as_ref() {
+                        None => None,
+                        // `as_str`, not `{side:?}`: these reason strings reach
+                        // the intents file and the digest, and Debug would
+                        // spell it `Bid`.
+                        Some(t) => match t.verdict(&leg_market, side, now) {
+                            ToxVerdict::Clear => None,
+                            ToxVerdict::Toxic(v) => {
+                                Some(format!("toxgate {} {v:.3} > {TOXGATE_MAX}", side.as_str()))
+                            }
+                            ToxVerdict::Untrusted { age_s } => Some(format!(
+                                "toxgate feed {age_s:.0}s old > {TOXGATE_MAX_AGE} — \
+                                 cannot score {}",
+                                side.as_str()
+                            )),
+                        },
+                    };
+                    if let Some(why) = why {
+                        intents.push(Intent::Skip(intent::Skip { skip: vec![why], ts: now }));
+                        target = None;
                     }
                 }
                 let Some(target) = target else {
@@ -665,6 +730,75 @@ pub(crate) mod tests_support {
 
         assert_eq!(skips(&intents), vec!["toxgate bid 0.050 > 0.03"]);
         assert!(!any_place(&intents), "a toxic side rests nothing: {intents:?}");
+    }
+
+    /// **A gate that has gone dark does not become a permit.**
+    ///
+    /// `Toxgate` carries one `ts`, captured when the file was read. Nothing
+    /// reloaded it, and `score` answered a feed older than TOXGATE_MAX_AGE with
+    /// `None` — the same answer as "this market is not listed", i.e. quote
+    /// freely. So an installed gate gated for exactly two minutes and then
+    /// silently stopped, forever. Same book, same fixture, same scores as the
+    /// test above: only the feed's age differs.
+    #[test]
+    fn a_stale_feed_blocks_instead_of_permitting() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        q.set_toxgate(Some(Arc::new(Toxgate {
+            ts: 100.0 - TOXGATE_MAX_AGE - 1.0,
+            markets: HashMap::new(), // nothing scored: the AGE is the refusal
+        })));
+        let mut oid = 0u64;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+
+        assert!(!any_place(&intents), "a gate that cannot score must not permit: {intents:?}");
+        assert!(
+            skips(&intents).iter().any(|s| s.contains("toxgate feed 121s old")),
+            "and it must say the feed is what refused: {intents:?}"
+        );
+    }
+
+    /// The boundary, in both directions, on the exact fixture above: one second
+    /// inside TOXGATE_MAX_AGE still scores normally (so the refusal above is
+    /// the AGE and not the empty market map), one second outside does not.
+    #[test]
+    fn a_feed_inside_the_max_age_still_quotes() {
+        for (age, want_place) in [(TOXGATE_MAX_AGE - 1.0, true), (TOXGATE_MAX_AGE + 1.0, false)] {
+            let (mut cx, fees, mut bb, mut q) = fixture();
+            q.set_toxgate(Some(Arc::new(Toxgate {
+                ts: 100.0 - age,
+                markets: HashMap::new(),
+            })));
+            let mut oid = 0u64;
+            let mut intents = Vec::new();
+            pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+            q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+            assert_eq!(any_place(&intents), want_place, "age {age}: {intents:?}");
+        }
+    }
+
+    /// The parser both binaries load the research file through. It was written
+    /// out longhand in `arb-intent` with `ts` defaulting to 0.0 on a document
+    /// that has none — which, now that age is what refuses, would read as a
+    /// feed from 1970 rather than as an unreadable one. Here it is `None`, and
+    /// the caller decides what an unreadable feed means.
+    #[test]
+    fn the_feed_parser_refuses_a_document_with_no_timestamp() {
+        let good = Toxgate::from_json(
+            r#"{"ts": 1785079574.72, "markets": {"K1": {"bid": 0.0822, "ask": 0.01}}}"#,
+        )
+        .expect("a well-formed feed");
+        assert_eq!(good.ts, 1785079574.72);
+        assert_eq!(
+            good.verdict("K1", BookSide::Bid, 1785079574.72),
+            ToxVerdict::Toxic(0.0822)
+        );
+        assert_eq!(good.verdict("K1", BookSide::Ask, 1785079574.72), ToxVerdict::Clear);
+        assert_eq!(good.verdict("nope", BookSide::Bid, 1785079574.72), ToxVerdict::Clear);
+
+        assert!(Toxgate::from_json(r#"{"markets": {}}"#).is_none(), "no ts");
+        assert!(Toxgate::from_json("not json").is_none());
     }
 
     /// card 6fb469da (the fraalb sawtooth): the throttle applies to RE-ENTRY

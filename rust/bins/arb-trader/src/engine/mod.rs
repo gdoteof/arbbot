@@ -57,6 +57,10 @@ pub struct RunCfg {
     /// Recorder health feed to watch; None = check disabled (bench/replay,
     /// which have no live feed and must stay byte-deterministic).
     pub health_file: Option<String>,
+    /// Research toxicity feed to RE-READ; None = the gate is off. `Toxgate`
+    /// carries one `ts` fixed at load, so a gate nothing reloads goes
+    /// permanently open two minutes after startup — see `tox_tick`.
+    pub toxgate_file: Option<String>,
     /// Shared risk view. The quoters consult it per place; the engine feeds it
     /// exposure on fills. None = risk off (bench/replay).
     pub risk: Option<std::sync::Arc<crate::risk::RiskView>>,
@@ -231,6 +235,13 @@ struct Engine {
     /// check is on: we have not yet proven the feeds are healthy, and the first
     /// tick either clears it or names the problem.
     feed_reason: Option<String>,
+    /// Why the toxicity feed may not be gated behind, when it may not be.
+    ///
+    /// Held as a REASON for the same purpose `feed_reason` is: a maker that has
+    /// stopped quoting must always be able to say what stopped it. Kept
+    /// separate from `feed_reason` because they fail independently and the
+    /// remedies differ — one is the recorder, the other is the research writer.
+    tox_reason: Option<String>,
     /// The engine's own subscription to the recorder, tracked separately from
     /// what the recorder says about the venues: a bench tape cannot disconnect,
     /// a socket can and did (ten times on 2026-07-28).
@@ -337,6 +348,15 @@ impl Engine {
         }
         let feed_reason: Option<String> =
             cfg.health_file.is_some().then(|| "startup — feeds not yet proven healthy".to_string());
+        // Same read `install_policy` just made, for the other half of the
+        // answer: it decides what to INSTALL on the quoters, this decides
+        // whether the engine may quote at all. Read here rather than passed in
+        // so that the state and the file cannot drift apart, exactly as
+        // `tt_bar` is re-derived from marks above.
+        let tox_reason = cfg
+            .toxgate_file
+            .as_deref()
+            .and_then(|p| crate::load_toxgate(p, wall_now()).err());
         let link = if cfg.bench { Link::Fresh } else { Link::Down };
         let required = required_feeds(by_market);
         let t_start = std::time::Instant::now();
@@ -378,6 +398,7 @@ impl Engine {
             next_tt_oid: id_base,
             killed: false,
             feed_reason,
+            tox_reason,
             link,
             stale_seen: HashMap::new(),
             last_now: 0.0,
@@ -565,6 +586,49 @@ impl Engine {
         }
     }
 
+    /// Re-read the research toxicity feed onto every quoter, and refuse to
+    /// quote at all while it cannot be read.
+    ///
+    /// `Toxgate` carries a single `ts` captured when the file was parsed, and
+    /// `Toxgate::verdict` refuses to score anything past `TOXGATE_MAX_AGE`. So
+    /// without this the gate is not merely frozen, it is a two-minute gate: at
+    /// startup + 120s every side goes `Untrusted` and stays there. Reloading is
+    /// what makes the gate a gate.
+    ///
+    /// The BLOCK lives here rather than being left to the per-side
+    /// `Untrusted` skip because that skip fires once per leg per side per book
+    /// event: on a live feed a dead research writer would mean thousands of
+    /// identical skip lines a second, forever. One edge-triggered line and one
+    /// pull says the same thing once. The per-side refusal stays as the
+    /// backstop that covers the window between ticks.
+    pub(super) fn tox_tick(&mut self, quoters: &mut [Quoter]) {
+        let Some(path) = self.cfg.toxgate_file.clone() else { return };
+        let reason = match crate::load_toxgate(&path, wall_now()) {
+            Ok(gate) => {
+                for q in quoters.iter_mut() {
+                    q.set_toxgate(Some(gate.clone()));
+                }
+                None
+            }
+            Err(why) => Some(why),
+        };
+        // Edge-triggered, like `feed_reason` and the take-take bar: the reason
+        // string carries an age that moves every tick, so comparing the strings
+        // would log every tick and a line every tick is a line nobody reads.
+        let changed = reason.is_some() != self.tox_reason.is_some();
+        if changed {
+            match &reason {
+                Some(why) => eprintln!("[toxgate] UNUSABLE ({why}) — maker quotes pulled"),
+                None => eprintln!("[toxgate] feed current again — maker quoting resumes"),
+            }
+        }
+        let entering = changed && reason.is_some();
+        self.tox_reason = reason;
+        if entering {
+            self.pull_quotes(quoters, "TOXGATE UNUSABLE");
+        }
+    }
+
     fn summary(&self) -> serde_json::Value {
         let elapsed = self.t_start.elapsed().as_secs_f64();
         serde_json::json!({
@@ -575,6 +639,7 @@ impl Engine {
             "take_take_net_under_slip": self.n_tt_under_slip,
             "killed": self.killed,
             "feed_pulled": self.feed_reason.is_some(),
+            "toxgate_pulled": self.tox_reason.is_some(),
             "risk_allowed": self.cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
             "risk_rejected": self.cfg.risk.as_ref().map(|r| r.stats().1).unwrap_or(0),
             // Cancels the engine has DECIDED and the venue has not yet
@@ -779,7 +844,14 @@ impl Engine {
         self.last_now = now;
         if !self.killed && self.feed_reason.is_none() {
             if let Some(idxs) = by_market.get(&(venue, market_id)) {
-                self.quote(quoters, idxs, now);
+                // The toxicity gate scores MAKER sides, so an unusable feed
+                // stops the maker and nothing else. Take-take is a different
+                // decision behind a different bar (`taketake::Bar`), and
+                // silently widening this pull to cover it would be a policy
+                // change wearing a safety check's clothes.
+                if self.tox_reason.is_none() {
+                    self.quote(quoters, idxs, now);
+                }
                 // Take-take on the SAME event that moved the book: the
                 // crossing exists for as long as the slower side takes
                 // to react, which is not minutes.
@@ -1168,6 +1240,10 @@ pub async fn run(
     cancel_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut fill_iv = tokio::time::interval(std::time::Duration::from_secs(1));
     fill_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Well inside TOXGATE_MAX_AGE (120s), so a feed that is being written stays
+    // installed and one that stopped is noticed long before the next quote.
+    let mut tox_iv = tokio::time::interval(std::time::Duration::from_secs(30));
+    tox_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     // Unbounded in bench/replay: the budget never reaches zero, so both guards
     // below are constant, the select polls exactly the arms it polled before in
@@ -1203,6 +1279,10 @@ pub async fn run(
             // without a health file must still be able to notice, and clear, a
             // disconnect of its own feed.
             _ = feed_iv.tick(), if !bench => eng.health_tick(&mut quoters),
+            // Off in bench/replay for the same reason as the two above: it
+            // re-reads a file another process rewrites, which no pinned tape
+            // can reproduce. Bench keeps whatever `install_policy` installed.
+            _ = tox_iv.tick(), if !bench => eng.tox_tick(&mut quoters),
             _ = stats_iv.tick(), if !bench => eng.stats_tick(),
             // The budget is spent and every deadline that was DUE has now had
             // its turn: the arms above are polled first and this one is always
@@ -1235,6 +1315,7 @@ fn test_cfg() -> RunCfg {
         bench: true,
         wal_path: None,
         health_file: None,
+        toxgate_file: None,
         risk: None,
         ledger_path: None,
         hedge_retry: None,
@@ -1417,6 +1498,7 @@ mod feed_wiring_tests {
             bench: false,
             wal_path: None,
             health_file,
+            toxgate_file: None,
             risk: None,
             ledger_path: None,
             // Take-take now prices its net edge against the hedge's slip
@@ -1776,5 +1858,190 @@ mod feed_wiring_tests {
         assert!(intents.contains("crossed book kalshi K bid"), "{intents}");
         assert_eq!(summary["take_take_found"], serde_json::json!(0), "{summary}");
         assert!(!intents.contains(r#""tag":"take-take""#), "{intents}");
+    }
+}
+
+/// **A gate nothing reloads is a two-minute gate.**
+///
+/// `Toxgate` carries ONE `ts`, captured when the file was parsed, and
+/// `Toxgate::verdict` will not score anything past `TOXGATE_MAX_AGE` (120s).
+/// So even the wiring this PR adds would have gated for two minutes after
+/// startup and then gone quiet forever. The file on disk when this was written
+/// was stamped 2026-07-26 — three days behind — for exactly that reason:
+/// nothing ever went back for it.
+#[cfg(test)]
+mod toxgate_reload_tests {
+    use super::*;
+    use arb_core::scan::{RelLeg, RelType};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("arb-trader-toxreload-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A feed stamped `age` seconds ago, scoring the PM-US leg's bid at `score`.
+    fn write_feed(path: &std::path::Path, age: f64, score: f64) {
+        std::fs::write(
+            path,
+            format!(
+                r#"{{"ts": {}, "markets": {{"P": {{"bid": {score}}}}}}}"#,
+                wall_now() - age
+            ),
+        )
+        .unwrap();
+    }
+
+    fn engine_watching(path: &std::path::Path) -> Engine {
+        let mut cfg = test_cfg();
+        cfg.toxgate_file = Some(path.to_string_lossy().into_owned());
+        test_engine(cfg)
+    }
+
+    /// Same fixture the quoter's own tests use: Kalshi's 0.60 bid funds a
+    /// PM-US maker YES bid one tick inside PM-US's 0.30.
+    fn quoter_and_books() -> (Vec<Quoter>, BookBuilder) {
+        let rel = Rel {
+            id: "xvus-france-pres-27-test".into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: "K".into() },
+                RelLeg { venue: Venue::PolymarketUs, market_id: "P".into() },
+            ],
+        };
+        let lvl = |p: &str, s: &str| Level { price: p.into(), size: s.into() };
+        let mut bb = BookBuilder::new();
+        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.60", "500")],
+                          vec![lvl("0.99", "1")], 1, 1_000_000_000, None);
+        bb.apply_snapshot(Venue::PolymarketUs, "P", vec![lvl("0.30", "500")],
+                          vec![lvl("0.99", "1")], 1, 1_000_000_000, None);
+        (vec![Quoter::new(rel)], bb)
+    }
+
+    /// Every way the feed can fail to be readable blocks the maker, and a
+    /// reload — not a restart — is what clears it and what puts it back.
+    #[test]
+    fn a_feed_the_engine_cannot_read_blocks_the_maker_until_a_reload_clears_it() {
+        let d = scratch("cycle");
+        let p = d.join("toxgate.json");
+        let mut quoters: Vec<Quoter> = Vec::new();
+
+        // 1. No file at all. The engine starts PULLED, exactly as it does when
+        //    the recorder health feed has not yet been proven.
+        let mut eng = engine_watching(&p);
+        assert!(eng.tox_reason.is_some(), "a missing feed must not read as permission");
+
+        // 2. The three-day-old file that was actually on disk. No better.
+        write_feed(&p, 3.0 * 86_400.0, 0.001);
+        eng.tox_tick(&mut quoters);
+        let why = eng.tox_reason.clone().expect("a 3-day-old feed must not permit");
+        assert!(why.contains("old"), "and it must say the age refused it: {why}");
+
+        // 3. The research writer comes back. THIS is the transition the frozen
+        //    `ts` made unreachable: without a reload the engine would still be
+        //    holding the document from step 2.
+        write_feed(&p, 1.0, 0.001);
+        eng.tox_tick(&mut quoters);
+        assert_eq!(eng.tox_reason, None, "a current feed must clear the block");
+
+        // 4. ...and it goes dark again. The gate has to notice BOTH ways, or
+        //    it is a startup check wearing a gate's name.
+        write_feed(&p, arb_core::quoter::TOXGATE_MAX_AGE + 1.0, 0.001);
+        eng.tox_tick(&mut quoters);
+        assert!(eng.tox_reason.is_some(), "a feed that stopped must block again");
+    }
+
+    /// The reload REPLACES what the quoter gates on, rather than only clearing
+    /// a flag: a side that becomes toxic while the process runs stops being
+    /// quoted without a restart.
+    #[test]
+    fn a_reload_replaces_the_scores_the_quoter_gates_on() {
+        let d = scratch("scores");
+        let p = d.join("toxgate.json");
+        let (mut quoters, bb) = quoter_and_books();
+        let mut eng = engine_watching(&p);
+
+        let decide = |quoters: &mut Vec<Quoter>| {
+            let mut cx = Cx::default();
+            let fees = FeeSchedule::new(&mut cx);
+            let (mut oid, mut intents) = (0u64, Vec::new());
+            quoters[0].on_book(&mut cx, &fees, &bb, wall_now(), &mut oid, &mut intents);
+            intents
+        };
+
+        write_feed(&p, 1.0, 0.001); // well under TOXGATE_MAX
+        eng.tox_tick(&mut quoters);
+        assert_eq!(eng.tox_reason, None);
+        let clean = decide(&mut quoters);
+        assert!(
+            clean.iter().any(|i| matches!(i, Intent::Place(_))),
+            "a clean side must quote: {clean:?}"
+        );
+
+        // The research feed rescores the same side at 7x the max — the range it
+        // was actually reporting (0.0822-0.2199) while the gate was unwired.
+        write_feed(&p, 1.0, 0.2199);
+        eng.tox_tick(&mut quoters);
+        let toxic = decide(&mut quoters);
+        assert!(
+            !toxic.iter().any(|i| matches!(i, Intent::Place(_))),
+            "the reloaded score must gate: {toxic:?}"
+        );
+        assert!(
+            toxic.iter().any(|i| matches!(i, Intent::Skip(s) if s.skip[0].contains("toxgate bid"))),
+            "and say so: {toxic:?}"
+        );
+    }
+
+    /// No `--toxgate` at all is the gate being OFF, which is not the same
+    /// state as a gate that is on and cannot see. The golden and intent
+    /// replays run this way and must keep deciding as they always have.
+    #[test]
+    fn the_gate_is_off_entirely_when_no_file_is_configured() {
+        let mut eng = test_engine(test_cfg()); // toxgate_file: None
+        assert_eq!(eng.tox_reason, None, "no gate configured is not a blocked gate");
+        eng.tox_tick(&mut Vec::new());
+        assert_eq!(eng.tox_reason, None, "and the tick is a no-op");
+    }
+
+    /// And the reason is CONSULTED, not merely computed. A gate the engine
+    /// works out and then quotes straight past is the same defect this whole
+    /// change exists to fix, one level up.
+    #[test]
+    fn a_blocked_gate_stops_the_engine_emitting_anything_for_a_book_event() {
+        let d = scratch("consulted");
+        let p = d.join("toxgate.json");
+        let (mut quoters, _) = quoter_and_books();
+        let by_market: ByMarket = HashMap::from([
+            ((Venue::Kalshi, "K".to_string()), vec![0usize]),
+            ((Venue::PolymarketUs, "P".to_string()), vec![0usize]),
+        ]);
+        // The same two snapshots `quoter_and_books` builds, as feed lines.
+        let feed = |venue: &str, market: &str, bid: &str| FeedMsg {
+            line: serde_json::json!({
+                "kind": "snapshot", "venue": venue, "market_id": market,
+                "bids": [{"price": bid, "size": "500"}],
+                "asks": [{"price": "0.99", "size": "1"}],
+                "seq": 1, "ts_local_ns": (wall_now() * 1e9) as i64})
+            .to_string(),
+            t_read: std::time::Instant::now(),
+        };
+
+        write_feed(&p, 3.0 * 86_400.0, 0.001); // stale: the engine starts pulled
+        let mut eng = engine_watching(&p);
+        assert!(eng.tox_reason.is_some());
+        eng.on_feed(feed("kalshi", "K", "0.60"), 0, &mut quoters, &by_market);
+        eng.on_feed(feed("polymarket_us", "P", "0.30"), 0, &mut quoters, &by_market);
+        assert_eq!(eng.n_int, 0, "a blocked gate must decide nothing");
+
+        // Same books, same engine, feed current: the quote comes out.
+        write_feed(&p, 1.0, 0.001);
+        eng.tox_tick(&mut quoters);
+        assert_eq!(eng.tox_reason, None);
+        eng.on_feed(feed("polymarket_us", "P", "0.30"), 0, &mut quoters, &by_market);
+        assert!(eng.n_int > 0, "and a current one must not");
     }
 }
