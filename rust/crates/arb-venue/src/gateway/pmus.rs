@@ -70,6 +70,26 @@ impl<T: Transport> PmusGateway<T> {
     /// or `{"orders": [...]}` (Python: `j if isinstance(j, list) else
     /// j.get("orders", [])`).
     ///
+    /// PRE-EXISTING, NOT INTRODUCED HERE, and recorded because this function is
+    /// now the sweep's only evidence on this venue: it reads ONE page and
+    /// handles no cursor, while [`resp::PmPositions`] in the same crate models a
+    /// `next_cursor` for the positions endpoint. If `/v1/orders/open` paginates
+    /// the way positions does, a book wider than one page would report only its
+    /// first page and `resting_order_ids` could answer "empty" over a later one
+    /// — Kalshi's `listing` walks its cursor for exactly that reason. Nobody has
+    /// captured a paginated response here either way. Left alone rather than
+    /// guessed at: inventing a cursor parameter this endpoint may not accept is
+    /// its own failure mode, on the halt path.
+    ///
+    /// The envelope's `orders` is REQUIRED — the same defect
+    /// [`resp::KalshiOrdersPage`] carried, reached through the fallback instead
+    /// of the struct. Python's `.get("orders", [])` really does default, and
+    /// copying that here meant any json object that was not a list answered
+    /// `Ok(vec![])`: a 200 error envelope became an EMPTY BOOK, which the sweep
+    /// then accepted as proof. A body with no `orders` key is a body we cannot
+    /// read, and this function's callers — `resting_order_ids` and
+    /// `recover_place` — both treat "empty" as a licence to stop looking.
+    ///
     /// [`Priority::Critical`] for the same reason as Kalshi's
     /// [`super::KalshiGateway::all_orders`]: its one caller is
     /// `resting_order_ids`, which is the only evidence `cancel_all_and_verify`
@@ -90,15 +110,23 @@ impl<T: Transport> PmusGateway<T> {
         }
         #[derive(serde::Deserialize)]
         struct Envelope {
-            #[serde(default)]
             orders: Vec<resp::PmOrder>,
         }
-        serde_json::from_str::<Envelope>(&r.body)
-            .map(|e| e.orders)
-            .map_err(|e| VenueError::Parse {
+        serde_json::from_str::<Envelope>(&r.body).map(|e| e.orders).map_err(|e| {
+            // The RAW body, as `kalshi_created_order` already does for the same
+            // reason: this is the one shape nobody has captured. An EMPTY BOOK
+            // on either documented shape (`[]`, `{"orders":[]}`) parses above,
+            // so reaching here means PM-US sent a third thing — and the only
+            // record of what that third thing is, is this line. Guessing it
+            // twice is what the defect above cost.
+            VenueError::Parse {
                 endpoint: "pmus:open_orders",
-                detail: e.to_string(),
-            })
+                detail: format!(
+                    "{e} — body was: {}",
+                    r.body.chars().take(600).collect::<String>()
+                ),
+            }
+        })
     }
 
     /// POST /v1/order/preview — projected fills and fees. NEVER submits, so it
@@ -292,6 +320,22 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
 
     /// One idempotent call cancels every resting order (kill-switch sweep) —
     /// no pagination, unlike Kalshi.
+    ///
+    /// AND UNLIKE KALSHI IT IS STILL ACCOUNT-WIDE. `docs/venue-quirks.md`
+    /// §`xv-graceful-shutdown-cancels-orders` asks for a sweep scoped to orders
+    /// this stack owns and PM-US cannot answer it: the create body carries no
+    /// tag of ours (§`pmus-no-client-order-id`), so nothing on the wire
+    /// distinguishes our resting order from anybody else's — the same absence
+    /// that forces [`Self::recover_place`] to match on market and size and to
+    /// REFUSE when two rows are indistinguishable.
+    ///
+    /// The fields an open-orders row does carry (slug, quantity) are not
+    /// ownership. Scoping a KILL SWEEP by them would leave a real order of ours
+    /// resting whenever the guess missed, which is the failure this sweep is the
+    /// last backstop against; the recovery path can afford that trade because it
+    /// only ever ADOPTS an id, and a wrong guess there is caught by its
+    /// single-candidate rule. So this stays wide, deliberately, and
+    /// `--sweep-only`'s blast-radius banner names it as the one that is.
     fn cancel_all_open(&self) -> Result<(), VenueError> {
         let r = self.call(Priority::Critical, "POST", P_CANCEL_ALL, Some(&json_empty()))?;
         if r.status >= 300 {

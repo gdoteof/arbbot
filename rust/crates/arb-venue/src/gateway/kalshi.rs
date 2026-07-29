@@ -32,6 +32,7 @@ pub struct KalshiGateway<T: Transport = NotWired> {
     pub limiter: Mutex<RateLimiter>,
     pub transport: T,
     settle: Settle,
+    unscoped_sweep: bool,
 }
 
 impl KalshiGateway<NotWired> {
@@ -49,12 +50,32 @@ impl<T: Transport> KalshiGateway<T> {
             limiter: Mutex::new(limiter),
             transport,
             settle: Settle::default(),
+            unscoped_sweep: false,
         }
     }
 
     /// Override the create-visibility poll (tests use a zero delay).
     pub fn with_settle(mut self, delay: std::time::Duration, attempts: u32) -> Self {
         self.settle = Settle { delay, attempts };
+        self
+    }
+
+    /// THE OPERATOR ESCAPE HATCH (`--sweep-unscoped`): go back to cancelling
+    /// every resting order on the account, whoever placed it.
+    ///
+    /// It exists because this change added a way for the engine to REFUSE TO
+    /// START. If the venue stops echoing `client_order_id` on its order list,
+    /// a scoped sweep can neither attribute nor prove, `startup_sweep` fails and
+    /// `main` exits 10 — and the documented manual remedy,
+    /// `scripts/kalshi_cancel_all.py`, is Python and forbidden by the Rust-only
+    /// scope. A safety gate with no override is an outage waiting for a venue
+    /// change nobody controls.
+    ///
+    /// It is OFF by default and must stay that way: on it re-arms the exact
+    /// shared-account failure `docs/venue-quirks.md`
+    /// §`xv-graceful-shutdown-cancels-orders` names.
+    pub fn with_unscoped_sweep(mut self, unscoped: bool) -> Self {
+        self.unscoped_sweep = unscoped;
         self
     }
 
@@ -96,8 +117,29 @@ impl<T: Transport> KalshiGateway<T> {
     /// a halt that a token bucket can turn into "NOT CLEAN at exit" is the same
     /// hazard as the hedge this priority exists to protect.
     pub fn all_orders(&self) -> Result<Vec<resp::KalshiOrder>, VenueError> {
+        Ok(self.listing()?.orders)
+    }
+
+    /// [`Self::all_orders`], keeping whether the walk actually FINISHED.
+    ///
+    /// The trailing page of a cursor walk is the one place the required-`orders`
+    /// rule could bite a legitimate response. `orders` is required so that a
+    /// FIRST page without it cannot read as "the book is empty" — that is the
+    /// whole of defect A. A CONTINUATION page is a different question: page 1
+    /// already proved the list is readable and already carries real rows, so a
+    /// final `{"cursor":""}` with `orders` omitted cannot make us conclude
+    /// anything about emptiness. Hard-erroring the entire sweep on it would be
+    /// fail-closed on a shape nobody has captured.
+    ///
+    /// So the walk ENDS there instead — and says it was cut short, because the
+    /// one thing it must not do is let a truncated walk read as a complete one.
+    /// A page we never saw could hold a resting order of ours, and
+    /// `resting_order_ids` returning early would be "PROVEN clean" over exactly
+    /// that. Incomplete means: cancel what we did find, prove nothing.
+    fn listing(&self) -> Result<Listing, VenueError> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut cut_short: Option<String> = None;
         loop {
             let q = cursor.as_ref().map(|c| format!("limit=100&cursor={c}"));
             let r = self.call(
@@ -114,14 +156,26 @@ impl<T: Transport> KalshiGateway<T> {
                     body: r.body,
                 });
             }
-            let page = resp::kalshi_orders_page(&r.body)?;
+            let page = match resp::kalshi_orders_page(&r.body) {
+                Ok(p) => p,
+                // Only AFTER a good page. The first page keeps the hard error.
+                Err(e) if cursor.is_some() => {
+                    cut_short = Some(format!(
+                        "the cursor walk stopped at a page that could not be read ({e}); \
+                         body was: {}",
+                        r.body.chars().take(300).collect::<String>()
+                    ));
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
             out.extend(page.orders);
             match page.cursor {
                 Some(c) if !c.is_empty() => cursor = Some(c),
                 _ => break,
             }
         }
-        Ok(out)
+        Ok(Listing { orders: out, cut_short })
     }
 
     /// Where an order carrying OUR `client_order_id` stands on this account.
@@ -129,9 +183,21 @@ impl<T: Transport> KalshiGateway<T> {
     /// but finished" and "not here at all" call for three different answers
     /// from a cancel, and collapsing them is how a cancel reports success for
     /// an order it never touched.
+    /// A TRUNCATED walk cannot answer "not here at all". `all_orders` discards
+    /// `cut_short` — a refactor artifact of this change — and reading a PREFIX
+    /// of the account as the account is how `Ours::Absent` becomes a wrong
+    /// diagnosis: the caller then prints "the place may have been rejected, or
+    /// the order list has not caught up" about an order that is simply on a page
+    /// nobody read. `Absent` is only sound over a COMPLETE list, so the
+    /// truncation is surfaced instead.
+    ///
+    /// Finding it despite the truncation is still an answer — a prefix that
+    /// contains the order tells the truth about it — so only the not-found arm
+    /// has to care.
     fn find_ours(&self, coid: &str) -> Result<Ours, VenueError> {
+        let listing = self.listing()?;
         let mut seen = false;
-        for o in self.all_orders()? {
+        for o in listing.orders {
             if o.client_order_id.as_deref() != Some(coid) {
                 continue;
             }
@@ -140,7 +206,11 @@ impl<T: Transport> KalshiGateway<T> {
             }
             seen = true;
         }
-        Ok(if seen { Ours::Gone } else { Ours::Absent })
+        if seen {
+            return Ok(Ours::Gone);
+        }
+        truncated(listing.cut_short)?;
+        Ok(Ours::Absent)
     }
 
     /// Find a RESTING order by our own `client_order_id` and cancel it.
@@ -159,6 +229,129 @@ impl<T: Transport> KalshiGateway<T> {
             }
             Ours::Gone | Ours::Absent => Ok(None),
         }
+    }
+}
+
+/// `Err` when the walk that produced this result was cut short. The cancels have
+/// already gone out by the time this is consulted — this decides only what the
+/// operation REPORTS, and reporting success is what would arm the engine.
+fn truncated(cut_short: Option<String>) -> Result<(), VenueError> {
+    match cut_short {
+        Some(why) => Err(VenueError::Parse { endpoint: "kalshi:orders", detail: why }),
+        None => Ok(()),
+    }
+}
+
+/// One cursor walk, and whether it reached the end.
+struct Listing {
+    orders: Vec<resp::KalshiOrder>,
+    /// `Some(why)` when a CONTINUATION page could not be read, so the rows below
+    /// are a prefix of the account, not the account.
+    cut_short: Option<String>,
+}
+
+/// The account history, partitioned the way a scoped sweep needs it.
+///
+/// Built from ONE paginated read, because the premise the scope rests on has to
+/// be checked against the same bytes the scope is applied to.
+struct Book {
+    /// Resting orders carrying a tag of ours — cancel these, and they must be
+    /// gone before the book is proven.
+    ours: Vec<String>,
+    /// Resting rows with NO `client_order_id` at all. Not cancelled — nothing
+    /// claims them — and not counted against the proof either: an order a human
+    /// places through Kalshi's own web UI has no tag, and must not be able to
+    /// stop this process arming.
+    untagged: usize,
+    /// Did ANY row in the whole history — resting or finished, ours or theirs —
+    /// carry a `client_order_id`?
+    ///
+    /// THIS IS THE PREMISE, CHECKED RATHER THAN ASSUMED. Every scoping decision
+    /// below is worthless if the list does not echo the tag, and NOTHING in this
+    /// repo has ever demonstrated that it does: the only live-provenance list
+    /// row on record (`tests/test_venue_contracts.py`, 2026-07-21) does not
+    /// carry the field, and the one production path that reads it —
+    /// [`Self::find_ours`] — has never fired on the armed unit, so its
+    /// deliberately quiet "nothing cancelled" would have hidden a non-echoing
+    /// list indefinitely.
+    ///
+    /// History is the right place to look and costs nothing extra: this account
+    /// has hundreds of finished rows, both stacks have always sent a
+    /// `client_order_id` (Kalshi's create body REQUIRES it —
+    /// [`crate::wire::kalshi_place_body`]), so one tag anywhere proves the field
+    /// survives the round trip. Zero tags across a non-empty history is the
+    /// signature of the premise being false, and is the only case that refuses.
+    echoes_tags: bool,
+    /// Rows seen at all, so an empty account is not mistaken for a broken one.
+    rows: usize,
+}
+
+impl Book {
+    fn read(orders: Vec<resp::KalshiOrder>) -> Self {
+        let mut b = Book { ours: Vec::new(), untagged: 0, echoes_tags: false, rows: orders.len() };
+        for o in orders {
+            match o.client_order_id.as_deref() {
+                Some(c) => {
+                    b.echoes_tags = true;
+                    if o.is_resting() && super::is_ours(c) {
+                        b.ours.push(o.order_id);
+                    }
+                }
+                None if o.is_resting() => b.untagged += 1,
+                None => {}
+            }
+        }
+        b
+    }
+
+    /// The refusal, when the premise the scope rests on is demonstrably false.
+    ///
+    /// Deliberately NOT a silent fallback in either direction. Cancelling the
+    /// whole account anyway is the documented failure this change exists to
+    /// stop; answering "clean" is the defect the other half of this change
+    /// exists to stop. So it is named, it carries the numbers, and it names the
+    /// flag that overrides it — `--sweep-unscoped` restores the old
+    /// account-wide behaviour for an operator who has decided to accept it.
+    /// Say out loud how many resting rows this sweep declined to attribute.
+    ///
+    /// `untagged` was computed and thrown away, which left the ONE residual in
+    /// this design with no signal at all: the premise check asks whether the tag
+    /// survives the round trip ANYWHERE in history, but the proof relies on it
+    /// being present on EVERY resting row of ours. A venue that echoed the tag
+    /// on finished rows but dropped it from resting ones would pass the premise,
+    /// land our own resting orders in `untagged`, and let `resting_order_ids`
+    /// answer `Ok(vec![])` — "PROVEN clean" over our own book.
+    ///
+    /// Tightening the check cannot fix that without wedging the web-UI order
+    /// this design deliberately tolerates, so the residual stays and this line
+    /// is how anyone would ever notice it. On a healthy account it is silent;
+    /// a count that tracks our own quote count is the tell.
+    fn report_untagged(&self) {
+        if self.untagged > 0 {
+            eprintln!(
+                "[venue] kalshi sweep: {} resting order(s) carry NO client_order_id — not \
+                 cancelled and not counted as ours. Expected for orders placed by hand in \
+                 the venue's own UI; if this tracks THIS engine's quote count, the list has \
+                 stopped echoing the tag on resting rows and the sweep is proving nothing.",
+                self.untagged
+            );
+        }
+    }
+
+    fn premise_broken(&self) -> Option<VenueError> {
+        (!self.echoes_tags && self.rows > 0).then(|| VenueError::Status {
+            endpoint: "kalshi orders",
+            status: 0,
+            body: format!(
+                "not one of {} order(s) in this account's history carries a \
+                 `client_order_id`, so the order list is not echoing the tag a scoped \
+                 sweep needs and NOTHING here can be attributed to this process. \
+                 Refusing to cancel blind on a SHARED key, and refusing to call the \
+                 book clean. Re-run with --sweep-unscoped to cancel EVERY resting \
+                 order on the account instead (the pre-2026-07-29 behaviour)",
+                self.rows
+            ),
+        })
     }
 }
 
@@ -277,22 +470,92 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
         Ok(resp::kalshi_order_envelope(&r.body)?.order)
     }
 
+    /// The evidence half of the sweep, scoped to match the cancel half.
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
-        Ok(self.all_orders()?.into_iter().filter(|o| o.is_resting()).map(|o| o.order_id).collect())
+        let listing = self.listing()?;
+        // A walk that was cut short cannot prove anything: the page we never
+        // read could hold a resting order of ours, and answering "empty" here is
+        // precisely the "PROVEN clean over a book nobody read" defect.
+        if let Some(why) = listing.cut_short {
+            return Err(VenueError::Parse { endpoint: "kalshi:orders", detail: why });
+        }
+        if self.unscoped_sweep {
+            return Ok(listing
+                .orders
+                .into_iter()
+                .filter(|o| o.is_resting())
+                .map(|o| o.order_id)
+                .collect());
+        }
+        let book = Book::read(listing.orders);
+        match book.premise_broken() {
+            Some(e) => Err(e),
+            None => Ok(book.ours),
+        }
     }
 
     /// Kill-switch sweep. `/portfolio/orders` returns history (canceled and
     /// executed too), so filter to `resting` — never try to cancel a dead order.
+    ///
+    /// And filter to OURS. This looped every resting order on the account
+    /// regardless of `client_order_id`, against the port requirement in
+    /// `docs/venue-quirks.md` §`xv-graceful-shutdown-cancels-orders`, on the
+    /// key `arbbot-hedge.timer` also trades under. The material was already
+    /// here — [`Self::find_ours`] matches on exactly this field — and the sweep
+    /// was the one caller not using it.
+    ///
+    /// SCOPING DOES NOT COST THE UNACKED-ORDER CATCH, which is the reason an
+    /// unscoped sweep was worth keeping. The `client_order_id` goes out IN THE
+    /// CREATE BODY, so an order whose ack we never read is already carrying our
+    /// tag when it starts resting: it is ours on the very next list read, with
+    /// no ack, no venue id and no local record needed. That is a STRONGER
+    /// handle than the sweep had before — the old blanket cancel could only
+    /// catch it by catching everything — and it is the same handle
+    /// [`Self::cancel_by_client_order_id`] recovers a lost create with. Orders a
+    /// PREVIOUS run left behind are caught for the same reason: `is_ours` is a
+    /// property of this codebase's ids, not of one process's seed.
+    ///
+    /// AND THE SCOPE IS NEVER ASSUMED. All of the above is void if the order
+    /// list does not echo the tag, which nothing in this repo has ever shown it
+    /// does — so [`Book`] checks that against the same read, and refuses rather
+    /// than quietly cancelling nothing. See [`Book::echoes_tags`].
     fn cancel_all_open(&self) -> Result<(), VenueError> {
-        for o in self.all_orders()? {
-            if o.is_resting() {
-                self.cancel(&CancelRequest {
-                    by: CancelBy::VenueId(o.order_id),
-                    market_slug: None,
-                })?;
+        // A cut-short walk cancels everything it DID read and then still
+        // REPORTS the truncation. Both halves matter and the first cut had only
+        // the first: withholding the cancel would leave read orders resting to
+        // protect a proof we could never give, but returning `Ok(())` sets
+        // `cancel_accepted` in the sweep, which makes the whole failure
+        // `is_only_unconfirmed()` — and the engine ARMS over pages 3..n it never
+        // read. That is defect A relocated one layer up, and it is likeliest
+        // exactly when page 1 holds no resting rows, which is the common case.
+        //
+        // Note the asymmetry it fixes: a continuation page with status != 200 is
+        // already fail-closed (`listing` returns Err), so only the
+        // 200-with-unreadable-body page could arm — the same hypothesised body
+        // class this whole change exists to refuse.
+        let listing = self.listing()?;
+        let cut_short = listing.cut_short;
+        let orders = listing.orders;
+        if self.unscoped_sweep {
+            for o in orders {
+                if o.is_resting() {
+                    self.cancel(&CancelRequest {
+                        by: CancelBy::VenueId(o.order_id),
+                        market_slug: None,
+                    })?;
+                }
             }
+            return truncated(cut_short);
         }
-        Ok(())
+        let book = Book::read(orders);
+        if let Some(e) = book.premise_broken() {
+            return Err(e);
+        }
+        book.report_untagged();
+        for oid in book.ours {
+            self.cancel(&CancelRequest { by: CancelBy::VenueId(oid), market_slug: None })?;
+        }
+        truncated(cut_short)
     }
 
     /// Live auth rehearsal (docs/migration-plan.md M2): place ONE contract at

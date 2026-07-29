@@ -298,6 +298,36 @@ fn open_orders_accepts_both_shapes() {
     }
 }
 
+/// ...but a 200 that is NEITHER a list nor an envelope carrying `orders` is a
+/// body we could not READ, and it must never answer "the book is empty".
+///
+/// The envelope's `orders` had `#[serde(default)]` — Python's
+/// `j.get("orders", [])` ported literally — so any json object deserialized to
+/// an EMPTY BOOK. `resting_order_ids` is the only evidence
+/// `cancel_all_and_verify` accepts, so a 200 error envelope here was laundered
+/// into the proof that lets a halt exit 0. Same defect as
+/// `KalshiOrdersPage`, reached through the fallback instead of the struct.
+#[test]
+fn a_200_with_no_orders_key_is_unreadable_not_an_empty_book() {
+    for body in [
+        r#"{"error":{"code":"internal_error"}}"#,
+        r#"{"data":{"orders":[]}}"#,
+        "{}",
+    ] {
+        match gw(vec![(200, body)]).open_orders() {
+            Err(VenueError::Parse { endpoint: "pmus:open_orders", .. }) => {}
+            other => panic!("{body} must be unreadable, got {other:?}"),
+        }
+        assert!(
+            gw(vec![(200, body)]).resting_order_ids().is_err(),
+            "the sweep's PROOF read must fail too, not answer `empty`: {body}"
+        );
+    }
+    // an empty book still reads as one — on the shape the venue actually sends.
+    assert!(gw(vec![(200, "[]")]).resting_order_ids().unwrap().is_empty());
+    assert!(gw(vec![(200, r#"{"orders":[]}"#)]).resting_order_ids().unwrap().is_empty());
+}
+
 // ------------------------------------------- a place whose answer was lost ---
 
 /// PM-US HAS NO CLIENT ORDER ID ON THE WIRE, so a create whose response is lost

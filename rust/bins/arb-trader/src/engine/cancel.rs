@@ -1226,6 +1226,47 @@ mod cancel_addressing_tests {
         );
     }
 
+    /// The tag the kill sweep now scopes on is THIS id, put on the wire by this
+    /// funnel, and nothing pinned that it is recognisable.
+    ///
+    /// `KalshiGateway::cancel_all_open` cancels a resting order only when
+    /// `arb_venue::gateway::is_ours(client_order_id)`, so anything that changed
+    /// the shape of an engine order id would silently narrow the sweep to
+    /// nothing — an armed process exiting 0 with its own quotes resting, which
+    /// is the failure the sweep exists to make impossible. The id below is not
+    /// invented: `LIVE_REPRICE` is the verbatim intent line from the armed M3
+    /// run, so this asserts on a `client_order_id` that has really been sent.
+    ///
+    /// It also covers the seed. `Engine::id_base` is `wall_now() as u64 * 1000`
+    /// on a live run and `0` in bench, and the grammar has to survive both — a
+    /// seed that acquired a `.` or a `-` would break ownership without breaking
+    /// anything a digest can see.
+    #[test]
+    fn the_client_order_id_this_engine_sends_is_recognisable_as_ours() {
+        use arb_venue::gateway::is_ours;
+        let mut parked = HashMap::new();
+        let acts = intent_actions(&intent(LIVE_REPRICE), true, &HashMap::new(), &mut parked, t0());
+        let Action::Place(p) = acts.iter().find(|a| matches!(a, Action::Place(_))).unwrap() else {
+            unreachable!()
+        };
+        assert_eq!(p.client_order_id, "m1785257819053", "the engine's own id rides along");
+        assert!(is_ours(&p.client_order_id), "the sweep must be able to claim it");
+
+        // every counter, on both seeds: bench (0) and a live wall-clock base.
+        //
+        // `m` is pinned end to end above and `h` is pinned by
+        // `hedge::…::a_retry_mints_a_new_attempt_under_the_same_chain_id`, which
+        // asserts on an id the engine minted. `t` is NOT: firing take-take needs
+        // books, a registry and a marks bar, so its format is only covered here,
+        // by construction rather than by exercise. Named, not papered over.
+        let live = arb_core::clock::now_s() as u64 * 1000;
+        for base in [0u64, live] {
+            for id in [format!("m{}", base + 1), format!("h{base}"), format!("t{}", base + 42)] {
+                assert!(is_ours(&id), "{id} must be sweepable");
+            }
+        }
+    }
+
     /// ...and the cancel names the order being REPLACED, never the new one.
     #[test]
     fn the_reprice_cancel_names_the_old_order_not_the_new_one() {

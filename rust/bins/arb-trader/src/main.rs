@@ -81,6 +81,9 @@ struct Args {
     /// Run the startup sweep against the live venues and EXIT, without ever
     /// quoting. The safe way to exercise the reconciliation path.
     sweep_only: bool,
+    /// Restore the pre-2026-07-29 account-wide sweep when ownership cannot be
+    /// determined. Loud, off by default — see `KalshiGateway::with_unscoped_sweep`.
+    sweep_unscoped: bool,
     /// Credential suffixes for the order path (`--cred-suffix pmus=rs_trader`).
     cred_suffix: Vec<(String, String)>,
     /// Append-only trade ledger; open baskets seed the risk view's exposure.
@@ -187,6 +190,7 @@ fn default_args() -> Args {
         enable_orders: false,
         confirm_live: false,
         sweep_only: false,
+        sweep_unscoped: false,
         cred_suffix: Vec::new(),
         ledger: "data/exec/trades.jsonl".into(),
         hedge_retry_s: 5.0,
@@ -233,6 +237,7 @@ fn parse_args() -> Args {
                 a.enable_orders = true;
                 a.sweep_only = true;
             }
+            "--sweep-unscoped" => a.sweep_unscoped = true,
             "--cred-suffix" => {
                 let kv = it.next().expect("--cred-suffix venue=suffix");
                 let (v, sfx) = kv.split_once('=').expect("--cred-suffix wants venue=suffix");
@@ -438,7 +443,7 @@ fn cancel_preconditions(
     let suffix = |v: &str| {
         args.cred_suffix.iter().find(|(k, _)| k == v).map(|(_, s)| s.clone())
     };
-    match build_kalshi_sink(suffix("kalshi").as_deref()) {
+    match build_kalshi_sink(suffix("kalshi").as_deref(), args.sweep_unscoped) {
         Ok(s) => {
             sinks.insert(Venue::Kalshi, s);
         }
@@ -568,7 +573,7 @@ fn spawn_shutdown_sweep() {
 /// A pure function so it can be tested without credentials — proving the banner
 /// says "PRIMARY" when no suffix was given is the whole point, and doing it for
 /// real would mean a live venue call.
-fn sweep_only_blast_radius(cred_suffix: &[(String, String)]) -> Vec<String> {
+fn sweep_only_blast_radius(cred_suffix: &[(String, String)], unscoped: bool) -> Vec<String> {
     let ident = |keys: &[&str]| {
         cred_suffix
             .iter()
@@ -576,12 +581,26 @@ fn sweep_only_blast_radius(cred_suffix: &[(String, String)]) -> Vec<String> {
             .map(|(_, s)| format!("suffix `{s}`"))
             .unwrap_or_else(|| "PRIMARY key — SHARED WITH THE PYTHON STACK".into())
     };
-    vec![
-        "[exec] --sweep-only CANCELS EVERY RESTING ORDER ON THE WHOLE ACCOUNT,".into(),
-        "[exec]   not just the ones this process placed. Keys in use:".into(),
+    let kalshi_scope = if unscoped {
+        vec![
+            "[exec]     --sweep-unscoped IS SET: THE WHOLE ACCOUNT, including every".into(),
+            "[exec]     order another workstream placed under this key.".into(),
+        ]
+    } else {
+        vec![
+            "[exec]     scoped to ids THIS STACK minted (m…/h…/t…/rehearse-…/sweep-…);".into(),
+            "[exec]     another workstream's orders under this key are LEFT RESTING.".into(),
+        ]
+    };
+    let mut out = vec![
+        "[exec] --sweep-only DESTROYS REAL RESTING ORDERS. Keys in use:".into(),
         format!("[exec]   kalshi        -> {}", ident(&["kalshi"])),
-        format!("[exec]   polymarket_us -> {}", ident(&["pmus", "polymarket_us"])),
-    ]
+    ];
+    out.extend(kalshi_scope);
+    out.push(format!("[exec]   polymarket_us -> {}", ident(&["pmus", "polymarket_us"])));
+    out.push("[exec]     THE WHOLE ACCOUNT — PM-US carries no id of ours to scope by,".into());
+    out.push("[exec]     so this cancels orders this stack never placed.".into());
+    out
 }
 
 /// Cancel every resting order on every armed venue, then PROVE the book is
@@ -604,15 +623,26 @@ fn sweep_only_blast_radius(cred_suffix: &[(String, String)]) -> Vec<String> {
 ///
 /// The pre-read survives only as a log line for the human, and is now
 /// best-effort: an unreadable list is a reason to sweep, not a reason to stop.
+/// `Ok(unconfirmed)` — the venues that swept without proving. Empty is the
+/// normal answer; anything in it means the caller armed over a book no venue
+/// could confirm, and every caller has to say so rather than print "clean".
 async fn startup_sweep(
     sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
     pol: &sink::SweepPolicy,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
+    let mut unconfirmed: Vec<String> = Vec::new();
     for (venue, sink) in sinks {
         let s = sink.clone();
         match tokio::task::spawn_blocking(move || s.resting_order_ids()).await {
             Ok(Ok(before)) if before.is_empty() => {
-                eprintln!("[exec] {venue:?}: nothing resting (unconfirmed) — sweeping anyway");
+                // NOT the word "unconfirmed": that is the verdict line below,
+                // and this one fires on every single start. A `grep -i
+                // unconfirmed` that matches the boring line twice a start is
+                // exactly how the grave one gets trained away.
+                eprintln!(
+                    "[exec] {venue:?}: pre-read shows nothing resting (one read, not \
+                     evidence) — sweeping anyway"
+                );
             }
             Ok(Ok(before)) => {
                 eprintln!("[exec] {venue:?}: CANCELLING {} resting order(s): {}", before.len(),
@@ -622,12 +652,38 @@ async fn startup_sweep(
                                      sweeping blind, the sweep is the authority"),
             Err(e) => eprintln!("[exec] {venue:?}: list task panicked ({e}) — sweeping anyway"),
         }
-        sink::cancel_all_and_verify_with(sink.clone(), pol.clone())
-            .await
-            .map_err(|e| format!("{venue:?}: {e}"))?;
-        eprintln!("[exec] {venue:?}: book is clean");
+        match sink::cancel_all_and_verify_with(sink.clone(), pol.clone()).await {
+            Ok(()) => eprintln!("[exec] {venue:?}: book is clean"),
+            // The cancel-all went in and NOTHING was ever observed resting — we
+            // just could not read the confirmation. Arm, loudly.
+            //
+            // Refusing here would be fail-closed on a premise nobody has
+            // verified: no capture in this repo shows what PM-US returns for an
+            // EMPTY book, so if that shape is one `open_orders` cannot parse,
+            // this refusal would be permanent and the engine could never start
+            // again — an outage manufactured out of an empty book. Fail-closed
+            // is earned where the premise is checked (Kalshi's tag echo is, and
+            // its failure comes back through `cancel_all_open`, so it still
+            // refuses below); it is not earned here.
+            Err(e) if e.is_only_unconfirmed() => {
+                // `###`, the same mechanism `ShutdownOutcome::report` reserves
+                // for a non-zero exit. "Loud" in wording alone is not loud
+                // against a journal whose 60s cadence is a 2 KB JSON blob.
+                eprintln!("[exec] ###########################################################");
+                eprintln!("[exec] ### ARMING ON A BOOK NO VENUE COULD CONFIRM            ###");
+                eprintln!("[exec] ###########################################################");
+                eprintln!("[exec] ### {venue:?}: {e}");
+                eprintln!(
+                    "[exec] ###   cancel-all was ACCEPTED and nothing was seen resting, but \
+                     the resting list could not be READ. The body above is a response shape \
+                     this repo has never captured — PIN IT and tighten the check."
+                );
+                unconfirmed.push(format!("{venue:?}: {e}"));
+            }
+            Err(e) => return Err(format!("{venue:?}: {e}")),
+        }
     }
-    Ok(())
+    Ok(unconfirmed)
 }
 
 fn credential(name: &str) -> Result<String, String> {
@@ -642,6 +698,7 @@ fn credential(name: &str) -> Result<String, String> {
 
 fn build_kalshi_sink(
     suffix: Option<&str>,
+    unscoped_sweep: bool,
 ) -> Result<std::sync::Arc<dyn sink::OrderSink>, String> {
     let (id, pem) = match suffix {
         Some(s) => (format!("kalshi_{s}_api_key_id"), format!("kalshi_{s}_private_key.pem")),
@@ -652,11 +709,14 @@ fn build_kalshi_sink(
     let transport =
         arb_venue::transport::HttpTransport::new("https://api.elections.kalshi.com/trade-api/v2", 15)
             .map_err(|e| e.to_string())?;
-    Ok(std::sync::Arc::new(arb_venue::gateway::KalshiGateway::with_transport(
-        signer,
-        arb_venue::ratelimit::RateLimiter::from_per_minute(60.0, 0),
-        transport,
-    )))
+    Ok(std::sync::Arc::new(
+        arb_venue::gateway::KalshiGateway::with_transport(
+            signer,
+            arb_venue::ratelimit::RateLimiter::from_per_minute(60.0, 0),
+            transport,
+        )
+        .with_unscoped_sweep(unscoped_sweep),
+    ))
 }
 
 fn build_pmus_sink(
@@ -1176,12 +1236,14 @@ fn arm_venues(args: &Args, bench: bool) -> HashMap<Venue, std::sync::Arc<dyn sin
     if args.sweep_only {
         // BLAST RADIUS, said out loud, and said BEFORE the preconditions are
         // even checked so it is on screen whether or not the run proceeds.
-        // `cancel_all_open` is account-wide — not per-relationship and not
-        // per-process — so with no `--cred-suffix` this is the PRIMARY key and it
-        // cancels the Python stack's resting orders too. Clearing the 15:40
-        // orphan was run exactly that way; it happened to find one order, which
-        // was luck, not safety.
-        for l in sweep_only_blast_radius(&args.cred_suffix) {
+        //
+        // Kalshi's `cancel_all_open` is scoped to ids this stack minted, so it
+        // no longer cancels the Python stack's resting orders — but PM-US's
+        // still cancels its whole account (no client-order-id on the wire), and
+        // `--sweep-unscoped` puts Kalshi back that way on purpose. Neither is
+        // per-relationship. Clearing the 15:40 orphan was run account-wide; it
+        // happened to find one order, which was luck, not safety.
+        for l in sweep_only_blast_radius(&args.cred_suffix, args.sweep_unscoped) {
             eprintln!("{l}");
         }
     }
@@ -1387,14 +1449,34 @@ async fn main() {
         // SIGTERM did, and only after the engine was already quoting.
         exec::register_sinks(sinks.clone());
         exec::install_armed_panic_hook();
-        if let Err(e) = startup_sweep(&sinks, &sink::SweepPolicy::default()).await {
-            eprintln!("[exec] STARTUP SWEEP FAILED: {e}");
-            eprintln!("[exec] refusing to arm: the book could not be proven clean");
-            std::process::exit(10);
-        }
+        let unconfirmed = match startup_sweep(&sinks, &sink::SweepPolicy::default()).await {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("[exec] STARTUP SWEEP FAILED: {e}");
+                eprintln!("[exec] refusing to arm: the book could not be proven clean");
+                std::process::exit(10);
+            }
+        };
         if args.sweep_only {
-            eprintln!("[exec] --sweep-only: book reconciled, exiting without quoting");
-            return;
+            // The verdict, not just the fact that we finished. This is the tool
+            // the halt banner tells a human to reach for, so "reconciled" over
+            // a book no venue could confirm — and an exit 0 with it — is the
+            // one answer it must never give.
+            if unconfirmed.is_empty() {
+                eprintln!("[exec] --sweep-only: book reconciled, exiting without quoting");
+                return;
+            }
+            eprintln!(
+                "[exec] ### --sweep-only: the cancel went in, but {} venue(s) could NOT \
+                 CONFIRM the book: {}",
+                unconfirmed.len(),
+                unconfirmed.join("; ")
+            );
+            eprintln!(
+                "[exec] ### exiting {} — nothing was seen resting, and nothing is proven",
+                exec::EXIT_BOOK_UNCONFIRMED
+            );
+            std::process::exit(exec::EXIT_BOOK_UNCONFIRMED);
         }
         spawn_shutdown_sweep();
         spawn_fill_feeds(&args, tx_acks.as_ref());
@@ -1693,6 +1775,92 @@ mod sweep_tests {
         assert!(err.contains("SURVIVED"), "{err}");
         assert!(err.contains('b'), "names what is left: {err}");
     }
+
+    /// A resting list this process cannot READ must not be able to stop it
+    /// starting, when the cancel-all itself was accepted and nothing was ever
+    /// seen resting.
+    ///
+    /// This is the second blocking review finding. Nobody has captured what
+    /// PM-US returns for an EMPTY book; if that shape is one `open_orders`
+    /// cannot parse, a fail-closed proof would refuse to arm on every start and
+    /// exit 17 on every shutdown, permanently, over an empty book. Absence of
+    /// evidence is not evidence of a leak — so it arms, and the raw body goes
+    /// in the log so the shape finally gets captured.
+    #[tokio::test]
+    async fn an_unreadable_resting_list_arms_loudly_instead_of_refusing() {
+        struct Unreadable {
+            cancelled: std::sync::Mutex<bool>,
+        }
+        impl sink::OrderSink for Unreadable {
+            fn place(&self, _r: &PlaceRequest) -> Result<String, VenueError> {
+                unreachable!("a sweep never places")
+            }
+            fn cancel(&self, _r: &CancelRequest) -> Result<(), VenueError> {
+                unreachable!("a sweep uses cancel_all_open")
+            }
+            fn cancel_all_open(&self) -> Result<(), VenueError> {
+                *self.cancelled.lock().unwrap() = true;
+                Ok(()) // the venue ACCEPTED the cancel
+            }
+            fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+                Err(VenueError::Parse {
+                    endpoint: "pmus:open_orders",
+                    detail: "missing field `orders` — body was: {}".into(),
+                })
+            }
+        }
+        let m = std::sync::Arc::new(Unreadable { cancelled: std::sync::Mutex::new(false) });
+        let mut h: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> = HashMap::new();
+        h.insert(Venue::PolymarketUs, m.clone());
+        let unconfirmed = startup_sweep(&h, &fast())
+            .await
+            .expect("an unread list is not a leak, and must not manufacture an outage");
+        assert!(*m.cancelled.lock().unwrap(), "the cancel-all still went in");
+        // THE RETURNED VALUE, not just the Ok. It is what drives the `###`
+        // banner and, on `--sweep-only`, exit 18 — and this assertion was
+        // missing, so deleting the `unconfirmed.push` left every test green
+        // while `--sweep-only` exited 0 over a book no venue could confirm.
+        assert_eq!(unconfirmed.len(), 1, "the venue must be REPORTED, not just tolerated");
+        assert!(unconfirmed[0].contains("PolymarketUs"), "{unconfirmed:?}");
+        assert!(
+            unconfirmed[0].contains("could NOT be proven clean"),
+            "carries the verdict the banner prints: {unconfirmed:?}"
+        );
+    }
+
+    /// ...and a book that IS proven clean reports nothing, or the banner and
+    /// exit 18 would fire on every ordinary start.
+    #[tokio::test]
+    async fn a_clean_book_reports_nothing_unconfirmed() {
+        let (h, _m) = sinks(&[], &[]);
+        assert!(startup_sweep(&h, &fast()).await.unwrap().is_empty());
+    }
+
+    /// ...but the leniency is exactly that narrow. A cancel-all the venue never
+    /// ACCEPTED means the sweep never got its instruction in, so there is no
+    /// basis to proceed — that stays fail-closed whatever the list said.
+    #[tokio::test]
+    async fn a_cancel_all_the_venue_refused_still_refuses_to_arm() {
+        struct RefusesBoth;
+        impl sink::OrderSink for RefusesBoth {
+            fn place(&self, _r: &PlaceRequest) -> Result<String, VenueError> {
+                unreachable!()
+            }
+            fn cancel(&self, _r: &CancelRequest) -> Result<(), VenueError> {
+                unreachable!()
+            }
+            fn cancel_all_open(&self) -> Result<(), VenueError> {
+                Err(VenueError::Transport("429".into()))
+            }
+            fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+                Err(VenueError::Transport("503".into()))
+            }
+        }
+        let mut h: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> = HashMap::new();
+        h.insert(Venue::Kalshi, std::sync::Arc::new(RefusesBoth));
+        let err = startup_sweep(&h, &fast()).await.unwrap_err();
+        assert!(err.contains("could NOT be proven clean"), "{err}");
+    }
 }
 
 /// The cancel path must be the easiest thing in this binary to run. On
@@ -1741,7 +1909,7 @@ mod precondition_tests {
     /// so nothing was lost, but the command said nothing about the risk.
     #[test]
     fn sweep_only_names_the_key_it_will_cancel_under() {
-        let none = sweep_only_blast_radius(&[]).join("\n");
+        let none = sweep_only_blast_radius(&[], false).join("\n");
         assert!(none.contains("WHOLE ACCOUNT"), "{none}");
         assert_eq!(
             none.matches("PRIMARY key").count(),
@@ -1749,17 +1917,31 @@ mod precondition_tests {
             "both venues warn when no suffix is given: {none}"
         );
         assert!(none.contains("SHARED WITH THE PYTHON STACK"), "{none}");
+        // ...and WHICH venue is the wide one, now that Kalshi's sweep is scoped
+        // to ids this stack minted and PM-US's still cannot be.
+        let (k, p) = none.split_once("polymarket_us").expect("{none}");
+        assert!(!k.contains("WHOLE ACCOUNT"), "kalshi is scoped now: {k}");
+        assert!(p.contains("WHOLE ACCOUNT"), "PM-US has no id of ours to scope by: {p}");
 
-        let both = sweep_only_blast_radius(&[
-            ("kalshi".into(), "rs_trader".into()),
-            ("pmus".into(), "rs_trader".into()),
-        ])
+        // ...and the override moves Kalshi back, which the banner MUST say: the
+        // flag exists to re-arm the shared-account risk, so a run that is about
+        // to take it has to see that on screen.
+        let un = sweep_only_blast_radius(&[], true).join("\n");
+        let (uk, _) = un.split_once("polymarket_us").expect("{un}");
+        assert!(uk.contains("--sweep-unscoped IS SET"), "{uk}");
+        assert!(uk.contains("WHOLE ACCOUNT"), "the wider radius must be stated: {uk}");
+
+        let both = sweep_only_blast_radius(
+            &[("kalshi".into(), "rs_trader".into()), ("pmus".into(), "rs_trader".into())],
+            false,
+        )
         .join("\n");
         assert!(!both.contains("PRIMARY key"), "a suffixed run is scoped: {both}");
         assert_eq!(both.matches("suffix `rs_trader`").count(), 2);
 
         // The real trap: a pmus suffix given, kalshi forgotten.
-        let half = sweep_only_blast_radius(&[("pmus".into(), "rs_trader".into())]).join("\n");
+        let half =
+            sweep_only_blast_radius(&[("pmus".into(), "rs_trader".into())], false).join("\n");
         assert!(half.contains("kalshi        -> PRIMARY key"), "{half}");
         assert!(half.contains("polymarket_us -> suffix `rs_trader`"), "{half}");
     }

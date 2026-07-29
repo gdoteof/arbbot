@@ -64,6 +64,54 @@ impl Default for SweepPolicy {
     }
 }
 
+/// Why a sweep could not prove the book clean — and, crucially, WHICH of the two
+/// very different reasons it was.
+///
+/// These were one `String`, and a caller could only act on both alike. That is
+/// safe only while every "cannot prove" is equally serious, and it is not:
+///
+///   * `orders_seen` — the venue's own list showed orders STILL RESTING after
+///     the cancel-alls. There is a leak and it has ids. Refuse everything.
+///   * neither — every cancel-all was accepted and nothing was ever OBSERVED
+///     resting; we simply could not read the confirmation. That is an absence
+///     of evidence, not evidence of a leak.
+///
+/// The distinction exists because a fail-closed gate is only safe on a premise
+/// somebody has verified. Nobody has captured what PM-US sends on an EMPTY book:
+/// if it is a shape `open_orders` cannot read, requiring proof would refuse to
+/// arm and fail every shutdown, for ever, over an empty book — a self-inflicted
+/// outage on a response nobody has seen. So the unread case fails OPEN and
+/// LOUDLY, carrying the raw body, and the observed-leak case stays fail-closed.
+#[derive(Debug, Clone)]
+pub struct Unproven {
+    pub msg: String,
+    /// Orders were positively OBSERVED still resting. Not "unproven" — leaked.
+    /// Latches: an order seen once is never unseen, which is fail-CLOSED.
+    pub orders_seen: bool,
+    /// Whether the MOST RECENT cancel-all was accepted by the venue — not
+    /// whether any ever was. False means the last thing this sweep did to the
+    /// venue failed, which is fail-closed on any premise.
+    ///
+    /// "At least one" is what this said, and it was wrong in the one direction
+    /// that matters: a latch here latches fail-OPEN. See the assignment in
+    /// `cancel_all_and_verify_blocking` for the trace.
+    pub cancel_accepted: bool,
+}
+
+impl std::fmt::Display for Unproven {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.msg)
+    }
+}
+
+impl Unproven {
+    /// May a caller proceed on this? Only when nothing was seen resting AND the
+    /// cancel actually went in.
+    pub fn is_only_unconfirmed(&self) -> bool {
+        !self.orders_seen && self.cancel_accepted
+    }
+}
+
 /// Cancel everything resting on a venue and PROVE it is gone — blocking, so the
 /// abnormal-exit paths (panic hook, WAL crash-stop) can run it without a tokio
 /// runtime of their own.
@@ -94,8 +142,9 @@ impl Default for SweepPolicy {
 pub fn cancel_all_and_verify_blocking(
     sink: &dyn OrderSink,
     pol: &SweepPolicy,
-) -> Result<(), String> {
+) -> Result<(), Unproven> {
     let t0 = std::time::Instant::now();
+    let mut cancel_accepted = false;
     let mut left: Vec<String> = Vec::new();
     let mut last_err: Option<String> = None;
     let mut rounds_done = 0u32;
@@ -113,9 +162,25 @@ pub fn cancel_all_and_verify_blocking(
             break;
         }
         rounds_done += 1;
+        // The state of the LAST cancel-all, not a latch. `left` latching is
+        // right — it latches fail-CLOSED, so an order seen once is never
+        // unseen — and this is the same shape pointing the other way.
+        //
+        // Latched, round 1 succeeding was enough to make the whole sweep
+        // `is_only_unconfirmed()` for ever. That is the `rounds > 1` incident
+        // itself: round 1 walks the whole list and cancels cleanly, a queued
+        // place lands at the venue a moment later, rounds 2-4 are cut short by
+        // an unreadable continuation page and so cancel only the pages they
+        // reached, and the late arrival sits on a page nobody read. Every
+        // resting-list read errors, so `left` stays empty and `orders_seen`
+        // stays false — and a real resting order came out as "the cancel went
+        // in, nothing was seen resting".
         match sink.cancel_all_open() {
-            Ok(()) => {}
-            Err(e) => last_err = Some(format!("cancel_all_open: {e}")),
+            Ok(()) => cancel_accepted = true,
+            Err(e) => {
+                cancel_accepted = false;
+                last_err = Some(format!("cancel_all_open: {e}"));
+            }
         }
         for _ in 0..pol.polls_per_round.max(1) {
             if !pol.poll_delay.is_zero() {
@@ -165,14 +230,14 @@ pub fn cancel_all_and_verify_blocking(
     if let Some(e) = last_err {
         msg.push_str(&format!(" (last venue error: {e})"));
     }
-    Err(msg)
+    Err(Unproven { msg, orders_seen: !left.is_empty(), cancel_accepted })
 }
 
 /// The async face of [`cancel_all_and_verify_blocking`] with the default policy.
 /// Signature unchanged: the engine's kill path and the startup sweep call this.
 pub async fn cancel_all_and_verify(
     sink: std::sync::Arc<dyn OrderSink>,
-) -> Result<(), String> {
+) -> Result<(), Unproven> {
     cancel_all_and_verify_with(sink, SweepPolicy::default()).await
 }
 
@@ -181,13 +246,18 @@ pub async fn cancel_all_and_verify(
 pub async fn cancel_all_and_verify_with(
     sink: std::sync::Arc<dyn OrderSink>,
     pol: SweepPolicy,
-) -> Result<(), String> {
+) -> Result<(), Unproven> {
     // The whole sweep, sleeps included, runs on ONE blocking thread rather than
     // hopping back to the runtime between polls: the gateways are blocking, and
     // a tokio worker must never be the thread that waits on a venue.
     tokio::task::spawn_blocking(move || cancel_all_and_verify_blocking(sink.as_ref(), &pol))
         .await
-        .map_err(|e| format!("sweep task panicked: {e}"))?
+        .map_err(|e| Unproven {
+            msg: format!("sweep task panicked: {e}"),
+            orders_seen: false,
+            // A panicked sweep proves nothing about whether the cancel landed.
+            cancel_accepted: false,
+        })?
 }
 
 /// What an executor may do to a venue. Deliberately only two verbs: the engine
@@ -363,7 +433,7 @@ mod sweep_tests {
         };
         let err = cancel_all_and_verify_blocking(&s, &fast())
             .expect_err("one empty read while an order is resting is NOT clean");
-        assert!(err.contains("66e1c799"), "it found the order the lag hid: {err}");
+        assert!(err.msg.contains("66e1c799"), "it found the order the lag hid: {err}");
         assert!(*s.reads.lock().unwrap() > 1, "it looked more than once");
         assert!(*s.cancels.lock().unwrap() > 1, "and re-cancelled once it saw it");
     }
@@ -413,7 +483,7 @@ mod sweep_tests {
         }
         let err = cancel_all_and_verify_blocking(&Alternating { n: Mutex::new(0) }, &fast())
             .expect_err("an error between two empties breaks the run");
-        assert!(err.contains("could NOT be proven clean"), "{err}");
+        assert!(err.msg.contains("could NOT be proven clean"), "{err}");
     }
 
     /// THE 15:40 leak, in one test. A queued place lands one second into the
@@ -436,8 +506,8 @@ mod sweep_tests {
         let s = Scripted::new(&["m1"], &[&["m1"], &["m1"], &["m1"], &["m1"], &["m1"]]);
         let pol = fast();
         let err = cancel_all_and_verify_blocking(s.as_ref(), &pol).unwrap_err();
-        assert!(err.contains("SURVIVED"), "{err}");
-        assert!(err.contains("m1"), "names the order left behind: {err}");
+        assert!(err.msg.contains("SURVIVED"), "{err}");
+        assert!(err.msg.contains("m1"), "names the order left behind: {err}");
         assert_eq!(s.cancels(), pol.rounds as usize, "it tried every round it was given");
     }
 
@@ -459,8 +529,8 @@ mod sweep_tests {
         let s = Scripted::new(&[], &[]);
         *s.list_errs.lock().unwrap() = 1000;
         let err = cancel_all_and_verify_blocking(s.as_ref(), &fast()).unwrap_err();
-        assert!(err.contains("could NOT be proven clean"), "{err}");
-        assert!(err.contains("503"), "carries the venue's own error: {err}");
+        assert!(err.msg.contains("could NOT be proven clean"), "{err}");
+        assert!(err.msg.contains("503"), "carries the venue's own error: {err}");
     }
 
     /// An already-empty book is proven inside the first round and costs one
@@ -470,6 +540,95 @@ mod sweep_tests {
         let s = Scripted::new(&[], &[]);
         cancel_all_and_verify_blocking(s.as_ref(), &fast()).unwrap();
         assert_eq!(s.cancels(), 1, "confirmation costs a poll, not a second cancel-all");
+    }
+
+    /// The two "cannot prove" outcomes are distinguishable, because callers act
+    /// on them completely differently: one arms and one refuses.
+    #[test]
+    fn an_unread_list_is_distinguishable_from_an_observed_leak() {
+        // observed leak: ids came back, repeatedly
+        let s = Scripted::new(&["m1"], &[&["m1"], &["m1"], &["m1"], &["m1"], &["m1"]]);
+        let e = cancel_all_and_verify_blocking(s.as_ref(), &fast()).unwrap_err();
+        assert!(e.orders_seen, "orders were SEEN resting");
+        assert!(!e.is_only_unconfirmed(), "a leak must never read as merely unconfirmed");
+
+        // unread list, cancel accepted: nothing was ever observed resting
+        let s = Scripted::new(&[], &[]);
+        *s.list_errs.lock().unwrap() = 1000;
+        let e = cancel_all_and_verify_blocking(s.as_ref(), &fast()).unwrap_err();
+        assert!(!e.orders_seen, "nothing was ever seen");
+        assert!(e.cancel_accepted, "the venue took the cancel");
+        assert!(e.is_only_unconfirmed(), "absence of evidence, not evidence of a leak");
+        assert!(e.msg.contains("could NOT be proven clean"), "{}", e.msg);
+    }
+
+    /// **A cancel-all that worked ONCE does not make the sweep unconfirmed.**
+    ///
+    /// The latch bug, in the incident `rounds > 1` exists for. Round 1 walks the
+    /// whole list and cancels cleanly; a queued place lands at the venue a
+    /// moment later; rounds 2-4 are cut short and cancel only the pages they
+    /// reached; every resting-list read errors, so nothing is ever OBSERVED.
+    ///
+    /// With `cancel_accepted` latched from round 1 this came out
+    /// `is_only_unconfirmed()` — so the halt exited 18 and printed
+    /// "the cancel went in, nothing was seen resting" over a book with a real
+    /// order on an unread page, and a start would have armed on top of it.
+    #[test]
+    fn a_cancel_all_that_worked_once_does_not_make_a_later_failure_unconfirmed() {
+        struct FirstRoundOnly {
+            rounds: Mutex<u32>,
+        }
+        impl OrderSink for FirstRoundOnly {
+            fn place(&self, _r: &PlaceRequest) -> Result<String, VenueError> {
+                unreachable!()
+            }
+            fn cancel(&self, _r: &CancelRequest) -> Result<(), VenueError> {
+                unreachable!()
+            }
+            fn cancel_all_open(&self) -> Result<(), VenueError> {
+                let mut n = self.rounds.lock().unwrap();
+                *n += 1;
+                if *n == 1 {
+                    return Ok(()); // the full walk, everything cancelled
+                }
+                // ...and from here every walk is cut short by an unreadable
+                // continuation page, so only pages 1..k were cancelled.
+                Err(VenueError::Parse {
+                    endpoint: "kalshi:orders",
+                    detail: "the cursor walk stopped at a page that could not be read".into(),
+                })
+            }
+            fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+                Err(VenueError::Parse {
+                    endpoint: "kalshi:orders",
+                    detail: "the cursor walk stopped at a page that could not be read".into(),
+                })
+            }
+        }
+        let s = FirstRoundOnly { rounds: Mutex::new(0) };
+        let e = cancel_all_and_verify_blocking(&s, &fast()).unwrap_err();
+        assert!(*s.rounds.lock().unwrap() > 1, "the sweep really did re-issue the cancel");
+        assert!(!e.orders_seen, "nothing was ever observed — that half is honest");
+        assert!(
+            !e.cancel_accepted,
+            "the LAST cancel-all failed; round 1's success must not still be speaking"
+        );
+        assert!(
+            !e.is_only_unconfirmed(),
+            "a late arrival on a page nobody read is not a book we merely could not confirm"
+        );
+    }
+
+    /// A cancel-all the venue never accepted is fail-closed on any premise —
+    /// the sweep never even got its instruction in.
+    #[test]
+    fn a_sweep_whose_cancel_never_landed_is_not_merely_unconfirmed() {
+        let mut s = Scripted::new(&[], &[]);
+        std::sync::Arc::get_mut(&mut s).unwrap().cancel_errs = vec![true; 8];
+        *s.list_errs.lock().unwrap() = 1000;
+        let e = cancel_all_and_verify_blocking(s.as_ref(), &fast()).unwrap_err();
+        assert!(!e.cancel_accepted);
+        assert!(!e.is_only_unconfirmed(), "nothing was cancelled — nothing may proceed");
     }
 
     /// The wall-clock ceiling holds even when the rounds have not run out — a
@@ -487,7 +646,7 @@ mod sweep_tests {
         let t0 = std::time::Instant::now();
         let err = cancel_all_and_verify_blocking(s.as_ref(), &pol).unwrap_err();
         assert!(t0.elapsed() < std::time::Duration::from_secs(3), "took {:?}", t0.elapsed());
-        assert!(err.contains("gave up at the"), "{err}");
+        assert!(err.msg.contains("gave up at the"), "{err}");
         assert!(s.cancels() < 1000, "it stopped short of the round limit");
     }
 }
@@ -606,6 +765,86 @@ mod tests {
         let sent = gw.transport.sent.lock().unwrap();
         assert_eq!(sent[0].0, "DELETE");
         assert_eq!(sent[0].1, "/trade-api/v2/portfolio/events/orders/srv-1");
+    }
+
+    /// The whole chain, end to end: a venue answering 200 with a body that has
+    /// no `orders` key must come out of the sweep as UNPROVEN.
+    ///
+    /// `sweep_tests` above proves the loop refuses to let a read ERROR stand in
+    /// for a confirmation. This proves the venue layer actually hands it one —
+    /// which, until `KalshiOrdersPage::orders` became required, it did not: the
+    /// body deserialized to an empty page, `cancel_all_open` cancelled nothing
+    /// and returned `Ok(())`, both confirming reads came back empty, and this
+    /// call returned `Ok(())`. That `Ok` is what `exec::ShutdownOutcome` prints
+    /// as "book PROVEN clean at exit" before exiting 0.
+    #[test]
+    fn a_book_the_venue_never_showed_us_is_not_proven_clean() {
+        let mock = Mock {
+            // one cancel-all round + one confirming poll, both list reads
+            replies: Mutex::new(vec![
+                (200, r#"{"error":"internal"}"#.to_string()),
+                (200, r#"{"error":"internal"}"#.to_string()),
+            ]),
+            sent: Mutex::new(Vec::new()),
+        };
+        let gw = KalshiGateway::with_transport(
+            signer(),
+            RateLimiter::from_per_minute(600.0, 0),
+            mock,
+        );
+        let pol = SweepPolicy {
+            rounds: 1,
+            polls_per_round: 1,
+            poll_delay: std::time::Duration::ZERO,
+            ..SweepPolicy::default()
+        };
+        let err = cancel_all_and_verify_blocking(&gw, &pol)
+            .expect_err("a book we never read is not a clean book");
+        assert!(err.msg.contains("could NOT be proven clean"), "{err}");
+        assert!(err.msg.contains("missing required field `orders`"), "names the cause: {err}");
+    }
+
+    /// THE SWEEP-LEVEL VERDICT on a truncated cursor walk — where the bug was.
+    ///
+    /// The gateway halves were each pinned separately and neither was wrong:
+    /// the proof refused, and the cancel went out. What nothing pinned was what
+    /// `cancel_all_and_verify_blocking` CONCLUDES from that pair. While
+    /// `cancel_all_open` returned `Ok(())` on a cut-short walk it set
+    /// `cancel_accepted`, every proof read then errored so `orders_seen` stayed
+    /// false, and the whole failure came out `is_only_unconfirmed()` — which
+    /// ARMS. An order resting on page 3 would have been cancelled by nothing,
+    /// observed by nothing, and armed on top of.
+    #[test]
+    fn a_truncated_cursor_walk_does_not_come_out_as_merely_unconfirmed() {
+        // page 1 parses and carries a tag (so the premise holds); page 2 is a
+        // 200 whose body cannot be read. Repeated for every round.
+        let p1 = r#"{"orders":[{"order_id":"o-1","status":"canceled","client_order_id":"m1"}],"cursor":"CUR"}"#;
+        let p2 = r#"{"cursor":""}"#;
+        let mut replies = Vec::new();
+        for _ in 0..40 {
+            replies.push((200, p1.to_string()));
+            replies.push((200, p2.to_string()));
+        }
+        let gw = KalshiGateway::with_transport(
+            signer(),
+            RateLimiter::from_per_minute(600.0, 0),
+            Mock { replies: Mutex::new(replies), sent: Mutex::new(Vec::new()) },
+        );
+        let pol = SweepPolicy {
+            poll_delay: std::time::Duration::ZERO,
+            ..SweepPolicy::default()
+        };
+        let e = cancel_all_and_verify_blocking(&gw, &pol)
+            .expect_err("a walk that never finished cannot prove a book clean");
+        assert!(
+            !e.cancel_accepted,
+            "a cancel over a list we could not finish reading is not an accepted cancel"
+        );
+        assert!(
+            !e.is_only_unconfirmed(),
+            "this must NOT arm: pages we never read could hold our resting orders"
+        );
+        assert!(e.msg.contains("cursor walk stopped"), "{}", e.msg);
     }
 
     /// A venue rejection surfaces as an error rather than being counted as a
