@@ -12,6 +12,19 @@ pub enum Priority {
     Background,
 }
 
+impl Priority {
+    /// The wire/log spelling, as carried by
+    /// [`VenueError::RateLimited`](crate::error::VenueError::RateLimited). It
+    /// belongs next to the enum: a second `match` written at the point of use
+    /// is a second place the two names can drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Priority::Critical => "critical",
+            Priority::Background => "background",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TokenBucket {
     capacity: f64,
