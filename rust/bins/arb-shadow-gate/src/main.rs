@@ -629,19 +629,6 @@ fn run(a: &Args) -> Vec<String> {
         a.window_s,
         a.socket.display()
     );
-    // THE VERDICT IS STAKED OUT BEFORE ANY WORK IS DONE. Rust's stdout is
-    // line-buffered even into a pipe, so this line reaches the `tee`'d report
-    // immediately. If it is the LAST `SHADOW GATE:` line in a report, the run
-    // was killed before it decided — systemd's `TimeoutStartSec`, an OOM kill,
-    // a Ctrl-C — and the file is a truncated one, not a passing one.
-    //
-    // Without it a killed run leaves a report with NO verdict line, which is
-    // byte-for-byte the operator signal the three 153-byte `can't open file`
-    // reports gave, and the soak grep in the runbook prints nothing for it —
-    // indistinguishable from "the gate was never installed". That silence is
-    // the defect this whole PR exists to fix; it must not be reachable from
-    // inside the fix.
-    println!("SHADOW GATE: NO VERDICT — this run has not finished");
     let python_universe = if a.do_tape {
         tape_stage(a, &mut fails)
     } else {
@@ -668,7 +655,34 @@ fn run(a: &Args) -> Vec<String> {
     fails
 }
 
+/// Staked out before anything that can exit, and checked by
+/// `tests/verdict_sentinel.rs`.
+const NO_VERDICT: &str = "SHADOW GATE: NO VERDICT — this run has not finished";
+
 fn main() {
+    // THE VERDICT IS STAKED OUT BEFORE ANY WORK IS DONE — including
+    // `parse_args()`, which is why this is the first statement in `main` and
+    // not the first statement in `run`. Rust's stdout is line-buffered even
+    // into a pipe (`std/src/io/stdio.rs` builds a `LineWriter`
+    // unconditionally), so it reaches the `tee`'d report immediately.
+    //
+    // If it is the LAST `SHADOW GATE:` line in a report, the run was killed
+    // before it decided — systemd's `TimeoutStartSec`, an OOM kill, a Ctrl-C —
+    // and the file is a truncated one, not a passing one.
+    //
+    // Without it a killed run leaves a report with NO verdict line, which is
+    // byte-for-byte the operator signal the three 153-byte `can't open file`
+    // reports gave, and the soak grep in the runbook prints nothing for it —
+    // indistinguishable from "the gate was never installed". That silence is
+    // the defect this whole PR exists to fix; it must not be reachable from
+    // inside the fix.
+    //
+    // It used to sit inside `run`, AFTER `parse_args`, and `parse_args` exits 2
+    // on an unknown flag and panics on a flag missing its value. Since the unit
+    // appends (`tee -a`, so a hand-run cannot erase the timer's report), either
+    // exit left the PREVIOUS run's `PASS` standing as the last `SHADOW GATE:`
+    // line in the day's file — a typo'd hand-run made a day look green.
+    println!("{NO_VERDICT}");
     if !run(&parse_args()).is_empty() {
         std::process::exit(1);
     }
