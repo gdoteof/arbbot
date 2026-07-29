@@ -585,7 +585,7 @@ impl Engine {
     /// thing that ever retired the obligation was `try_send` returning true,
     /// which says the executor's channel had room and nothing whatever about
     /// the venue.
-    pub(super) fn on_cancel_result(&mut self, v: &serde_json::Value, t_deq: std::time::Instant) {
+    pub(super) fn on_cancel_result(&mut self, v: &serde_json::Value) {
         let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
         // Ours when the cancel was addressed by our id (an escalation);
         // otherwise the venue's, mapped back through the ack that taught us the
@@ -604,7 +604,6 @@ impl Engine {
         if let Some(oid) = oid {
             on_venue_answer(&mut self.parked_cancels, &oid, attempt, ok);
         }
-        self.decision.record(t_deq.elapsed().as_nanos() as u64);
     }
 }
 
@@ -1110,7 +1109,6 @@ mod cancel_addressing_tests {
         e.on_order_ack(
             &serde_json::json!({"order_id": "m1", "venue_order_id": "BH8H83AY09NG"}),
             1_000_000_000,
-            std::time::Instant::now(),
         );
         e.intents.push(cancel_of("slug", "m1", Venue::PolymarketUs));
         e.drain_intents(Option::<&arb_core::scan::Rel>::None);
