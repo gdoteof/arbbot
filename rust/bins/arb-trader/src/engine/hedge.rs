@@ -173,6 +173,75 @@ pub(super) struct HedgeOrder {
     /// reports are cumulative and arrive over several frames, so only the
     /// increase is credited — the same rule `arb_core::fill` applies to makers.
     pub(super) cum_filled: i64,
+    /// OUR id for the attempt this one supersedes — `None` for the first in a
+    /// chain, which supersedes nothing.
+    ///
+    /// It exists because the retry cannot be trusted to know that attempt is
+    /// dead. A hedge is never in the `FillLedger` (registering one would let
+    /// its own fill mint another hedge), so the fill FEED is the only thing
+    /// that can say an attempt traded — and a Kalshi frame lost while the
+    /// socket was dark is exactly what `kalshi_fill_gaps` counts. With the
+    /// frame gone `filled` stays short, this retry re-places, and BOTH orders
+    /// fill: long against our own short. `hedges_overfilled` does not catch it,
+    /// because the second fill is credited to an obligation the first already
+    /// discharged.
+    ///
+    /// So the executor asks the venue about this id before sending the retry —
+    /// see `sink::prior_attempt`. Kept here rather than on `PendingHedge`
+    /// because the obligation outlives its attempts and this is a fact about
+    /// ONE attempt; `drain_intents` reads it back out by the place's order id.
+    pub(super) supersedes: Option<String>,
+}
+
+/// The attempt a hedge place must reconcile against venue truth before it is
+/// sent: the most recent one in its chain THAT REACHED THE VENUE, with what
+/// this process has already booked against it.
+///
+/// WALKING BACK IS THE WHOLE POINT, and it is not defensive coding. `supersedes`
+/// names the immediately preceding attempt, but that attempt may never have
+/// existed at the venue — the executor withholds a retry whose verification came
+/// back unreadable, `drain_intents` drops a command when the executor channel is
+/// full, and an ack can still be in flight. An attempt with no venue id is
+/// therefore not a hazard (nothing of it is at the venue to have filled unseen)
+/// and not an answer either (the venue cannot be asked about an id it never
+/// issued). The hazard is the one BEFORE it, which is still outstanding.
+///
+/// Stopping at the first link instead is how this fix would reintroduce the
+/// defect one cycle later: h1 fills unseen, h2 is withheld and so never acked,
+/// h3 names h2, h2 resolves to nothing, and h3 goes out unverified on top of h1.
+/// One retry interval bought, then the same double hedge — with
+/// `hedges_overfilled` still reading 0.
+///
+/// It terminates: `supersedes` is set once at mint from the attempt before it,
+/// so the chain is strictly descending and finite. `None` means no attempt in
+/// this chain has a venue id — the lost-ACK case, which is `recover_place`'s to
+/// repair and not this path's to refuse.
+pub(super) fn superseded(
+    hedge_orders: &HashMap<String, HedgeOrder>,
+    oid_venue: &HashMap<String, String>,
+    order_id: &str,
+) -> Option<crate::exec::Superseded> {
+    let mut at = hedge_orders.get(order_id)?.supersedes.clone();
+    while let Some(prior) = at {
+        if let Some(vid) = oid_venue.get(&prior) {
+            return Some(crate::exec::Superseded {
+                venue_order_id: vid.clone(),
+                // What we have ALREADY booked for that attempt. The executor
+                // compares the venue's total against this, never against zero:
+                // an attempt that partially filled and was credited is fully
+                // accounted for, and refusing its remainder's retry would leave
+                // the leg naked for ever.
+                //
+                // 0 if the attempt is somehow not in `hedge_orders`, which is
+                // the fail-CLOSED reading — anything the venue reports then
+                // exceeds it and the retry is withheld. Entries are never
+                // removed from that map, so this should be unreachable.
+                credited: hedge_orders.get(&prior).map_or(0, |h| h.cum_filled),
+            });
+        }
+        at = hedge_orders.get(&prior).and_then(|h| h.supersedes.clone());
+    }
+    None
 }
 
 /// The order side that TAKES `book_side` of the hedge leg's book: taking a bid
@@ -597,6 +666,12 @@ impl Engine {
                     let Some(p) = self.pending_hedges.get_mut(&chain) else { continue };
                     p.tries += 1;
                     p.last_try_at = mono;
+                    // The attempt this one supersedes, captured BEFORE
+                    // `latest_attempt` moves on. Every retry gets a FRESH
+                    // client_order_id, so the venue sees two unrelated orders
+                    // and would happily fill both — its `409
+                    // order_already_exists` cannot save us here.
+                    let supersedes = p.latest_attempt.clone();
                     // This attempt becomes the one whose `order_ack` the
                     // ack-hold waits for, and it gets its own hold line:
                     // a new attempt is a new ack that can go missing.
@@ -612,6 +687,7 @@ impl Engine {
                         price: price.clone(),
                         qty,
                         cum_filled: 0,
+                        supersedes,
                     };
                     self.n_retry += 1;
                     eprintln!(
@@ -1480,6 +1556,7 @@ mod hedge_accounting_tests {
             price: "0.40".into(),
             qty: 10,
             cum_filled: 0,
+            supersedes: None,
         };
         let f1 = hedge_credit(4, 10, 0, Some((10, 0)));
         let f2 = hedge_credit(10, 10, 4, Some((10, 4)));
@@ -1730,6 +1807,25 @@ mod hedge_tick_tests {
         assert_eq!((ho.qty, ho.cum_filled), (5, 0));
         assert_eq!(ho.side, BookSide::Ask, "taking a bid SELLS");
         assert_eq!(e.n_retry, 1);
+        // ...and it records WHICH attempt it supersedes, captured before
+        // `latest_attempt` moved on. That is the id the executor asks the venue
+        // about before this retry is allowed on the wire: h1 is an IOC that may
+        // have filled with its fill frame lost, and re-placing over it is how
+        // one 5-lot hedge becomes 10 — long against our own short, with
+        // `hedges_overfilled` still reading 0 because the second fill is
+        // credited to an obligation the first already discharged.
+        assert_eq!(
+            ho.supersedes.as_deref(),
+            Some("h1"),
+            "the retry must name the attempt whose fate is unknown"
+        );
+        // A THIRD attempt supersedes the second, not the first: each attempt is
+        // verified before the next goes out, so the chain stays covered.
+        e.apply_hedge_plans(
+            vec![("h1".into(), HedgePlan::Retry { qty: 5, price: "0.40".into() }, None)],
+            after(t, 12.0),
+        );
+        assert_eq!(e.hedge_orders["h3"].supersedes.as_deref(), Some("h2"));
 
         // ...and a Retire really retires, while leaving the attempts behind
         e.apply_hedge_plans(vec![("h1".into(), HedgePlan::Retire, None)], mono);
@@ -1738,6 +1834,79 @@ mod hedge_tick_tests {
             e.hedge_orders.contains_key("h2"),
             "a late frame on a retired obligation's attempt must stay recognisable"
         );
+    }
+
+    /// THE ONE-CYCLE-LATER DEFECT. A retry the executor WITHHELD never reached
+    /// the venue, so it never gets an ack and never enters `oid_venue` — and the
+    /// next retry must therefore verify the attempt BEFORE it, not that one.
+    ///
+    /// `latest_attempt` advances the moment a retry is decided, before the
+    /// executor can withhold it, so the chain accumulates links that exist only
+    /// in this process. Resolving only the first link would hand the executor
+    /// `None` for h3, the verification guard would not match, and the place
+    /// would go out with no read at all — on top of an h1 whose fate is exactly
+    /// as unknown as it was one interval ago. That buys a retry interval and
+    /// then produces the same double hedge.
+    #[test]
+    fn a_refused_retry_does_not_become_the_attempt_the_next_retry_verifies() {
+        let mut e = test_engine(RunCfg { hedge_retry: Some(pol()), ..test_cfg() });
+        let t = t0();
+        e.next_hedge_oid = 1;
+        e.pending_hedges.insert("h1".into(), pending(Some("h1"), t));
+        // h1 is the chain's FIRST attempt, minted on the maker fill — so it is
+        // in `hedge_orders` and supersedes nothing. It reached the venue and was
+        // acked; nothing after it has been.
+        e.hedge_orders.insert(
+            "h1".into(),
+            HedgeOrder {
+                maker_order_id: "m1".into(),
+                chain_id: "h1".into(),
+                market_id: "SYNTH-K-YES".into(),
+                venue: Venue::Kalshi,
+                side: BookSide::Ask,
+                price: "0.40".into(),
+                qty: 5,
+                cum_filled: 0,
+                supersedes: None,
+            },
+        );
+        e.oid_venue.insert("h1".into(), "venue-h1".into());
+
+        // h2 is decided (and, in the story, withheld by the executor)...
+        e.apply_hedge_plans(
+            vec![("h1".into(), HedgePlan::Retry { qty: 5, price: "0.40".into() }, None)],
+            after(t, 6.0),
+        );
+        // ...and h3 one interval later.
+        e.apply_hedge_plans(
+            vec![("h1".into(), HedgePlan::Retry { qty: 5, price: "0.40".into() }, None)],
+            after(t, 12.0),
+        );
+        assert_eq!(e.hedge_orders["h3"].supersedes.as_deref(), Some("h2"), "the chain link");
+
+        assert_eq!(
+            superseded(&e.hedge_orders, &e.oid_venue, "h3"),
+            Some(crate::exec::Superseded { venue_order_id: "venue-h1".into(), credited: 0 }),
+            "h2 never reached the venue, so h3 must verify h1 — the attempt still outstanding"
+        );
+
+        // The credited count travels with it: an attempt whose partial fill WAS
+        // seen is accounted for, and the executor compares against this rather
+        // than against zero.
+        e.hedge_orders.get_mut("h1").expect("h1").cum_filled = 4;
+        assert_eq!(superseded(&e.hedge_orders, &e.oid_venue, "h3").expect("h1").credited, 4);
+
+        // Once h2 IS acked it becomes the nearer answer and the walk stops there.
+        e.oid_venue.insert("h2".into(), "venue-h2".into());
+        assert_eq!(
+            superseded(&e.hedge_orders, &e.oid_venue, "h3").expect("h2").venue_order_id,
+            "venue-h2"
+        );
+        // A chain with no acked attempt resolves to nothing rather than looping
+        // — that is `recover_place`'s case, not this path's.
+        assert_eq!(superseded(&e.hedge_orders, &HashMap::new(), "h3"), None);
+        // ...and a first attempt supersedes nothing.
+        assert_eq!(superseded(&e.hedge_orders, &e.oid_venue, "h1"), None);
     }
 
     /// The alarm is a side effect of the ACT half, and it fires once. `alarmed`

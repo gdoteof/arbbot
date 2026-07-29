@@ -27,7 +27,16 @@ use tokio::sync::mpsc;
 /// on a wire. The requests are arb-venue's venue-neutral types, so the same
 /// value the executor counts today is the value a gateway will send.
 pub enum Action {
-    Place(PlaceRequest),
+    /// A place, plus — for a hedge RETRY only — the attempt it supersedes,
+    /// which must be reconciled against venue truth before this one is sent.
+    ///
+    /// It rides on the place rather than arriving as its own command because
+    /// the two decisions are one decision: a separate verify command could not
+    /// suppress a place that was already queued behind it. See
+    /// [`crate::sink::prior_attempt`] for what a lost fill frame costs without
+    /// it. `None` for everything else — a maker quote, a take-take leg, and the
+    /// FIRST attempt of a hedge chain supersede nothing.
+    Place { req: PlaceRequest, supersedes: Option<Superseded> },
     /// A cancel, plus the engine's ATTEMPT NUMBER for the order it names.
     ///
     /// The number never reaches a wire — it is echoed back in `cancel_result` so
@@ -44,6 +53,32 @@ pub enum Action {
     /// outcome. Halting is the one moment where "probably cancelled" is not
     /// good enough.
     SweepAndVerify,
+}
+
+/// The hedge attempt a retry is about to supersede, as the executor needs it.
+///
+/// Both halves are required and neither is redundant. The VENUE's id is the
+/// only name the venue answers to; `credited` is what the engine has already
+/// booked against that attempt (`HedgeOrder::cum_filled`), and without it the
+/// executor would have to compare the venue's total against ZERO — which
+/// refuses every retry that follows an ordinary partial fill, for ever.
+///
+/// `credited` IS A SNAPSHOT, AND IT CAN ONLY BE STALE IN THE SAFE DIRECTION.
+/// It is read when the command is queued and used when the executor gets to it,
+/// so a fill frame landing in between makes it too LOW. That matters, and the
+/// direction is what makes it safe: `HedgeOrder::cum_filled` is monotone — the
+/// only write in the process is `+= c.delta` with a non-negative delta, and it
+/// is never reset or decremented — so a snapshot can never read HIGHER than the
+/// truth. Too low means the venue's total more easily exceeds it, which
+/// WITHHOLDS a place. The cost of the race is at most one retry interval of
+/// extra naked time, and the fill it withheld for is reported and credited on
+/// the way past, so the next retry is `Accounted` and goes out. The opposite
+/// error — a snapshot reading high, and so waving through a fill nobody saw —
+/// is not reachable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Superseded {
+    pub venue_order_id: String,
+    pub credited: i64,
 }
 
 pub struct ExecCmd {
@@ -313,6 +348,22 @@ static HALT: std::sync::LazyLock<Arc<Halt>> =
 
 pub fn halt() -> &'static Arc<Halt> {
     &HALT
+}
+
+/// Hedge retries this process refused to send because it could not first
+/// establish that the attempt they supersede filled nothing.
+///
+/// Each one is a double hedge that did not happen — or, on the unreadable
+/// branch, a leg deliberately left naked rather than hedged twice. Either way
+/// it is a decision an operator has to be able to see, and neither shows up in
+/// any other gauge: `hedges_retried` counts retries the engine DECIDED on,
+/// `exec_failed` counts venue refusals, and `hedges_overfilled` structurally
+/// cannot see the outcome this prevents (the second fill is credited to an
+/// obligation the first already discharged). Steady zero is the resting state.
+static HEDGE_RETRIES_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+pub fn hedge_retries_refused() -> u64 {
+    HEDGE_RETRIES_REFUSED.load(Ordering::Relaxed)
 }
 
 /// The armed sinks, so an ABNORMAL exit can still cancel.
@@ -971,7 +1022,7 @@ async fn run_executor(
         // actually touched a wire. Incremented before the token bucket rather
         // than after it; totals are identical either way.
         match &cmd.action {
-            Action::Place(_) => st.placed.fetch_add(1, Ordering::Relaxed),
+            Action::Place { .. } => st.placed.fetch_add(1, Ordering::Relaxed),
             Action::Cancel { .. } | Action::SweepAndVerify => {
                 st.cancelled.fetch_add(1, Ordering::Relaxed)
             }
@@ -980,7 +1031,7 @@ async fn run_executor(
         // queued places are dropped instantly instead of trickling out at the
         // rate limit while the sweep tries to verify an empty book behind them.
         if halt.is_on() {
-            if let Action::Place(p) = &cmd.action {
+            if let Action::Place { req: p, .. } = &cmd.action {
                 let n = halt.count_discard(p);
                 // A discarded taker is a leg that was meant to CLOSE something,
                 // so it always gets a line however many there are; makers are
@@ -1035,6 +1086,72 @@ async fn run_executor(
             }
             continue;
         };
+        // A hedge RETRY asks the venue about the attempt it supersedes BEFORE
+        // it re-places. Here rather than in the engine because the answer and
+        // the place have to be one decision: routed back through the feed, the
+        // answer would race the very hedge tick it is meant to stop.
+        //
+        // The three outcomes are in `PriorAttempt`, and only one of them
+        // places. `Filled` is told to the engine as a fill on the VENUE's id —
+        // the same shape and the same schema the fill feed emits, so it lands
+        // on `hedge_credit` exactly as the lost frame would have, discharges
+        // the obligation, and is idempotent if that frame later arrives after
+        // all. `Unreadable` sends nothing and places nothing.
+        if let Action::Place { req, supersedes: Some(prior) } = &cmd.action {
+            let pid = &prior.venue_order_id;
+            match crate::sink::prior_attempt(sink.clone(), pid.clone(), prior.credited).await {
+                crate::sink::PriorAttempt::Accounted => {}
+                crate::sink::PriorAttempt::Unaccounted(n) => {
+                    HEDGE_RETRIES_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[exec] {venue:?}: NOT re-placing hedge {} ({} x{} @{}) — the venue \
+                         says the attempt it supersedes ({pid}) has FILLED {n} against the {} \
+                         this process has booked. The fill frame for the difference never \
+                         reached us; re-placing would have left us long against our own \
+                         short. Crediting it now. hedge_retries_refused={}",
+                        req.client_order_id,
+                        req.market,
+                        req.qty,
+                        req.price,
+                        prior.credited,
+                        hedge_retries_refused()
+                    );
+                    tell_engine(
+                        &acks,
+                        serde_json::json!({
+                            "kind": "fill",
+                            "venue": venue.as_str(),
+                            "market_id": req.market,
+                            "order_id": pid,
+                            "cum": n,
+                            "ts_local_ns": now_ns(),
+                        }),
+                    )
+                    .await;
+                    continue;
+                }
+                crate::sink::PriorAttempt::Unreadable(why) => {
+                    HEDGE_RETRIES_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    st.failed.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "[exec] {venue:?}: NOT re-placing hedge {} ({} x{} @{}) — could not \
+                         read whether the attempt it supersedes ({pid}) filled ({why}). \
+                         This leg stays NAKED and will alarm; that is the safe direction, \
+                         because placing on an unread answer is how one hedge becomes two. \
+                         The next retry asks about {pid} AGAIN — this refused place never \
+                         reached the venue, so it never becomes the thing the next retry \
+                         verifies (`drain_intents` walks back past it). \
+                         hedge_retries_refused={}",
+                        req.client_order_id,
+                        req.market,
+                        req.qty,
+                        req.price,
+                        hedge_retries_refused()
+                    );
+                    continue;
+                }
+            }
+        }
         // Not a per-order verb: it owns its own blocking + polling, so
         // it is handled before the place/cancel dispatch below.
         if matches!(cmd.action, Action::SweepAndVerify) {
@@ -1064,7 +1181,7 @@ async fn run_executor(
         // and this is the only place both are in hand), and a place whose
         // response is lost needs the whole request to find the order by.
         let placing = match &cmd.action {
-            Action::Place(p) => Some(p.clone()),
+            Action::Place { req, .. } => Some(req.clone()),
             Action::Cancel { .. } | Action::SweepAndVerify => None,
         };
         // ...and what a cancel was addressed to, and as which attempt, for the
@@ -1073,14 +1190,14 @@ async fn run_executor(
             Action::Cancel { req, attempt } => {
                 Some((req.by.clone(), req.market_slug.clone().unwrap_or_default(), *attempt))
             }
-            Action::Place(_) | Action::SweepAndVerify => None,
+            Action::Place { .. } | Action::SweepAndVerify => None,
         };
         // The latch can flip between the check above and here. `enter` closes
         // that window and counts the discard; the guard rides INTO the blocking
         // closure so `await_quiescent` cannot return until the venue has
         // actually answered.
         let Some(guard) = halt.enter(match &cmd.action {
-            Action::Place(p) => Some(p),
+            Action::Place { req, .. } => Some(req),
             Action::Cancel { .. } | Action::SweepAndVerify => None,
         }) else {
             eprintln!("[exec] {venue:?}: HALTED mid-dispatch — place discarded, not sent");
@@ -1089,7 +1206,7 @@ async fn run_executor(
         let res = tokio::task::spawn_blocking(move || {
             let _g = guard;
             match &cmd.action {
-                Action::Place(p) => sink.place(p).map(Some),
+                Action::Place { req, .. } => sink.place(req).map(Some),
                 Action::Cancel { req, .. } => sink.cancel(req).map(|_| None),
                 // handled above, before this dispatch
                 Action::SweepAndVerify => Ok(None),
@@ -1242,6 +1359,15 @@ mod tests {
         /// Latched from INSIDE the place — SIGTERM arriving while this very
         /// call is on the wire.
         latch: Option<Arc<Halt>>,
+        /// What a single-order status read reports FILLED. `None` is a venue
+        /// that cannot be read at all, which is NOT the same answer as 0 — see
+        /// `OrderSink::filled_qty`.
+        prior_filled: Option<i64>,
+        /// Every order the executor asked the venue about, so "it never asked"
+        /// is as observable as "it asked and ignored the answer". This is also
+        /// what makes the read's cost against the shared budget testable: a
+        /// place that supersedes nothing must leave this empty.
+        status_reads: Mutex<Vec<String>>,
     }
 
     impl OrderSink for Recorder {
@@ -1302,37 +1428,65 @@ mod tests {
             }
             Ok(self.resting.lock().unwrap().clone())
         }
+        fn filled_qty(&self, order_id: &str) -> Result<i64, VenueError> {
+            self.status_reads.lock().unwrap().push(order_id.to_string());
+            self.prior_filled
+                .ok_or_else(|| VenueError::Transport("status read timed out".into()))
+        }
     }
 
     fn place(oid: &str) -> ExecCmd {
         ExecCmd {
             t_read: Instant::now(),
-            action: Action::Place(PlaceRequest {
-                market: "KXTEST".into(),
-                side: Side::Bid,
-                price: "0.4200".into(),
-                qty: 5,
-                tif: Tif::Gtc,
-                post_only: true,
-                client_order_id: oid.into(),
-            }),
+            action: Action::Place {
+                req: PlaceRequest {
+                    market: "KXTEST".into(),
+                    side: Side::Bid,
+                    price: "0.4200".into(),
+                    qty: 5,
+                    tif: Tif::Gtc,
+                    post_only: true,
+                    client_order_id: oid.into(),
+                },
+                supersedes: None,
+            },
         }
     }
 
     /// A hedge / take-take leg: IOC, not post-only. It cannot rest, and it is
     /// the leg that closes something already half-done.
     fn taker_place(oid: &str) -> ExecCmd {
+        hedge_retry(oid, None)
+    }
+
+    /// ...and a hedge RETRY, which names the attempt it supersedes: the one
+    /// place that must not go out until the venue has been reconciled against
+    /// what we booked for that attempt. `None` is the first attempt of a chain
+    /// (`taker_place`); `credited` is what this process already has for it.
+    fn retry_after(oid: &str, prior: &str, credited: i64) -> ExecCmd {
+        let mut c = hedge_retry(oid, None);
+        if let Action::Place { supersedes, .. } = &mut c.action {
+            *supersedes =
+                Some(Superseded { venue_order_id: prior.into(), credited });
+        }
+        c
+    }
+
+    fn hedge_retry(oid: &str, supersedes: Option<Superseded>) -> ExecCmd {
         ExecCmd {
             t_read: Instant::now(),
-            action: Action::Place(PlaceRequest {
-                market: "KXTEST".into(),
-                side: Side::Ask,
-                price: "0.3000".into(),
-                qty: 5,
-                tif: Tif::Ioc,
-                post_only: false,
-                client_order_id: oid.into(),
-            }),
+            action: Action::Place {
+                req: PlaceRequest {
+                    market: "KXTEST".into(),
+                    side: Side::Ask,
+                    price: "0.3000".into(),
+                    qty: 5,
+                    tif: Tif::Ioc,
+                    post_only: false,
+                    client_order_id: oid.into(),
+                },
+                supersedes,
+            },
         }
     }
 
@@ -1425,6 +1579,187 @@ mod tests {
             told.push(serde_json::from_str(&m.line).expect("the engine parses these"));
         }
         (st, told)
+    }
+
+    // ------------------------------ the hedge retry that must not go out ---
+
+    /// THE DOUBLE HEDGE. A hedge attempt filled at the venue, its fill frame
+    /// never reached this process, and the retry is about to re-place the same
+    /// contracts on top of it.
+    ///
+    /// Reachable today with no reconciliation involved. A hedge is deliberately
+    /// absent from the `FillLedger` — registering one would let its own fill
+    /// mint another hedge, forever — so the fill FEED is the only thing that can
+    /// say an attempt traded, and `kalshi_fill_gaps` counts the windows in which
+    /// a Kalshi frame is lost (the channel sums per-fill DELTAS, so a frame
+    /// missed while the socket was dark leaves the running total permanently
+    /// short). The obligation still reads unhedged, this retry goes out, and
+    /// both orders fill: LONG AGAINST OUR OWN SHORT, which is the directional
+    /// exposure the whole hedge path exists to avoid.
+    ///
+    /// Nothing else catches it. Every retry gets a FRESH client_order_id, so
+    /// Kalshi's `409 order_already_exists` sees two unrelated orders and takes
+    /// both. `hedges_overfilled` cannot see it either: the second fill is
+    /// credited to an obligation the first already discharged, so it is credited
+    /// to no obligation at all and that gauge still reads 0.
+    #[tokio::test]
+    async fn a_hedge_retry_is_not_sent_when_the_attempt_it_supersedes_filled() {
+        let _g = REFUSED_TURN.lock();
+        let before = hedge_retries_refused();
+        let sink = Arc::new(Recorder { prior_filled: Some(5), ..Recorder::default() });
+        let (st, told) =
+            drain_reporting(Venue::Kalshi, sink.clone(), vec![retry_after("h2", "venue-h1", 0)])
+                .await;
+
+        assert!(
+            sink.placed.lock().unwrap().is_empty(),
+            "the retry must NOT reach the venue: those contracts are already ours"
+        );
+        assert_eq!(
+            *sink.status_reads.lock().unwrap(),
+            vec!["venue-h1"],
+            "and it must have ASKED — about the VENUE's id, the only one the venue knows"
+        );
+        assert_eq!(st.sent.load(Ordering::Relaxed), 0);
+        // The fill the feed lost is told to the engine now, in the fill feed's
+        // own schema, so it lands on `hedge_credit` and discharges the
+        // obligation exactly as the lost frame would have.
+        assert_eq!(told.len(), 1, "exactly one thing to say: the fill. {told:?}");
+        assert_eq!(told[0]["kind"], "fill");
+        assert_eq!(told[0]["venue"], "kalshi");
+        assert_eq!(told[0]["market_id"], "KXTEST");
+        assert_eq!(told[0]["order_id"], "venue-h1", "the VENUE's id — the engine maps it");
+        assert_eq!(told[0]["cum"], 5, "cumulative, like every other fill frame");
+        assert_eq!(
+            hedge_retries_refused() - before,
+            1,
+            "a refusal an operator can see — asserted as a DELTA, because `> 0` on a \
+             process-global is satisfiable by the OTHER refusal test's increment and stayed \
+             green with this arm's `fetch_add` deleted"
+        );
+    }
+
+    /// The gauge is process-global and libtest runs these threads in parallel,
+    /// so every test that asserts a DELTA on it takes turns — the same rule
+    /// `fills.rs`'s `COUNTER` exists for, and for the same reason: a gate that
+    /// is red at random is worse than one that is slow.
+    ///
+    /// It has to cover every test that MOVES the counter, not only the ones
+    /// that read it. Both refusal arms increment the same static, so without
+    /// this the two assertions below can each be satisfied by the other's work.
+    static REFUSED_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The control, and it is what stops the fix from being "never hedge
+    /// again": once the venue CONFIRMS the superseded attempt filled nothing,
+    /// the very same retry goes out.
+    #[tokio::test]
+    async fn the_same_retry_is_sent_once_the_venue_says_that_attempt_filled_nothing() {
+        let sink = Arc::new(Recorder { prior_filled: Some(0), ..Recorder::default() });
+        let (st, told) =
+            drain_reporting(Venue::Kalshi, sink.clone(), vec![retry_after("h2", "venue-h1", 0)])
+                .await;
+
+        assert_eq!(*sink.placed.lock().unwrap(), vec!["h2"], "nothing filled, so re-place");
+        assert_eq!(*sink.status_reads.lock().unwrap(), vec!["venue-h1"]);
+        assert_eq!(st.sent.load(Ordering::Relaxed), 1);
+        assert_eq!(told[0]["kind"], "order_ack", "and the ack is reported as usual");
+    }
+
+    /// An answer nobody could READ is not the answer "unfilled".
+    ///
+    /// Fail-closed, and it is a real trade: this obligation stays naked and
+    /// alarms (`hedges_naked`), and the next retry asks again. It is the right
+    /// way round anyway — waiting is already this engine's policy when it cannot
+    /// hedge profitably, and waiting is alarmed, while a double hedge is
+    /// neither. The one thing it must never do is CLAIM a fill it could not
+    /// read: that would discharge the obligation on no evidence.
+    #[tokio::test]
+    async fn a_retry_whose_verification_cannot_be_read_is_not_sent_either() {
+        let _g = REFUSED_TURN.lock();
+        let before = hedge_retries_refused();
+        // `prior_filled: None` — the venue could not be asked.
+        let sink = Arc::new(Recorder::default());
+        let (st, told) =
+            drain_reporting(Venue::Kalshi, sink.clone(), vec![retry_after("h2", "venue-h1", 0)])
+                .await;
+
+        assert!(sink.placed.lock().unwrap().is_empty(), "an unread answer is not a licence");
+        assert_eq!(*sink.status_reads.lock().unwrap(), vec!["venue-h1"], "it did ask");
+        assert_eq!(st.sent.load(Ordering::Relaxed), 0);
+        assert!(told.is_empty(), "and it claims NOTHING about a fill nobody could read");
+        assert_eq!(st.failed.load(Ordering::Relaxed), 1, "counted as a venue failure");
+        // THIS arm's own increment, pinned separately from the other refusal's:
+        // one shared `> 0` assertion let either `fetch_add` be deleted while the
+        // whole suite stayed green.
+        assert_eq!(hedge_retries_refused() - before, 1, "the unreadable refusal is counted too");
+    }
+
+    /// A PARTIAL fill whose frame DID arrive is not a reason to refuse the
+    /// retry for its remainder — it is the ordinary case.
+    ///
+    /// The question is whether the venue knows something we do not, so it is
+    /// asked against what this process has already BOOKED for that attempt, not
+    /// against zero. Against zero, a 10-lot that filled 4 and was credited 4
+    /// would refuse the retry for the missing 6 on every tick, for ever, and
+    /// the leg would simply never be hedged — the fix turning into a worse
+    /// outage than the defect.
+    #[tokio::test]
+    async fn a_partial_fill_this_process_already_booked_does_not_refuse_the_remainder() {
+        let sink = Arc::new(Recorder { prior_filled: Some(4), ..Recorder::default() });
+        let (st, told) =
+            drain_reporting(Venue::Kalshi, sink.clone(), vec![retry_after("h2", "venue-h1", 4)])
+                .await;
+
+        assert_eq!(
+            *sink.placed.lock().unwrap(),
+            vec!["h2"],
+            "venue 4, booked 4 — nothing unexplained, so the remainder MUST be hedged"
+        );
+        assert_eq!(st.sent.load(Ordering::Relaxed), 1);
+        assert_eq!(told[0]["kind"], "order_ack");
+    }
+
+    /// ...and one contract of daylight between the two is still caught. The
+    /// boundary is `venue > booked`, not `venue > 0`.
+    #[tokio::test]
+    async fn a_venue_total_one_ahead_of_our_books_still_refuses() {
+        let _g = REFUSED_TURN.lock(); // moves the counter, so it takes its turn too
+        let sink = Arc::new(Recorder { prior_filled: Some(5), ..Recorder::default() });
+        let (_st, told) =
+            drain_reporting(Venue::Kalshi, sink.clone(), vec![retry_after("h2", "venue-h1", 4)])
+                .await;
+
+        assert!(sink.placed.lock().unwrap().is_empty(), "one contract we never saw is enough");
+        assert_eq!(told[0]["kind"], "fill");
+        assert_eq!(
+            told[0]["cum"], 5,
+            "the CUMULATIVE venue total, not the delta — hedge_credit does that arithmetic"
+        );
+    }
+
+    /// WHAT IT COSTS. A place that supersedes nothing — every maker quote, every
+    /// take-take leg, and the FIRST attempt of a hedge chain, which is the only
+    /// attempt most obligations ever have — reads no venue at all.
+    ///
+    /// That is the whole rate-budget argument, and it is asserted rather than
+    /// claimed: the read is one BACKGROUND call per hedge RETRY, never per tick
+    /// and never on the order path a cancel shares.
+    #[tokio::test]
+    async fn a_place_that_supersedes_nothing_spends_no_read_budget() {
+        let sink = Arc::new(Recorder::default()); // any read would ERROR here
+        let (st, _) = drain_reporting(
+            Venue::Kalshi,
+            sink.clone(),
+            vec![place("m1"), taker_place("h1")],
+        )
+        .await;
+
+        assert_eq!(*sink.placed.lock().unwrap(), vec!["m1", "h1"], "both go straight out");
+        assert!(
+            sink.status_reads.lock().unwrap().is_empty(),
+            "not one venue read: a first attempt supersedes nothing to verify"
+        );
+        assert_eq!(st.sent.load(Ordering::Relaxed), 2);
     }
 
     /// FINDING #0, first half. At 15:40:13 the sweep began; at 15:40:14 an

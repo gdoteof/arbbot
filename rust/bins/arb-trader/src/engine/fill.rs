@@ -410,6 +410,9 @@ impl Engine {
                                     price: px.clone(),
                                     qty,
                                     cum_filled: 0,
+                                    // The first attempt of a chain supersedes
+                                    // nothing, so there is nothing to verify.
+                                    supersedes: None,
                                 },
                             );
                             self.intents.push(Intent::Place(intent::Place {
@@ -655,6 +658,7 @@ mod ledger_write_tests {
             price: "0.40".into(),
             qty: 5,
             cum_filled: 0,
+            supersedes: None,
         };
         book_basket(p, &maker, &hedge, 5, 1_700_000_000.0);
         book_basket(p, &maker, &hedge, 3, 1_700_000_100.0);
@@ -716,6 +720,7 @@ mod ledger_write_tests {
             price: "0.0400".into(),
             qty: 5,
             cum_filled: 0,
+            supersedes: None,
         };
         book_basket(p, &maker, &hedge, 5, 1_700_000_000.0);
 
@@ -782,6 +787,7 @@ mod attribute_fill_tests {
             price: "0.40".into(),
             qty,
             cum_filled: 0,
+            supersedes: None,
         }
     }
 

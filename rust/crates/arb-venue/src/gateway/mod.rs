@@ -201,6 +201,33 @@ pub trait VenueGateway {
     /// The venue's own id for an order. Kalshi spells it `order_id`, PM-US
     /// spells it `id`; callers that work across venues need one name.
     fn order_id(order: &Self::Order) -> String;
+    /// Cumulative contracts the venue reports FILLED on ONE order we placed.
+    /// Kalshi spells it `fill_count_fp`, PM-US `cumQuantity`; a caller asking
+    /// "did this order trade?" across venues needs one name, exactly as
+    /// [`Self::order_id`] does.
+    ///
+    /// ON THE ORDER PATH'S PRIORITY, NOT THE BACKGROUND BUDGET, and that is a
+    /// requirement rather than a preference. Its one caller gates a HEDGE place
+    /// on the answer (`arb-trader`'s `sink::prior_attempt`), so this is a read
+    /// an order-path call cannot complete without — precisely the case quirk
+    /// `xv-shared-api-budget`'s 2026-07-29 corollary puts inside "the order
+    /// path". Metering it would let an empty bucket refuse the read, the
+    /// refusal would refuse the hedge, and `ratelimit.rs` states the
+    /// consequence in one line: *a hedge refused for want of a token is a naked
+    /// leg*. The correlation is what makes it sharp — a socket flap is both
+    /// what loses a fill frame and what triggers the paged reconciliation that
+    /// drains the background bucket, so the moment this read matters most is
+    /// the moment it would most likely be refused.
+    ///
+    /// It is ONE request against a single order, not a walk: the accepted cost
+    /// of the corollary is unmetered LISTINGS, and this is far below that.
+    ///
+    /// `Err` when the venue did not answer the question — including a 200 whose
+    /// count field is absent or unparseable. It must never fold that into 0:
+    /// the caller reads a low number as "did not trade" and acts on it by
+    /// sending another order. Implementations settle the not-yet-visible 404
+    /// window (see [`Settle::retry_404`]) rather than reporting it as unknown.
+    fn order_filled_qty(&self, order_id: &str) -> Result<i64, VenueError>;
     fn order_status(&self, order_id: &str) -> Result<Self::Order, VenueError>;
     /// Cancel every RESTING order THIS STACK owns (kill-switch sweep) — see
     /// [`is_ours`] for what that means and why it is not "this process".

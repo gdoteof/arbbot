@@ -661,12 +661,26 @@ impl Engine {
                 // cancel is parked when it is decided and discharged only when
                 // the venue answers — see `cancel::resolve_cancel`.
                 let owed = cancel::cancel_target(&it).map(str::to_string);
+                // For a hedge RETRY, the attempt it supersedes. Only hedge
+                // attempts are in `hedge_orders`, so this is `None` for every
+                // other place — and for a first attempt, which supersedes
+                // nothing. See `HedgeOrder::supersedes`: without it a lost fill
+                // frame turns one hedge into two.
+                let supersedes = match &it {
+                    Intent::Place(p) => hedge::superseded(
+                        &self.hedge_orders,
+                        &self.oid_venue,
+                        &p.order_id,
+                    ),
+                    _ => None,
+                };
                 for action in intent_actions(
                     &it,
                     self.cfg.armed,
                     &self.oid_venue,
                     &mut self.parked_cancels,
                     now,
+                    supersedes.clone(),
                 ) {
                     let is_cancel = matches!(action, Action::Cancel { .. });
                     let queued = self.dispatch(venue, action);
@@ -1032,6 +1046,13 @@ impl Engine {
             // arbbot-hedge.timer is what completes them (see `orphan`).
             "hedges_undischarged": self.cfg.hedges_undischarged,
             "hedges_retried": self.n_retry,
+            // ...which counts retries the engine DECIDED on, and can therefore
+            // run ahead of the places that reached a venue: the executor
+            // withholds one whose superseded attempt turns out to have filled,
+            // or could not be read. That is the discriminant, and it only IS
+            // one if it is somewhere a monitor can read it — steady 0 is the
+            // resting state.
+            "hedge_retries_refused": crate::exec::hedge_retries_refused(),
             "hedges_naked": self.n_naked,
             // Hedge contracts filled beyond what an obligation owed — a
             // position with no maker leg to pair it with. Must stay 0.
@@ -2015,7 +2036,7 @@ mod feed_wiring_tests {
                 cmds.push(match c.action {
                     Action::SweepAndVerify => "sweep",
                     Action::Cancel { .. } => "cancel",
-                    Action::Place(_) => "place",
+                    Action::Place { .. } => "place",
                 });
             }
             out.push((*v, cmds));

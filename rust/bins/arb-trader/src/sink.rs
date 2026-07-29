@@ -294,6 +294,19 @@ pub trait OrderSink: Send + Sync {
     fn fills_since(&self, _min_ts: i64) -> Result<Vec<arb_venue::resp::KalshiFillRow>, VenueError> {
         Ok(Vec::new())
     }
+    /// Contracts the venue reports FILLED on ONE order we already sent — venue
+    /// truth for a single order, where `fills_since` is venue truth for a
+    /// window. See [`prior_attempt`] for the one thing that asks.
+    ///
+    /// The default REFUSES rather than answering 0, and that asymmetry is the
+    /// whole point. Every other default on this trait is inert because its
+    /// caller can safely do nothing (`recover_place` -> no recovery,
+    /// `fills_since` -> no history). Here "0" is not inert: it is an
+    /// affirmative claim that the order did not trade, and the caller acts on
+    /// it by sending another order. A sink that cannot answer must say so.
+    fn filled_qty(&self, _order_id: &str) -> Result<i64, VenueError> {
+        Err(VenueError::NotWired)
+    }
 }
 
 /// Every gateway is a sink. The adapter is the same four delegations for both
@@ -329,6 +342,136 @@ where
     }
     fn fills_since(&self, min_ts: i64) -> Result<Vec<arb_venue::resp::KalshiFillRow>, VenueError> {
         VenueGateway::fills_since(self, min_ts)
+    }
+    fn filled_qty(&self, order_id: &str) -> Result<i64, VenueError> {
+        VenueGateway::order_filled_qty(self, order_id)
+    }
+}
+
+/// What the venue says about the hedge attempt a retry is about to supersede.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PriorAttempt {
+    /// The venue has nothing on it we have not already credited. The retry is
+    /// safe to send.
+    ///
+    /// NOT "it filled nothing". The question is whether the venue knows
+    /// something we do not, so it is answered against what the engine has
+    /// ALREADY booked for that attempt (`HedgeOrder::cum_filled`), never
+    /// against zero. A 10-lot that filled 4, was credited 4, and left an
+    /// obligation still owing 6 is a completely ordinary retry: comparing it
+    /// against zero would refuse that retry for ever and the leg would never
+    /// be hedged at all.
+    Accounted,
+    /// The venue reports MORE filled than we have credited. Those contracts are
+    /// ours whether or not the fill frame ever arrived, so re-placing on top of
+    /// them is a double hedge. Carries the venue's CUMULATIVE total, which is
+    /// what the fill schema wants.
+    Unaccounted(i64),
+    /// The venue could not be asked. NOT the same as `Accounted` — see
+    /// [`OrderSink::filled_qty`].
+    Unreadable(String),
+}
+
+/// Ask the venue whether the attempt a hedge retry supersedes actually filled.
+///
+/// THE DEFECT THIS CLOSES. A hedge is deliberately absent from the
+/// `FillLedger` — registering one would let its own fill mint another hedge,
+/// forever (`engine/fill.rs`) — so nothing but the fill FEED can tell the
+/// engine that a hedge attempt traded. Lose that one frame and the obligation
+/// still reads unhedged, the retry re-places, and both orders fill: long
+/// against our own short, which is the directional exposure the whole hedge
+/// path exists to avoid. `hedges_overfilled` cannot see it either, because the
+/// second fill is credited to an obligation that has already been discharged by
+/// the first — the engine's own boot banner says it would still read 0.
+///
+/// NOT THE SAME DEFECT AS A LOST ACK, though they end identically. There are
+/// three ways one obligation buys its hedge twice, and only the third is this:
+///
+///   1. the ack is LATE and the fill beats it. The fill is held in
+///      `unclaimed_fills` and replayed by `on_order_ack` the moment the ack
+///      names it; the retry additionally defers via `HedgePlan::HoldForAck`.
+///      Already handled — and the incident that bought that handling is
+///      recorded verbatim at that replay (an ack merely 48 ms late).
+///   2. the ack NEVER comes, because the place's own answer was lost. The held
+///      fill is then never replayed and expires unattributable. That is the
+///      executor's `recover_place` path, which runs ONLY when
+///      `place_answer_was_lost`, and which recovers the venue id so case 1's
+///      replay can finally happen.
+///   3. THIS ONE: the ack landed, and the FILL FRAME is what went missing.
+///      Nothing is held, so there is nothing for any ack to replay, and no id
+///      needs recovering because the id was never lost. The obligation simply
+///      reads short forever, and only venue truth about that order can say so.
+///
+/// The three are disjoint at the mechanism and this handles only the third. It
+/// is also why the resolution below is by ORDER STATUS and not by anything in
+/// `unclaimed_fills`: there is no local trace of this fill to consult.
+///
+/// A lost frame is not hypothetical: `kalshi_fill_gaps` counts the windows it
+/// happens in, and the Kalshi fill channel sums per-fill DELTAS, so a frame
+/// missed while the socket was dark leaves the running total permanently short
+/// (`fills.rs`). The reconciliation added with that gauge recovers the fill —
+/// but on RECONNECT, deferred up to `RECONCILE_MIN_INTERVAL`, while the retry
+/// becomes due on `hedge_retry.interval_s`. It repairs the accounting after the
+/// fact; it cannot get there first. This can, because it happens on the same
+/// executor command as the place it gates.
+///
+/// FAIL-CLOSED on an unreadable answer, and that is a real trade: an obligation
+/// whose verification keeps failing is never re-placed and stays naked. It is
+/// the right way round anyway — waiting is already this engine's policy when it
+/// cannot hedge profitably (`hedge_plan` -> `Wait`), waiting is alarmed
+/// (`hedges_naked`), and a double hedge is neither.
+///
+/// ON THE ORDER PATH'S PRIORITY. `VenueGateway::order_filled_qty` sends at
+/// `Priority::Critical`, not `Background`, and that is load-bearing rather than
+/// greedy: a hedge place cannot complete without this answer, which is exactly
+/// what quirk `xv-shared-api-budget`'s 2026-07-29 corollary puts inside "the
+/// order path". Background is a hard `try_acquire`, not a wait, so metering it
+/// would let an empty bucket produce `Unreadable`, and `ratelimit.rs` says what
+/// that is worth: *a hedge refused for want of a token is a naked leg*. The
+/// correlation makes it worse than it sounds — a socket flap is both what loses
+/// a fill frame and what fires the paged reconciliation that drains the
+/// background bucket, so this read would be refused precisely when it matters.
+///
+/// ONE request, not a walk: the single-order GET, so it costs nothing like the
+/// paged `/portfolio/orders` history a lookup by `client_order_id` pages
+/// through — well inside what that corollary already accepts as unmetered. We
+/// can address the order directly precisely because case 2 above did not
+/// happen: its ack landed, so the venue gave us its id.
+///
+/// AN INTERLOCK, NOT A DURATION. Nothing here waits out a window and then
+/// assumes: the read and the place it gates are the same executor command, so
+/// the place cannot be dispatched until this has answered. The one duration on
+/// the path is `Settle::retry_404`'s not-yet-visible poll, and it fails to the
+/// SAFE side — running out returns the 404, which is `Unreadable`, which
+/// withholds. It also removes a duration that WAS standing in for an interlock:
+/// `HedgePlan::HoldForAck` gives up after `HOLD_FOR_ACK` and re-places anyway,
+/// and for any attempt the venue has issued an id for that expiry no longer
+/// means placing blind — this asks instead. What is left is the attempt with no
+/// venue id at all, which is `recover_place`'s to repair.
+///
+/// WHAT IT COSTS IN TIME, stated at the tail and not the median: one venue
+/// round trip added to a hedge retry, and in the worst case the transport's 15s
+/// timeout followed by a refusal. It is also inline in the executor's serial
+/// loop, so a cancel queued behind it on the SAME venue waits that long — the
+/// loop already blocks this way on every place, cancel and recovery read, so
+/// this lengthens an existing worst case rather than adding a new one, but it
+/// does lengthen it.
+pub async fn prior_attempt(
+    sink: std::sync::Arc<dyn OrderSink>,
+    venue_order_id: String,
+    credited: i64,
+) -> PriorAttempt {
+    // The gateways block; running one on this worker would stall every other
+    // task on it — the same reason every other venue call here is spawned.
+    match tokio::task::spawn_blocking(move || sink.filled_qty(&venue_order_id)).await {
+        // Against what we ALREADY BOOKED for this attempt, never against zero.
+        // A partial fill whose frame DID arrive is credited, so the retry for
+        // the remainder is ordinary and must go out; only a venue total that
+        // runs AHEAD of our books is evidence of a frame we never saw.
+        Ok(Ok(n)) if n <= credited => PriorAttempt::Accounted,
+        Ok(Ok(n)) => PriorAttempt::Unaccounted(n),
+        Ok(Err(e)) => PriorAttempt::Unreadable(e.to_string()),
+        Err(e) => PriorAttempt::Unreadable(format!("verification task panicked: {e}")),
     }
 }
 
