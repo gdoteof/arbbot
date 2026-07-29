@@ -235,7 +235,12 @@ fn rank(rows: &mut [serde_json::Value]) {
 /// execution style:
 ///   resting on leg A only  -> make A, take B when it fills
 ///   resting on leg B only  -> take A, make B
-///   resting on both        -> make/make (no taking at all)
+///   resting on both        -> BOTH of the above, priced and ranked
+///
+/// That last line used to read "make/make (no taking at all)". The code has
+/// never done that, `routes_for` says the opposite four lines from here, and
+/// `resting_on_both_legs_is_two_make_take_routes_not_one_make_make` now pins
+/// which of the two was right.
 ///
 /// The take leg is priced off the venue quote from the ToB rollup, so its age
 /// is reported per row: a stale quote makes the edge a guess, not a number.
@@ -550,9 +555,6 @@ mod tests {
     /// route exists in the output and none may: a basket that needs both of
     /// our quotes to fill is not one that can be priced as available.
     ///
-    /// (`json`'s doc comment above still says "resting on both -> make/make
-    /// (no taking at all)". It contradicts `routes_for`'s doc and this test;
-    /// the code has never done that.)
     #[test]
     fn resting_on_both_legs_is_two_make_take_routes_not_one_make_make() {
         let r = xv();
