@@ -14,7 +14,10 @@ use arb_registry::{Allowlist, Leg, Registry, Relationship};
 use arb_scenario::price_at;
 use arb_tob::{series, TobSample};
 
-use crate::endpoints::{coverage_age_s, rollup_paths, Latest, MAX_COVERAGE_AGE_S};
+use crate::endpoints::{
+    coverage_by_venue, coverage_json, rollup_paths, stalest_age_s, venue_age_s, Latest,
+    MAX_COVERAGE_AGE_S,
+};
 use crate::{integrity, Args, FEE_CATEGORY};
 
 /// market -> relationship. A market can back more than one pair; the first
@@ -271,7 +274,8 @@ pub fn json(a: &Args) -> String {
 
     let day = integrity::build(&a.data_dir).today;
     let latest = series::latest_by_market(&rollup_paths(&a.rollup_dir, &day));
-    let coverage_age_s = coverage_age_s(&latest, (now * 1e9) as i64);
+    let cov = coverage_by_venue(&latest, (now * 1e9) as i64);
+    let coverage_age_s = stalest_age_s(&cov);
     let rollup_current = coverage_age_s <= MAX_COVERAGE_AGE_S;
 
     let mut cx = Cx::default();
@@ -288,8 +292,14 @@ pub fn json(a: &Args) -> String {
         let (best_edge, best_route) = best.unwrap_or((f64::MIN, "none"));
         let priced = routes.get(best_route).cloned();
         let f = feasible(&p, best_route);
+        // Per VENUE, and the older of the two: this row is only as current as
+        // its stalest leg, and a live feed on one venue is not evidence about
+        // the other. A whole-rollup `rollup_current` here let a dead venue's
+        // rows ride on a live venue's newest sample.
+        let covered = venue_age_s(&cov, &p.la.venue).max(venue_age_s(&cov, &p.lb.venue))
+            <= MAX_COVERAGE_AGE_S;
         let actionable =
-            f.fillable && f.deep_enough && f.have_books && rollup_current && best_edge > 0.0;
+            f.fillable && f.deep_enough && f.have_books && covered && best_edge > 0.0;
 
         rows.push(serde_json::json!({
             "relationship_id": rel_id,
@@ -343,6 +353,7 @@ pub fn json(a: &Args) -> String {
         "min_take_depth": 25,
         "rollup_current": rollup_current,
         "rollup_coverage_age_s": if coverage_age_s == i64::MAX { -1 } else { coverage_age_s },
+        "venues": coverage_json(&cov),
         "max_coverage_age_s": MAX_COVERAGE_AGE_S,
         "engine_live": (0.0..120.0).contains(&age),
         "last_intent_age_s": age.round() as i64,

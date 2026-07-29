@@ -547,6 +547,21 @@ function dur(sec){
   const d=Math.floor(h/24); return `${d}d ${h%24}h`;
 }
 
+/* Coverage is per VENUE, so the badge is too. One recorder dying leaves the
+   other venues sampling, and a single ROLLUP CURRENT badge off the newest
+   sample anywhere said "go" over a six-hour-dead book. Three chips instead:
+   green = covering now, red = covering but behind, amber = not in the rollup
+   at all, which is a different fact and gets a different colour. */
+function venueChips(vs){
+  return (vs||[]).map(v=>{
+    const cls = v.current ? 'ok' : (v.coverage_age_s<0 ? 'warn' : 'bad');
+    const age = v.coverage_age_s<0 ? 'NO ROLLUP' : dur(v.coverage_age_s);
+    return `<span class="badge ${cls}">${esc(v.venue)} ${age}</span>`;
+  }).join(' ');
+}
+const staleVenues = (d) => (d.venues||[]).filter(v=>!v.current && v.coverage_age_s>=0)
+  .map(v=>v.venue);
+
 const ROUTE_LABEL={'take-take':'take / take','make-a-take-b':'make A → take B',
                    'take-a-make-b':'take A → make B','none':'—'};
 const SERIES_KEYS=[['take_take','take/take','var(--accent)'],
@@ -720,8 +735,9 @@ function intentsPanel(d){
       ? 'The engine is resting ' + d.resting_orders + ' order(s), but none of them are on a '
         + 'pair with both books in the rollup.'
       : (!d.rollup_current
-        ? 'All ' + all.length + ' pair(s) are filtered out, and nothing can be actionable '
-          + 'while the rollup is ' + dur(d.rollup_coverage_age_s) + ' behind — rebuild it above, '
+        ? 'All ' + all.length + ' pair(s) are filtered out, and no pair with a '
+          + staleVenues(d).join(' or ') + ' leg can be actionable while that rollup is '
+          + dur(d.rollup_coverage_age_s) + ' behind — rebuild it above, '
           + 'or turn off <b>actionable only</b> to see the pairs as last priced.'
         : 'All ' + all.length + ' pair(s) are hidden by the filters above.')}</div>`;
 
@@ -730,7 +746,8 @@ function intentsPanel(d){
     <h2>Engine intents &middot; ${d.resting_orders} resting &middot; ${rows.length}/${d.pairs} shown
       &middot; <span class="${d.actionable?'ok':'warn'}">${d.actionable} actionable</span>
       &middot; <span class="badge ${d.engine_live?'ok':'bad'}">${d.engine_live?'ENGINE LIVE':'NOT RUNNING'}</span>
-      <span class="dim">last ${dur(d.last_intent_age_s)} ago &middot; rollup ${d.rollup_current?'current':'stale '+dur(d.rollup_coverage_age_s)} &middot; clip ${d.clip}</span></h2>
+      &middot; ${venueChips(d.venues)}
+      <span class="dim">last ${dur(d.last_intent_age_s)} ago &middot; clip ${d.clip}</span></h2>
     <nav style="padding:0;border:0;margin-bottom:8px">
       ${rbtn('','all routes')}${rbtn('take-take','take / take')}${rbtn('make-a-take-b','make A → take B')}${rbtn('take-a-make-b','take A → make B')}
       <span style="flex:1"></span>
@@ -747,7 +764,8 @@ function intentsPanel(d){
       points, whichever side gets hit first.<br>
       <b>Actionable</b> = positive edge, the rested leg's book within ${d.max_rest_spread},
       at least ${d.min_take_depth} contracts resting at the touch we would cross, both
-      books known, and the rollup covering the last ${(d.max_coverage_age_s/60)|0} minutes.<br>
+      books known, and BOTH of the row's venues covered by the rollup within the last
+      ${(d.max_coverage_age_s/60)|0} minutes.<br>
       ${intlNote(d.rows)}</div>
   </section>`);
 
@@ -841,27 +859,38 @@ function currentPanel(d){
       <td class="num dim">${Number(p.gross_cost).toFixed(4)}</td>
       <td class="num dim">${(Number(p.fee_a)+Number(p.fee_b)).toFixed(4)}</td>
       <td class="num">${Number(p.total_cost).toFixed(4)}</td>
-      <td class="num ${e>0?(p.fill_plausible?'ok':'warn'):'bad'}">
+      <td class="num ${e>0?(r.actionable?'ok':'warn'):'bad'}">
         <b>${e>0?'+':''}${e.toFixed(4)}</b></td>
       <td class="num ${p.fill_plausible?'dim':'warn'}">${p.maker_spread!=null?Number(p.maker_spread).toFixed(3):'—'}</td>
       <td class="num ${p.take_depth==null||Number(p.take_depth)<Number(d.clip)?'warn':'dim'}">
         ${p.take_depth==null?'?':Math.floor(Number(p.take_depth)).toLocaleString()}</td>
       <td class="num ${stale>3600?'warn':'dim'}">${dur(stale)}</td>
+      <td class="num ${r.coverage_age_s>d.max_coverage_age_s?'bad':'dim'}">${dur(r.coverage_age_s)}</td>
       <td class="dim" style="font-size:11px">${esc(alt)}</td>
     </tr>`;
   }).join('');
+
+  const stales = staleVenues(d);
+  const uneval = d.unevaluated_by_venue || {};
+  const unevalWhy = Object.keys(uneval).map(v=>`${uneval[v]} with a ${esc(v)} leg`).join(', ');
 
   return $(`<section class="wide">
     <h2>Current opportunities &middot; ${esc(d.day)}
       &middot; ${d.priced_pairs} priced
       &middot; <span class="dim">${d.profitable} profitable</span>
       &middot; <span class="${d.actionable?'ok':'warn'}">${d.actionable} actionable</span>
-      &middot; <span class="badge ${d.rollup_current?'ok':'bad'}">${d.rollup_current
-          ? 'ROLLUP CURRENT' : 'ROLLUP STALE '+dur(d.rollup_coverage_age_s)}</span>
+      &middot; ${venueChips(d.venues)}
       &middot; <span class="dim">${d.only_tradable?'tradable only':'all pairs'}</span></h2>
-    ${d.rollup_current ? '' : `<div class="warn" style="margin-bottom:8px">▲ These prices
-      are ${dur(d.rollup_coverage_age_s)} old — the rollup stopped covering then, so nothing
-      here is actionable until it is rebuilt.</div>`}
+    ${d.rollup_current ? '' : `<div class="warn" style="margin-bottom:8px">▲ ${stales.length
+      ? stales.join(' and ') + ' stopped covering ' + dur(d.rollup_coverage_age_s) + ' ago'
+      : 'The rollup carries no samples at all'}. Every row with a leg on a venue that
+      stopped covering is priced off a dead book and cannot be actionable until the rollup
+      is rebuilt — the other venues are unaffected.</div>`}
+    ${unevalWhy ? `<div class="warn" style="margin-bottom:8px">▲ ${d.unevaluated_pairs}
+      permitted pair(s) were NOT evaluated — the rollup carried no book for one of their
+      legs (${unevalWhy}). They are absent from every count above, including
+      &ldquo;${d.actionable} actionable&rdquo;, so that number is about ${d.priced_pairs}
+      pair(s), not the whole universe.</div>` : ''}
     <nav style="padding:0;border:0;margin-bottom:6px">${SCENARIOS.map(([k,l])=>tab(k,l)).join('')}</nav>
     <div class="sub" style="margin-bottom:10px">clip size:
       <nav style="display:inline-flex;padding:0;border:0">${clips}</nav>
@@ -873,6 +902,7 @@ function currentPanel(d){
         <th class="num">edge/ct</th><th class="num">rest spread</th>
         <th class="num" title="Contracts resting at the touch on the leg(s) this route crosses. '?' means the tape carried no size.">take depth</th>
         <th class="num">quote age</th>
+        <th class="num" title="How far the ROLLUP covers on the older of this row's two venues — not how long this market has been quiet. Past the limit, the row is history.">coverage</th>
         <th>other scenarios</th></tr></thead>
       <tbody>${rows}</tbody></table></div>
     <div class="sub" style="margin-top:8px">Edge = $1.00 &minus; total cost, per contract.
@@ -880,8 +910,8 @@ function currentPanel(d){
       Making rests on the near side and pays the maker fee (Kalshi 0.0175 vs 0.07
       taker; PM-US makers pay nothing) but is not a certain fill.
       Quotes are as fresh as the ToB rollup, not as fresh as the venue.<br>
-      <b>Actionable</b> = profitable, the rollup still covering the last
-      ${(d.max_coverage_age_s/60)|0} minutes, the leg we would rest on inside a spread of
+      <b>Actionable</b> = profitable, BOTH of this row's venues still covered by the rollup
+      within the last ${(d.max_coverage_age_s/60)|0} minutes, the leg we would rest on inside a spread of
       ${esc(d.max_spread)}, AND at least ${esc(d.clip)} contracts resting at the touch we
       would cross. Making is priced at the FAR touch, the optimistic bound: on a tight
       book that is about right, on a wide one it is fiction — resting an ask at 0.99
