@@ -236,10 +236,12 @@ afterwards.
   re-run.**
 * **A slow subscriber is shed SILENTLY on the running image.** Measured twice:
   a subscriber that connects and never reads is dropped after 70-155s with zero
-  `DROPPED subscriber` lines in the recorder's journal. This is the running
-  image having no such string in it, not a new defect — but it is what the
-  armed engine would hit today, and the only trace would be on the engine's
-  side as `subscription ended (EOF)`.
+  `DROPPED subscriber` lines in the recorder's journal. The cap itself works —
+  draining that socket afterwards yielded **16,127,981 bytes** against
+  `MAX_BUFFER = 16_000_000` — so this is the running image having no notice in
+  it, not a broken eviction. It is still what the armed engine would hit today,
+  and the only trace would be on the engine's side as
+  `subscription ended (EOF)`, followed by every resting quote being pulled.
 * **PM-US `trade.size` is not a number.** `pmus.rs:55` reads `quantity`
   straight through `dec_string`, and the venue sends it as
   `{"currency":"USD","value":"4.0000"}`, so the tape and the socket both carry
