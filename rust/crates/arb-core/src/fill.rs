@@ -24,13 +24,17 @@ pub struct HedgeAnchor {
     pub venue: crate::model::Venue,
     pub market_id: String,
     /// hedge-leg BOOK side the anchor price came from — consistent with
-    /// `price` (maker bid fills => we sell into the hedge bid => "bid").
+    /// `price` (maker bid fills => we sell into the hedge bid => `Bid`).
     /// Matches the engine's capture convention (see engine.rs, which mirrors
     /// `Quoter::hedge_has_depth` side selection).
-    pub side: &'static str,
+    ///
+    /// The obligation's whole direction hangs off this one field: it picks the
+    /// side of the book the retry reads its touch from, which way `max_slip`
+    /// runs, and — through `taking_side` — whether the hedge BUYS or SELLS. It
+    /// was a `&'static str`, so every one of those three was an `if == "bid"`
+    /// with the other case as the else.
+    pub side: crate::model::BookSide,
     pub price: String,
-    /// tape/event time the anchor was captured (never a clock read)
-    pub ts: f64,
 }
 
 struct OrderRec {
@@ -212,9 +216,8 @@ mod tests {
         HedgeAnchor {
             venue: crate::model::Venue::PolymarketUs,
             market_id: "hedge-mkt".into(),
-            side: "ask",
+            side: crate::model::BookSide::Ask,
             price: "0.41".into(),
-            ts: 1000.0,
         }
     }
 

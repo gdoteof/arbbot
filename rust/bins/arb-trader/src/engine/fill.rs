@@ -15,7 +15,7 @@ use super::cancel::{settle, CancelWork};
 use super::hedge::{first_attempt_acceptable, hedge_credit, taking_side, HedgeOrder, PendingHedge};
 use super::Engine;
 use arb_core::intent::{self, Intent, Tag};
-use arb_core::model::Venue;
+use arb_core::model::{BookSide, Venue};
 use arb_core::scan::Rel;
 use serde_json::json;
 use std::collections::HashMap;
@@ -27,7 +27,9 @@ pub(super) struct MakerOrder {
     pub(super) class: &'static str,
     pub(super) venue: String,
     pub(super) market_id: String,
-    pub(super) side: String,
+    /// Serialises into the ledger leg as `"bid"`/`"ask"` — the same bytes it
+    /// wrote as a `String`, because `BookSide` renames to the wire spelling.
+    pub(super) side: BookSide,
     pub(super) price: String,
     /// Which strategy opened this leg — `maker-hedge` or `take-take`.
     ///
@@ -289,8 +291,9 @@ impl Engine {
                         let px = self
                             .books
                             .get(a.venue, &a.market_id)
-                            .and_then(|b| {
-                                if a.side == "bid" { b.bids.first() } else { b.asks.first() }
+                            .and_then(|b| match a.side {
+                                BookSide::Bid => b.bids.first(),
+                                BookSide::Ask => b.asks.first(),
                             })
                             .map(|l| l.price.clone())
                             .unwrap_or_else(|| a.price.clone());
@@ -358,7 +361,7 @@ impl Engine {
                                 // The FIRST attempt carries no `retry`, which
                                 // is what makes the retries visible in the tape.
                                 retry: None,
-                                side: order_side.to_string(),
+                                side: order_side,
                                 tag: Some(Tag::Hedge),
                                 taker: true,
                                 ts: now,
@@ -377,7 +380,10 @@ impl Engine {
                                  Obligation {hoid} is live and retrying; NOTHING is hedged \
                                  yet, and it alarms as NAKED if it is still open in \
                                  {alarm_s:.0}s.",
-                                a.market_id, a.venue.as_str(), a.price, a.side
+                                a.market_id,
+                                a.venue.as_str(),
+                                a.price,
+                                a.side.as_str()
                             );
                         }
                         self.drain_intents(Option::<&Rel>::None);
@@ -573,7 +579,7 @@ mod ledger_write_tests {
             class: "cross-venue-equivalent",
             venue: "kalshi".into(),
             market_id: "KXDEMO".into(),
-            side: "bid".into(),
+            side: BookSide::Bid,
             price: "0.31".into(),
             strategy: "maker-hedge",
         };
@@ -582,7 +588,7 @@ mod ledger_write_tests {
             chain_id: "h1".into(),
             market_id: "demo-slug".into(),
             venue: Venue::PolymarketUs,
-            side: "ask",
+            side: BookSide::Ask,
             price: "0.40".into(),
             qty: 5,
             cum_filled: 0,
@@ -634,7 +640,7 @@ mod ledger_write_tests {
             class: "cross-venue-equivalent",
             venue: "polymarket_us".into(),
             market_id: "tac-nobel-peace-2026-10-09-dontru".into(),
-            side: "ask".into(),
+            side: BookSide::Ask,
             price: "0.0800".into(),
             strategy: "take-take",
         };
@@ -643,7 +649,7 @@ mod ledger_write_tests {
             chain_id: "h1".into(),
             market_id: "KXNOBELPEACE-26-DJT".into(),
             venue: Venue::Kalshi,
-            side: "bid",
+            side: BookSide::Bid,
             price: "0.0400".into(),
             qty: 5,
             cum_filled: 0,
@@ -686,9 +692,8 @@ mod attribute_fill_tests {
         HedgeAnchor {
             venue: Venue::PolymarketUs,
             market_id: "P".into(),
-            side: "bid",
+            side: BookSide::Bid,
             price: "0.40".into(),
-            ts: 1.0,
         }
     }
 
@@ -698,7 +703,7 @@ mod attribute_fill_tests {
             class: "cross-venue-equivalent",
             venue: "kalshi".into(),
             market_id: "K".into(),
-            side: "bid".into(),
+            side: BookSide::Bid,
             price: "0.31".into(),
             strategy: "maker-hedge",
         }
@@ -710,7 +715,7 @@ mod attribute_fill_tests {
             chain_id: "h1".into(),
             market_id: "P".into(),
             venue: Venue::PolymarketUs,
-            side: "ask",
+            side: BookSide::Ask,
             price: "0.40".into(),
             qty,
             cum_filled: 0,

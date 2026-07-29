@@ -9,7 +9,11 @@
 //! missing price silently became `"0"`, a missing side silently became a BID,
 //! and every id was a `&str` interchangeable with every other id. None of that
 //! is representable here — `price`, `count` and `order_id` are required fields
-//! of the variant that has them, so a place that lacks one does not compile.
+//! of the variant that has them, so a place that lacks one does not compile,
+//! and `side` is a `BookSide`, so a place whose side is neither bid nor ask
+//! cannot be BUILT and cannot be PARSED. The first cut of this enum left `side`
+//! a `String` and the trader still ended `if p.side == "ask" { Ask } else
+//! { Bid }`: the value could no longer be missing, but "asl" was still a buy.
 //!
 //! The JSON is now produced exactly once, at the write boundary
 //! (`Intent::to_line`), and never re-parsed by the engine.
@@ -41,7 +45,7 @@
 //! market id, which reads oddly — precisely so that rule 1 can be checked by
 //! eye against the declaration.
 
-use crate::model::Venue;
+use crate::model::{BookSide, Venue};
 use serde::{Deserialize, Serialize};
 
 /// One decision. Serialises to the object it always was; the variant is chosen
@@ -94,7 +98,7 @@ pub struct Place {
     /// attempt, which is what makes the retries visible in the tape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry: Option<u32>,
-    pub side: String,
+    pub side: BookSide,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<Tag>,
     /// A marketable IOC rather than a resting post-only quote. Absent means
@@ -112,7 +116,7 @@ pub struct Cancel {
     pub cancel: String,
     pub order_id: String,
     pub price: String,
-    pub side: String,
+    pub side: BookSide,
     pub ts: f64,
     pub venue: Venue,
 }
@@ -235,7 +239,7 @@ mod wire_format_tests {
             price: "0.10".into(),
             replaces: None,
             retry: None,
-            side: "bid".into(),
+            side: BookSide::Bid,
             tag: None,
             taker: false,
             ts: 1.0,
@@ -265,7 +269,7 @@ mod wire_format_tests {
                 price: "0.10".into(),
                 replaces: Some("m1".into()),
                 retry: Some(3),
-                side: "bid".into(),
+                side: BookSide::Bid,
                 tag: Some(Tag::Hedge),
                 taker: true,
                 ts: 1.0,
@@ -275,7 +279,7 @@ mod wire_format_tests {
                 cancel: "M".into(),
                 order_id: "m1".into(),
                 price: "0.10".into(),
-                side: "bid".into(),
+                side: BookSide::Bid,
                 ts: 1.0,
                 venue: Venue::PolymarketUs,
             }),
@@ -332,6 +336,35 @@ mod wire_format_tests {
     fn a_damaged_line_fails_to_parse_rather_than_matching_a_variant() {
         assert!(Intent::from_line(r#"{"place":"M","order_"#).is_err());
         assert!(Intent::from_line(r#"{"ts":1.0}"#).is_err(), "no discriminator key");
+    }
+
+    /// A side that is neither `bid` nor `ask` is REFUSED, and that is the whole
+    /// point of the type.
+    ///
+    /// While `side` was a `String` this line parsed happily and the trader ended
+    /// `if p.side == "ask" { Ask } else { Bid }`, so `"asl"`, `"BID"`, `""` and
+    /// `"sell"` all reached the venue as a BUY on the bid — the wrong side of
+    /// the book, at a price chosen for the other one. It cannot get that far
+    /// now: it stops at the parse, and the arm that used to absorb it does not
+    /// exist (`intent_actions` matches `BookSide` exhaustively).
+    #[test]
+    fn a_side_that_is_not_a_side_is_refused_rather_than_read_as_a_bid() {
+        for bad in ["asl", "BID", "", "sell", "buy", "yes"] {
+            let line = format!(
+                r#"{{"count":5,"order_id":"m1","place":"M","price":"0.10","side":"{bad}","ts":1.0,"venue":"kalshi"}}"#
+            );
+            assert!(
+                Intent::from_line(&line).is_err(),
+                "a place whose side is {bad:?} must not parse — it used to become a BID"
+            );
+        }
+        // ...and the two real spellings still do, unchanged.
+        for good in ["bid", "ask"] {
+            let line = format!(
+                r#"{{"count":5,"order_id":"m1","place":"M","price":"0.10","side":"{good}","ts":1.0,"venue":"kalshi"}}"#
+            );
+            assert_eq!(Intent::from_line(&line).expect("parse").to_line(), line);
+        }
     }
 
     /// The venue rides on the intent so the dispatch site cannot pair a command

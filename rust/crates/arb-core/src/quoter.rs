@@ -12,7 +12,7 @@
 use crate::book::BookBuilder;
 use crate::fees::FeeSchedule;
 use crate::intent::{self, Intent};
-use crate::model::Venue;
+use crate::model::{BookSide, Venue};
 use crate::scan::{maker_ask_quote, maker_quote, Cx, MarketMeta, Rel, RelType, D};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -48,15 +48,20 @@ pub struct RiskVerdict {
 pub struct Toxgate {
     pub ts: f64,
     /// market_id -> side ("bid"/"ask") -> expected adverse cost per contract
+    ///
+    /// Keyed by the WIRE spelling because that is what the research file on
+    /// disk contains; the lookup below is the only reader, and it asks with
+    /// `BookSide::as_str`. A key that is neither is simply never asked for,
+    /// which is the same fail-open a missing entry gets.
     pub markets: HashMap<String, HashMap<String, f64>>,
 }
 
 impl Toxgate {
-    fn score(&self, market_id: &str, side: &str, now: f64) -> Option<f64> {
+    fn score(&self, market_id: &str, side: BookSide, now: f64) -> Option<f64> {
         if now - self.ts > TOXGATE_MAX_AGE {
             return None; // stale — fail open
         }
-        self.markets.get(market_id)?.get(side).copied()
+        self.markets.get(market_id)?.get(side.as_str()).copied()
     }
 }
 
@@ -85,12 +90,12 @@ pub struct Quoter {
     apr_margin: Option<D>,
     /// (market_id, side) pairs another subsystem owns (maker-unwind exit
     /// asks) — `target` returns None so any entry quote cancels, none rests.
-    suppress: HashSet<(String, &'static str)>,
+    suppress: HashSet<(String, BookSide)>,
     /// Toxicity gate feed; None => gate off (exact original behavior).
     toxgate: Option<Arc<Toxgate>>,
     risk: Option<Arc<dyn RiskGate>>,
-    resting: HashMap<(usize, &'static str), RestingQuote>,
-    last_quote_ts: HashMap<(usize, &'static str), f64>,
+    resting: HashMap<(usize, BookSide), RestingQuote>,
+    last_quote_ts: HashMap<(usize, BookSide), f64>,
 }
 
 fn default_meta(cx: &mut Cx) -> MarketMeta {
@@ -138,7 +143,7 @@ impl Quoter {
         self.apr_margin = Some(cx.quantize_4dp(m));
     }
 
-    pub fn set_suppress(&mut self, pairs: HashSet<(String, &'static str)>) {
+    pub fn set_suppress(&mut self, pairs: HashSet<(String, BookSide)>) {
         self.suppress = pairs;
     }
 
@@ -156,12 +161,15 @@ impl Quoter {
         cx: &mut Cx,
         books: &BookBuilder,
         i: usize,
-        side: &'static str,
+        side: BookSide,
     ) -> Option<D> {
         let leg = &self.rel.legs[i];
         let book = books.get(leg.venue, &leg.market_id)?;
         let rq = self.resting.get(&(i, side));
-        let levels = if side == "bid" { &book.bids } else { &book.asks };
+        let levels = match side {
+            BookSide::Bid => &book.bids,
+            BookSide::Ask => &book.asks,
+        };
         for lvl in levels {
             let p = cx.parse(&lvl.price)?;
             let mut size = cx.parse(&lvl.size)?;
@@ -184,7 +192,7 @@ impl Quoter {
         fees: &FeeSchedule,
         books: &BookBuilder,
         i: usize,
-        side: &'static str,
+        side: BookSide,
     ) -> Option<D> {
         let leg = &self.rel.legs[i];
         if self.suppress.contains(&(leg.market_id.clone(), side)) {
@@ -200,7 +208,7 @@ impl Quoter {
             let _ = l;
             default_meta(&mut Cx::default())
         };
-        if side == "bid" {
+        if side == BookSide::Bid {
             let mut p_max = maker_quote(cx, fees, &self.rel, i, books, &metas, clip)?;
             if let Some(m) = self.apr_margin {
                 p_max = cx.sub(p_max, m); // fill must annualize >= min_apr
@@ -313,13 +321,16 @@ impl Quoter {
         cx: &mut Cx,
         books: &BookBuilder,
         i: usize,
-        side: &'static str,
+        side: BookSide,
     ) -> bool {
         let hedge_leg = &self.rel.legs[1 - i];
         let Some(b) = books.get(hedge_leg.venue, &hedge_leg.market_id) else {
             return false;
         };
-        let lvl = if side == "bid" { b.bids.first() } else { b.asks.first() };
+        let lvl = match side {
+            BookSide::Bid => b.bids.first(),
+            BookSide::Ask => b.asks.first(),
+        };
         match lvl {
             Some(l) => {
                 let Some(sz) = cx.parse(&l.size) else { return false };
@@ -339,8 +350,13 @@ impl Quoter {
     /// Cancel every resting quote (kill switch / shutdown), emitting cancel
     /// intents in deterministic (leg, side) order. Mirrors Python cancel_all.
     pub fn cancel_all(&mut self, cx: &mut Cx, now: f64, intents: &mut Vec<Intent>) {
-        let mut keys: Vec<(usize, &'static str)> = self.resting.keys().copied().collect();
-        keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(b.1)));
+        let mut keys: Vec<(usize, BookSide)> = self.resting.keys().copied().collect();
+        // By the WIRE spelling, so `ask` comes before `bid` — the order these
+        // cancels have always gone out in, and one the golden digest hashes.
+        // `BookSide` is deliberately not `Ord` so that this cannot quietly
+        // become declaration order (bid before ask) when the key stopped being
+        // a string.
+        keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.as_str().cmp(b.1.as_str())));
         for key in keys {
             let curq = self.resting.remove(&key).expect("key from keys()");
             let leg = &self.rel.legs[key.0];
@@ -348,7 +364,7 @@ impl Quoter {
                 cancel: leg.market_id.clone(),
                 order_id: curq.order_id,
                 price: Self::px(cx, curq.price),
-                side: key.1.to_string(),
+                side: key.1,
                 ts: now,
                 venue: leg.venue,
             }));
@@ -383,7 +399,7 @@ impl Quoter {
             if let Some(reason) = &crossed {
                 intents.push(Intent::Skip(intent::Skip { skip: vec![reason.clone()], ts: now }));
             }
-            for side in ["bid", "ask"] {
+            for side in [BookSide::Bid, BookSide::Ask] {
                 let key = (i, side);
                 let leg_venue = self.rel.legs[i].venue;
                 let leg_market = self.rel.legs[i].market_id.clone();
@@ -403,7 +419,13 @@ impl Quoter {
                     {
                         if tox > TOXGATE_MAX {
                             intents.push(Intent::Skip(intent::Skip {
-                                skip: vec![format!("toxgate {side} {tox:.3} > {TOXGATE_MAX}")],
+                                // `as_str`, not `{side:?}`: this reason string
+                                // reaches the intents file and the digest, and
+                                // Debug would spell it `Bid`.
+                                skip: vec![format!(
+                                    "toxgate {} {tox:.3} > {TOXGATE_MAX}",
+                                    side.as_str()
+                                )],
                                 ts: now,
                             }));
                             target = None;
@@ -416,7 +438,7 @@ impl Quoter {
                             cancel: leg_market,
                             order_id: curq.order_id,
                             price: Self::px(cx, curq.price),
-                            side: side.to_string(),
+                            side,
                             ts: now,
                             venue: leg_venue,
                         }));
@@ -488,7 +510,7 @@ impl Quoter {
                     // The quoter rests post-only GTC makers and nothing else:
                     // no retry chain, no strategy tag, never a taker.
                     retry: None,
-                    side: side.to_string(),
+                    side,
                     tag: None,
                     taker: false,
                     ts: now,
@@ -620,6 +642,29 @@ pub(crate) mod tests_support {
         assert_eq!(reprice.replaces.as_ref(), Some(&old_oid));
         assert_eq!(reprice.old_price.as_ref(), Some(&old_px));
         assert_ne!(reprice.order_id, old_oid, "the replacement is a new order id");
+    }
+
+    /// The toxgate's skip reason is an emitted byte string: it lands in
+    /// `intents.jsonl` and in the golden digest. `side` is a `BookSide` now, so
+    /// the format has to ask for `as_str()` — `{side}` would not compile and
+    /// `{side:?}` would compile and silently write `Bid`.
+    #[test]
+    fn a_toxic_side_skips_by_its_wire_spelling() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        q.set_toxgate(Some(Arc::new(Toxgate {
+            ts: 100.0,
+            markets: HashMap::from([(
+                "P".to_string(),
+                HashMap::from([("bid".to_string(), 0.05)]),
+            )]),
+        })));
+        let mut oid = 0u64;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+
+        assert_eq!(skips(&intents), vec!["toxgate bid 0.050 > 0.03"]);
+        assert!(!any_place(&intents), "a toxic side rests nothing: {intents:?}");
     }
 
     /// card 6fb469da (the fraalb sawtooth): the throttle applies to RE-ENTRY

@@ -85,11 +85,7 @@ fn to_event(row: &Row) -> Option<TapeEvent> {
             ts_venue,
         }),
         "delta" => {
-            let side = match str_field(row, "side")?.as_str() {
-                "bid" => BookSide::Bid,
-                "ask" => BookSide::Ask,
-                _ => return None,
-            };
+            let side = BookSide::parse(&str_field(row, "side")?)?;
             Some(TapeEvent::Delta {
                 venue,
                 market_id,

@@ -13,7 +13,7 @@
 use super::Engine;
 use crate::exec::Action;
 use arb_core::intent::Intent;
-use arb_core::model::Venue;
+use arb_core::model::{BookSide, Venue};
 use arb_venue::gateway::{CancelBy, CancelRequest, PlaceRequest, Side as VenueSide, Tif};
 use std::collections::HashMap;
 
@@ -262,11 +262,17 @@ pub(super) fn intent_actions(
             // retried place idempotent at the venue.
             out.push(Action::Place(PlaceRequest {
                 market: p.place.clone(),
-                // The last stringly-typed field on this path. Until the hedge
-                // policy's `book_side: &str` chain is typed too, an unknown
-                // side still reads as a BID — but it can no longer be a
-                // MISSING one: `side` is a required field of a place.
-                side: if p.side == "ask" { VenueSide::Ask } else { VenueSide::Bid },
+                // THE line this whole typing pass existed for. It was
+                // `if p.side == "ask" { Ask } else { Bid }`, so every value
+                // that was not exactly `"ask"` — a typo, a case difference, a
+                // venue's own spelling — became a BID, which is a BUY, at a
+                // price chosen for the other side of the book. There is no
+                // else here any more: two variants in, two arms out, and the
+                // compiler refuses a third.
+                side: match p.side {
+                    BookSide::Bid => VenueSide::Bid,
+                    BookSide::Ask => VenueSide::Ask,
+                },
                 price: p.price.clone(),
                 qty: p.count,
                 tif: if p.taker { Tif::Ioc } else { Tif::Gtc },
@@ -366,7 +372,7 @@ mod cancel_addressing_tests {
             cancel: market.into(),
             order_id: oid.into(),
             price: "0.12".into(),
-            side: "ask".into(),
+            side: BookSide::Ask,
             ts: 1.0,
             venue,
         })
@@ -742,6 +748,33 @@ mod cancel_addressing_tests {
         let Action::Place(p) = &hedge[0] else { panic!("expected a place") };
         assert!(!p.post_only, "a hedge crosses");
         assert!(matches!(p.tif, Tif::Ioc));
+    }
+
+    /// The side an intent decided is the side the venue is asked for, both ways
+    /// round — the assertion this file did not have while the mapping was
+    /// `if p.side == "ask" { Ask } else { Bid }`.
+    ///
+    /// That form had no way to be wrong about `"ask"` and no way to be right
+    /// about anything else: every other value — a typo, a case difference, a
+    /// venue's own spelling — took the else and became a BUY. It cannot arise
+    /// now, because a place carrying one does not parse (`arb_core::intent`
+    /// pins that) and would not compile if it were built by hand.
+    #[test]
+    fn a_place_asks_the_venue_for_the_side_the_intent_decided() {
+        for (side, want) in [("bid", VenueSide::Bid), ("ask", VenueSide::Ask)] {
+            let mut parked = HashMap::new();
+            let acts = intent_actions(
+                &intent(&format!(
+                    r#"{{"count":5,"order_id":"m1","place":"KXTEST","price":"0.31","side":"{side}","ts":1.0,"venue":"kalshi"}}"#
+                )),
+                true,
+                &HashMap::new(),
+                &mut parked,
+                t0(),
+            );
+            let Action::Place(p) = &acts[0] else { panic!("expected a place") };
+            assert_eq!(p.side, want, "a {side} intent must place on the {side}");
+        }
     }
 
     /// An UNARMED engine never receives an ack (the executor drops the command
