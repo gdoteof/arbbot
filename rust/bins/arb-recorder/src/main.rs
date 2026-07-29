@@ -391,7 +391,8 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            println!("[hb] gaps={} subscribers={}", core_hb.gap_count(),
+            println!("[hb] gaps={} dropped_composite={} subscribers={}", core_hb.gap_count(),
+                     crate::core::dropped_composite(),
                      core_hb.broadcaster.subscriber_count());
         }
     });

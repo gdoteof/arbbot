@@ -20,18 +20,18 @@ pub const WS_MARKET_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/m
 
 fn levels(raw: Option<&Value>, descending: bool) -> Vec<Level> {
     sorted_levels(raw, descending, |l| {
-        Some((dec_string(l.get("price")?), dec_string(l.get("size")?)))
+        Some((dec_string(l.get("price")?)?, dec_string(l.get("size")?)?))
     })
 }
 
 fn ts_venue_of(msg: &Value) -> Option<String> {
-    Some(dec_string(msg.get("timestamp").unwrap_or(&Value::String(String::new()))))
+    dec_string(msg.get("timestamp").unwrap_or(&Value::String(String::new())))
 }
 
 fn book_event(msg: &Value, seq: u64) -> Option<TapeEvent> {
     Some(TapeEvent::Snapshot {
         venue: Venue::Polymarket,
-        market_id: dec_string(msg.get("asset_id")?),
+        market_id: dec_string(msg.get("asset_id")?)?,
         bids: levels(msg.get("bids"), true),
         asks: levels(msg.get("asks"), false),
         seq,
@@ -56,15 +56,23 @@ fn parse_ws_frame(frame: &str, seq: &mut SeqCounter) -> Vec<TapeEvent> {
     for m in msgs {
         match m.get("event_type").and_then(Value::as_str) {
             Some("book") => {
-                if let Some(asset) = m.get("asset_id") {
-                    let s = seq.next(&dec_string(asset));
+                if let Some(asset) = m.get("asset_id").and_then(dec_string) {
+                    let s = seq.next(&asset);
                     out.extend(book_event(m, s));
                 }
             }
             Some("price_change") => {
                 for ch in m.get("price_changes").and_then(Value::as_array).unwrap_or(&vec![]) {
-                    let Some(asset) = ch.get("asset_id") else { continue };
-                    let asset = dec_string(asset);
+                    let Some(asset) = ch.get("asset_id").and_then(dec_string) else { continue };
+                    // Resolved BEFORE the seq is taken, so a frame we cannot
+                    // read does not spend a sequence number the book stream
+                    // then waits forever for.
+                    let (Some(price), Some(size)) = (
+                        dec_string(ch.get("price").unwrap_or(&Value::Null)),
+                        dec_string(ch.get("size").unwrap_or(&Value::Null)),
+                    ) else {
+                        continue;
+                    };
                     let s = seq.next(&asset);
                     let side_buy = ch
                         .get("side")
@@ -75,8 +83,8 @@ fn parse_ws_frame(frame: &str, seq: &mut SeqCounter) -> Vec<TapeEvent> {
                         venue: Venue::Polymarket,
                         market_id: asset,
                         side: if side_buy { BookSide::Bid } else { BookSide::Ask },
-                        price: dec_string(ch.get("price").unwrap_or(&Value::Null)),
-                        size: dec_string(ch.get("size").unwrap_or(&Value::Null)),
+                        price,
+                        size,
                         seq: s,
                         ts_local_ns: now_local_ns(),
                         ts_venue: ts_venue_of(m),
@@ -84,8 +92,14 @@ fn parse_ws_frame(frame: &str, seq: &mut SeqCounter) -> Vec<TapeEvent> {
                 }
             }
             Some("last_trade_price") => {
-                if let Some(asset) = m.get("asset_id") {
-                    let asset = dec_string(asset);
+                if let Some(asset) = m.get("asset_id").and_then(dec_string) {
+                    // Resolved before the seq is taken — see the delta arm.
+                    let (Some(price), Some(size)) = (
+                        dec_string(m.get("price").unwrap_or(&Value::Null)),
+                        dec_string(m.get("size").unwrap_or(&Value::Null)),
+                    ) else {
+                        continue;
+                    };
                     // Trades get their OWN seq stream. Sharing the book's
                     // per-asset counter spends a sequence number that no book
                     // update ever consumes, so the NEXT delta arrives one ahead
@@ -110,8 +124,8 @@ fn parse_ws_frame(frame: &str, seq: &mut SeqCounter) -> Vec<TapeEvent> {
                     out.push(TapeEvent::Trade {
                         venue: Venue::Polymarket,
                         market_id: asset,
-                        price: dec_string(m.get("price").unwrap_or(&Value::Null)),
-                        size: dec_string(m.get("size").unwrap_or(&Value::Null)),
+                        price,
+                        size,
                         taker_side: Some(if buy { TakerSide::Buy } else { TakerSide::Sell }),
                         seq: s,
                         ts_local_ns: now_local_ns(),
@@ -390,6 +404,31 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    /// Ticket #58 landed on PM-US, but the hole was in the helper all three
+    /// feeds share, so this is the same assertion on this venue. INTL is the
+    /// most exposed of the three: a `price_change` delta's price AND size go
+    /// straight to the tape with no `Dec::parse` anywhere between the venue and
+    /// the writer.
+    #[test]
+    fn a_composite_where_a_decimal_belongs_drops_the_event() {
+        let mut seq = SeqCounter::default();
+        let pc = json!([{"event_type": "price_change", "timestamp": "17",
+                         "price_changes": [{"asset_id": "123", "side": "SELL",
+                                             "price": "0.61", "size": {"value": "9"}}]}])
+        .to_string();
+        assert!(
+            parse_ws_frame(&pc, &mut seq).is_empty(),
+            "a delta whose size is not a decimal must not reach the tape at all"
+        );
+        let lt = json!({"event_type": "last_trade_price", "asset_id": "123", "side": "BUY",
+                        "price": {"value": "0.61"}, "size": "9", "timestamp": "17"})
+        .to_string();
+        assert!(
+            parse_ws_frame(&lt, &mut seq).is_empty(),
+            "a trade whose price is not a decimal must not reach the tape at all"
+        );
     }
 
     /// A trade must NOT consume a sequence number from the book's stream.

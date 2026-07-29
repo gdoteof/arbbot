@@ -19,9 +19,26 @@ pub const GATEWAY_BASE: &str = "https://gateway.polymarket.us/v1";
 pub const WS_MARKETS_URL: &str = "wss://api.polymarket.us/v1/ws/markets";
 pub const WS_MARKETS_PATH: &str = "/v1/ws/markets";
 
+/// Unwrap PM-US's money type, `{"currency":"USD","value":"5.0000"}`.
+///
+/// The `currency` label travels with the WRAPPER, not with the meaning: the
+/// venue reuses the same type for a price (dollars) and for a trade's
+/// `quantity` (CONTRACTS — see `trade_size_is_the_contract_count_inside_the_
+/// money_wrapper`, which settles it against the book depth the print consumes).
+/// Reading `currency` as the unit is the trap this helper exists to keep in one
+/// place.
+///
+/// A field that arrives BARE is taken as-is, which is the same spelling the
+/// venue already uses for a book level's `qty` in this very feed. A field that
+/// is an object without `value` is a shape nobody has seen: `dec_string`
+/// refuses it and says so.
+fn money_value(v: &Value) -> Option<String> {
+    dec_string(v.get("value").unwrap_or(v))
+}
+
 fn levels(raw: Option<&Value>, descending: bool) -> Vec<Level> {
     sorted_levels(raw, descending, |l| {
-        Some((dec_string(l.get("px")?.get("value")?), dec_string(l.get("qty")?)))
+        Some((money_value(l.get("px")?)?, dec_string(l.get("qty")?)?))
     })
 }
 
@@ -33,7 +50,7 @@ pub fn normalize_book(slug: &str, md: &Value, seq: u64) -> TapeEvent {
         asks: levels(md.get("offers"), false), // ask side = "offers"
         seq,
         ts_local_ns: now_local_ns(),
-        ts_venue: Some(dec_string(md.get("transactTime").unwrap_or(&Value::String(String::new())))),
+        ts_venue: dec_string(md.get("transactTime").unwrap_or(&Value::String(String::new()))),
     }
 }
 
@@ -50,9 +67,28 @@ fn parse_ws_message(msg: &Value, seq: &mut SeqCounter) -> Vec<TapeEvent> {
             .and_then(|x| x.get("intent"))
             .and_then(Value::as_str)
             .unwrap_or("");
+        // BOTH legs are money-wrapped, and `size` is a contract count despite
+        // the wrapper's `"currency":"USD"` — see `money_value`. Resolved before
+        // the sequence number is taken, so a frame we cannot read does not also
+        // spend a seq.
+        //
+        // All-or-nothing on the COMPOSITE case, which is ticket #58's: an
+        // absent or unreadable leg costs the whole trade, where
+        // `unwrap_or_default` used to write `price: ""` — a lie of the same
+        // kind as a stringified object. It is NOT all-or-nothing on an explicit
+        // JSON `null`: `dec_string` maps null to `Some("")` (that arm is what
+        // keeps this change inert for the fields that legitimately arrive
+        // absent), so `{"currency":"USD","value":null}` still writes a trade
+        // with an empty price. Unchanged from before this fix, so not a
+        // regression, and no such payload has ever been seen on four full
+        // tapes — but it is a hole, not a guarantee, and saying otherwise here
+        // would claim more than the code does.
+        let (Some(price), Some(size)) =
+            (t.get("price").and_then(money_value), t.get("quantity").and_then(money_value))
+        else {
+            return vec![];
+        };
         let s = seq.next(&format!("{slug}|tape"));
-        let price = t.get("price").and_then(|p| p.get("value")).map(dec_string).unwrap_or_default();
-        let size = t.get("quantity").map(dec_string).unwrap_or_default();
         return vec![TapeEvent::Trade {
             venue: Venue::PolymarketUs,
             market_id: slug,
@@ -61,7 +97,7 @@ fn parse_ws_message(msg: &Value, seq: &mut SeqCounter) -> Vec<TapeEvent> {
             taker_side: Some(if taker.contains("BUY") { TakerSide::Buy } else { TakerSide::Sell }),
             seq: s,
             ts_local_ns: now_local_ns(),
-            ts_venue: Some(dec_string(t.get("tradeTime").unwrap_or(&Value::String(String::new())))),
+            ts_venue: dec_string(t.get("tradeTime").unwrap_or(&Value::String(String::new()))),
         }];
     }
     vec![] // heartbeat/error/lite ignored
@@ -258,14 +294,142 @@ mod tests {
     #[test]
     fn trade_takes_tape_seq_stream() {
         let mut seq = SeqCounter::default();
-        let t = json!({"trade": {"marketSlug": "s-1", "price": {"value": "0.55"},
-                                  "quantity": "12.0000",
+        let t = json!({"trade": {"marketSlug": "s-1", "price": {"value": "0.55", "currency": "USD"},
+                                  "quantity": {"value": "12.0000", "currency": "USD"},
                                   "taker": {"intent": "INTENT_BUY_LONG"},
                                   "tradeTime": "2026-07-23T02:03:04Z"}});
         match &parse_ws_message(&t, &mut seq)[0] {
             TapeEvent::Trade { taker_side, seq, .. } => {
                 assert_eq!(*taker_side, Some(TakerSide::Buy));
                 assert_eq!(*seq, 1); // independent |tape stream
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// PROVENANCE, because this test's whole subject is not claiming more than
+    /// you have. RECORDED, byte for byte, from the 2026-07-29 tape line for this
+    /// market: `marketSlug`, `tradeTime`, `price`'s value, and `quantity` —
+    /// the entire wrapper verbatim, since that stringified object is precisely
+    /// what the defect wrote into `size`. RECONSTRUCTED: `price`'s wrapper (the
+    /// recorder already unwrapped `price` before writing, so the tape holds
+    /// `"0.2800"` and the wrapper around it is known from the call site, not
+    /// from the recording), and `taker.intent`, which the tape NEVER stores —
+    /// it keeps only the derived `taker_side`. `BUY_SHORT` is DERIVED, not
+    /// observed: the tape says `taker_side: "buy"`, so the intent contained
+    /// "BUY" and was not `SELL_LONG`; the book below says the aggressor
+    /// consumed the resting BID; and hitting a resting YES bid is
+    /// `ORDER_INTENT_BUY_SHORT` (`docs/venue-quirks.md`,
+    /// `pmus-intent-buy-short`). Neither field is load-bearing for the
+    /// assertion, which is exactly why an invented value could sit here
+    /// unnoticed.
+    ///
+    /// UNITS. `quantity` arrives inside the venue's generic money wrapper —
+    /// `{"currency":"USD","value":"5.0000"}` — and the `currency: USD` label is
+    /// the whole trap, because it reads as "these are dollars". It is not: it
+    /// belongs to the WRAPPER, not to the meaning.
+    ///
+    /// The book settles it by ATTRIBUTION, not by adjacency. PM-US stamps the
+    /// post-trade snapshot's `transactTime` byte-identically to the trade's
+    /// `tradeTime`, so the snapshot carrying this print's consequence is
+    /// IDENTIFIED rather than merely next to it:
+    /// `2026-07-29T01:56:27.328744187Z` appears on exactly one snapshot for
+    /// this market. The resting bid at 0.2800 holds 240.0000 across the five
+    /// snapshots before it, and reads 235.0000 on it and after — consumed by
+    /// EXACTLY the printed `value`. Nothing else can account for the move:
+    /// this is the ONLY trade on this market all day, so no interleaving is
+    /// possible. Book sizes are contracts (`qty` is the bare decimal the venue
+    /// also takes as a bare integer `quantity` on `POST /v1/orders`), so the
+    /// printed value is contracts. USD notional would have had to remove
+    /// 5.0000/0.28 = 17.86 from that level, and it did not.
+    ///
+    /// Not a one-off. Sweeping the same tape for every print whose post-trade
+    /// snapshot is identified this way: thousands match contracts and **zero**
+    /// match notional. The exact count moves with how you treat prints sharing
+    /// one snapshot (3,113 by the sweep in this PR's transcript); the zero does
+    /// not. A non-integral `value` is NOT evidence against contracts either —
+    /// PM-US positions are genuinely fractional, and 1,899 of those matches
+    /// carry a fractional size (`51.4800`, `1.0500`) agreeing to the cent with
+    /// an equally fractional level.
+    #[test]
+    fn trade_size_is_the_contract_count_inside_the_money_wrapper() {
+        let mut seq = SeqCounter::default();
+        let t = json!({"trade": {
+            "marketSlug": "ewc-pres-bra-2026-10-04-flabol",
+            "price": {"currency": "USD", "value": "0.2800"},
+            "quantity": {"currency": "USD", "value": "5.0000"},
+            "taker": {"intent": "ORDER_INTENT_BUY_SHORT"},
+            "tradeTime": "2026-07-29T01:56:27.328744187Z"}});
+        match &parse_ws_message(&t, &mut seq)[0] {
+            TapeEvent::Trade { price, size, .. } => {
+                assert_eq!(price, "0.2800");
+                assert_eq!(size, "5.0000", "size must be the contract count, not the wrapper");
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// A shape nobody anticipated must COST us the event, not be laundered into
+    /// a decimal-shaped string.
+    ///
+    /// The money wrapper without its `value` stands in for any future venue
+    /// change. Before this was fixed the whole object went into `size` as
+    /// `"{\"currency\":\"USD\"}"` and then round-tripped `serde_json` and
+    /// `arb-recorder --parse-check` untouched, because both only ask whether the
+    /// string survives re-serialization — and a string that was already a string
+    /// when it arrived always does.
+    #[test]
+    fn a_trade_field_of_an_unknown_shape_is_dropped_not_stringified() {
+        let mut seq = SeqCounter::default();
+        let t = json!({"trade": {
+            "marketSlug": "s-1",
+            "price": {"currency": "USD", "value": "0.2800"},
+            "quantity": {"currency": "USD"},
+            "taker": {"intent": "ORDER_INTENT_BUY_LONG"},
+            "tradeTime": "2026-07-29T01:56:27Z"}});
+        assert!(
+            parse_ws_message(&t, &mut seq).is_empty(),
+            "a trade whose quantity is not a decimal must not reach the tape at all"
+        );
+    }
+
+    /// The same exposure one call site over: `quantity` was never special, the
+    /// silent `to_string()` under it was.
+    ///
+    /// A level's SIZE happens to be safe already — `sorted_levels` runs
+    /// `Dec::parse` over it and a stringified object does not parse, so the
+    /// level is dropped. Nothing checks the PRICE. A composite there survived
+    /// into `Level.price` verbatim, and the sort reads it back as `Dec::ZERO`
+    /// (`sorted_levels`' `unwrap_or`).
+    ///
+    /// Where that lands is NOT symmetric, and the benign-sounding half is the
+    /// bid half. Bids sort descending, so a `Dec::ZERO` price goes to the far
+    /// end and reads as a deep quote. Asks sort ASCENDING (`sorted_levels`'
+    /// other branch), so the same bad level sorts to `asks[0]` — the BEST
+    /// OFFER, the top of book the engine prices off.
+    ///
+    /// What actually saves us is downstream and is not the sort at all:
+    /// `book.rs`'s `px` parses that same price back to `Dec::ZERO`, so
+    /// `crossing()` sees bid >= ask and reports the book CROSSED, and every
+    /// consumer filters crossed books out (`scan.rs`, `hedge.rs`,
+    /// `quoter.rs`). The corrupt book is refused rather than priced. That is
+    /// the safe outcome, but it is safety by a corruption check catching a
+    /// poisoned top of book — not by the bad level being harmless.
+    ///
+    /// That accidental, ASYMMETRIC half-protection is exactly why this is fixed
+    /// in `dec_string` and not at the `quantity` call site.
+    #[test]
+    fn a_book_level_of_an_unknown_shape_is_dropped_not_stringified() {
+        let md = json!({"marketSlug": "s-1",
+                        "bids": [{"px": {"value": {"amount": "0.6300"}}, "qty": "42.0000"},
+                                 {"px": {"value": "0.6200"}, "qty": "17.0000"}],
+                        "offers": [],
+                        "transactTime": "2026-07-23T01:02:03.123456789Z"});
+        let mut seq = SeqCounter::default();
+        match &parse_ws_message(&json!({"marketData": md}), &mut seq)[0] {
+            TapeEvent::Snapshot { bids, .. } => {
+                assert_eq!(bids.len(), 1, "the composite-price level must be dropped");
+                assert_eq!(bids[0].price, "0.6200");
             }
             _ => panic!(),
         }
