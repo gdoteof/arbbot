@@ -606,7 +606,8 @@ mod tests {
         }
         assert_eq!(stale_ticks, 0, "the feed went >600ms unread while the sweep ran");
         // ...and not by skipping the sweep: every book must still be refreshed.
-        let books = core.snapshot_lines().join("");
+        let mut books = String::new();
+        core.with_snapshot_lines(&mut |lines| books = lines.join(""));
         for t in &tokens {
             assert!(books.contains(t.as_str()), "{t} was never re-snapshotted");
         }

@@ -122,24 +122,72 @@ impl Core {
         }
     }
 
-    pub fn snapshot_lines(&self) -> Vec<String> {
+    /// Hand the current books, as snapshot event lines, to `use_lines` WHILE
+    /// STILL HOLDING the core lock.
+    ///
+    /// This is the whole of the fix for two defects that were one defect. The
+    /// old `snapshot_lines()` captured the books under the lock and RELEASED it
+    /// before returning, so its caller published them with the feed running:
+    ///
+    ///  * the 30s heal captured `Snapshot{M,100}`, a feed task then published
+    ///    `Delta{M,101}`, and the heal loop published the snapshot after it.
+    ///    Wire order delta-101 then snapshot-100, and `apply_snapshot` inserts
+    ///    UNCONDITIONALLY: the engine rewound M to seq 100 with a pulled bid
+    ///    restored, priced against it, then gapped on seq 102 and deleted the
+    ///    book — dark for up to 30s with quotes resting on both venues.
+    ///  * the welcome burst was the same shape one layer down: state captured
+    ///    with the lock released, ~1,163 lines enqueued, and only then the
+    ///    subscriber registered. Deltas published inside that window were
+    ///    queued for nobody — a LOSS, gapping the engine on the reconnect it
+    ///    had just been forced into.
+    ///
+    /// `on_event` publishes while holding this lock, so holding it across the
+    /// USE — not just the capture — is what makes the two atomic against the
+    /// feed.
+    ///
+    /// What that costs is SMALLER than "feed tasks now wait out a burst", which
+    /// is the easy thing to say and charges the whole burst to a change that
+    /// did not introduce it. `snapshot_lines()` ALREADY held this lock across
+    /// `snapshot_events()` plus 1,163 `to_json_line()` calls — the acquisition
+    /// below is unchanged and only `use_lines(..)` moved inside it. The NEW
+    /// hold is the publish loop alone: 1,163 `subs` lock/unlock pairs and, per
+    /// subscriber, an `Arc<str>` and an unbounded `send`. The live recorder
+    /// runs at `subscribers=0` (the trader is still on the Python socket), so
+    /// today that is tens of microseconds; ~1-2ms at five subscribers.
+    ///
+    /// For scale: `JsonlWriter::write` does an unbuffered `write(2)` per event
+    /// under this same lock at ~230 events/s, so the lock is already
+    /// syscall-bound at roughly 0.1% duty and this adds ~0.017%.
+    ///
+    /// LOCK ORDER is core then subs, everywhere and only that way. `on_event`,
+    /// `rebroadcast_snapshots` and the welcome all take the core lock first and
+    /// reach `Broadcaster`'s `subs` lock second (`publish`, or the registration
+    /// inside `add_subscriber`). Nothing under `subs` takes the core lock, so
+    /// the nesting cannot invert. Returning the lines instead — letting the
+    /// broadcaster take `subs` and then ask for state — is exactly the
+    /// inversion, which is why `welcome` takes a callback.
+    pub fn with_snapshot_lines(&self, use_lines: &mut dyn FnMut(Vec<String>)) {
         let inner = self.inner.lock().expect("core lock");
-        inner
-            .books
-            .snapshot_events()
-            .iter()
-            .map(|e| {
-                let mut l = e.to_json_line();
-                l.push('\n');
-                l
-            })
-            .collect()
+        use_lines(
+            inner
+                .books
+                .snapshot_events()
+                .iter()
+                .map(|e| {
+                    let mut l = e.to_json_line();
+                    l.push('\n');
+                    l
+                })
+                .collect(),
+        );
     }
 
     pub fn rebroadcast_snapshots(&self) {
-        for line in self.snapshot_lines() {
-            self.broadcaster.publish(&line);
-        }
+        self.with_snapshot_lines(&mut |lines| {
+            for line in lines {
+                self.broadcaster.publish(&line);
+            }
+        });
     }
 
     pub fn evict_book(&self, venue: arb_core::model::Venue, market_id: &str) {
@@ -183,4 +231,249 @@ pub fn stall_reconnect_s() -> u64 {
 /// never sets these; the constants remain the real venues.
 pub fn ws_url(env_key: &str, default: &str) -> String {
     std::env::var(env_key).unwrap_or_else(|_| default.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arb_core::model::{BookSide, Level, TapeEvent, Venue};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::net::UnixStream;
+
+    /// Enough books that a burst is a real burst. The market the feed hammers
+    /// is the LAST one in `BookBuilder`'s ordering, so before the fix almost
+    /// the whole burst sat between the capture and its snapshot reaching
+    /// the wire — the window the deltas landed in.
+    const MARKETS: usize = 400;
+    const HOT: &str = "M399";
+    const DELTAS: u64 = 5_000;
+    const BURSTS: usize = 30;
+    const END: &str = "{\"end\":true}\n";
+
+    fn snap(market: &str, seq: u64) -> TapeEvent {
+        TapeEvent::Snapshot {
+            venue: Venue::Kalshi,
+            market_id: market.to_owned(),
+            bids: vec![Level { price: "0.40".into(), size: "10".into() }],
+            asks: vec![Level { price: "0.60".into(), size: "10".into() }],
+            seq,
+            ts_local_ns: 1,
+            ts_venue: None,
+        }
+    }
+
+    fn delta(seq: u64) -> TapeEvent {
+        TapeEvent::Delta {
+            venue: Venue::Kalshi,
+            market_id: HOT.to_owned(),
+            side: BookSide::Bid,
+            price: "0.40".into(),
+            size: "11".into(),
+            seq,
+            ts_local_ns: 1,
+            ts_venue: None,
+        }
+    }
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("arb-core-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("tmpdir");
+        d
+    }
+
+    fn new_core(dir: &Path) -> Arc<Core> {
+        Arc::new(Core::new(
+            JsonlWriter::new(dir.join("tape")).expect("writer"),
+            Broadcaster::new(arb_tape::broadcast::MAX_BUFFER),
+        ))
+    }
+
+    /// A Core holding MARKETS books at seq 1, serving the socket. Seeding runs
+    /// before anything subscribes, so it publishes to nobody.
+    async fn seeded(dir: &Path) -> Arc<Core> {
+        let core = new_core(dir);
+        for i in 0..MARKETS {
+            core.on_event(&snap(&format!("M{i:03}"), 1));
+        }
+        let (b, c, sock) = (core.broadcaster.clone(), core.clone(), dir.join("t.sock"));
+        tokio::spawn(async move {
+            b.serve(&sock, move |register: &mut dyn FnMut(Vec<String>)| {
+                c.with_snapshot_lines(register)
+            })
+            .await
+            .ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        core
+    }
+
+    async fn subscribe(dir: &Path) -> tokio::io::BufReader<UnixStream> {
+        tokio::io::BufReader::new(UnixStream::connect(dir.join("t.sock")).await.expect("connect"))
+    }
+
+    /// Everything the subscriber saw, in wire order, up to the sentinel.
+    async fn wire(reader: &mut tokio::io::BufReader<UnixStream>) -> Vec<(String, String, u64)> {
+        let mut out = Vec::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).await.expect("read");
+            assert!(n > 0, "socket closed before the sentinel");
+            let v: serde_json::Value = serde_json::from_str(&line).expect("wire json");
+            if v.get("end").is_some() {
+                return out;
+            }
+            out.push((
+                v["kind"].as_str().expect("kind").to_owned(),
+                v["market_id"].as_str().expect("market_id").to_owned(),
+                v["seq"].as_u64().expect("seq"),
+            ));
+        }
+    }
+
+    /// DEFECT 1. A delta published while the 30s heal is in flight must never
+    /// be followed on the wire by an older snapshot of the same market: the
+    /// engine's `apply_snapshot` inserts unconditionally, so that rewinds the
+    /// book, and the next real delta gaps it out of the engine's view.
+    ///
+    /// The invariant established here is LOCAL and that is what the assertion
+    /// checks: between a heal burst and the deltas published concurrently with
+    /// it, this market's wire seq does not go backwards. It is NOT the global
+    /// claim that a market's wire seq only ever rises, which production breaks
+    /// twice on purpose — `kalshi::ws_session` builds its `SeqCounter` inside
+    /// the session (kalshi.rs:315), so every reconnect restarts every Kalshi
+    /// market at 1, and trades take an independent counter keyed `{t}|tape`
+    /// (kalshi.rs:428) under the same `market_id`, so a trade at seq 12 follows
+    /// a delta at seq 500. Neither harms the engine (a reconnect is
+    /// snapshot-led and `apply_snapshot` inserts unconditionally; trades are
+    /// inert for the book), and this fixture sees neither: one market, its own
+    /// snapshots and deltas, one session.
+    ///
+    /// Cannot spuriously PASS. After the fix `on_event` and
+    /// `rebroadcast_snapshots` take the same lock, so a burst and a delta are
+    /// strictly ordered and the per-subscriber channel is FIFO — the ordering
+    /// is monotone by construction whatever the scheduler does. The concurrency
+    /// exists to WITNESS the old bug, not to establish the new guarantee: a
+    /// feed thread runs deltas without pause across BURSTS heals, and the old
+    /// lock-free publish loop is interrupted many times over.
+    ///
+    /// It CAN spuriously fail RED under heavy load: if `queued` crosses
+    /// MAX_BUFFER during the ~40ms burst the subscriber is evicted and the read
+    /// hits `socket closed before the sentinel`. Known, not defended against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rebroadcast_never_trails_a_newer_delta_with_an_older_snapshot() {
+        let dir = tmpdir("rebroadcast");
+        let core = seeded(&dir).await;
+        let mut reader = subscribe(&dir).await;
+        let collect = tokio::spawn(async move { wire(&mut reader).await });
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (started, feeding) = tokio::sync::oneshot::channel();
+        let feed = {
+            let (core, stop) = (core.clone(), stop.clone());
+            tokio::task::spawn_blocking(move || {
+                started.send(()).expect("feed start");
+                let mut seq = 2;
+                while !stop.load(Ordering::Relaxed) {
+                    core.on_event(&delta(seq));
+                    seq += 1;
+                }
+            })
+        };
+        feeding.await.expect("feed started");
+        for _ in 0..BURSTS {
+            core.rebroadcast_snapshots();
+            // the lock is not fair; without a yield the burst loop can starve
+            // the feed and there would be nothing to interleave
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        stop.store(true, Ordering::Relaxed);
+        feed.await.expect("feed");
+        core.broadcaster.publish(END);
+
+        let hot: Vec<(String, u64)> = collect
+            .await
+            .expect("reader")
+            .into_iter()
+            .filter(|(_, m, _)| m == HOT)
+            .map(|(k, _, s)| (k, s))
+            .collect();
+        let bursts = hot.iter().filter(|(k, _)| k == "snapshot").count();
+        let deltas = hot.iter().filter(|(k, _)| k == "delta").count();
+        assert!(bursts >= BURSTS, "burst snapshots missing ({bursts})");
+        assert!(deltas >= BURSTS, "feed did not overlap the bursts ({deltas} deltas)");
+        let mut last = 0;
+        for (kind, seq) in &hot {
+            assert!(*seq >= last, "wire went backwards for {HOT}: {last} then a {kind} at {seq}");
+            last = *seq;
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// DEFECT 2, the same root cause one layer down. A subscriber connecting
+    /// while the feed runs must not have an event dropped on the floor between
+    /// its welcome snapshot and its registration — that is a LOSS, and the
+    /// engine gaps and deletes the book on the very reconnect it was already
+    /// flat-footed for.
+    ///
+    /// Cannot spuriously PASS, for the same reason: after the fix the welcome
+    /// is built and registered under the core lock, so `on_event` cannot
+    /// publish inside that window at all and the delta run is contiguous by
+    /// construction. It CAN fail RED if the accept loop loses a race and the
+    /// subscriber lands after the feed is done — the `connected too late`
+    /// assertion says so rather than passing on an empty proof.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_subscriber_connecting_mid_feed_loses_nothing() {
+        let dir = tmpdir("welcome");
+        let core = seeded(&dir).await;
+
+        let (started, feeding) = tokio::sync::oneshot::channel();
+        let feed = {
+            let core = core.clone();
+            tokio::task::spawn_blocking(move || {
+                started.send(()).expect("feed start");
+                for seq in 2..=DELTAS + 1 {
+                    core.on_event(&delta(seq));
+                }
+            })
+        };
+        feeding.await.expect("feed started");
+        let mut reader = subscribe(&dir).await;
+        feed.await.expect("feed");
+        core.broadcaster.publish(END);
+
+        let hot: Vec<(String, u64)> = wire(&mut reader)
+            .await
+            .into_iter()
+            .filter(|(_, m, _)| m == HOT)
+            .map(|(k, _, s)| (k, s))
+            .collect();
+        assert_eq!(hot[0].0, "snapshot", "first {HOT} line is the welcome snapshot");
+        assert!(hot.len() > 1, "connected too late to see any delta");
+        assert!(hot[0].1 < DELTAS, "connected too late for this to prove anything");
+        for (i, (kind, seq)) in hot.iter().enumerate() {
+            let want = hot[0].1 + i as u64;
+            // abs_diff, not `seq - want`: format args are evaluated only on
+            // failure, and the duplicate/reorder direction underflows into
+            // "attempt to subtract with overflow" instead of a diagnostic.
+            assert_eq!(*seq, want, "lost {} event(s) at the connect ({kind})", seq.abs_diff(want));
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// The mechanism both of the above rest on, deterministically and with no
+    /// second thread: the core lock is still held while the caller USES the
+    /// lines, not merely while they are captured.
+    #[test]
+    fn with_snapshot_lines_holds_the_core_lock_across_the_use() {
+        let dir = tmpdir("locked");
+        let core = new_core(&dir);
+        let mut held = false;
+        core.with_snapshot_lines(&mut |_lines| held = core.inner.try_lock().is_err());
+        assert!(held, "the core lock was released before the lines were used");
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

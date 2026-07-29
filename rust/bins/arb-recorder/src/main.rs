@@ -188,7 +188,10 @@ async fn main() -> Result<()> {
         let b = broadcaster.clone();
         let sock = cfg.socket_path.clone();
         tokio::spawn(async move {
-            if let Err(e) = b.serve(&sock, move || core_w.snapshot_lines()).await {
+            let welcome = move |register: &mut dyn FnMut(Vec<String>)| {
+                core_w.with_snapshot_lines(register)
+            };
+            if let Err(e) = b.serve(&sock, welcome).await {
                 eprintln!("[recorder] socket server died: {e}");
             }
         });
