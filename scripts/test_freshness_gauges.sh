@@ -116,34 +116,56 @@ PY
 }
 
 pass=0; failed=0
-# run SCENARIO -- feeds a journal, runs the REAL script, captures the POST
 run() {
   : > "$STUB_POSTS"
   ( cd "$ROOT" && ./scripts/freshness_check.sh >"$TMP/stdout" 2>"$TMP/stderr" )
+  echo $? > "$TMP/rc"
+}
+# Every assertion below is "no POST" or "this POST". BOTH are satisfied by a
+# script that died on line 1, and "silent" is satisfied by a script that
+# computed a perfectly good page and then dropped it because the ntfy topic did
+# not resolve — which is a real outage this file has already had once, for seven
+# days. So no verdict is trusted until the run that produced it is known to have
+# completed and to have had somewhere to send to. Checked on EVERY assertion,
+# not once at startup: an env change mid-suite would otherwise turn the rest of
+# the file green and silent at the same time.
+run_was_sane() {
+  local rc; rc=$(cat "$TMP/rc" 2>/dev/null || echo missing)
+  if [ "$rc" != 0 ]; then echo "the script exited $rc"; return 1; fi
+  if grep -q UNRESOLVED "$TMP/stderr" 2>/dev/null; then
+    echo "the ntfy topic did not resolve — every 'silent' below is meaningless"
+    return 1
+  fi
+  return 0
+}
+fail() {  # fail NAME REASON [detail...]
+  failed=$((failed+1)); echo "  FAIL $1"; shift
+  for l in "$@"; do echo "       $l"; done
+  [ -s "$TMP/stderr" ] && sed 's/^/       err: /' "$TMP/stderr"
+  return 0   # else `cond && fail ... || ok ...` runs BOTH when stderr is empty
 }
 check() {  # check NAME EXPECT ; EXPECT is "silent" or a substring of the POST
-  local name=$1 want=$2 got
+  local name=$1 want=$2 got why
+  why=$(run_was_sane) || { fail "$name" "$why"; return; }
   got=$(cat "$STUB_POSTS" 2>/dev/null)
   if [ "$want" = silent ]; then
     if [ -z "$got" ]; then pass=$((pass+1)); echo "  ok   $name"; return; fi
   elif printf '%s' "$got" | grep -qF -- "$want"; then
     pass=$((pass+1)); echo "  ok   $name"; return
   fi
-  failed=$((failed+1))
-  echo "  FAIL $name"
-  echo "       wanted: $want"
-  echo "       got:    ${got:-<no post>}"
-  [ -s "$TMP/stderr" ] && sed 's/^/       err: /' "$TMP/stderr"
+  fail "$name" "wanted: $want" "got:    ${got:-<no post>}"
 }
-check_absent() {  # the POST happened, but must NOT contain this
-  local name=$1 unwanted=$2 got
+check_absent() {  # the run happened, but its POST must NOT contain this
+  local name=$1 unwanted=$2 got why
+  why=$(run_was_sane) || { fail "$name" "$why"; return; }
   got=$(cat "$STUB_POSTS" 2>/dev/null)
   if printf '%s' "$got" | grep -qF -- "$unwanted"; then
-    failed=$((failed+1)); echo "  FAIL $name"; echo "       must NOT contain: $unwanted"
+    fail "$name" "must NOT contain: $unwanted"
   else
     pass=$((pass+1)); echo "  ok   $name"
   fi
 }
+ok() { pass=$((pass+1)); echo "  ok   $1"; }
 cooldown_clear() {
   rm -f "$TMP/arbbot-freshness-alerted" "$TMP/arbbot-freshness-routine" \
         "$TMP/arbbot-freshness-armed"
@@ -222,9 +244,59 @@ check "sustained poll 1 of 3 is silent" silent
 stats 360 cancels_unresolved=2 > "$TMP/journal"; run
 check "sustained poll 2 of 3 is silent" silent
 stats 420 cancels_unresolved=2 > "$TMP/journal"; run
-check "sustained poll 3 of 3 pages" "cancels_unresolved has held at 2 for 3 consecutive polls"
+check "sustained poll 3 of 3 pages" "held at 2 across 3 consecutive checks"
+check "...reporting the real span, not an implied one" "spanning 120s of engine uptime"
 cooldown_clear; stats 480 cancels_unresolved=2 > "$TMP/journal"; run
 check "...and does not page again while it persists" silent
+
+# A SKIPPED poll must BREAK the run, not bridge it. Measured before this was
+# fixed: a level seen at 2, then eight polls with no stats line at all (a wedged
+# engine — same process, so no restart to reset anything), then seen at 2 once
+# more, fired and said "3 consecutive polls" about samples spanning 55 minutes.
+# The hole is not unreported: an engine that stops printing stats pages on its
+# own, which is the check immediately below this one.
+fresh
+stats 300 cancels_unresolved=2 > "$TMP/journal"; run
+stats 600 cancels_unresolved=2 > "$TMP/journal"; run     # streak now 2
+: > "$TMP/journal"; run                                  # the hole
+cooldown_clear
+stats 3600 cancels_unresolved=2 > "$TMP/journal"; run
+check_absent "a hole in the poll series breaks the streak, it does not bridge" \
+  "cancels_unresolved has held"
+
+# ...and the blind spot that leaves, on the record rather than by accident: a
+# level that genuinely dips below the threshold between every poll never
+# sustains. That is CORRECT by the gauge's own doc — dipping IS "coming back
+# down" — and the ratchet is what makes it safe: exhausted entries are never
+# removed, so a real leak raises the FLOOR monotonically until it stops dipping.
+# What stays invisible is a floor of exactly 1, which the doc calls the benign
+# case (one venue-rejected place, nothing resting).
+fresh; : > "$STUB_POSTS"   # these loops do NOT truncate per run — see the note
+                           # on the oscillation case; without this the assertion
+                           # below inherits the previous scenario's POSTs
+for e in 300 600 900 1200 1500 1800 2100; do
+  case $e in 600|1200|1800) v=2 ;; *) v=0 ;; esac
+  stats $e cancels_unresolved=$v > "$TMP/journal"
+  cooldown_clear
+  ( cd "$ROOT" && ./scripts/freshness_check.sh >"$TMP/stdout" 2>"$TMP/stderr" )
+  echo $? > "$TMP/rc"
+done
+check_absent "a level that dips below the bar every poll never sustains" \
+  "cancels_unresolved has held"
+
+# ...but the ratchet climbing past the bar DOES fire, which is the case that
+# makes the blind spot above acceptable.
+fresh; : > "$STUB_POSTS"
+for e in 300 600 900 1200 1500 1800; do
+  case $e in 300) v=0 ;; 600) v=2 ;; 900) v=1 ;; 1200) v=3 ;; 1500) v=2 ;; *) v=4 ;; esac
+  stats $e cancels_unresolved=$v > "$TMP/journal"
+  cooldown_clear
+  ( cd "$ROOT" && ./scripts/freshness_check.sh >"$TMP/stdout" 2>"$TMP/stderr" )
+  echo $? > "$TMP/rc"
+done
+check "a ratchet floor climbing past the bar pages" "cancels_unresolved has held at 4"
+check "...dated from where the contiguous run began, not the first spike" \
+  "spanning 600s of engine uptime"
 
 # A slow leak, +1 per poll, never JUMPS — the case RISE cannot see at all.
 fresh
@@ -255,12 +327,28 @@ check "no stats line from a long-up unit pages" "printed NO stats line"
 
 # 11. ...but a unit that started 30s ago has not printed one YET.
 fresh; : > "$TMP/journal"
-STUB_ACTIVE_SINCE="$(date -d '-30 seconds' '+%a %Y-%m-%d %H:%M:%S %Z')" run
+old_since=$STUB_ACTIVE_SINCE
+export STUB_ACTIVE_SINCE="$(date -d '-30 seconds' '+%a %Y-%m-%d %H:%M:%S %Z')"
+run
+export STUB_ACTIVE_SINCE="$old_since"
 check "no stats line from a just-started unit is silent" silent
 
 # 12. Garbage where a stats line should be.
 fresh; echo '{not json' > "$TMP/journal"; run
 check "an unparseable stats line pages" "gauge check FAILED to run"
+
+# ...and it must not take the GOOD baseline down with it. The script deletes
+# both CANDIDATE states when the writer dies; deleting the state itself would
+# reset every gauge to cold start and lose whatever rise was in flight — the
+# corrupt-state hazard arriving from the other side.
+fresh; stats 300 fills_unattributed=5 > "$TMP/journal"; run
+cp "$TMP/arbbot-gauge-last" "$TMP/baseline-before"
+echo '{not json' > "$TMP/journal"; run
+cmp -s "$TMP/baseline-before" "$TMP/arbbot-gauge-last" &&
+  ok "a failed gauge run leaves the existing baseline intact" ||
+  fail "a transient failure destroyed a good baseline"
+cooldown_clear; stats 360 fills_unattributed=5 > "$TMP/journal"; run
+check "...so the next good poll does not re-page what was already reported" silent
 
 # 12b. elapsed_s is the restart discriminator, not a gauge, so renaming it used
 #      to escape the vanished-name guard — and every standing gauge would then
@@ -282,8 +370,8 @@ stats 360 > "$TMP/journal"; run
 check "a truncated baseline does NOT page and does NOT wedge" silent
 [ -s "$TMP/arbbot-gauge-last" ] && python3 -c "import json,sys;json.load(open(sys.argv[1]))" \
     "$TMP/arbbot-gauge-last" 2>/dev/null &&
-  { echo "  ok   ...it reseeded a valid baseline"; pass=$((pass+1)); } ||
-  { echo "  FAIL the baseline is still unusable"; failed=$((failed+1)); }
+  ok "...it reseeded a valid baseline" ||
+  fail "the baseline is still unusable"
 stats 420 fills_unattributed=1 > "$TMP/journal"; run
 check "...and the very next poll works normally" "fills_unattributed +1"
 
@@ -299,11 +387,11 @@ echo "=== the trader being deliberately stopped ==="
 #     still serves the last session's stats line; evaluating it would page about
 #     a process that no longer exists.
 fresh; stats 300 fills_unattributed=9 > "$TMP/journal"
-STUB_INACTIVE=arbbot-trader-m3 run
+export STUB_INACTIVE=arbbot-trader-m3; run; unset STUB_INACTIVE
 check "a stopped trader's stale stats line is not evaluated" silent
 [ -f "$TMP/arbbot-gauge-last" ] &&
-  { echo "  FAIL a stopped trader must not write the baseline"; failed=$((failed+1)); } ||
-  { echo "  ok   a stopped trader leaves the baseline untouched"; pass=$((pass+1)); }
+  fail "a stopped trader must not write the baseline" ||
+  ok "a stopped trader leaves the baseline untouched"
 
 echo "=== a suppressed alert must not retire the increment ==="
 
@@ -340,8 +428,8 @@ stats 360 fills_unattributed=1 > "$TMP/journal"
 export STUB_CURL_FAIL=1; run; unset STUB_CURL_FAIL
 check "a rejected POST still attempts delivery" "fills_unattributed +1"
 [ -f "$TMP/arbbot-freshness-alerted" ] &&
-  { echo "  FAIL a rejected POST must not burn the cooldown"; failed=$((failed+1)); } ||
-  { echo "  ok   a rejected POST does not burn the cooldown"; pass=$((pass+1)); }
+  fail "a rejected POST must not burn the cooldown" ||
+  ok "a rejected POST does not burn the cooldown"
 stats 420 fills_unattributed=1 > "$TMP/journal"; run
 check "...and the verdict is retried, not retired" "fills_unattributed +1"
 
@@ -351,9 +439,43 @@ echo "=== the armed unit's page cannot be deferred by gauge noise ==="
 #     wait 30 minutes behind one of them, so it has its own stamp.
 fresh; stats 300 > "$TMP/journal"
 touch "$TMP/arbbot-freshness-alerted"          # the shared window is burnt
-STUB_FAILED=arbbot-trader-m3 run
+export STUB_FAILED=arbbot-trader-m3; run; unset STUB_FAILED
 check "ARMED trader-m3 FAILED pages through a burnt shared cooldown" "ARMED trader-m3 FAILED"
 check "...at urgent priority on its own stamp" "PRIORITY=urgent"
+
+# 19. Both channels firing in the SAME poll: two POSTs, two stamps, and neither
+#     swallows the other. The gauge verdict must not ride the urgent body (it
+#     would then be retired by the armed channel's delivery) and the armed page
+#     must not wait behind the gauge one.
+fresh; stats 300 > "$TMP/journal"; run
+stats 360 fills_unattributed=1 > "$TMP/journal"
+export STUB_FAILED=arbbot-trader-m3; run; unset STUB_FAILED
+check "both channels fire in one poll: the armed one" "ARMED trader-m3 FAILED"
+check "...and the gauge one" "fills_unattributed +1"
+n_posts=$(grep -c '^PRIORITY=' "$STUB_POSTS")
+[ "$n_posts" = 2 ] &&
+  ok "...as two separate POSTs ($n_posts)" ||
+  fail "expected 2 POSTs, got $n_posts"
+grep -q '^PRIORITY=urgent' "$STUB_POSTS" && grep -q '^PRIORITY=high' "$STUB_POSTS" &&
+  ok "...one urgent, one high" ||
+  fail "the two POSTs did not carry the two priorities"
+
+echo "=== what the stubs cannot cover ==="
+
+# The journalctl stub cats a file and ignores every flag, so nothing above
+# exercises the WINDOW the real script asks for. `--since "-600s"` is a systemd
+# time spec, not a shell one, and a rejected spec would make journalctl exit
+# non-zero into a `2>/dev/null` — the gauge block would then see an empty stats
+# line every single poll and report "no stats line" forever, or nothing at all.
+# So the flag combination is checked against the REAL journalctl. Read-only.
+if command -v /usr/bin/journalctl >/dev/null; then
+  /usr/bin/journalctl --user -u arbbot-trader-m3 --since "-600s" -o cat \
+      --no-pager >/dev/null 2>&1 &&
+    ok "real journalctl accepts the exact --since window the script uses" ||
+    fail "real journalctl REJECTED --since \"-600s\" — the gauge block would read nothing"
+else
+  echo "  skip journalctl not present"
+fi
 
 echo
 if [ "$PROOF" = 1 ]; then

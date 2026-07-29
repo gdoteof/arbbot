@@ -100,6 +100,22 @@ import tempfile
 # cadence: long enough that nothing merely in flight survives it.
 SUSTAIN_POLLS = 3
 
+# How far the engine's own clock may advance between two observations that still
+# count as CONSECUTIVE. 900s is 3x the watchdog's 5-minute cadence, which
+# absorbs ordinary timer drift (OnUnitActiveSec plus Persistent=true) and
+# nothing else.
+#
+# Without this the streak bridges any hole. Measured: a level at 2, observed
+# twice, then EIGHT polls with no stats line at all (a wedged engine, same
+# process, so no restart to reset it), then observed at 2 once more — fired,
+# saying "held for 3 consecutive polls" about three samples spanning 55 minutes.
+# "We saw it high 3 times running" and "we saw it high 3 times with an unknown
+# hole in the middle" are different facts, and a rule whose message cannot tell
+# them apart is the same defect this whole campaign keeps finding. A hole means
+# we do not know it stayed up, so the streak restarts — and the hole itself is
+# not unreported, because an engine that stops printing stats pages on its own.
+SUSTAIN_MAX_GAP_S = 900
+
 # gauge -> (rule, severity, threshold, what it MEANS)
 #
 # For RISE, `threshold` is the largest increase in one watchdog poll (5 min)
@@ -194,12 +210,23 @@ WATCH = [
         60,
         "venue rejections in one window — at this rate the order path is not "
         "working, whatever the individual errors say",
-    ),  # NOT derived from observed data, and the earlier "5x the worst session"
-    # claim is withdrawn. The all-time max on the armed unit is 4, but those 4
-    # were a BURST inside seconds, and a burst says nothing about a 5-minute
-    # total: the same shape sustained is ~200/window. 60 is chosen as a rate at
-    # which the order path cannot be functioning, not as a multiple of anything
-    # measured. Present in 892/892.
+    ),  # A JUDGEMENT CALL, NOT A MEASUREMENT — said plainly because the first
+    # version of this number was a guess wearing the words "5x the worst session
+    # ever observed", which is exactly the shape of claim that got caught in
+    # review. That framing is withdrawn: the all-time armed max is 4, but those 4
+    # were a BURST inside seconds, and a burst rate implies nothing about a
+    # 5-minute total — the same shape sustained is ~200/window, so the observed
+    # maximum bounds neither direction.
+    #
+    # 60 is therefore NOT derived from this gauge's history at all. It is picked
+    # as a rate the order path cannot plausibly be working at, and its real
+    # justification is that the conditions it would catch are all covered
+    # elsewhere by rules that ARE grounded: a refused cancel shows up in
+    # cancels_unresolved, a lost command in exec_dropped, an order adopted after
+    # a lost response in exec_recovered. This one is the coarse backstop for
+    # "the venue is refusing everything", and it is deliberately set where only
+    # that reads. Revise it from data the first time it fires. Present in
+    # 892/892.
     (
         "kalshi_reconcile_failures",
         "RISE",
@@ -377,17 +404,39 @@ def main() -> int:
         if gauge not in cur:
             continue
         if rule == "SUSTAINED":
-            # A restart resets the streak: a fresh process has not held anything
-            # anywhere for any length of time.
-            n = 0 if (cold or restarted) else int(prev_streak.get(gauge, 0) or 0)
-            n = n + 1 if cur[gauge] >= thresh else 0
-            streak[gauge] = n
+            now_s = float(cur.get("elapsed_s", 0) or 0)
+            p = prev_streak.get(gauge)
+            p = p if isinstance(p, dict) else {}
+            n, at, since = 0, 0.0, now_s
+            try:
+                n = int(p.get("n", 0) or 0)
+                at = float(p.get("at", 0) or 0)
+                since = float(p.get("since", now_s) or now_s)
+            except (TypeError, ValueError):
+                n, at, since = 0, 0.0, now_s
+            # A restart resets: a fresh process has not held anything anywhere
+            # for any length of time. So does a hole — see SUSTAIN_MAX_GAP_S.
+            broken = cold or restarted or (now_s - at) > SUSTAIN_MAX_GAP_S
+            if cur[gauge] < thresh:
+                n = 0
+            elif broken or n == 0:
+                # `n == 0` matters as much as `broken`: a streak restarting
+                # after a DIP must re-date itself too, or the span reported
+                # below is measured from a run that already ended.
+                n, since = 1, now_s
+            else:
+                n += 1
+            streak[gauge] = {"n": n, "at": now_s, "since": since}
             # Exactly AT the crossing, not above it: an incident pages once and
             # then stays quiet while it persists, the same contract RISE gives.
+            # The SPAN is reported rather than implied: "3 polls" is 15 minutes
+            # only if the watchdog ran on time, and the operator is the one who
+            # has to judge whether it did.
             if n == SUSTAIN_POLLS:
                 out.append(
-                    f"{sev}|ARMED trader-m3 {gauge} has held at {cur[gauge]} for "
-                    f"{SUSTAIN_POLLS} consecutive polls — {why}"
+                    f"{sev}|ARMED trader-m3 {gauge} has held at {cur[gauge]} across "
+                    f"{SUSTAIN_POLLS} consecutive checks spanning "
+                    f"{int(now_s - since)}s of engine uptime — {why}"
                 )
             continue
         if cold:
