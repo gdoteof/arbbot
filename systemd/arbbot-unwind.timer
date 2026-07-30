@@ -1,0 +1,16 @@
+[Unit]
+Description=arbbot auto-unwind check every 5 min
+
+[Timer]
+# OnCalendar, not OnBootSec+OnUnitActiveSec. Both monotonic anchors go stale:
+# when this timer was re-enabled on 2026-07-29 after being off since 07-26,
+# OnBootSec=2min had elapsed 2.5 days earlier and OnUnitActiveSec=5min anchored
+# off the 07-26 run, so systemd reported NextElapseUSecMonotonic=infinity --
+# `is-enabled` said enabled, `is-active` said active, and it would never have
+# fired again. A wall-clock schedule always has a next elapse. Matches
+# arbbot-hedge.timer, which uses this pattern for the same cadence.
+OnCalendar=*:0/5
+Persistent=true
+
+[Install]
+WantedBy=timers.target

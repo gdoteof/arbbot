@@ -12,6 +12,7 @@ Fake gateways + monkeypatched book reads; no venue, no orders.
 import importlib.util
 import json
 import pathlib
+import sys
 from decimal import Decimal
 
 import pytest
@@ -137,3 +138,81 @@ def test_partial_kalshi_close_fees_follow_each_legs_filled_qty(sandbox, monkeypa
     assert rec["gross_proceeds_usd"] == pytest.approx(4.30)
     assert rec["exit_fees_usd"] == pytest.approx(0.135)
     assert rec["stranded_kalshi_qty"] == 2
+
+
+def test_unpriced_basket_is_skipped_not_fatal(monkeypatch, tmp_path, capsys):
+    """A basket with no cost basis must be skipped and counted, not crash the pass.
+
+    The Rust engine books a basket at place time and never reads fill reports,
+    so its records carry no cost_usd/profit_usd. compute_row subscripts those
+    keys directly, so one such record aborts main() — taking with it every
+    hard-unwind the pass had not reached yet. This bit mark_positions.py on
+    2026-07-28; unwind_positions.py carried the same latent crash because it had
+    been switched off since 2026-07-26, and it fired the moment it was re-armed
+    (5 maker-hedge baskets, 3 pending hard unwinds behind them).
+    """
+    priced = basket(cost=5.00)
+    priced["profit_usd"] = 1.0
+    unpriced = basket(cost=5.00)
+    del unpriced["cost_usd"]          # engine-booked record: neither key present
+    unpriced["relationship_id"] = "xvus-engine-booked-no-cost"
+
+    monkeypatch.setattr(up, "LEDGER", tmp_path / "trades.jsonl")
+    (tmp_path / "trades.jsonl").write_text("")
+    monkeypatch.setattr(up, "parse_lines", lambda _lines: [])
+    # unpriced FIRST, so a regression aborts before reaching the priced basket
+    monkeypatch.setattr(up, "open_baskets", lambda _recs: [unpriced, priced])
+    monkeypatch.setattr(up, "httpx", type("H", (), {"Client": lambda **kw: None}))
+    monkeypatch.setattr(up, "kalshi_books", lambda _c, _ids: {})
+    monkeypatch.setattr(up, "pmus_topbook", lambda _c, _mid: (None, None))
+    monkeypatch.setattr(sys, "argv", ["unwind_positions.py"])   # dry run
+
+    up.main()   # must not raise
+
+    out = capsys.readouterr().out
+    assert "1 unpriced" in out, out
+    assert "xvus-engine-booked-no-cost" not in out, out
+    # and the pass still reached the basket behind it
+    assert "checked 2 open baskets" in out, out
+
+
+@pytest.mark.parametrize("costs,qtys,expect_soft_unwind", [
+    # $300 exposure, 346 contracts, threshold $325.85: the contract count clears
+    # the dollar threshold but the dollars do not. Pre-fix this unwound; the
+    # correct answer is to hold.
+    ([300.24], [346], False),
+    # genuinely capital-constrained in dollars -> soft displacement is allowed
+    ([330.00], [346], True),
+])
+def test_soft_displacement_gates_on_dollars_not_contract_count(
+        monkeypatch, tmp_path, capsys, costs, qtys, expect_soft_unwind):
+    """The capital-constrained displacement branch must measure DOLLARS.
+
+    CLASS_BUDGET is bankroll_usd(980) x per_class_cap(0.35) = $343, so the 0.95
+    threshold is $325.85. Summing `qty` compared contracts against that, and
+    since average price is well under $1 the count crosses first — on 2026-07-29
+    346 contracts read as "constrained" on $300.24 of real exposure and
+    early-unwound a soft-signal position the policy says to hold.
+    """
+    soft = basket(cost=costs[0])
+    soft["profit_usd"] = 1.0
+    soft["qty"] = qtys[0]
+    soft["relationship_id"] = "xvus-soft-signal-only"
+
+    monkeypatch.setattr(up, "LEDGER", tmp_path / "trades.jsonl")
+    (tmp_path / "trades.jsonl").write_text("")
+    monkeypatch.setattr(up, "parse_lines", lambda _lines: [])
+    monkeypatch.setattr(up, "open_baskets", lambda _recs: [soft])
+    monkeypatch.setattr(up, "httpx", type("H", (), {"Client": lambda **kw: None}))
+    monkeypatch.setattr(up, "kalshi_books", lambda _c, _ids: {})
+    monkeypatch.setattr(up, "pmus_topbook", lambda _c, _mid: (None, None))
+    # soft signal only: below the 12% hurdle, but above the 4% hard floor
+    monkeypatch.setattr(up, "compute_row", lambda *a, **k: {
+        "unwind_hard": False, "unwind_signal": True, "forward_hold_apr": 10.9,
+        "mark_pnl_usd": 1.23})
+    monkeypatch.setattr(sys, "argv", ["unwind_positions.py"])   # dry run
+
+    up.main()
+
+    out = capsys.readouterr().out
+    assert ("1 hard-unwind" in out) is expect_soft_unwind, out

@@ -1,0 +1,7 @@
+[Unit]
+Description=arbbot auto-unwind of HARD unwind signals (fwd APR < floor)
+[Service]
+Type=oneshot
+WorkingDirectory=%h/claude/arbbot
+Environment=ARBBOT_CREDENTIALS_DIR=%h/.arbbot-credentials
+ExecStart=%h/claude/arbbot/.venv313/bin/python scripts/unwind_positions.py --live

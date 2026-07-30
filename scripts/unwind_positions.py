@@ -254,6 +254,7 @@ def main() -> None:
                           for l in t["legs"] if l["venue"] == "kalshi"])
     pgw = kgw = None
     hard = 0
+    unpriced = 0
     for t in baskets:
         kleg = next((l for l in t["legs"] if l["venue"] == "kalshi"), None)
         pleg = next((l for l in t["legs"] if l["venue"] == "polymarket_us"), None)
@@ -263,6 +264,18 @@ def main() -> None:
             print(f"[UNWIND] {t['relationship_id']} skipped — not a kalshi/pm-us pair "
                   f"(legs: {[l['venue'] for l in t['legs']]})", flush=True)
             continue
+        # Same guard mark_positions.py grew on 2026-07-28, for the same reason:
+        # the Rust engine books a basket at place time and never reads fill
+        # reports, so its records carry no cost_usd/profit_usd and compute_row
+        # subscripts them hard. This unwinder stopped running 2026-07-26, before
+        # the engine wrote its first such record, so it kept the latent version
+        # of that crash — 5 maker-hedge baskets were enough to kill the whole
+        # pass, including the legs it had already been about to unwind.
+        # Checked BEFORE pmus_topbook so an unpriced basket costs no API call:
+        # this runs every 5 min against a budget that 429s.
+        if t.get("cost_usd") is None or t.get("profit_usd") is None:
+            unpriced += 1
+            continue
         k_bid, k_ask = kb.get(kleg["market_id"], (None, None))
         p_bid, p_ask = pmus_topbook(c, pleg["market_id"])
         row = compute_row(t, k_bid, k_ask, p_bid, p_ask)
@@ -271,8 +284,16 @@ def main() -> None:
         # fwd APR below the 12% hurdle) — early unwinds have realized very
         # high annualized returns and the freed capital redeploys into the
         # opportunities the cap is otherwise blocking.
-        CLASS_BUDGET = 980 * 0.35   # keep in sync with RiskConfig
-        open_notional = sum(float(b.get("qty") or 0) for b in baskets)
+        CLASS_BUDGET = 980 * 0.35   # DOLLARS: bankroll_usd 980 x per_class_cap 0.35
+        # cost_usd, not qty. This summed CONTRACTS and compared them against a
+        # DOLLAR budget. Average price is well under $1, so the contract count
+        # runs ~15% above the dollar figure and crosses the threshold first: on
+        # 2026-07-29 it read 346 >= 325.85 -> constrained, when the real
+        # exposure was $300.24 -> NOT constrained. That flipped on the soft-signal
+        # displacement branch and early-unwound Mélenchon (fwd_apr 10.9%) for
+        # $1.23, the exact position the policy says to HOLD while capital is idle.
+        # The two measures are close enough to look right, which is why it stood.
+        open_notional = sum(float(b.get("cost_usd") or 0) for b in baskets)
         constrained = open_notional >= 0.95 * CLASS_BUDGET
         eligible = row.get("unwind_hard") or (constrained and row.get("unwind_signal"))
         if not eligible:
@@ -303,7 +324,8 @@ def main() -> None:
             pgw = PolymarketUsOrderGateway(us_id, us_key, live=True)
         close_basket(t, row, k_bid, p_ask, pgw, kgw, args.live,
                      k_ask=k_ask, p_bid=p_bid)
-    print(f"checked {len(baskets)} open baskets, {hard} hard-unwind")
+    print(f"checked {len(baskets)} open baskets, {hard} hard-unwind, "
+          f"{unpriced} unpriced (no cost basis — skipped)")
 
 
 if __name__ == "__main__":
