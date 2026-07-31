@@ -11,6 +11,7 @@
 
 use crate::hist::Hist;
 use crate::sink::{OrderSink, SweepPolicy};
+use arb_venue::error::Retry;
 use arb_venue::gateway::{CancelBy, CancelRequest, PlaceRequest};
 use arb_core::clock::now_ns;
 use arb_core::model::Venue;
@@ -1248,6 +1249,35 @@ async fn run_executor(
                 st2.failed.fetch_add(1, Ordering::Relaxed);
                 eprintln!("[exec] {venue:?} FAILED: {e}");
                 unreadable = place_answer_was_lost(&e);
+                // THE VENUE SAID "NOT THIS MARKET, NOT YET", and until now
+                // nothing carried that back. A rejected place answered the
+                // engine with silence — the same gap `cancel_result` was
+                // written to close — so the hedge retry saw only "no fill" and
+                // re-sent on its 5s interval. 335 times on 2026-07-30.
+                //
+                // ONLY `MarketHalted` is reported. `Retry::Now` is the status
+                // quo by construction, and `Retry::Terminal` needs no message
+                // either: it means THIS request is spent, and every hedge retry
+                // already mints a fresh `client_order_id` (see `apply_hedge_plans`),
+                // so the ordinary retry is already the right response to it. A
+                // message the engine would only ignore is WAL volume bought for
+                // nothing.
+                if let (Some(p), Retry::MarketHalted) = (&placing, e.retry()) {
+                    tell_engine(
+                        &acks,
+                        serde_json::json!({
+                            "kind": "place_result",
+                            "venue": venue.as_str(),
+                            "market_id": p.market,
+                            "order_id": p.client_order_id,
+                            "ok": false,
+                            "retry": "market_halted",
+                            "error": e.to_string(),
+                            "ts_local_ns": now_ns(),
+                        }),
+                    )
+                    .await;
+                }
                 Some(e.to_string())
             }
             Err(e) => {
@@ -2501,6 +2531,58 @@ mod tests {
             let (st, told) = drain_reporting(Venue::PolymarketUs, sink, vec![place("m1")]).await;
             assert_eq!(st.recovered.load(Ordering::Relaxed), 1, "{e:?} leaves it unknown");
             assert_eq!(told[0]["venue_order_id"], "pm-lost");
+        }
+    }
+
+    /// A HALTED MARKET IS REPORTED; every other rejection stays silent.
+    ///
+    /// The executor's half of the 2026-07-30 storm. A refused place answered the
+    /// engine with nothing at all, so `trading_is_paused` — a refusal no price
+    /// and no interval can fix — was indistinguishable from "not filled yet",
+    /// and the hedge re-sent it 335 times.
+    ///
+    /// The silence is deliberate everywhere else and is asserted here so it
+    /// stays that way: a REJECTED place is routine (one replay of a 3.7-day
+    /// shadow produced ~150 on PM-US alone), the ordinary retry is already the
+    /// right response to all of it, and a message the engine would only ignore
+    /// is WAL volume bought for nothing.
+    #[tokio::test]
+    async fn only_a_halted_market_is_reported_back_to_the_engine() {
+        // Verbatim from `arbbot-trader-m3`, 2026-07-30 04:29:06.
+        let paused = VenueError::Status {
+            endpoint: "kalshi place",
+            status: 409,
+            body: r#"{"error":{"code":"trading_is_paused","message":"trading is paused"}}"#.into(),
+        };
+        let sink = Arc::new(Recorder {
+            refuse_places_from: 1,
+            place_err: Some(paused),
+            ..Default::default()
+        });
+        let (_, told) = drain_reporting(Venue::Kalshi, sink, vec![taker_place("h2")]).await;
+        assert_eq!(told.len(), 1, "the engine is told once: {told:?}");
+        assert_eq!(told[0]["kind"], "place_result");
+        assert_eq!(told[0]["retry"], "market_halted");
+        assert_eq!(told[0]["order_id"], "h2", "named by OUR id — the engine has no other");
+        assert_eq!(told[0]["ok"], false);
+
+        // ...and the two refusals that are NOT a halt, including the OTHER 409
+        // on the same endpoint in the same journal.
+        for e in [
+            VenueError::Status {
+                endpoint: "kalshi place",
+                status: 409,
+                body: r#"{"error":{"code":"order_already_exists","message":"order already exists","service":"exchange"}}"#.into(),
+            },
+            VenueError::Status { endpoint: "pmus place", status: 503, body: String::new() },
+        ] {
+            let sink = Arc::new(Recorder {
+                refuse_places_from: 1,
+                place_err: Some(e.clone()),
+                ..Default::default()
+            });
+            let (_, told) = drain_reporting(Venue::Kalshi, sink, vec![taker_place("h2")]).await;
+            assert!(told.is_empty(), "{e:?} keeps the ordinary retry: {told:?}");
         }
     }
 

@@ -82,8 +82,18 @@ impl MakerOrder {
 /// venue fees arrive on the fill reports the reconciler reads, so writing a
 /// `cost_usd` here would be a guess in the accounting record. `fees_pending`
 /// says so out loud rather than shipping a confident wrong number.
+/// `hedge_order_id` is OUR id for the attempt that filled — the one leg 2 is
+/// stamped with, so a basket in the file names both of the orders that made it
+/// and not just the maker's.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn book_basket(path: &str, maker: &MakerOrder, hedge: &HedgeOrder, qty: i64, ts: f64) {
+pub(super) fn book_basket(
+    path: &str,
+    maker: &MakerOrder,
+    hedge: &HedgeOrder,
+    hedge_order_id: &str,
+    qty: i64,
+    ts: f64,
+) {
     let rec = json!({
         "ts": ts,
         "relationship_id": maker.rel_id,
@@ -91,27 +101,55 @@ pub(super) fn book_basket(path: &str, maker: &MakerOrder, hedge: &HedgeOrder, qt
         "qty": qty,
         "strategy": maker.strategy,
         "status": "open",
-        "source": "arb-trader",
+        "source": crate::ledger::SOURCE,
         "fees_pending": true,
         "legs": [
             {"venue": maker.venue, "market_id": maker.market_id, "side": maker.side,
              "role": maker.role(), "qty": qty, "yes_price": maker.price,
              "order_id": hedge.maker_order_id},
             {"venue": hedge.venue, "market_id": hedge.market_id, "side": hedge.side,
-             "role": "taker", "qty": qty, "yes_price": hedge.price},
+             "role": "taker", "qty": qty, "yes_price": hedge.price,
+             "order_id": hedge_order_id},
         ],
     });
-    if let Err(e) = crate::ledger::append(path, &rec) {
-        // The priority used to be inverted: a WAL write failure crash-stops the
-        // process (wal.rs), while a LEDGER write failure was one stderr line and
-        // trading carried on. The ledger is the more important file — an
-        // unbooked basket is exposure no restart can see, so the caps free
-        // themselves against it and nothing ever unwinds it — so it now stops
-        // trading on the same terms, through the same clean halt: the book is
-        // cancelled and PROVEN empty before the exit.
-        eprintln!("[ledger] WRITE FAILED ({e}) — basket {} is UNBOOKED", maker.rel_id);
-        eprintln!("[ledger] RECOVER BY HAND — append this line to {path}: {rec}");
-        crate::exec::spawn_halt_and_exit(70, format!("ledger write failed: {e}"));
+    match crate::ledger::append_basket(path, rec.clone()) {
+        Ok(crate::ledger::Booking::Booked) => {}
+        Ok(crate::ledger::Booking::AlreadyBooked) => eprintln!(
+            "[ledger] ALREADY BOOKED {} at ts {ts} — a record with that exact key is \
+             already in {path} and this one was NOT written. (relationship_id, ts) is \
+             what every correction and unwind addresses a basket by, so two of them \
+             would leave both ambiguous.",
+            maker.rel_id
+        ),
+        Ok(crate::ledger::Booking::Contested(others)) => {
+            for other in others {
+                eprintln!(
+                    "[ledger] CONTESTED {} — another writer already booked an OPEN basket \
+                     on {} + {} at ts {other}, and this engine has just booked its own \
+                     fill at ts {ts}. BOTH are in the ledger and BOTH count as exposure, \
+                     because content cannot tell one position booked twice from two real \
+                     fills seconds apart. If a human confirms it was ONE position, void \
+                     the other by appending: {{\"ts\":<now>,\"relationship_id\":\"{}\",\
+                     \"status\":\"correction\",\"corrects_ts\":{other},\"reason\":\"<why>\",\
+                     \"fields\":{{\"status\":\"superseded\"}}}}. If it was TWO fills, the \
+                     account is over-hedged on {} — RECONCILE BY HAND.",
+                    maker.rel_id, maker.market_id, hedge.market_id, maker.rel_id,
+                    hedge.market_id
+                );
+            }
+        }
+        Err(e) => {
+            // The priority used to be inverted: a WAL write failure crash-stops the
+            // process (wal.rs), while a LEDGER write failure was one stderr line and
+            // trading carried on. The ledger is the more important file — an
+            // unbooked basket is exposure no restart can see, so the caps free
+            // themselves against it and nothing ever unwinds it — so it now stops
+            // trading on the same terms, through the same clean halt: the book is
+            // cancelled and PROVEN empty before the exit.
+            eprintln!("[ledger] WRITE FAILED ({e}) — basket {} is UNBOOKED", maker.rel_id);
+            eprintln!("[ledger] RECOVER BY HAND — append this line to {path}: {rec}");
+            crate::exec::spawn_halt_and_exit(70, format!("ledger write failed: {e}"));
+        }
     }
 }
 
@@ -230,7 +268,7 @@ impl Engine {
                         match self.order_rel.get(&h.maker_order_id) {
                             Some(mo) => {
                                 if let Some(lp) = self.cfg.ledger_path.as_deref() {
-                                    book_basket(lp, mo, &h, c.book, now);
+                                    book_basket(lp, mo, &h, oid, c.book, now);
                                 }
                                 eprintln!(
                                     "[ledger] booked {} x{} ({} maker / {} hedge)",
@@ -382,6 +420,8 @@ impl Engine {
                                 tries: 0,
                                 alarmed: false,
                                 hold_logged: false,
+                                parked_until: None,
+                                paused_strikes: 0,
                             },
                         );
                         // I5, first attempt included — see
@@ -656,8 +696,8 @@ mod ledger_write_tests {
             cum_filled: 0,
             supersedes: None,
         };
-        book_basket(p, &maker, &hedge, 5, 1_700_000_000.0);
-        book_basket(p, &maker, &hedge, 3, 1_700_000_100.0);
+        book_basket(p, &maker, &hedge, "h1", 5, 1_700_000_000.0);
+        book_basket(p, &maker, &hedge, "h1", 3, 1_700_000_100.0);
 
         let recs = crate::ledger::read(p).unwrap();
         let open = crate::ledger::open_exposure(recs);
@@ -718,7 +758,7 @@ mod ledger_write_tests {
             cum_filled: 0,
             supersedes: None,
         };
-        book_basket(p, &maker, &hedge, 5, 1_700_000_000.0);
+        book_basket(p, &maker, &hedge, "h1", 5, 1_700_000_000.0);
 
         let rec: serde_json::Value =
             serde_json::from_str(std::fs::read_to_string(p).unwrap().lines().next().unwrap())
@@ -730,6 +770,81 @@ mod ledger_write_tests {
         // and it must still seed exposure like any other basket
         let open = crate::ledger::open_exposure(crate::ledger::read(p).unwrap());
         assert_eq!(open.get("xvus-nobel-peace-26-donaldtrump"), Some(&5.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-07-30, end to end. Kalshi was `409 trading_is_paused` for 31
+    /// minutes with this take-take's PM-US leg already one short. This engine
+    /// retried its hedge 336 times; the frozen Python hedger, which reads VENUE
+    /// POSITIONS and completes any uncovered PM-US short, retried the same
+    /// hedge every 5 minutes. Both got through 600ms apart when the venue
+    /// reopened, and the engine booked a second complete basket over the top of
+    /// the Python hedger's with nothing said.
+    ///
+    /// What is pinned: the engine NOTICES. The record is still written — both
+    /// contracts are real and suppressing one would delete exposure — and it
+    /// names the booking it may be a duplicate of, so the operator has the
+    /// pair rather than a silent 30 -> 32.
+    #[test]
+    fn a_basket_another_writer_already_booked_is_flagged_not_silently_doubled() {
+        let dir = std::env::temp_dir().join(format!("arb-book-contest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trades.jsonl");
+        let p = path.to_str().unwrap();
+
+        // The Python hedger's line, off the live ledger: position sides, Kalshi
+        // leg first, no `source`.
+        crate::ledger::append(
+            p,
+            &serde_json::from_str(
+                r#"{"ts":1785402005.539014,"relationship_id":"xvus-nobel-peace-26-mykolakuleba",
+                    "title":"xvus-nobel-peace-26-mykolakuleba (naked-leg hedge)","qty":1,
+                    "strategy":"take-take","status":"open","cost_usd":0.72,"profit_usd":0.28,
+                    "legs":[{"venue":"kalshi","market_id":"KXNOBELPEACE-27-MKUL","side":"yes",
+                             "role":"taker","qty":1,"yes_price":"0.0800"},
+                            {"venue":"polymarket_us",
+                             "market_id":"tac-nobel-peace-2026-10-09-mykkul","side":"no",
+                             "role":"taker","qty":1,"yes_price":"0.36"}]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let maker = MakerOrder {
+            rel_id: "xvus-nobel-peace-26-mykolakuleba".into(),
+            class: "cross-venue-equivalent",
+            venue: "polymarket_us".into(),
+            market_id: "tac-nobel-peace-2026-10-09-mykkul".into(),
+            side: BookSide::Ask,
+            price: "0.3600".into(),
+            strategy: "take-take",
+        };
+        let hedge = HedgeOrder {
+            maker_order_id: "t1785351000001".into(),
+            chain_id: "h1785351000001".into(),
+            market_id: "KXNOBELPEACE-27-MKUL".into(),
+            venue: Venue::Kalshi,
+            side: BookSide::Bid,
+            price: "0.0800".into(),
+            qty: 1,
+            cum_filled: 0,
+            supersedes: None,
+        };
+        book_basket(p, &maker, &hedge, "h1785351000336", 1, 1785402003.8191998);
+
+        let recs = crate::ledger::read(p).unwrap();
+        assert_eq!(recs.len(), 2, "the basket is written — both contracts are real");
+        let ours = recs.iter().find(|r| r["source"] == "arb-trader").expect("ours");
+        assert_eq!(
+            ours["contested_with_ts"],
+            serde_json::json!([1785402005.539014]),
+            "the engine's record must name the booking it collides with"
+        );
+        assert_eq!(
+            ours["legs"][1]["order_id"], "h1785351000336",
+            "leg 2 names the hedge attempt that filled it"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -800,6 +915,8 @@ mod attribute_fill_tests {
             tries: 1,
             alarmed: false,
             hold_logged: false,
+            parked_until: None,
+            paused_strikes: 0,
         }
     }
 

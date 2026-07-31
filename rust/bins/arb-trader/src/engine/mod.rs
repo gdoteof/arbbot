@@ -521,6 +521,10 @@ struct Engine {
     unclaimed_fills: HashMap<String, UnclaimedFill>,
     n_retry: u64,
     n_naked: u64,
+    /// Times an obligation was parked because the venue refused the place with
+    /// the market halted. Rises WITHOUT `n_naked` rising is the shape to read:
+    /// the leg is naked and the venue, not the price, is why.
+    n_parked: u64,
     /// Fills that expired unclaimed (money we cannot explain) and hedge fills
     /// beyond what an obligation owed. Both must stay 0.
     n_unattributed: u64,
@@ -748,6 +752,7 @@ impl Engine {
             unclaimed_fills: HashMap::new(),
             n_retry: 0,
             n_naked: 0,
+            n_parked: 0,
             n_unattributed: 0,
             n_overhedge: 0,
             n_ack: 0,
@@ -1280,6 +1285,12 @@ impl Engine {
             // resting state.
             "hedge_retries_refused": crate::exec::hedge_retries_refused(),
             "hedges_naked": self.n_naked,
+            // ...and obligations parked because the VENUE said the market is
+            // halted. Not an alarm on its own — a halt is the venue's business,
+            // not a fault of ours — but it is the only place the distinction
+            // between "the book will not offer a price" and "there is no book
+            // to offer one" is visible without reading the log.
+            "hedges_parked": self.n_parked,
             // Hedge contracts filled beyond what an obligation owed — a
             // position with no maker leg to pair it with. Must stay 0.
             "hedges_overfilled": self.n_overhedge,
@@ -1552,6 +1563,19 @@ impl Engine {
             // actually been carried out — or refused.
             "cancel_result" => {
                 self.on_cancel_result(&v);
+                return;
+            }
+            // ...and the venue's answer to a PLACE it refused, but ONLY when
+            // that refusal is one no retry can fix:
+            //   {"kind":"place_result","venue":...,"market_id":str,
+            //    "order_id":str,"ok":false,"retry":"market_halted",
+            //    "error":str,"ts_local_ns":int}
+            // A place normally answers with an `order_ack` or with nothing, and
+            // "nothing" is indistinguishable from "not filled yet" — which is
+            // how one halted Kalshi market drew 335 identical hedge places on
+            // 2026-07-30. `Retry` in arb-venue is what makes the distinction.
+            "place_result" => {
+                self.on_place_result(&v);
                 return;
             }
             "fill" => {
