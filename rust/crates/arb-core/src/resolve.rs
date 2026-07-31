@@ -24,6 +24,28 @@ const RULES: &[(&str, &str, bool)] = &[
     ("xvus-nobel-peace-26", "2026-10-09", true),
     ("xvus-fedcut-26", "2026-12-31", false),
     ("xvus-btcmax-26-31", "2026-12-31", false),
+    // Added 2026-07-31 (Geoff). The DECEMBER rung only, and the prefix is
+    // deliberately narrow enough to say so: `xvus-btc150k-ladder-12-31` cannot
+    // match `-07-31-2026` or `-08-31-2026`, which stay undated.
+    //
+    // This is the kalshi + polymarket_us case the comment below warns about,
+    // taken knowingly: it WIDENS the armed take-take set by this one pair.
+    // What makes December the one to date is that the APR bar still filters
+    // there. `years_to` floors the horizon at ONE DAY, so a rung resolving
+    // today reads a 2c edge on 50c as ~730%/yr and clears any bar that exists;
+    // at five months the same edge reads ~9.5%/yr against a ~10% bar, which is
+    // a hurdle doing real work. The two near-dated rungs are left undated for
+    // exactly that reason, not by oversight.
+    //
+    // Not `estimated`: Kalshi's own rung is "Above $149,999.99 before the day
+    // after the slug date", so 2026-12-31 is the market's stated bound rather
+    // than a curated guess.
+    //
+    // DIVERGES from `src/arbbot/exec/resolve_dates.py` on purpose. That file is
+    // frozen (not modified, not run) and the header's "keep it identical" rule
+    // predates the freeze; the ordering rule it exists to protect is unaffected,
+    // since no other prefix here matches this family.
+    ("xvus-btc150k-ladder-12-31", "2026-12-31", false),
     // Added 2026-07-29 with the maker APR hurdle: an id with no date here gets
     // NO hurdle, and this family was quoting without one. The date is READ OFF
     // the relationship's own Kalshi legs — the same December-2026 FOMC decision
@@ -157,15 +179,36 @@ mod tests {
             Some(("2026-12-31", false)),
             "same December FOMC as xvus-fedcut-26"
         );
-        for still_undated in [
-            "xv-dem-nom-2028-newsom",
-            "xv-rep-nom-2028-vance",
-            "xvus-btc150k-ladder-07-31-2026",
-            "xvus-btc150k-ladder-08-31-2026",
-            "xvus-btc150k-ladder-12-31-2026",
-        ] {
+        for still_undated in ["xv-dem-nom-2028-newsom", "xv-rep-nom-2028-vance"] {
             assert_eq!(resolve_date(still_undated), None, "{still_undated}");
         }
+    }
+
+    /// The December rung was dated on 2026-07-31 and the other two were NOT,
+    /// which makes the prefix's narrowness the whole safety property: dating
+    /// this family widens the armed take-take set, and a prefix one character
+    /// looser (`xvus-btc150k-ladder`) would have widened it by three pairs
+    /// instead of one — including a rung resolving that same day, whose
+    /// day-floored horizon reads any edge as a triple-digit APR and so clears
+    /// every bar the engine has.
+    #[test]
+    fn only_the_december_btc150k_rung_is_dated() {
+        assert_eq!(
+            resolve_date("xvus-btc150k-ladder-12-31-2026"),
+            Some(("2026-12-31", false)),
+            "Kalshi's own stated bound, not an estimate"
+        );
+        for undated in ["xvus-btc150k-ladder-07-31-2026", "xvus-btc150k-ladder-08-31-2026"] {
+            assert_eq!(resolve_date(undated), None, "{undated} must stay unhurdled AND out of take-take");
+        }
+    }
+
+    /// The neighbouring BTC family must be unaffected in both directions: it
+    /// keeps its own date, and it does not lend it to the ladder.
+    #[test]
+    fn the_two_btc_families_stay_separate() {
+        assert_eq!(resolve_date("xvus-btcmax-26-31-2026-150k"), Some(("2026-12-31", false)));
+        assert_eq!(resolve_date("xvus-btc150k-ladder-01-31-2027"), None, "an undated rung is undated");
     }
 
     #[test]
