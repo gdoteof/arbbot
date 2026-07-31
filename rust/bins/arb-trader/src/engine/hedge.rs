@@ -115,6 +115,58 @@ pub(super) struct PendingHedge {
     /// Whether the ack-hold has already been logged for this obligation. One
     /// line per obligation: the decision is re-taken every second.
     pub(super) hold_logged: bool,
+    /// MONOTONIC time before which no further attempt will be PLACED, because
+    /// the venue said the market is halted (`Retry::MarketHalted`). `None` until
+    /// a place is refused that way.
+    ///
+    /// A HALT IS NOT A PRICE PROBLEM, and `interval_s` is sized for one: it is
+    /// "comfortably longer than a fill report takes", i.e. tuned against a book
+    /// that is trading. Against a venue that has stopped trading the market
+    /// entirely, the same interval is a request every 5s that cannot succeed —
+    /// 335 of them over 31 minutes on 2026-07-30, all identical, all spending
+    /// the SHARED `Priority::Critical` budget that the next real hedge and the
+    /// halt sweep both draw on.
+    ///
+    /// Parking is deliberately NOT going quiet. The obligation stays in
+    /// `pending_hedges`, stays owed, and keeps its naked alarm — `hedge_tick_plans`
+    /// computes the alarm independently of the plan, and `HedgePlan::Parked` is
+    /// not `Retire`. A parked leg is exactly as naked as an unparked one, and
+    /// silence about it would be strictly worse than the storm.
+    pub(super) parked_until: Option<std::time::Instant>,
+    /// Consecutive places on this obligation the venue refused as halted. Drives
+    /// the backoff step (see `venue_reopen_park`), and is what makes this a
+    /// BACKOFF rather than a second fixed interval.
+    pub(super) paused_strikes: u32,
+}
+
+/// The first park after a halted refusal, and the ceiling the doubling stops at.
+///
+/// SEPARATE CONSTANTS, not multiples of `interval_s`, for the reason
+/// `HOLD_FOR_ACK` is separate from `--hedge-alarm-s`: an operator tuning the
+/// retry interval against book latency is not thereby making a decision about
+/// how long to wait out a venue halt, and tying the two means they cannot say
+/// one without saying the other.
+///
+/// The ceiling is what bounds the cost of being wrong. A halt ends at a moment
+/// nothing tells us about, so the park is also the WORST-CASE delay between the
+/// market reopening and our first attempt on it — paid in naked time. 60s is
+/// chosen against the only other thing on this box that closes such a leg, the
+/// Python hedger's 5-minute timer (`arbbot-hedge.timer`): a ceiling under that
+/// keeps this engine the likelier of the two to hedge its own obligation.
+///
+/// Against the observed 31-minute halt this is 15/30/60/60/... — 33 places where
+/// there were 335, with at most 60s of added naked time at the end.
+const VENUE_REOPEN_PARK_FIRST: std::time::Duration = std::time::Duration::from_secs(15);
+const VENUE_REOPEN_PARK_MAX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long to park after the `strikes`-th consecutive halted refusal.
+///
+/// Doubling, capped. `strikes` is 1-based (the first refusal is strike 1); 0
+/// is not reachable from the caller and answers with the first step rather
+/// than with 0, because a park of 0 is the storm.
+fn venue_reopen_park(strikes: u32) -> std::time::Duration {
+    let steps = strikes.saturating_sub(1).min(16); // 2^16 * 15s already > the cap
+    (VENUE_REOPEN_PARK_FIRST * 2u32.saturating_pow(steps)).min(VENUE_REOPEN_PARK_MAX)
 }
 
 /// May a retry take `touch`, given the anchor the basket was priced against?
@@ -304,6 +356,11 @@ enum HedgePlan {
     /// Deferring to an unattributed fill that might be this obligation's own —
     /// a distinct answer from `Hold` so the reason can be logged and tested.
     HoldForAck,
+    /// The VENUE said this market is halted, and the park it bought has not
+    /// expired. A distinct answer from `Hold` for the same reason `HoldForAck`
+    /// is: the cause is different, and "not due yet" cannot be told from "the
+    /// venue is refusing everything" in a log that spells them the same.
+    Parked,
     /// Covered — retire the obligation.
     Retire,
     /// The book offers no price inside the slip budget (or no price at all).
@@ -347,6 +404,7 @@ fn hedge_plan(
     last_try_at: std::time::Instant,
     now: std::time::Instant,
     ack_outstanding: bool,
+    parked_until: Option<std::time::Instant>,
 ) -> HedgePlan {
     if filled >= owed {
         return HedgePlan::Retire;
@@ -354,6 +412,14 @@ fn hedge_plan(
     let since_try = now.saturating_duration_since(last_try_at);
     if since_try.as_secs_f64() < pol.interval_s {
         return HedgePlan::Hold;
+    }
+    // BELOW `Retire`, ABOVE everything else. A halted venue cannot fill an
+    // order at any price, so reading the book and judging the touch would only
+    // decide which price not to send. Above `HoldForAck` too: that hold defers
+    // to a fill that might already have discharged this obligation, and a fill
+    // discharges it through `filled >= owed`, which is already answered.
+    if parked_until.is_some_and(|t| now < t) {
+        return HedgePlan::Parked;
     }
     // An unattributed fill on this obligation's own venue+market, while an
     // attempt of ITS OWN is still waiting for an `order_ack`, may BE that
@@ -544,6 +610,7 @@ fn hedge_tick_plans(
             p.last_try_at,
             mono,
             ack_outstanding,
+            p.parked_until,
         );
         // The alarm is independent of the plan: waiting is the policy
         // (Geoff 2026-07-22, "hedge only if profitable; otherwise find
@@ -611,6 +678,50 @@ impl Engine {
         self.apply_hedge_plans(plans, mono);
     }
 
+    /// The venue REFUSED a place because the market is halted.
+    ///
+    /// The one class of refusal the executor reports (`Retry::MarketHalted`);
+    /// see the emission site in `exec.rs` for why the other two need no message.
+    /// A refusal on anything that is not a live hedge attempt — a maker quote, a
+    /// take-take leg 1, an attempt whose obligation is already discharged — is
+    /// read and dropped here: this is the hedge retry's backoff, and it is not
+    /// licensed to change what any other path does.
+    ///
+    /// The clock is MONOTONIC and read HERE rather than taken from the message's
+    /// `ts_local_ns`, which is the same rule `PendingHedge::first_at` follows and
+    /// for the same reason: every other hedge deadline is monotonic, and mixing
+    /// the two would let a wall-clock step decide when a park ends.
+    pub(super) fn on_place_result(&mut self, v: &serde_json::Value) {
+        // Read the class rather than assume it. The field is the contract
+        // between the two halves, and an emitter that later reports more
+        // classes must not silently start parking on all of them.
+        if v.get("retry").and_then(|r| r.as_str()) != Some("market_halted") {
+            return;
+        }
+        let Some(oid) = v.get("order_id").and_then(|x| x.as_str()) else { return };
+        let Some(chain) = self.hedge_orders.get(oid).map(|h| h.chain_id.clone()) else { return };
+        let now = std::time::Instant::now();
+        let Some(p) = self.pending_hedges.get_mut(&chain) else { return };
+        p.paused_strikes += 1;
+        let park = venue_reopen_park(p.paused_strikes);
+        p.parked_until = Some(now + park);
+        let (owed, filled, strikes) = (p.owed, p.filled, p.paused_strikes);
+        let (market, venue) = (p.anchor.market_id.clone(), p.anchor.venue);
+        self.n_parked += 1;
+        // ONE line per refusal, which is one line per park and not one per
+        // tick. It has to say NAKED out loud: the whole risk of backing off is
+        // that a quieter log reads like a solved problem.
+        eprintln!(
+            "[hedge] PARKED {}x {market} on {} for {}s — the venue refused the place \
+             with `trading_is_paused` (strike {strikes}); no price can fill against a \
+             halted market. The obligation {chain} is STILL OWED and STILL NAKED, and \
+             its alarm is unchanged.",
+            owed - filled,
+            venue.as_str(),
+            park.as_secs(),
+        );
+    }
+
     /// The ACT half of the hedge deadline: everything `hedge_tick_plans`
     /// decided, in the order it decided it.
     fn apply_hedge_plans(
@@ -632,7 +743,13 @@ impl Engine {
                 // PLACEMENTS, and looking at the book again next tick is
                 // free, so a naked leg hedges the moment the price comes
                 // back instead of up to `interval_s` later.
-                HedgePlan::Hold | HedgePlan::Wait => {}
+                //
+                // `Parked` joins them for the same reason: the park is held on
+                // the obligation and expires on its own clock, so nothing here
+                // has to be bumped. Its LINE was already said once, at the
+                // moment the venue refused (`on_place_result`) — repeating it
+                // every second would be the storm again in a quieter font.
+                HedgePlan::Hold | HedgePlan::Wait | HedgePlan::Parked => {}
                 // Deferring to a fill we cannot attribute. Said out loud
                 // once per obligation: `HedgePlan::Hold` used to swallow
                 // this, so added naked time had no signal at all.
@@ -790,6 +907,28 @@ mod hedge_deadline_tests {
         panic!("the quoter never placed anything at {}", path.display());
     }
 
+    /// ...and the same for the HEDGE attempt the maker fill mints. Hedge ids are
+    /// the only ones spelled `h<n>` (`Engine::next_hedge_oid`), which is what
+    /// tells one apart from the maker place already in this stream.
+    fn wait_for_hedge_place(path: &std::path::Path) -> String {
+        for _ in 0..200 {
+            if let Ok(txt) = std::fs::read_to_string(path) {
+                for l in txt.lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(l) else { continue };
+                    if v.get("place").is_none() {
+                        continue;
+                    }
+                    match v.get("order_id").and_then(|x| x.as_str()) {
+                        Some(oid) if oid.starts_with('h') => return oid.to_string(),
+                        _ => {}
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("the maker fill never produced a hedge place at {}", path.display());
+    }
+
     /// R1, end to end. A maker fill arrives, the market feed then goes silent for
     /// good, and the obligation must still be retried and must still alarm.
     ///
@@ -899,6 +1038,140 @@ mod hedge_deadline_tests {
         assert_eq!(s["dropped_unconsumed"], 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// THE 2026-07-30 STORM, end to end.
+    ///
+    /// Kalshi had KXNOBELPEACE-27-MKUL halted from 04:29:06 to 04:59:58 and
+    /// answered every place with `409 trading_is_paused`. The engine re-sent the
+    /// same 1 lot at the same 0.0800 for 31 minutes — 335 attempts — because a
+    /// refused place answered it with nothing, and nothing is what "not filled
+    /// yet" looks like too. Every retry was correct policy applied to a fact the
+    /// engine did not have.
+    ///
+    /// Driven through `run()` and not against the pure policy, because the pure
+    /// policy was never wrong: the defect was the missing EVENT, and only the
+    /// real arm can prove the event now arrives and is acted on. The synthetic
+    /// rel's venues are the harness's, not the incident's; the verbatim Kalshi
+    /// body is pinned where it is parsed (`arb_venue::error`).
+    #[tokio::test]
+    async fn a_venue_that_says_the_market_is_halted_stops_the_retry_storm() {
+        let dir = std::env::temp_dir().join(format!("arb-halted-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let out = dir.join("intents.jsonl");
+        let _ = std::fs::remove_file(&out);
+
+        let q = Quoter::new(rel());
+        let mut by_market = HashMap::new();
+        by_market.insert((Venue::Kalshi, "SYNTH-K-YES".to_string()), vec![0usize]);
+        by_market.insert((Venue::PolymarketUs, "SYNTH-P-YES".to_string()), vec![0usize]);
+
+        let (tx, rx) = mpsc::channel::<FeedMsg>(64);
+        let cfg = RunCfg {
+            out_path: Some(out.to_string_lossy().to_string()),
+            kill_file: dir.join("no-such-kill").to_string_lossy().to_string(),
+            stats_every_s: 3600,
+            bench: false,
+            wal_path: None,
+            health_file: None,
+            toxgate_file: None,
+            apr: None,
+            apr_installed: (0.0, String::new()),
+            risk: None,
+            ledger_path: None,
+            // The live shape: retries due far faster than the test's own window,
+            // so an unparked obligation cannot help but storm.
+            hedge_retry: Some(HedgeRetry {
+                interval_s: 0.05,
+                max_slip: "0.01".into(),
+                alarm_after_s: 0.1,
+            }),
+            take_take: None,
+            unwind: None,
+            armed: false,
+            hedges_undischarged: 0,
+        };
+        let handle = tokio::spawn(run(
+            vec![q],
+            by_market,
+            rx,
+            HashMap::new(),
+            Arc::new(ExecStats {
+                hop: Hist::new(),
+                placed: std::sync::atomic::AtomicU64::new(0),
+                cancelled: std::sync::atomic::AtomicU64::new(0),
+                dropped: std::sync::atomic::AtomicU64::new(0),
+                sent: std::sync::atomic::AtomicU64::new(0),
+                failed: std::sync::atomic::AtomicU64::new(0),
+                recovered: std::sync::atomic::AtomicU64::new(0),
+            }),
+            cfg,
+        ));
+
+        tx.send(msg(snapshot("kalshi", "SYNTH-K-YES", "0.30", "0.45", 1_700_000_000)))
+            .await
+            .expect("send");
+        tx.send(msg(snapshot("polymarket_us", "SYNTH-P-YES", "0.40", "0.42", 1_700_000_001)))
+            .await
+            .expect("send");
+        let maker = tokio::task::spawn_blocking({
+            let out = out.clone();
+            move || wait_for_first_place(&out)
+        })
+        .await
+        .expect("join");
+
+        // The maker fills, which mints the obligation and sends its first hedge.
+        tx.send(msg(format!(
+            r#"{{"kind":"fill","venue":"kalshi","market_id":"SYNTH-K-YES","order_id":"{maker}",
+                 "cum":5,"ts_local_ns":1700000003000000000}}"#
+        )))
+        .await
+        .expect("send");
+        let hedge = tokio::task::spawn_blocking({
+            let out = out.clone();
+            move || wait_for_hedge_place(&out)
+        })
+        .await
+        .expect("join");
+
+        // ...and the venue refuses it: the market is halted. This is the line
+        // that did not exist.
+        tx.send(msg(
+            serde_json::json!({
+                "kind": "place_result",
+                "venue": "polymarket_us",
+                "market_id": "SYNTH-P-YES",
+                "order_id": hedge,
+                "ok": false,
+                "retry": "market_halted",
+                "error": "place: HTTP 409: {\"error\":{\"code\":\"trading_is_paused\"}}",
+                "ts_local_ns": 1700000003000000000i64,
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send");
+
+        // Wall time passes. The deadline ticks at 1Hz and `interval_s` is 0.05,
+        // so every tick in here would have produced another place.
+        tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
+        drop(tx);
+        let s = handle.await.expect("engine task");
+
+        assert_eq!(s["hedges_parked"], 1, "the refusal parked the obligation: {s}");
+        assert_eq!(
+            s["hedges_retried"], 0,
+            "and NOT ONE further place went out while the venue was halted — this \
+             is the 335: {s}"
+        );
+        // The two halves of "parked is not quiet".
+        assert_eq!(s["hedges_pending"], 1, "the obligation is still owed");
+        assert!(
+            s["hedges_naked"].as_u64().expect("hedges_naked") >= 1,
+            "and it still alarms as NAKED while parked: {s}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -991,7 +1264,7 @@ mod hedge_accounting_tests {
         let t = t0();
         hedge_plan(
             &mut cx, pol, owed, filled, anchor, BookSide::Bid, Some(touch), t,
-            after(t, 100.0), false,
+            after(t, 100.0), false, None,
         )
     }
 
@@ -1145,7 +1418,7 @@ mod hedge_accounting_tests {
         assert_eq!(
             hedge_plan(
 
-                &mut cx, &p, 5, 0, "0.40", BookSide::Bid, Some("0.40"), t, after(t, 4.9), false,
+                &mut cx, &p, 5, 0, "0.40", BookSide::Bid, Some("0.40"), t, after(t, 4.9), false, None,
 
             ),
             HedgePlan::Hold,
@@ -1153,7 +1426,7 @@ mod hedge_accounting_tests {
         );
         // no level on the side we take is a WAIT, not a silent skip
         assert_eq!(
-            hedge_plan(&mut cx, &p, 5, 0, "0.40", BookSide::Bid, None, t, after(t, 100.0), false),
+            hedge_plan(&mut cx, &p, 5, 0, "0.40", BookSide::Bid, None, t, after(t, 100.0), false, None),
             HedgePlan::Wait
         );
     }
@@ -1194,6 +1467,7 @@ mod hedge_accounting_tests {
                     t,
                     after(t, 100.0 + i as f64 * 10.0),
                     false,
+                    None,
                 );
                 if let HedgePlan::Retry { price, .. } = got {
                     taken += 1;
@@ -1257,7 +1531,7 @@ mod hedge_accounting_tests {
         assert_eq!(
             hedge_plan(
 
-                &mut cx, &p, 5, 0, "0.40", BookSide::Ask, Some("0.41"), t, after(t, 100.0), false,
+                &mut cx, &p, 5, 0, "0.40", BookSide::Ask, Some("0.41"), t, after(t, 100.0), false, None,
 
             ),
             HedgePlan::Retry { qty: 5, price: "0.41".into() }
@@ -1265,7 +1539,7 @@ mod hedge_accounting_tests {
         assert_eq!(
             hedge_plan(
 
-                &mut cx, &p, 5, 0, "0.40", BookSide::Ask, Some("0.42"), t, after(t, 100.0), false,
+                &mut cx, &p, 5, 0, "0.40", BookSide::Ask, Some("0.42"), t, after(t, 100.0), false, None,
 
             ),
             HedgePlan::Wait
@@ -1342,7 +1616,7 @@ mod hedge_accounting_tests {
         assert_eq!(
             hedge_plan(
 
-                &mut cx, &p, 5, 0, "0.40", BookSide::Bid, Some("0.40"), t, after(t, 10.0), false,
+                &mut cx, &p, 5, 0, "0.40", BookSide::Bid, Some("0.40"), t, after(t, 10.0), false, None,
 
             ),
             HedgePlan::Retry { qty: 5, price: "0.40".into() },
@@ -1352,6 +1626,7 @@ mod hedge_accounting_tests {
             hedge_plan(
 
                 &mut cx, &p, 5, 0, "0.40", BookSide::Bid, Some("0.40"), t, after(t, 10.0), true,
+                None,
 
             ),
             HedgePlan::HoldForAck,
@@ -1386,7 +1661,8 @@ mod hedge_accounting_tests {
                     Some("0.40"),
                     t,
                     after(t, due - 0.1),
-                    true
+                    true,
+                    None,
                 ),
                 HedgePlan::HoldForAck,
                 "inside the grace the ack may still land (alarm {alarm_after_s})"
@@ -1394,7 +1670,7 @@ mod hedge_accounting_tests {
             assert_eq!(
                 hedge_plan(
                     &mut cx, &p, 5, 0, "0.40", BookSide::Bid, Some("0.40"), t, after(t, due),
-                    true,
+                    true, None,
                 ),
                 HedgePlan::Retry { qty: 5, price: "0.40".into() },
                 "past the grace, being naked is the larger harm (alarm {alarm_after_s})"
@@ -1433,6 +1709,7 @@ mod hedge_accounting_tests {
             fill_at,
             after(fill_at, 30.0),
             false,
+            None,
         );
         assert_eq!(
             plan,
@@ -1460,7 +1737,8 @@ mod hedge_accounting_tests {
                 Some("0.40"),
                 after(fill_at, 3600.0),
                 fill_at,
-                false
+                false,
+                None,
             ),
             HedgePlan::Hold,
             "a reading from before the stamp must not panic or fire"
@@ -1621,6 +1899,8 @@ mod hedge_tick_tests {
             tries: u32::from(attempt.is_some()),
             alarmed: false,
             hold_logged: false,
+            parked_until: None,
+            paused_strikes: 0,
         }
     }
 
@@ -1933,5 +2213,160 @@ mod hedge_tick_tests {
         );
         assert_eq!(plans[0].2, None, "an obligation alarms exactly once");
         assert_eq!(plans[0].1, HedgePlan::Wait, "and waiting is still the policy");
+    }
+
+    // ------------------------------------------- the halted venue (2026-07-30) ---
+
+    /// THE thing that makes parking acceptable at all.
+    ///
+    /// Backing off is only defensible if the leg stays as loud as it was. This
+    /// obligation is parked for the full window AND past its alarm horizon: the
+    /// plan must say `Parked` and the alarm must still be produced, in the same
+    /// tick. If the alarm ever moved under the plan — if `Parked` were folded in
+    /// with `Retire`, say — a halted venue would silently absorb a naked leg, and
+    /// that is strictly worse than 335 log lines.
+    #[test]
+    fn a_parked_obligation_is_quiet_about_retrying_and_loud_about_being_naked() {
+        let t = t0();
+        let mut p = pending(Some("h1"), t);
+        // Parked PAST the 60s alarm horizon, and read from inside the park but
+        // after the horizon — the only window where the two can disagree.
+        p.parked_until = Some(after(t, 120.0));
+        p.paused_strikes = 1;
+        let mut cx = Cx::default();
+        let plans = hedge_tick_plans(
+            &mut cx,
+            &pol(),
+            &HashMap::from([("h1".to_string(), p)]),
+            // A book that WOULD be taken — the anchor exactly. So the only
+            // reason not to place is the park.
+            &books("0.40", "0.41"),
+            &HashMap::new(),
+            &HashMap::new(),
+            after(t, 61.0),
+        );
+        assert_eq!(plans[0].1, HedgePlan::Parked, "the venue is halted: do not re-place");
+        let alarm = plans[0].2.as_deref().expect("a parked leg is still a naked leg");
+        assert!(alarm.contains("NAKED 5x P"), "and it still says so out loud: {alarm}");
+    }
+
+    /// ...and the park EXPIRES. A halt that ended must not leave the obligation
+    /// parked for ever — the park is a backoff, not a kill switch.
+    #[test]
+    fn the_park_expires_and_the_retry_becomes_due_again() {
+        let t = t0();
+        let mut p = pending(Some("h1"), t);
+        p.parked_until = Some(after(t, 15.0));
+        let mut cx = Cx::default();
+        let plans = hedge_tick_plans(
+            &mut cx,
+            &pol(),
+            &HashMap::from([("h1".to_string(), p)]),
+            &books("0.40", "0.41"),
+            &HashMap::new(),
+            &HashMap::new(),
+            after(t, 15.1),
+        );
+        assert_eq!(plans[0].1, HedgePlan::Retry { qty: 5, price: "0.40".into() });
+    }
+
+    /// The backoff is a BACKOFF: it grows, and it stops growing.
+    ///
+    /// A fixed second interval would be the same defect one order of magnitude
+    /// quieter, and an uncapped one would turn a long halt into an unbounded
+    /// naked window after the reopen.
+    #[test]
+    fn the_park_doubles_and_then_stops_at_the_ceiling() {
+        let secs = |s: u32| venue_reopen_park(s).as_secs();
+        assert_eq!((secs(1), secs(2), secs(3)), (15, 30, 60), "doubling");
+        assert_eq!((secs(4), secs(20), secs(u32::MAX)), (60, 60, 60), "and capped");
+    }
+
+    /// The venue's refusal parks the obligation it belongs to — and nothing else.
+    ///
+    /// `on_place_result` is keyed through `hedge_orders` to the CHAIN, so a
+    /// refusal on one attempt parks the obligation that attempt was made for,
+    /// even after the id has moved on. A refusal naming an order that is not a
+    /// live hedge attempt (a maker quote, a take-take leg 1) must change nothing:
+    /// this backoff is the hedge retry's, and it is not licensed to reach the
+    /// quoter.
+    #[test]
+    fn a_halted_refusal_parks_its_own_obligation_and_no_other() {
+        let mut e = test_engine(RunCfg { hedge_retry: Some(pol()), ..test_cfg() });
+        let t = t0();
+        e.pending_hedges.insert("h1".into(), pending(Some("h2"), t));
+        e.pending_hedges.insert("h9".into(), pending(Some("h9"), t));
+        // h2 is h1's SECOND attempt: same chain, different id.
+        e.hedge_orders.insert(
+            "h2".into(),
+            HedgeOrder {
+                maker_order_id: "m1".into(),
+                chain_id: "h1".into(),
+                market_id: "P".into(),
+                venue: Venue::PolymarketUs,
+                side: BookSide::Ask,
+                price: "0.40".into(),
+                qty: 5,
+                cum_filled: 0,
+                supersedes: Some("h1".into()),
+            },
+        );
+
+        let halted = |oid: &str| {
+            serde_json::json!({"kind":"place_result","venue":"polymarket_us",
+                               "market_id":"P","order_id":oid,"ok":false,
+                               "retry":"market_halted","error":"HTTP 409"})
+        };
+        e.on_place_result(&halted("h2"));
+        assert!(e.pending_hedges["h1"].parked_until.is_some(), "the chain h2 belongs to");
+        assert_eq!(e.pending_hedges["h1"].paused_strikes, 1);
+        assert!(e.pending_hedges["h9"].parked_until.is_none(), "a bystander obligation");
+        assert_eq!(e.n_parked, 1);
+
+        // A refusal for an id that is no hedge of ours at all.
+        e.on_place_result(&halted("q77"));
+        assert_eq!(e.n_parked, 1, "a refused maker quote is not a hedge park");
+
+        // ...and a refusal the classifier did NOT call halted keeps the ordinary
+        // retry, which is the whole point of `Retry::Now` being the default.
+        let mut ordinary = halted("h2");
+        ordinary["retry"] = serde_json::json!("something_else");
+        e.on_place_result(&ordinary);
+        assert_eq!(e.pending_hedges["h1"].paused_strikes, 1, "only halted parks");
+    }
+
+    /// A halt that outlasts the first park backs off further, and the park is
+    /// always measured from the LATEST refusal — not from the first.
+    #[test]
+    fn a_second_refusal_lengthens_the_park() {
+        let mut e = test_engine(RunCfg { hedge_retry: Some(pol()), ..test_cfg() });
+        let t = t0();
+        e.pending_hedges.insert("h1".into(), pending(Some("h1"), t));
+        e.hedge_orders.insert(
+            "h1".into(),
+            HedgeOrder {
+                maker_order_id: "m1".into(),
+                chain_id: "h1".into(),
+                market_id: "P".into(),
+                venue: Venue::PolymarketUs,
+                side: BookSide::Ask,
+                price: "0.40".into(),
+                qty: 5,
+                cum_filled: 0,
+                supersedes: None,
+            },
+        );
+        let halted = serde_json::json!({"kind":"place_result","venue":"polymarket_us",
+                                        "market_id":"P","order_id":"h1","ok":false,
+                                        "retry":"market_halted","error":"HTTP 409"});
+        e.on_place_result(&halted);
+        let first = e.pending_hedges["h1"].parked_until.expect("parked");
+        e.on_place_result(&halted);
+        let second = e.pending_hedges["h1"].parked_until.expect("still parked");
+        assert_eq!(e.pending_hedges["h1"].paused_strikes, 2);
+        assert!(
+            second.saturating_duration_since(first) >= VENUE_REOPEN_PARK_FIRST,
+            "strike 2 parks a full step longer than strike 1"
+        );
     }
 }
