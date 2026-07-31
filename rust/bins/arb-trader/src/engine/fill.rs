@@ -382,6 +382,8 @@ impl Engine {
                                 tries: 0,
                                 alarmed: false,
                                 hold_logged: false,
+                                parked_until: None,
+                                paused_strikes: 0,
                             },
                         );
                         // I5, first attempt included — see
@@ -800,6 +802,8 @@ mod attribute_fill_tests {
             tries: 1,
             alarmed: false,
             hold_logged: false,
+            parked_until: None,
+            paused_strikes: 0,
         }
     }
 
