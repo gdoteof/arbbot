@@ -7,6 +7,7 @@ pub mod clock;
 pub mod fees;
 pub mod fill;
 pub mod intent;
+pub mod naked;
 pub mod scan;
 pub mod dec;
 pub mod model;
