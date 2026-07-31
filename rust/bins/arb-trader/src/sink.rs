@@ -323,6 +323,13 @@ pub trait OrderSink: Send + Sync {
     fn net_positions(&self) -> Result<std::collections::BTreeMap<String, f64>, VenueError> {
         Err(VenueError::NotWired)
     }
+    /// Venue truth for a market's TOP OF BOOK, for a market this process holds
+    /// no feed subscription for — see
+    /// [`arb_venue::gateway::VenueGateway::market_quote`], which explains why
+    /// `BookBuilder` cannot answer and why the default refuses.
+    fn market_quote(&self, _market: &str) -> Result<arb_venue::gateway::Quote, VenueError> {
+        Err(VenueError::NotWired)
+    }
 }
 
 /// Every gateway is a sink. The adapter is the same four delegations for both
@@ -364,6 +371,9 @@ where
     }
     fn net_positions(&self) -> Result<std::collections::BTreeMap<String, f64>, VenueError> {
         VenueGateway::net_positions(self)
+    }
+    fn market_quote(&self, market: &str) -> Result<arb_venue::gateway::Quote, VenueError> {
+        VenueGateway::market_quote(self, market)
     }
 }
 
