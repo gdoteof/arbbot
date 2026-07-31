@@ -337,11 +337,14 @@ const EDGES: &[Edge] = &[
 // ---------------------------------------------------------------------------
 
 /// One running process, as `/proc` reports it.
+///
+/// `pub(crate)` for the Now view, which needs a unit's start time to date the
+/// summary line it reads out of the journal.
 #[derive(Clone)]
-struct Proc {
-    pid: u32,
-    up_s: u64,
-    cmd: String,
+pub struct Proc {
+    pub pid: u32,
+    pub up_s: u64,
+    pub cmd: String,
 }
 
 /// The unit a cgroup line belongs to, or None for anything outside a unit.
@@ -382,7 +385,7 @@ fn tags_of(cmd: &str) -> Vec<String> {
 /// `/proc/<pid>`'s mtime is the process start time, which is why no timestamp
 /// has to be parsed out of `systemctl`. Where a unit has several processes
 /// (an `ExecStart=/bin/sh -c …` grows a child), the OLDEST is the main one.
-fn procs_by_unit() -> BTreeMap<String, Proc> {
+pub fn procs_by_unit() -> BTreeMap<String, Proc> {
     let now = now_secs();
     let mut out: BTreeMap<String, Proc> = BTreeMap::new();
     let Ok(rd) = std::fs::read_dir("/proc") else { return out };

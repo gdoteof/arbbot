@@ -7,6 +7,7 @@
 pub mod books;
 pub mod current;
 pub mod intents;
+pub mod now;
 pub mod opportunities;
 pub mod pairs;
 pub mod trades;

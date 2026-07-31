@@ -168,7 +168,14 @@ pub struct Decision {
 
 // ---------- helpers ----------
 
-fn topic_of(rel_id: &str, topics: &[TopicIn]) -> String {
+/// Which topic budget a relationship falls under: longest matching family
+/// wins, `other` if none does.
+///
+/// `pub` so the dashboard buckets a position exactly the way the gate that
+/// refused it does. A second copy of longest-match-wins in the read path is a
+/// second thing to keep in step, and it would disagree silently — the reader
+/// would be told a pair is in a topic the engine never gated it under.
+pub fn topic_of(rel_id: &str, topics: &[TopicIn]) -> String {
     let hay = format!("-{rel_id}-");
     let mut best = "";
     for t in topics {
