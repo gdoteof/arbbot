@@ -662,7 +662,18 @@ fn a_web_ui_order_with_no_tag_is_left_alone_and_does_not_block_arming() {
 #[test]
 fn ownership_is_decided_by_the_tag_this_stack_mints() {
     use arb_venue::gateway::is_ours;
-    for id in ["m1785257819045", "h1", "t42", "rehearse-1785197117443", "sweep-1234", "m0"] {
+    for id in [
+        "m1785257819045",
+        "h1",
+        "t42",
+        // The venue-truth naked-leg completer's own space. It shares this key
+        // with the engine's `h` hedges, so the sweep has to reach it too — an
+        // id the sweep does not recognise is an order a halt leaves resting.
+        "n1785300830679",
+        "rehearse-1785197117443",
+        "sweep-1234",
+        "m0",
+    ] {
         assert!(is_ours(id), "{id} is minted by this tree");
     }
     for id in [
@@ -671,6 +682,7 @@ fn ownership_is_decided_by_the_tag_this_stack_mints() {
         "m",             // a prefix with no counter is not an id
         "m17852578-1",   // nor one with anything but digits behind it
         "manual-order",  // a word that merely starts with `m`
+        "naked-1",       // nor one that merely starts with `n`
         "theirs",
     ] {
         assert!(!is_ours(id), "{id} must never be swept as ours");
@@ -1481,4 +1493,112 @@ fn a_position_cursor_that_never_ends_is_refused() {
 fn a_failed_positions_read_is_an_error_not_an_empty_map() {
     let g = gw(vec![(503, "service unavailable")]);
     assert!(g.net_positions().is_err(), "503 must never read as 'nothing held'");
+}
+
+// ------------------------------------------------------- the public quote ---
+//
+// The bodies below are VERBATIM rows from `data/catalogs/kalshi-*.json` — this
+// repo's own captures of `GET /markets`, 35,640 of them — trimmed only of the
+// fields a quote does not read. Same rule as `error.rs`'s `retry_tests`: a test
+// that invents its own input can only prove the parser matches the test.
+
+/// `KXTIMEDECADE20S-30-VZEL`, one of the 7,224 TAPERED markets in the capture.
+const MARKET_TAPERED: &str = r#"{"markets":[{"can_close_early":true,
+ "event_ticker":"KXTIMEDECADE20S-30","last_price_dollars":"0.3800",
+ "liquidity_dollars":"0.0000","market_type":"binary","no_ask_dollars":"0.6200",
+ "no_bid_dollars":"0.5800","notional_value_dollars":"1.0000",
+ "open_interest_fp":"10348.77","previous_yes_ask_dollars":"0.4300",
+ "previous_yes_bid_dollars":"0.3800","price_level_structure":"tapered_deci_cent",
+ "price_ranges":[{"end":"0.1000","start":"0.0000","step":"0.0010"},
+                 {"end":"0.9000","start":"0.1000","step":"0.0100"},
+                 {"end":"1.0000","start":"0.9000","step":"0.0010"}],
+ "status":"active","ticker":"KXTIMEDECADE20S-30-VZEL","yes_ask_dollars":"0.4200",
+ "yes_bid_dollars":"0.3800"}]}"#;
+
+/// `KXMVESPORTSMULTIGAMEEXTENDED-...-7D6B1E6A6DC`: an ACTIVE market with nothing
+/// resting on either side. 1,742 of the captured rows look like this.
+const MARKET_EMPTY_BOOK: &str = r#"{"markets":[{
+ "price_ranges":[{"end":"1.0000","start":"0.0000","step":"0.0010"}],
+ "status":"active","ticker":"KXMVESPORTSMULTIGAMEEXTENDED-S2026FBF4F26EB2B-7D6B1E6A6DC",
+ "yes_ask_dollars":"0.0000","yes_bid_dollars":"0.0000"}]}"#;
+
+/// The whole ladder survives the read, in the venue's own order — because the
+/// tick is a function of the PRICE on a tapered market and this is the only
+/// thing that can say so. `scripts/hedge_naked_legs.py:95-99` keeps the first
+/// rung's step and uses it everywhere, which prices a $0.42 order to the tenth
+/// of a cent on exactly this market.
+#[test]
+fn a_market_quote_carries_the_whole_tick_ladder_not_just_the_first_rung() {
+    let g = gw(vec![(200, MARKET_TAPERED)]);
+    let q = g.market_quote("KXTIMEDECADE20S-30-VZEL").expect("a quote");
+    assert_eq!(q.status, "active");
+    assert_eq!(q.yes_bid.as_deref(), Some("0.3800"));
+    assert_eq!(q.yes_ask.as_deref(), Some("0.4200"));
+    assert_eq!(
+        q.ladder,
+        vec![
+            ("0.0000".to_string(), "0.1000".to_string(), "0.0010".to_string()),
+            ("0.1000".to_string(), "0.9000".to_string(), "0.0100".to_string()),
+            ("0.9000".to_string(), "1.0000".to_string(), "0.0010".to_string()),
+        ]
+    );
+    let sent = &g.transport.sent()[0];
+    assert_eq!(sent.method, "GET");
+    assert_eq!(sent.path, "/trade-api/v2/markets");
+    assert_eq!(sent.query.as_deref(), Some("tickers=KXTIMEDECADE20S-30-VZEL"));
+}
+
+/// THE `0.0000` TRAP. An empty side comes back as `None`, never as a price of
+/// zero — `Decimal("0.0000") <= limit` is true for every limit a hedger ever
+/// computes, so the Python's reading turns "nothing is offered" into "the
+/// cheapest possible offer".
+#[test]
+fn an_empty_book_side_is_absent_not_a_price_of_zero() {
+    let g = gw(vec![(200, MARKET_EMPTY_BOOK)]);
+    let q = g
+        .market_quote("KXMVESPORTSMULTIGAMEEXTENDED-S2026FBF4F26EB2B-7D6B1E6A6DC")
+        .expect("a quote");
+    assert_eq!(q.yes_ask, None, "an active market with nothing resting on it");
+    assert_eq!(q.yes_bid, None);
+}
+
+/// `tickers=` is a FILTER, and a venue that ignored it would hand back somebody
+/// else's book. Pricing one market's hedge off another's is not a degraded
+/// answer, it is a wrong one.
+#[test]
+fn a_listing_that_does_not_contain_the_ticker_asked_for_is_an_error() {
+    let g = gw(vec![(200, MARKET_TAPERED)]);
+    match g.market_quote("KXRATECUT-26DEC31") {
+        Err(VenueError::Parse { detail, .. }) => {
+            assert!(detail.contains("KXRATECUT-26DEC31"), "{detail}")
+        }
+        other => panic!("a listing about another market is not this market's quote: {other:?}"),
+    }
+    // ...and an EMPTY listing is the same refusal, not a quote with no prices.
+    let g = gw(vec![(200, r#"{"markets":[]}"#)]);
+    assert!(g.market_quote("KXRATECUT-26DEC31").is_err());
+}
+
+/// A refusal is a refusal. It must not come back as a market with no book,
+/// which is the shape a caller would read as "nothing to trade against".
+#[test]
+fn a_failed_quote_read_is_an_error_not_an_empty_book() {
+    let g = gw(vec![(503, "service unavailable")]);
+    assert!(g.market_quote("KXRATECUT-26DEC31").is_err());
+}
+
+/// `price_ranges` is REQUIRED. Defaulting it to a penny tick would be a claim
+/// about a ladder nobody read, and on the 7,224 tapered markets that claim is
+/// false below $0.10 and above $0.90.
+#[test]
+fn a_market_row_with_no_tick_ladder_is_refused() {
+    let g = gw(vec![(
+        200,
+        r#"{"markets":[{"ticker":"KXA","status":"active","yes_bid_dollars":"0.10",
+            "yes_ask_dollars":"0.11"}]}"#,
+    )]);
+    match g.market_quote("KXA") {
+        Err(VenueError::MissingField { field, .. }) => assert_eq!(field, "price_ranges"),
+        other => panic!("a ladder we never read must not be defaulted: {other:?}"),
+    }
 }

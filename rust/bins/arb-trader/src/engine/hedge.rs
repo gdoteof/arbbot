@@ -164,7 +164,7 @@ const VENUE_REOPEN_PARK_MAX: std::time::Duration = std::time::Duration::from_sec
 /// Doubling, capped. `strikes` is 1-based (the first refusal is strike 1); 0
 /// is not reachable from the caller and answers with the first step rather
 /// than with 0, because a park of 0 is the storm.
-fn venue_reopen_park(strikes: u32) -> std::time::Duration {
+pub(crate) fn venue_reopen_park(strikes: u32) -> std::time::Duration {
     let steps = strikes.saturating_sub(1).min(16); // 2^16 * 15s already > the cap
     (VENUE_REOPEN_PARK_FIRST * 2u32.saturating_pow(steps)).min(VENUE_REOPEN_PARK_MAX)
 }
@@ -674,6 +674,24 @@ impl Engine {
             &self.oid_venue,
             &self.unclaimed_fills,
             mono,
+        );
+        // WHAT THIS ENGINE IS ALREADY WORKING, published for the one other
+        // order-owner inside this process: the venue-truth naked-leg completer
+        // (`--positions-recon-act`), which reads venue POSITIONS and so cannot
+        // tell an unhedged leg from a leg whose hedge is on the wire.
+        //
+        // Published from HERE — one wholesale overwrite of the whole set, once a
+        // tick — rather than by enter/leave calls at the four `pending_hedges`
+        // mutation sites, because those can be got wrong in the fatal direction.
+        // A missed leave costs a market this process declines to touch; a missed
+        // enter is the 2026-07-30 double hedge. See `naked_act::Inflight` for
+        // why 1 Hz is fast enough against a 5-minute cycle.
+        //
+        // Unconditional, and that matters: an EMPTY set has to be published as
+        // eagerly as a full one, or the reader's staleness guard fails closed on
+        // an idle engine and no naked leg is ever completed.
+        crate::naked_act::publish_inflight(
+            self.pending_hedges.values().map(|p| p.anchor.market_id.clone()).collect(),
         );
         self.apply_hedge_plans(plans, mono);
     }
@@ -2022,6 +2040,43 @@ mod hedge_tick_tests {
         );
         let alarm = plans[0].2.as_deref().expect("still naked, still alarmed");
         assert!(!alarm.contains("CROSSED"), "{alarm}");
+    }
+
+    /// THE INTERLOCK THE OTHER ORDER-OWNER READS. `--positions-recon-act`
+    /// completes naked legs from venue POSITIONS, which cannot tell an unhedged
+    /// leg from one whose hedge is on the wire — so the hedge tick has to say
+    /// what it is working, every tick, or the two buy the same contract twice
+    /// (2026-07-30, and `hedges_overfilled` read 0 through it).
+    ///
+    /// Both directions are asserted because both are load-bearing: an obligation
+    /// must APPEAR, and an idle engine must publish an EMPTY set rather than
+    /// stay silent — the reader fails closed on silence, so a hedge tick that
+    /// only spoke when it had something to say would mean no naked leg is ever
+    /// completed.
+    #[tokio::test]
+    async fn the_hedge_tick_publishes_what_this_engine_is_already_working() {
+        let _s = crate::naked_act::TEST_SERIAL.lock().await;
+        crate::naked_act::reset_inflight();
+        let mut e = test_engine(RunCfg { hedge_retry: Some(pol()), ..test_cfg() });
+
+        // Idle: the tick still speaks, and everything is placeable.
+        e.hedge_tick();
+        assert!(crate::naked_act::inflight_check("KXTEST").is_ok());
+
+        // With an obligation on KXTEST, that market becomes untouchable...
+        e.pending_hedges.insert("h1".into(), pending(Some("h1"), t0()));
+        e.hedge_tick();
+        let err = crate::naked_act::inflight_check(&e.pending_hedges["h1"].anchor.market_id)
+            .expect_err("this engine owes a hedge there");
+        assert!(err.contains("double hedge"), "{err}");
+        // ...and nothing else is.
+        assert!(crate::naked_act::inflight_check("KXSOMETHINGELSE").is_ok());
+
+        // ...and when it is discharged the market is released, because the set
+        // is republished WHOLESALE rather than maintained by paired calls.
+        e.pending_hedges.clear();
+        e.hedge_tick();
+        assert!(crate::naked_act::inflight_check("KXTEST").is_ok());
     }
 
     /// Dispatch order is by chain id and nothing else. `pending_hedges` is a

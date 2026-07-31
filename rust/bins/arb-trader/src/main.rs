@@ -39,6 +39,7 @@ mod feed;
 mod fills;
 mod hist;
 mod ledger;
+mod naked_act;
 mod orphan;
 mod positions;
 mod risk;
@@ -152,13 +153,29 @@ struct Args {
     /// Reconcile registry pairs against BOTH venues' actual positions every 5
     /// minutes and REPORT naked legs (`positions::recon_loop`).
     ///
-    /// OFF by default, and there is no armed spelling — the same posture as
-    /// `--unwind-detect-only`, for a stronger reason: `arbbot-hedge.timer`
-    /// already acts on this read, and a second actor on the same Kalshi key is
-    /// a double hedge rather than a backup (`orphan.rs`). It also needs
-    /// `--enable-orders`, not because it writes anything but because the venue
-    /// READ handle is the order sink; see where it is spawned.
+    /// OFF by default, and detect-only on its own. It USED to say "there is no
+    /// armed spelling", on the reasoning that `arbbot-hedge.timer` already acts
+    /// on this read and a second actor on the same Kalshi key is a double hedge
+    /// rather than a backup (`orphan.rs`). That reasoning still holds and is
+    /// why `--positions-recon-act` below is a REPLACEMENT for the timer rather
+    /// than an addition to it — but it is no longer true that no armed spelling
+    /// exists. It also needs `--enable-orders`, not because it writes anything
+    /// but because the venue READ handle is the order sink; see where it is
+    /// spawned.
     positions_recon: bool,
+    /// ARM that reconciliation: complete a CONFIRMED naked leg with a real IOC,
+    /// profitable-only, and book the fill (`crate::naked_act`).
+    ///
+    /// OFF by default and inert without `--positions-recon` and
+    /// `--enable-orders`. This is the flag that lets this binary REPLACE
+    /// `arbbot-hedge.timer`; it does not make running both safe, and the banner
+    /// at the spawn site says so, because nothing in this process can detect
+    /// the other one.
+    positions_recon_act: bool,
+    /// Decide and LOG, never place (`positions::Act::shadow`). Wins over
+    /// `--positions-recon-act` when both are given, which is the safe direction
+    /// and the one an operator would want from a typo.
+    positions_recon_act_shadow: bool,
 }
 
 /// The floating maker APR bar (Geoff 2026-07-22, card 80ff7987), port of
@@ -237,6 +254,8 @@ fn default_args() -> Args {
         suppress: Vec::new(),
         unwind_detect_only: false,
         positions_recon: false,
+        positions_recon_act: false,
+        positions_recon_act_shadow: false,
     }
 }
 
@@ -323,6 +342,8 @@ fn parse_args() -> Args {
             }
             "--unwind-detect-only" => a.unwind_detect_only = true,
             "--positions-recon" => a.positions_recon = true,
+            "--positions-recon-act" => a.positions_recon_act = true,
+            "--positions-recon-act-shadow" => a.positions_recon_act_shadow = true,
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(2);
@@ -1109,7 +1130,8 @@ fn seed_exposure_from_ledger(
 /// is `owed - booked`, and `booked` is exactly the ledger's own record — the one
 /// `seed_exposure_from_ledger` has already seeded from. What is seeded here is
 /// the remainder that the ledger does not contain. When the obligation is later
-/// completed (by `arbbot-hedge.timer`, which owns naked-leg completion) a basket
+/// completed — by whichever of `arbbot-hedge.timer` and `--positions-recon-act`
+/// owns naked-leg completion at the time, which must never be both — a basket
 /// is appended and the NEXT startup's census reads `owed - booked = 0`, so the
 /// same contracts move from this seed to the ledger seed without ever being in
 /// both. Nothing in THIS process can book them: the maker order belongs to a
@@ -1392,8 +1414,9 @@ fn spawn_fill_feeds(
     }
 }
 
-/// The venue-truth positions reconciliation (`--positions-recon`), which is
-/// OFF unless asked for and never places anything. See `positions`.
+/// The venue-truth positions reconciliation (`--positions-recon`), OFF unless
+/// asked for, and placing nothing unless `--positions-recon-act` arms it on top
+/// of a live order path. See `positions`.
 ///
 /// It reads through the SINKS rather than building its own gateways, which is
 /// what ties it to `--enable-orders` even though it writes nothing: the sinks
@@ -1406,11 +1429,43 @@ fn spawn_fill_feeds(
 ///
 /// BOTH venues or nothing. A one-venue reconciliation has no imbalance to
 /// compute; it would only be able to list positions.
+///
+/// THE SINKS ARE ALSO THE ARMING GATE, and `--positions-recon-act` needs no
+/// second one. `arm_venues` returns an EMPTY map unless `--enable-orders` was
+/// passed and every precondition met, so reaching the pair below already means
+/// the order path is live. A separate `armed` flag here would read as a safety
+/// check while being unreachable, which is worse than no check at all.
+const PROBE_LOGS: [&str; 3] = [
+    "data/exec/pmus_maker_probe.jsonl",
+    "data/exec/toxicity_probe.jsonl",
+    "data/exec/leadlag_probe.jsonl",
+];
+
+/// What the two act flags select: `None` = detect only, `Some(shadow)`.
+///
+/// SHADOW WINS when both are given, and that precedence is a rule rather than an
+/// accident of evaluation order — which is why it is a function with a test
+/// rather than an `&&` inside a constructor call. A run given both was given
+/// contradictory instructions, and the one that spends no money is the one to
+/// obey; the opposite reading turns a fat-fingered command line into live
+/// orders.
+fn recon_act_shadow(act: bool, shadow: bool) -> Option<bool> {
+    (act || shadow).then_some(shadow)
+}
+
 fn spawn_positions_recon(
     args: &Args,
     sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
 ) {
     if !args.positions_recon {
+        // A flag that silently does nothing is worse than one that refuses.
+        if args.positions_recon_act || args.positions_recon_act_shadow {
+            eprintln!(
+                "[recon] --positions-recon-act{} IGNORED: it arms --positions-recon, which was \
+                 not passed. Nothing is reconciled and nothing will be placed.",
+                if args.positions_recon_act_shadow { "-shadow" } else { "" }
+            );
+        }
         return;
     }
     let (Some(k), Some(p)) =
@@ -1418,7 +1473,8 @@ fn spawn_positions_recon(
     else {
         eprintln!(
             "[recon] --positions-recon REFUSED: needs a read handle on BOTH venues \
-             (kalshi={}, polymarket_us={})",
+             (kalshi={}, polymarket_us={}). On a dry run there are none, so \
+             --positions-recon-act cannot place from one either.",
             sinks.contains_key(&Venue::Kalshi),
             sinks.contains_key(&Venue::PolymarketUs)
         );
@@ -1433,15 +1489,75 @@ fn spawn_positions_recon(
         );
         return;
     }
-    eprintln!(
-        "[recon] venue-truth positions reconciliation ON — {} pair(s), every 5 min, \
-         DETECTION ONLY (it places nothing; arbbot-hedge.timer still owns acting)",
-        pairs.len()
-    );
+    // Reaching here already means the order path is live — see the note on
+    // PROBE_LOGS above — so the flags are the whole gate.
+    let acting =
+        recon_act_shadow(args.positions_recon_act, args.positions_recon_act_shadow).map(
+            |shadow| {
+                positions::Act::new(
+                    shadow,
+                    args.ledger.clone(),
+                    PROBE_LOGS.iter().map(|s| s.to_string()).collect(),
+                )
+            },
+        );
+    match &acting {
+        None => {
+            eprintln!(
+                "[recon] venue-truth positions reconciliation ON — {} pair(s), every 5 min, \
+                 DETECTION ONLY (it places nothing)",
+                pairs.len()
+            );
+        }
+        Some(a) if a.shadow => {
+            eprintln!(
+                "[recon] venue-truth naked-leg completion in SHADOW — {} pair(s), every 5 \
+                 min. It reads both venues and the Kalshi book, derives a cost basis from \
+                 {}, decides, and PRINTS the order it would have sent. Nothing reaches a \
+                 venue.{} Watch for `[recon-act] SHADOW` lines; a leg that never produces \
+                 one is a leg some guard is holding, and the same line says which.",
+                pairs.len(),
+                args.ledger,
+                if args.positions_recon_act {
+                    " --positions-recon-act was ALSO passed and is overridden: shadow wins."
+                } else {
+                    ""
+                }
+            );
+        }
+        Some(_) => {
+            // The loudest banner in this file, because it is the only flag that
+            // puts a SECOND order-owner on the Kalshi key.
+            eprintln!(
+                "[recon] *** venue-truth naked-leg completion ARMED *** — {} pair(s), every \
+                 5 min. It will BUY the missing Kalshi YES on a confirmed PM-short leg, and \
+                 SELL a confirmed excess Kalshi long, both IOC, both profitable-only against \
+                 a cost basis taken from {}. Caps: {} contracts per order, {} order(s) per \
+                 cycle, >= {}/ct locked.",
+                pairs.len(),
+                args.ledger,
+                naked_act::MAX_CLIP,
+                naked_act::MAX_ACTIONS_PER_CYCLE,
+                naked_act::MIN_LOCK,
+            );
+            eprintln!(
+                "[recon] *** STOP arbbot-hedge.timer BEFORE RELYING ON THIS. *** It reads the \
+                 same venue positions every 5 minutes, completes the same PM-short legs, and \
+                 shares this Kalshi key. Two owners on one key is a DOUBLE HEDGE, not a \
+                 backup: on 2026-07-30 both got through 600ms apart and the ledger took two \
+                 complete baskets for one PM-US leg. This process CANNOT see that timer and \
+                 CANNOT interlock with it. What it does have is narrower: it declines a \
+                 relationship another writer booked inside the 300s contest window, and \
+                 `ledger::append_basket` flags a contested book AFTER the money is spent. \
+                 CHECK: systemctl --user is-active arbbot-hedge.timer"
+            );
+        }
+    }
     tokio::spawn(positions::recon_loop(
         positions::Recon::new(pairs),
         k.clone(),
         p.clone(),
+        acting,
     ));
 }
 
@@ -1620,9 +1736,9 @@ async fn main() {
     // `--positions-recon` that is silently ignored on an unarmed run is worse
     // than one that refuses out loud: the operator believes the engine is
     // watching venue truth and it is not.
+    let armed = !sinks.is_empty();
     spawn_positions_recon(&args, &sinks);
 
-    let armed = !sinks.is_empty();
     // Before the first quote: what did the LAST run of this unit leave naked?
     // ...and it does not merely REPORT it: an obligation the ledger cannot see
     // is still exposure, so it is seeded into the same risk view the ledger
@@ -2131,6 +2247,45 @@ mod precondition_tests {
     #[test]
     fn the_positions_reconciliation_is_off_by_default() {
         assert!(!default_args().positions_recon);
+    }
+
+    /// ...and ARMING it is off by default too, which is the stronger claim: this
+    /// is the only flag in this binary that puts a SECOND order-owner on the
+    /// Kalshi key, and `arbbot-hedge.timer` is the first. A default that armed
+    /// it would be a double hedge on the next restart of today's unit.
+    #[test]
+    fn completing_naked_legs_is_off_by_default() {
+        assert!(!default_args().positions_recon_act);
+        assert!(!default_args().positions_recon_act_shadow);
+        assert_eq!(recon_act_shadow(false, false), None, "neither flag places anything");
+    }
+
+    /// SHADOW WINS. A command line carrying both flags is contradictory, and the
+    /// reading that spends no money is the one to take — the opposite one turns
+    /// a fat-fingered invocation into live orders.
+    #[test]
+    fn asking_for_both_shadow_and_armed_gets_shadow() {
+        assert_eq!(recon_act_shadow(true, false), Some(false), "armed");
+        assert_eq!(recon_act_shadow(false, true), Some(true), "shadow");
+        assert_eq!(recon_act_shadow(true, true), Some(true), "and shadow wins over armed");
+    }
+
+    /// The caps are part of the safety argument, so they are pinned rather than
+    /// left to whoever edits the constant next. Single-digit clip, and a cycle
+    /// budget small enough that a venue snapshot which is wrong about the whole
+    /// book costs two orders and not thirty.
+    #[test]
+    fn the_naked_leg_completer_is_capped_small() {
+        assert!(
+            (1..10).contains(&crate::naked_act::MAX_CLIP),
+            "single digits: {}",
+            crate::naked_act::MAX_CLIP
+        );
+        assert!(
+            (1..=3).contains(&crate::naked_act::MAX_ACTIONS_PER_CYCLE),
+            "a bad venue read must not become a burst: {}",
+            crate::naked_act::MAX_ACTIONS_PER_CYCLE
+        );
     }
 }
 

@@ -23,7 +23,10 @@
 mod cancel;
 mod feed_health;
 mod fill;
-mod hedge;
+/// `pub(crate)` for ONE item: `venue_reopen_park`, the halt backoff. The
+/// venue-truth naked-leg completer (`positions::Act`) parks on the same policy,
+/// and a second copy of a backoff curve is a second thing to keep in step.
+pub(crate) mod hedge;
 
 use crate::exec::{Action, ExecCmd, ExecStats};
 use crate::feed::FeedMsg;
@@ -1389,6 +1392,24 @@ impl Engine {
             // forever rather than inventing a clean one, and this is what says
             // so.
             "positions_recon_age_s": crate::positions::age_s(),
+            // Naked legs this process COMPLETED with a real order and booked
+            // (`--positions-recon-act` only; 0 forever without it). Every one is
+            // money spent from a venue-truth read rather than from a fill this
+            // engine watched, so it is the count to reconcile against
+            // `data/exec/trades.jsonl` by hand while the policy is young.
+            "positions_recon_acted": crate::positions::acted(),
+            // Confirmed findings the act pass DECLINED. Not an error count:
+            // waiting for a book that pays is the policy, and a probe-owned
+            // market, an unaccounted-for position and an unprofitable ask all
+            // land here. Read it against `positions_recon_naked` — legs
+            // confirmed and never acted on are legs a guard is holding, and the
+            // journal names which guard for each one.
+            "positions_recon_act_refused": crate::positions::act_refused(),
+            // MUST STAY 0. Orders the venue ACCEPTED whose fate this process
+            // could not read. Not a refusal and not a fill: contracts that may
+            // be in the account and are certainly not in the ledger, which is
+            // the one state no exposure fold can see. Alarm on any change.
+            "positions_recon_act_unresolved": crate::positions::act_unresolved(),
             "would_place": self.exec_stats.placed.load(std::sync::atomic::Ordering::Relaxed),
             "would_cancel": self.exec_stats.cancelled.load(std::sync::atomic::Ordering::Relaxed),
             "exec_dropped": self.exec_stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
