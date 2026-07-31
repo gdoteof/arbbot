@@ -457,6 +457,20 @@ async fn pmus_consensus(sink: &Arc<dyn crate::sink::OrderSink>) -> Result<NetMap
 /// unchanged behaviour: no ledger read, no quote read, no order, and not one
 /// extra branch on the detection path.
 pub struct Act {
+    /// DECIDE, LOG, AND STOP (`--positions-recon-act-shadow`).
+    ///
+    /// Everything above the wire runs — the venue reads, the ownership
+    /// contract, the ledger basis, the limit, every refusal — and the order is
+    /// printed instead of sent. It exists because the alternative is that the
+    /// first time this code prices a real order is also the first time anyone
+    /// has seen it price one: the basis reconstruction is the part that has
+    /// never met live money, and the leg it was written for turns out to have
+    /// NO ledger lot at all (see `naked_act`). A day of shadow output answers
+    /// "what would it have done" without an account being involved.
+    ///
+    /// It still spends the venue read budget, which is why it is a flag and not
+    /// the default.
+    pub shadow: bool,
     /// The trade ledger — read for the cost basis, written for the fill.
     pub ledger_path: String,
     /// The research probes' own logs, re-read every cycle because they are
@@ -481,10 +495,10 @@ pub struct Act {
 }
 
 impl Act {
-    pub fn new(ledger_path: String, probe_logs: Vec<String>) -> Act {
+    pub fn new(shadow: bool, ledger_path: String, probe_logs: Vec<String>) -> Act {
         let mut cx = arb_core::scan::Cx::default();
         let fees = arb_core::fees::FeeSchedule::new(&mut cx);
-        Act { ledger_path, probe_logs, cx, fees, parked: BTreeMap::new() }
+        Act { shadow, ledger_path, probe_logs, cx, fees, parked: BTreeMap::new() }
     }
 
     /// The probe-ownership set, rebuilt from the live logs.
@@ -668,8 +682,9 @@ async fn place_and_book(
         client_order_id: coid.clone(),
     };
     eprintln!(
-        "[recon-act] {} {}x {} IOC limit {} (ledger basis {}/ct from the open record at ts {}, \
-         locks >= {}/ct) — id {coid}",
+        "[recon-act]{} {} {}x {} IOC limit {} (ledger basis {}/ct from the open record at ts \
+         {}, locks >= {}/ct) — id {coid}",
+        if st.shadow { " SHADOW —" } else { "" },
         if o.buy { "BUY YES" } else { "SELL YES" },
         o.qty,
         o.market,
@@ -678,6 +693,10 @@ async fn place_and_book(
         o.lot_ts,
         crate::naked_act::MIN_LOCK
     );
+    // THE LAST LINE BEFORE THE WIRE. Everything above ran; nothing below does.
+    if st.shadow {
+        return;
+    }
     let k = kalshi.clone();
     let r = req.clone();
     let oid = match tokio::task::spawn_blocking(move || k.place(&r)).await {
@@ -1424,7 +1443,7 @@ mod act_tests {
         crate::naked_act::publish_inflight(BTreeSet::new());
         let d = scratch("happy");
         let ledger = ledger_with_one_open_basket(&d);
-        let mut st = Act::new(ledger.clone(), probe_log(&d, "some-other-probe-slug"));
+        let mut st = Act::new(false, ledger.clone(), probe_log(&d, "some-other-probe-slug"));
         let (k, p) = steady(2);
         two_cycles(&mut st, &k, &p).await;
 
@@ -1482,7 +1501,7 @@ mod act_tests {
         }
         std::fs::write(&p_ledger, text).expect("ledger");
         let mut st =
-            Act::new(p_ledger.to_string_lossy().into_owned(), probe_log(&d, "other"));
+            Act::new(false, p_ledger.to_string_lossy().into_owned(), probe_log(&d, "other"));
 
         let pm = || Ok(net(&[("p-a", -5.0), ("p-b", -5.0), ("p-c", -5.0)]));
         let ka = || Ok(net(&[("K-a", 2.0), ("K-b", 2.0), ("K-c", 2.0)]));
@@ -1516,7 +1535,7 @@ mod act_tests {
         crate::naked_act::publish_inflight(BTreeSet::new());
         let d = scratch("caseb");
         let ledger = ledger_with_one_open_basket(&d);
-        let mut st = Act::new(ledger.clone(), probe_log(&d, "other"));
+        let mut st = Act::new(false, ledger.clone(), probe_log(&d, "other"));
 
         // Kalshi long 5 against a PM short of only 2: three contracts in excess.
         let pm = || Ok(net(&[("p-a", -2.0)]));
@@ -1567,7 +1586,7 @@ mod act_tests {
         crate::naked_act::publish_inflight(BTreeSet::new());
         let d = scratch("casebhold");
         let ledger = ledger_with_one_open_basket(&d);
-        let mut st = Act::new(ledger.clone(), probe_log(&d, "other"));
+        let mut st = Act::new(false, ledger.clone(), probe_log(&d, "other"));
         let pm = || Ok(net(&[("p-a", -2.0)]));
         let ka = || Ok(net(&[("K-a", 5.0)]));
         let k = FakeKalshi::new(vec![ka(), ka()]);
@@ -1579,6 +1598,33 @@ mod act_tests {
         assert_eq!(naked(), 1, "and the exposure stays reported while we wait");
     }
 
+    /// SHADOW. Everything above the wire runs — both venue reads, the ownership
+    /// contract, the ledger basis, the limit — and the order is printed instead
+    /// of sent. The alternative is that the first time this prices a real order
+    /// is also the first time anyone has watched it price one.
+    #[tokio::test(start_paused = true)]
+    async fn a_shadow_run_decides_everything_and_places_nothing() {
+        let _s = crate::naked_act::TEST_SERIAL.lock().await;
+        let _g = GAUGES.lock().await;
+        crate::naked_act::publish_inflight(BTreeSet::new());
+        let d = scratch("shadow");
+        let ledger = ledger_with_one_open_basket(&d);
+        let mut st = Act::new(true, ledger.clone(), probe_log(&d, "other"));
+        let (k, p) = steady(2);
+        two_cycles(&mut st, &k, &p).await;
+        assert_eq!(
+            k.quotes_asked.load(Ordering::Relaxed),
+            1,
+            "it really did price the hedge against the live book"
+        );
+        assert!(k.placed().is_empty(), "and stopped at the wire");
+        assert_eq!(
+            crate::ledger::read(&ledger).expect("readable").len(),
+            1,
+            "the ledger is untouched"
+        );
+    }
+
     /// GUARD 3, AT THE ORDER PATH. One sighting is never enough, and this is
     /// where that stops being a gauge and starts being money. The first cycle
     /// must not even ASK for a quote.
@@ -1588,7 +1634,7 @@ mod act_tests {
         let _g = GAUGES.lock().await;
         crate::naked_act::publish_inflight(BTreeSet::new());
         let d = scratch("oneshot");
-        let mut st = Act::new(ledger_with_one_open_basket(&d), probe_log(&d, "other"));
+        let mut st = Act::new(false, ledger_with_one_open_basket(&d), probe_log(&d, "other"));
         let (k, p) = steady(1);
         let (kd, pd) = (
             k.clone() as Arc<dyn crate::sink::OrderSink>,
@@ -1610,7 +1656,7 @@ mod act_tests {
         let _g = GAUGES.lock().await;
         crate::naked_act::publish_inflight(BTreeSet::from(["K-a".to_string()]));
         let d = scratch("double");
-        let mut st = Act::new(ledger_with_one_open_basket(&d), probe_log(&d, "other"));
+        let mut st = Act::new(false, ledger_with_one_open_basket(&d), probe_log(&d, "other"));
         let (k, p) = steady(2);
         two_cycles(&mut st, &k, &p).await;
         assert!(k.placed().is_empty(), "two hedgers on one market is the incident");
@@ -1627,7 +1673,7 @@ mod act_tests {
         crate::naked_act::publish_inflight(BTreeSet::new());
         let d = scratch("probe");
         // the probe claims the very slug this finding is about
-        let mut st = Act::new(ledger_with_one_open_basket(&d), probe_log(&d, "p-a"));
+        let mut st = Act::new(false, ledger_with_one_open_basket(&d), probe_log(&d, "p-a"));
         let (k, p) = steady(2);
         two_cycles(&mut st, &k, &p).await;
         assert!(k.placed().is_empty());
@@ -1646,6 +1692,7 @@ mod act_tests {
         crate::naked_act::publish_inflight(BTreeSet::new());
         let d = scratch("noown");
         let mut st = Act::new(
+            false,
             ledger_with_one_open_basket(&d),
             vec![d.join("does-not-exist.jsonl").to_string_lossy().into_owned()],
         );
@@ -1664,7 +1711,7 @@ mod act_tests {
         let _g = GAUGES.lock().await;
         crate::naked_act::publish_inflight(BTreeSet::new());
         let d = scratch("halt");
-        let mut st = Act::new(ledger_with_one_open_basket(&d), probe_log(&d, "other"));
+        let mut st = Act::new(false, ledger_with_one_open_basket(&d), probe_log(&d, "other"));
         let (k, p) = steady(3);
         *k.place.lock().expect("place") = Err(VenueError::Status {
             endpoint: "kalshi place",
@@ -1703,7 +1750,7 @@ mod act_tests {
         crate::naked_act::publish_inflight(BTreeSet::new());
         let d = scratch("unreadable");
         let ledger = ledger_with_one_open_basket(&d);
-        let mut st = Act::new(ledger.clone(), probe_log(&d, "other"));
+        let mut st = Act::new(false, ledger.clone(), probe_log(&d, "other"));
         let (k, p) = steady(2);
         *k.filled.lock().expect("filled") = Err(VenueError::Transport("timed out".into()));
         let before = (act_unresolved(), act_refused());
@@ -1740,7 +1787,7 @@ mod act_tests {
         crate::naked_act::publish_inflight(BTreeSet::new());
         let d = scratch("overfill");
         let ledger = ledger_with_one_open_basket(&d);
-        let mut st = Act::new(ledger.clone(), probe_log(&d, "other"));
+        let mut st = Act::new(false, ledger.clone(), probe_log(&d, "other"));
         let (k, p) = steady(2);
         *k.filled.lock().expect("filled") = Ok(9);
         let before = act_unresolved();
@@ -1770,7 +1817,7 @@ mod act_tests {
         let _g = GAUGES.lock().await;
         crate::naked_act::publish_inflight(BTreeSet::new());
         let d = scratch("lostplace");
-        let mut st = Act::new(ledger_with_one_open_basket(&d), probe_log(&d, "other"));
+        let mut st = Act::new(false, ledger_with_one_open_basket(&d), probe_log(&d, "other"));
 
         // A venue that ANSWERED no: an ordinary refusal.
         let (k, p) = steady(2);
@@ -1788,7 +1835,7 @@ mod act_tests {
         let (k, p) = steady(2);
         *k.place.lock().expect("place") = Err(VenueError::Transport("timed out".into()));
         let before = act_unresolved();
-        let mut st2 = Act::new(ledger_with_one_open_basket(&d), probe_log(&d, "other"));
+        let mut st2 = Act::new(false, ledger_with_one_open_basket(&d), probe_log(&d, "other"));
         two_cycles(&mut st2, &k, &p).await;
         assert_eq!(
             act_unresolved() - before,
@@ -1806,7 +1853,7 @@ mod act_tests {
         crate::naked_act::publish_inflight(BTreeSet::new());
         let d = scratch("unfilled");
         let ledger = ledger_with_one_open_basket(&d);
-        let mut st = Act::new(ledger.clone(), probe_log(&d, "other"));
+        let mut st = Act::new(false, ledger.clone(), probe_log(&d, "other"));
         let (k, p) = steady(2);
         *k.filled.lock().expect("filled") = Ok(0);
         two_cycles(&mut st, &k, &p).await;
@@ -1838,7 +1885,7 @@ mod act_tests {
             write!(f, "{{\"ts\":2.0,\"relationship_id\":\"a\",\"status\":\"unwo")
                 .expect("torn");
         }
-        let mut st = Act::new(ledger, probe_log(&d, "other"));
+        let mut st = Act::new(false, ledger, probe_log(&d, "other"));
         let (k, p) = steady(2);
         two_cycles(&mut st, &k, &p).await;
         assert!(
@@ -1862,7 +1909,7 @@ mod act_tests {
         crate::naked_act::publish_inflight(BTreeSet::new());
         let d = scratch("contest");
         let ledger = ledger_with_one_open_basket(&d);
-        let mut st = Act::new(ledger.clone(), probe_log(&d, "other"));
+        let mut st = Act::new(false, ledger.clone(), probe_log(&d, "other"));
         let (k, p) = steady(2);
         // The Python's own record shape: same relationship, same two markets,
         // no `source` of ours, `ts` in the same instant as the one we are about

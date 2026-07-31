@@ -172,6 +172,10 @@ struct Args {
     /// at the spawn site says so, because nothing in this process can detect
     /// the other one.
     positions_recon_act: bool,
+    /// Decide and LOG, never place (`positions::Act::shadow`). Wins over
+    /// `--positions-recon-act` when both are given, which is the safe direction
+    /// and the one an operator would want from a typo.
+    positions_recon_act_shadow: bool,
 }
 
 /// The floating maker APR bar (Geoff 2026-07-22, card 80ff7987), port of
@@ -251,6 +255,7 @@ fn default_args() -> Args {
         unwind_detect_only: false,
         positions_recon: false,
         positions_recon_act: false,
+        positions_recon_act_shadow: false,
     }
 }
 
@@ -338,6 +343,7 @@ fn parse_args() -> Args {
             "--unwind-detect-only" => a.unwind_detect_only = true,
             "--positions-recon" => a.positions_recon = true,
             "--positions-recon-act" => a.positions_recon_act = true,
+            "--positions-recon-act-shadow" => a.positions_recon_act_shadow = true,
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(2);
@@ -1435,16 +1441,29 @@ const PROBE_LOGS: [&str; 3] = [
     "data/exec/leadlag_probe.jsonl",
 ];
 
+/// What the two act flags select: `None` = detect only, `Some(shadow)`.
+///
+/// SHADOW WINS when both are given, and that precedence is a rule rather than an
+/// accident of evaluation order — which is why it is a function with a test
+/// rather than an `&&` inside a constructor call. A run given both was given
+/// contradictory instructions, and the one that spends no money is the one to
+/// obey; the opposite reading turns a fat-fingered command line into live
+/// orders.
+fn recon_act_shadow(act: bool, shadow: bool) -> Option<bool> {
+    (act || shadow).then_some(shadow)
+}
+
 fn spawn_positions_recon(
     args: &Args,
     sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
 ) {
     if !args.positions_recon {
         // A flag that silently does nothing is worse than one that refuses.
-        if args.positions_recon_act {
+        if args.positions_recon_act || args.positions_recon_act_shadow {
             eprintln!(
-                "[recon] --positions-recon-act IGNORED: it arms --positions-recon, which was \
-                 not passed. Nothing is reconciled and nothing will be placed."
+                "[recon] --positions-recon-act{} IGNORED: it arms --positions-recon, which was \
+                 not passed. Nothing is reconciled and nothing will be placed.",
+                if args.positions_recon_act_shadow { "-shadow" } else { "" }
             );
         }
         return;
@@ -1471,19 +1490,39 @@ fn spawn_positions_recon(
         return;
     }
     // Reaching here already means the order path is live — see the note on
-    // PROBE_LOGS above — so the flag is the whole gate.
-    let acting = args.positions_recon_act.then(|| {
-        positions::Act::new(
-            args.ledger.clone(),
-            PROBE_LOGS.iter().map(|s| s.to_string()).collect(),
-        )
-    });
+    // PROBE_LOGS above — so the flags are the whole gate.
+    let acting =
+        recon_act_shadow(args.positions_recon_act, args.positions_recon_act_shadow).map(
+            |shadow| {
+                positions::Act::new(
+                    shadow,
+                    args.ledger.clone(),
+                    PROBE_LOGS.iter().map(|s| s.to_string()).collect(),
+                )
+            },
+        );
     match &acting {
         None => {
             eprintln!(
                 "[recon] venue-truth positions reconciliation ON — {} pair(s), every 5 min, \
                  DETECTION ONLY (it places nothing)",
                 pairs.len()
+            );
+        }
+        Some(a) if a.shadow => {
+            eprintln!(
+                "[recon] venue-truth naked-leg completion in SHADOW — {} pair(s), every 5 \
+                 min. It reads both venues and the Kalshi book, derives a cost basis from \
+                 {}, decides, and PRINTS the order it would have sent. Nothing reaches a \
+                 venue.{} Watch for `[recon-act] SHADOW` lines; a leg that never produces \
+                 one is a leg some guard is holding, and the same line says which.",
+                pairs.len(),
+                args.ledger,
+                if args.positions_recon_act {
+                    " --positions-recon-act was ALSO passed and is overridden: shadow wins."
+                } else {
+                    ""
+                }
             );
         }
         Some(_) => {
@@ -2217,6 +2256,18 @@ mod precondition_tests {
     #[test]
     fn completing_naked_legs_is_off_by_default() {
         assert!(!default_args().positions_recon_act);
+        assert!(!default_args().positions_recon_act_shadow);
+        assert_eq!(recon_act_shadow(false, false), None, "neither flag places anything");
+    }
+
+    /// SHADOW WINS. A command line carrying both flags is contradictory, and the
+    /// reading that spends no money is the one to take — the opposite one turns
+    /// a fat-fingered invocation into live orders.
+    #[test]
+    fn asking_for_both_shadow_and_armed_gets_shadow() {
+        assert_eq!(recon_act_shadow(true, false), Some(false), "armed");
+        assert_eq!(recon_act_shadow(false, true), Some(true), "shadow");
+        assert_eq!(recon_act_shadow(true, true), Some(true), "and shadow wins over armed");
     }
 
     /// The caps are part of the safety argument, so they are pinned rather than
