@@ -62,6 +62,7 @@ dependencies = [
  "arb-tob",
  "serde",
  "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]

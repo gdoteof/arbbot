@@ -9,6 +9,7 @@ workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 arb-core = { path = "../../crates/arb-core" }
 arb-ledger = { path = "../../crates/arb-ledger" }
 arb-query = { path = "../../crates/arb-query" }

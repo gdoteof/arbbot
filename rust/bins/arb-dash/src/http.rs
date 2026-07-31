@@ -9,7 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::process::exit;
 use std::sync::{Arc, Mutex};
 
-use crate::endpoints::{books, current, intents, opportunities, pairs, trades};
+use crate::endpoints::{books, current, intents, now, opportunities, pairs, trades};
 use crate::rollup::{self, Rollup, Shared};
 use crate::{integrity, series, stream, Args};
 
@@ -61,13 +61,14 @@ fn handle(s: TcpStream, a: &Args, sh: &Shared) {
         // endpoints, which is the point — a single page would fan out to
         // every endpoint on every load as views are added.
         "/" | "/recording" | "/opportunities" | "/pairs" | "/current" | "/intents"
-        | "/trades" | "/live" | "/architecture" => {
+        | "/trades" | "/live" | "/architecture" | "/now" => {
             respond(s, "200 OK", "text/html; charset=utf-8", PAGE)
         }
         // Long-lived: these return only when the client goes away.
         "/api/stream" => stream::state(s, a, sh),
         "/api/tape" => stream::tape(s, a),
         "/api/books" => respond(s, "200 OK", "application/json", &books::json(a)),
+        "/api/now" => respond(s, "200 OK", "application/json", &now::json(a)),
         // Built from /proc, the unit files and the artifacts on disk on every
         // request — it holds no picture of its own to go stale.
         "/api/architecture" => {

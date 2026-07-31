@@ -54,6 +54,17 @@
   th.sortable{cursor:pointer;user-select:none}
   th.sortable:hover{color:var(--ink)}
 
+  /* --- now view --------------------------------------------------------- */
+  .rowflex{display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start}
+  .stat{min-width:96px}
+  .bar{height:7px;background:var(--line);border-radius:99px;overflow:hidden}
+  .bar i{display:block;height:100%;background:var(--ok);border-radius:99px}
+  .bar i.over{background:var(--bad)}
+  .split{display:flex;height:12px;border-radius:99px;overflow:hidden;background:var(--line);margin:4px 0 8px}
+  .split i{display:block;height:100%}
+  .split i.v-ok{background:var(--ok)} .split i.v-warn{background:var(--warn)}
+  .split i.v-bad{background:var(--bad)} .split i.v-dim{background:var(--dim)}
+
   /* --- architecture diagram -------------------------------------------- */
   .arch{width:100%;height:auto;display:block;overflow:visible}
   .arch text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
@@ -1089,6 +1100,229 @@ function oppsPanel(o){
 }
 
 /* ===========================================================================
+   NOW — what the engine is doing, and what is stopping it doing more.
+
+   The one rule this view is built on lives on the server (endpoints/now.rs):
+   every REASON is the engine's own, verbatim, and the only arithmetic done to
+   it is the subtraction that turns a cap into a break point. Nothing here
+   decides whether something should have traded.
+   =========================================================================== */
+const VERDICT = {
+  'acted':             {cls:'ok',   what:'the engine acted on this in the window'},
+  'refused':           {cls:'warn', what:'a gate refused it — the gate is named'},
+  'no refusal seen':   {cls:'dim',  what:'tradable, in scope, and no gate fired in the window: it either did not clear its APR bar or nothing asked'},
+  'not tradable':      {cls:'bad',  what:'never considered — no human vetting stamp and no tradable.yaml entry'},
+  'out of engine scope':{cls:'bad', what:'never considered — outside this engine’s --rel-prefix'},
+};
+
+/* The minus goes OUTSIDE the dollar sign. "$-4.00" reads as a price for about
+   a second before it reads as a deficit, and this column is scanned. */
+const usd0 = (v) => (v==null||!isFinite(v)) ? '—'
+  : (v<0?'\u2212$':'$') + Math.abs(Number(v)).toLocaleString('en-US',
+      {minimumFractionDigits:2, maximumFractionDigits:2});
+
+/* A cap as a bar. Over-cap is drawn PAST the end rather than clamped: a topic
+   $4 past its budget and one exactly full are different facts. */
+function capBar(used, limit){
+  if(used==null || limit==null || !(limit>0)) return '';
+  const pct = Math.min(100, (used/limit)*100), over = used > limit;
+  return `<div class="bar"><i style="width:${pct.toFixed(1)}%" class="${over?'over':''}"></i></div>`;
+}
+
+function nowHead(d){
+  const e = d.engine, w = d.window;
+  const chip = !e.running ? '<span class="badge bad">NOT RUNNING</span>'
+    : e.armed ? '<span class="badge ok">ARMED</span>'
+              : '<span class="badge warn">DRY-RUN</span>';
+  return $(`<section class="wide">
+    <h2>Right now</h2>
+    <div class="rowflex">
+      <div class="stat"><div class="big ${w.places?'ok':'dim'}">${w.places}</div>
+        <div class="sub">orders placed<br>in the last ${dur(w.seconds)}</div></div>
+      <div class="stat"><div class="big dim">${w.cancels}</div>
+        <div class="sub">cancelled</div></div>
+      <div class="stat"><div class="big ${w.resting.length?'ok':'dim'}">${w.resting.length}</div>
+        <div class="sub">resting now</div></div>
+      <div class="stat"><div class="big ${d.constraints.length?'warn':'ok'}">${d.constraints.length}</div>
+        <div class="sub">distinct refusals</div></div>
+      <div class="stat" style="flex:1">
+        <div>${chip} <b>${esc(e.unit||'no engine')}</b></div>
+        <div class="sub">${e.running ? 'up '+dur(e.up_s)+' &middot; pid '+e.pid : 'nothing is trading'}
+          ${e.intents?'<br>writing <code>'+esc(e.intents)+'</code>':''}</div>
+        <div class="sub">${e.summary_error
+          ? '<span class="warn">'+esc(e.summary_error)+'</span>'
+          : 'its own report is '+dur(e.summary_age_s)+' old'}</div>
+      </div>
+    </div>
+    ${e.gauges.length ? `<div class="rowflex" style="margin-top:12px">${e.gauges.map(g =>
+      `<div class="stat" data-k="g-${esc(g.key)}" title="${esc(g.what)}">
+        <div class="num big" style="font-size:18px">${esc(String(g.value).slice(0,9))}</div>
+        <div class="sub">${esc(g.key.replace(/_/g,' '))}</div></div>`).join('')}</div>` : ''}
+    <div class="sub" style="margin-top:10px">
+      Counts are over the last ${dur(w.seconds)} of the engine's own decision
+      stream${w.reaches_back ? '' : ' (all of it that was read)'}. The gauges
+      beneath are the engine's own, taken from the summary it prints every
+      minute — they are cumulative since it started, not windowed.
+    </div>
+  </section>`);
+}
+
+/* THE panel. Everything else on this page is context for it. */
+function nowConstraints(d){
+  if(!d.constraints.length) return $(`<section class="wide">
+    <h2>What is stopping us</h2>
+    <div class="kv"><span>refusals in the window</span><b class="ok">none</b></div>
+    <div class="sub" style="margin-top:8px">Nothing the engine looked at was
+      refused by a gate. If it is also not placing, the reason is upstream of
+      risk: no crossing cleared its APR bar, or no book moved.</div>
+  </section>`);
+  return $(`<section class="wide">
+    <h2>What is stopping us &middot; ${dur(d.window.seconds)}</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>gate</th><th>applies to</th><th class="num">times</th>
+        <th class="num">deployed</th><th class="num">limit</th>
+        <th style="width:130px">headroom</th><th class="num">to unblock</th>
+        <th>the engine's words</th></tr></thead>
+      <tbody>${d.constraints.map(c => `<tr data-k="c-${esc(c.gate+(c.scope||''))}">
+        <td><b>${esc(c.gate)}</b></td>
+        <td>${c.scoped ? esc(c.scope)
+          : '<span class="dim" title="This gate names no scope: it refuses every pair it covers, so no row on it is about one pair.">everything</span>'}</td>
+        <td class="num">${c.hits.toLocaleString()}</td>
+        <td class="num">${c.deployed==null?'<span class="dim">—</span>':usd0(c.deployed)}</td>
+        <td class="num">${c.limit==null?'<span class="dim">—</span>'
+          : (c.gate==='low-utilisation gate' ? 'util &lt; '+c.limit : usd0(c.limit))}</td>
+        <td>${c.gate==='low-utilisation gate'
+            ? capBar(c.at, c.limit)+`<div class="sub">at ${c.at}</div>`
+            : capBar(c.deployed, c.limit) +
+              (c.headroom==null?'':`<div class="sub ${c.headroom<0?'bad':''}">${
+                c.headroom<0 ? usd0(-c.headroom)+' over' : usd0(c.headroom)+' left'}</div>`)}</td>
+        <td class="num">${c.free_needed==null
+          ? '<span class="dim">fits</span>'
+          : '<b class="warn">free '+usd0(c.free_needed)+'</b>'}</td>
+        <td class="sub"><code>${esc(c.text)}</code>
+          <div>last ${dur(c.last_age_s)} ago</div></td>
+      </tr>`).join('')}</tbody>
+    </table></div>
+    <div class="sub" style="margin-top:8px">
+      Every number in this table except <b>headroom</b> and <b>to unblock</b> was
+      printed by the engine as it refused an order; those two are
+      <code>limit &minus; deployed</code> and <code>need &minus; headroom</code>.
+      Nothing here re-runs the risk gate — a second copy of it would eventually
+      disagree with the one that holds the money.
+    </div>
+  </section>`);
+}
+
+function nowCapital(d){
+  const c = d.capital, t = c.totals || {};
+  return $(`<section class="wide">
+    <h2>Capital</h2>
+    <div class="rowflex">
+      <div class="stat"><div class="big">${usd0(t.cost_usd)}</div><div class="sub">at cost, open</div></div>
+      <div class="stat"><div class="big ok">${usd0(t.locked_profit_usd)}</div><div class="sub">locked in</div></div>
+      <div class="stat"><div class="big dim">${usd0(c.class_cap_usd)}</div>
+        <div class="sub">class cap<br>${usd0(c.bankroll_usd)} &times; ${c.per_class_cap}</div></div>
+      <div class="stat"><div class="big dim">${t.n_open||0}</div><div class="sub">open positions</div></div>
+    </div>
+    <table style="margin-top:12px">
+      <thead><tr><th>topic</th><th class="num">deployed</th><th class="num">budget</th>
+        <th style="width:180px"></th><th class="num">headroom</th>
+        <th class="num">positions</th><th>gate</th></tr></thead>
+      <tbody>${(c.topics||[]).map(t => `<tr data-k="t-${esc(t.topic)}">
+        <td>${esc(t.topic)}</td>
+        <td class="num">${usd0(t.deployed_usd)}</td>
+        <td class="num">${t.budget_usd==null?'<span class="dim">—</span>':usd0(t.budget_usd)}</td>
+        <td>${capBar(t.deployed_usd, t.budget_usd)}</td>
+        <td class="num ${t.headroom_usd<0?'bad':''}">${t.headroom_usd==null?'':usd0(t.headroom_usd)}</td>
+        <td class="num dim">${t.positions}</td>
+        <td class="sub">${t.gate?'only below util '+esc(t.gate):''}</td>
+      </tr>`).join('')}</tbody>
+    </table>
+    <div class="sub" style="margin-top:8px">
+      Positions are bucketed by <code>arb_core::risk::topic_of</code> — the same
+      function the gate that refuses them uses, so a pair cannot appear here
+      under a topic it was never gated under. Marks are ${dur(c.marks_age_s)} old.
+    </div>
+  </section>`);
+}
+
+function nowOpportunities(d){
+  const o = d.opportunities, rows = o.rows || [];
+  // The headline: not how many crossings there are, but how much money each
+  // ANSWER to "why not" is sitting behind.
+  const by = {};
+  rows.forEach(r => {
+    const b = by[r.verdict] || (by[r.verdict] = {usd:0, n:0});
+    b.usd += r.edge_usd || 0; b.n++;
+  });
+  const order = ['acted','refused','no refusal seen','out of engine scope','not tradable'];
+  const total = Object.values(by).reduce((a,b) => a+b.usd, 0) || 1;
+  return $(`<section class="wide">
+    <h2>On the table right now &middot; ${dur(o.window_s)} of the scanner's stream</h2>
+    <div class="split">${order.filter(k=>by[k]).map(k =>
+      `<i class="v-${VERDICT[k].cls}" style="width:${(by[k].usd/total*100).toFixed(1)}%"
+         title="${esc(k)}: ${esc(VERDICT[k].what)}"></i>`).join('')}</div>
+    <div class="legend">${order.filter(k=>by[k]).map(k =>
+      `<span><b class="${VERDICT[k].cls}">■</b> ${esc(k)} &mdash;
+        ${usd0(by[k].usd)} across ${by[k].n}</span>`).join('')}</div>
+    <div class="scroll" style="margin-top:12px"><table>
+      <thead><tr><th>relationship</th><th class="num">edge / contract</th>
+        <th class="num">edge available</th><th class="num">size</th>
+        <th>topic</th><th>why not</th></tr></thead>
+      <tbody>${rows.map(r => `<tr data-k="o-${esc(r.relationship_id)}">
+        <td><a class="rel" href="/pair/${encodeURIComponent(r.relationship_id)}">${esc(r.relationship_id)}</a>
+          <div class="sub">${esc(r.tranche)} &middot; seen ${r.observations}&times; &middot;
+            last ${dur(r.last_age_s)} ago</div></td>
+        <td class="num">${(r.best_edge*100).toFixed(2)}&cent;</td>
+        <td class="num"><b>${usd0(r.edge_usd)}</b></td>
+        <td class="num dim">${esc(r.size)}</td>
+        <td class="sub">${esc(r.topic)}</td>
+        <td><span class="badge ${VERDICT[r.verdict]?VERDICT[r.verdict].cls:'dim'}"
+              title="${esc(VERDICT[r.verdict]?VERDICT[r.verdict].what:'')}">${esc(r.verdict)}</span>
+          ${r.blocked_by?`<div class="sub">${esc(r.blocked_by.gate)}${
+            r.blocked_by.scoped?' ['+esc(r.blocked_by.scope)+']':''}</div>`:''}</td>
+      </tr>`).join('')}</tbody>
+    </table></div>
+    <div class="sub" style="margin-top:8px">
+      Crossings the SCANNER found, over every registry pair; the verdict is what
+      the ENGINE could do about each. <b>not tradable</b> and <b>out of engine
+      scope</b> were never evaluated by a gate, so no amount of freed capital
+      reaches them — they need a vetting decision${o.scope?' or a wider <code>--rel-prefix</code> than <code>'+esc(o.scope)+'</code>':''}.
+      <b>no refusal seen</b> means the engine considered it and no gate fired:
+      the block, if any, is the APR bar rather than capital.
+    </div>
+  </section>`);
+}
+
+function nowRecent(d){
+  return $(`<section>
+    <h2>Recent decisions</h2>
+    <div class="scroll" style="max-height:340px"><table><tbody>
+      ${(d.recent||[]).map((r,i) => `<tr data-k="r-${i}">
+        <td class="sub" style="width:74px">${esc(new Date(r.ts*1000).toISOString().slice(11,19))}</td>
+        <td><span class="badge ${r.kind==='place'?'ok':r.kind==='cancel'?'warn':'dim'}">${esc(r.kind)}</span></td>
+        <td class="sub">${esc(String(r.text).slice(0,110))}</td></tr>`).join('')
+      || '<tr><td class="dim">nothing in the window</td></tr>'}
+    </tbody></table></div>
+  </section>`);
+}
+
+function nowBooked(d){
+  return $(`<section>
+    <h2>Last booked</h2>
+    <table><tbody>${(d.booked||[]).map((b,i) => `<tr data-k="b-${i}">
+      <td class="sub" style="width:96px">${b.ts?esc(new Date(b.ts*1000).toISOString().slice(5,16).replace('T',' ')):''}</td>
+      <td>${esc(b.relationship_id||b.title||'')}<div class="sub">${esc(b.strategy||'')} ${
+        b.qty!=null?'&times;'+esc(String(b.qty)):''}</div></td>
+      <td class="sub">${esc(b.status||'open')}</td></tr>`).join('')
+      || '<tr><td class="dim">the ledger tail is empty</td></tr>'}
+    </tbody></table>
+    <div class="sub" style="margin-top:8px">Straight off the append-only ledger,
+      newest last written first.</div>
+  </section>`);
+}
+
+/* ===========================================================================
    ARCHITECTURE
 
    The diagram is a pure function of /api/architecture, and the LAYOUT is a
@@ -1377,6 +1611,7 @@ function archInstalled(d){
 }
 
 const VIEWS = [
+  {path:'/now',           label:'Now'},
   {path:'/',              label:'Books'},
   {path:'/recording',     label:'Recording'},
   {path:'/opportunities', label:'Opportunities'},
@@ -1446,6 +1681,7 @@ const NEEDS = {
   '/pairs':         () => ({pairs:    '/api/pairs'}),
   '/current':       () => ({current:  '/api/current' + location.search}),
   '/intents':       () => ({intents:  '/api/intents', top:'/api/top-series?n=4'}),
+  '/now':           () => ({now:      '/api/now'}),
   '/trades':        () => ({trades:   '/api/trades'}),
   '/live':          () => ({}),
   '/architecture':  () => ({arch:     '/api/architecture'}),
@@ -1465,6 +1701,9 @@ const TOPIC = {
   // The tape moving is the cheapest proof the ingest half is alive, so it is
   // also the right thing to re-measure the whole picture on.
   '/architecture':'recording',
+  // Its own key: this view is about the ARMED engine, and `intents` tracks
+  // the shadow's file.
+  '/now':'now',
 };
 
 /* Each draw is PURE: reads S, appends to a fragment, returns the header text.
@@ -1530,6 +1769,24 @@ const DRAW = {
     f.append(intentsPanel(d));
     return d.error ? 'engine not running'
       : `${d.resting_orders} resting &middot; ${d.pairs} pairs &middot; last ${dur(d.last_intent_age_s)} ago`;
+  },
+  '/now': (f) => {
+    const d = S.data.now;
+    if(!d) return loading(f, 'the engine');
+    if(d.error) return fail(f, d.error);
+    f.append(nowHead(d));
+    f.append(nowConstraints(d));
+    f.append(nowOpportunities(d));
+    f.append(nowCapital(d));
+    f.append(nowRecent(d));
+    f.append(nowBooked(d));
+    const blocked = (d.opportunities.rows||[]).filter(r => r.verdict !== 'acted')
+      .reduce((a,r) => a + (r.edge_usd||0), 0);
+    const e = d.engine;
+    return (e.running ? (e.armed?'<span class="ok">armed</span>':'<span class="warn">dry-run</span>')
+                      : '<b class="bad">no engine</b>') +
+      ` &middot; ${d.window.places} placed in ${dur(d.window.seconds)}` +
+      ` &middot; <b class="warn">${usd0(blocked)}</b> of edge not taken`;
   },
   '/architecture': (f) => {
     const d = S.data.arch;

@@ -48,12 +48,21 @@ fn state_json(a: &Args, sh: &Shared) -> String {
         &VENUES.iter().map(|v| format!("{}/tob-{v}-{day}.jsonl", a.rollup_dir)).collect::<Vec<_>>(),
     );
     let intents = stat_sig(&a.intents_path);
+    // The Now view is about the ARMED engine, whose file is not the one
+    // `--intents` names, plus the two files that move under it. Its own key,
+    // so it refreshes when the engine acts rather than when the shadow does.
+    let armed: u64 = tape_sources(a)
+        .iter()
+        .map(|(_, p)| stat_sig(p))
+        .fold(0u64, |acc, s| acc.rotate_left(11) ^ s);
+    let now_sig = armed
+        ^ stat_sig(&format!("{}/exec/marks.json", a.data_dir)).rotate_left(23);
     let opps = stat_sig(&format!("{}/opportunities-{day}.jsonl", a.scan_dir));
     let registry = stat_all(&[a.registry.clone(), a.tradable.clone()]);
     format!(
         "{{\"today\":\"{day}\",\"books\":{books},\"recording\":{recording},\
          \"rollup\":{rollup},\"intents\":{intents},\"opportunities\":{opps},\
-         \"pairs\":{registry},\"rollup_status\":{}}}",
+         \"pairs\":{registry},\"now\":{now_sig},\"rollup_status\":{}}}",
         rollup::status(a, sh)
     )
 }
