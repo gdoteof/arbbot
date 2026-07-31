@@ -72,6 +72,17 @@
 //! side takes is not a lock. So this reports, loudly and with the full
 //! attribution the venue-truth owner cannot produce, and leaves acting to the
 //! single owner that already has it.
+//!
+//! UPDATE, and it does not change the paragraph above so much as give it a
+//! second subject. `--positions-recon-act` is now a venue-truth completer inside
+//! THIS binary, so "the single owner that already has it" is a choice between
+//! two rather than a fact about one — and the double-hedge argument applies
+//! unchanged to running both. What this module does is still the same: it
+//! reports. It does not hedge, and it could not: an undischarged obligation is
+//! reconstructed from the INTENT stream, and the completer prices from the
+//! LEDGER, so an obligation that never booked a basket has no cost basis for
+//! either of them to act on. See `naked_act`, which refuses exactly that case by
+//! name.
 
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -371,12 +382,17 @@ pub fn report(
     // Said once, after the list: the reason is the same for all of them, and a
     // repeated paragraph is a paragraph nobody reads.
     out.push(
-        "[hedge] This engine will NOT hedge these. arbbot-hedge.timer owns naked-leg \
-         completion from venue truth (every 5 minutes, profitable-only) and shares the \
-         Kalshi key, so a second hedger is a DOUBLE HEDGE — both IOCs fill and we end up \
-         long against our own short. Its fill would be credited to no obligation here, so \
-         `hedges_overfilled` would still read 0. CHECK: journalctl --user -u \
-         arbbot-hedge.service"
+        "[hedge] This engine's HEDGE RETRY will not touch these — the obligations belong to \
+         a previous process and nothing here can re-mint them. Naked-leg completion from \
+         venue truth belongs to exactly one owner, and there are now two spellings of it: \
+         arbbot-hedge.timer (every 5 minutes, profitable-only) and this binary's own \
+         --positions-recon-act. RUNNING BOTH IS A DOUBLE HEDGE, not a backup — both IOCs \
+         fill and we end up long against our own short, and the other party's fill is \
+         credited to no obligation here, so `hedges_overfilled` would still read 0. CHECK \
+         WHICH ONE IS ARMED: systemctl --user is-active arbbot-hedge.timer, and this \
+         process's own startup banner. NOTE that a venue-truth owner can only complete \
+         what our ledger vouches for a cost basis on, and an obligation that never booked \
+         a basket has none — so an orphan listed above may be one NEITHER owner will close."
             .to_string(),
     );
     out
@@ -530,8 +546,14 @@ mod tests {
         assert!(lines[0].contains("anchor 0.1080"), "{}", lines[0]);
         assert!(lines[0].contains("41 minutes ago"), "{}", lines[0]);
         assert!(
-            lines[1].contains("DOUBLE HEDGE") && lines[1].contains("arbbot-hedge.service"),
+            lines[1].contains("DOUBLE HEDGE") && lines[1].contains("arbbot-hedge.timer"),
             "the reason for NOT acting, and where to look instead: {}",
+            lines[1]
+        );
+        assert!(
+            lines[1].contains("--positions-recon-act"),
+            "there are now TWO spellings of the venue-truth owner and the operator has to \
+             know which is armed: {}",
             lines[1]
         );
     }

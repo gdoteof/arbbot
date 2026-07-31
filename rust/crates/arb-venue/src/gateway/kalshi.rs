@@ -48,6 +48,11 @@ const K_FILLS_MAX_PAGES: usize = 5;
 /// clean" over a book nobody read. 50 pages is 5,000 rows against a history in
 /// the hundreds, so reaching it means the cursor is not terminating.
 const K_ORDERS_MAX_PAGES: usize = 50;
+/// The PUBLIC market listing. Unsigned in the Python (`kalshi_ask` sends a bare
+/// GET), signed here because [`KalshiGateway::call`] signs everything and a
+/// signed request to a public endpoint is accepted — one code path rather than a
+/// second, unsigned one that would drift.
+const K_MARKETS: &str = "/trade-api/v2/markets";
 const K_POSITIONS: &str = "/trade-api/v2/portfolio/positions";
 /// Pages of the POSITION list one [`KalshiGateway::net_positions`] will walk.
 ///
@@ -976,6 +981,62 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
             });
         }
         resp::kalshi_balance(&r.body)
+    }
+
+    /// One market's top of book and tick ladder — port of
+    /// `scripts/hedge_naked_legs.py:89-100`'s `kalshi_ask`, with the two things
+    /// that function gets wrong left OUT rather than carried over. Both are
+    /// named on [`super::Quote`]: an empty side is `None` and not zero, and the
+    /// ladder is not collapsed to its first rung.
+    ///
+    /// [`Priority::Critical`], not `Background`, on the same argument
+    /// `all_orders` makes for itself: a hedge cannot be priced without this, and
+    /// `Background` is a hard `try_acquire` rather than a wait — so metering it
+    /// would let an empty bucket turn into "no quote", and a hedge refused for
+    /// want of a token is a naked leg (`ratelimit.rs`). It is ONE request, on a
+    /// 5-minute cycle, for at most a couple of markets, which is well inside
+    /// what quirk `xv-shared-api-budget`'s order-path corollary already accepts.
+    ///
+    /// The venue answering about a DIFFERENT ticker, or about none, is an error
+    /// and not an empty quote: `tickers=` is a filter, and a filter the venue
+    /// ignored would otherwise price one market's hedge off another's book.
+    fn market_quote(&self, market: &str) -> Result<super::Quote, VenueError> {
+        let q = format!("tickers={market}");
+        let r = self.call(Priority::Critical, "GET", K_MARKETS, Some(&q), None)?;
+        if r.status != 200 {
+            return Err(VenueError::Status {
+                endpoint: "kalshi markets",
+                status: r.status,
+                body: r.body,
+            });
+        }
+        let page = resp::kalshi_markets(&r.body)?;
+        let Some(m) = page.markets.into_iter().find(|m| m.ticker == market) else {
+            return Err(VenueError::Parse {
+                endpoint: "kalshi markets",
+                detail: format!("no row for {market} in the listing response"),
+            });
+        };
+        // "0.0000" is how this venue spells an EMPTY side; see `Quote::yes_bid`.
+        let side = |s: String| {
+            let zero = s.trim().parse::<f64>().map(|v| v == 0.0).unwrap_or(false);
+            if zero {
+                None
+            } else {
+                Some(s)
+            }
+        };
+        Ok(super::Quote {
+            market: m.ticker,
+            status: m.status,
+            yes_bid: side(m.yes_bid_dollars),
+            yes_ask: side(m.yes_ask_dollars),
+            ladder: m
+                .price_ranges
+                .into_iter()
+                .map(|p| (p.start, p.end, p.step))
+                .collect(),
+        })
     }
 
     fn positions(&self) -> Result<Self::Positions, VenueError> {

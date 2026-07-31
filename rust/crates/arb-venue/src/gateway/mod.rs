@@ -108,6 +108,13 @@ pub enum CancelBy {
 ///   * `m`, `h`, `t` + a decimal counter — the maker (`arb_core::quoter`),
 ///     hedge (`engine::hedge`/`engine::fill`) and take-take (`engine`) ids the
 ///     trader sends as its `client_order_id` verbatim (`engine::cancel`);
+///   * `n` + millis — the venue-truth naked-leg completer
+///     (`positions::act`, `--positions-recon-act`). A SEPARATE prefix from the
+///     engine's `h`, deliberately: the two are different owners placing on the
+///     same Kalshi market, the id is what a double-hedge post-mortem reads to
+///     tell them apart, and sharing `h` would make the counter spaces overlap
+///     (`Engine::id_base` is `wall_now() * 1000`, which is the same clock this
+///     one draws from);
 ///   * `rehearse-` + millis — [`KalshiGateway::rehearse`];
 ///   * `sweep-` + pid — `arb-order verify`, whose whole purpose is to watch the
 ///     kill sweep cancel a REAL resting order, so it has to be inside the
@@ -115,16 +122,16 @@ pub enum CancelBy {
 ///
 /// Nothing else on this account can collide with them. The retired Python
 /// gateway tags every order `uuid.uuid4().hex` (`exec/kalshi_gateway.py:51`) —
-/// 32 characters drawn from `[0-9a-f]`, and `m`/`h`/`t`/`r`/`s` are not hex
+/// 32 characters drawn from `[0-9a-f]`, and `m`/`h`/`t`/`n`/`r`/`s` are not hex
 /// digits, so no id it ever minted can match. The trailing run is required to be
 /// digits for the same reason: it is what the counters actually emit, and it
 /// keeps a bare word that happens to start with `t` from reading as ours.
 pub fn is_ours(client_order_id: &str) -> bool {
     // `continue`, not `return`, on a prefix that matches but whose tail is not a
-    // counter. With today's five prefixes no id can reach a second arm, but
+    // counter. With today's six prefixes no id can reach a second arm, but
     // `t` shadows any future `take-…` and the bug would be a SILENTLY NARROWER
     // sweep — the exact class this function exists to prevent.
-    for p in ["m", "h", "t", "rehearse-", "sweep-"] {
+    for p in ["m", "h", "t", "n", "rehearse-", "sweep-"] {
         if let Some(n) = client_order_id.strip_prefix(p) {
             if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
                 return true;
@@ -282,6 +289,54 @@ pub trait VenueGateway {
     fn net_positions(&self) -> Result<BTreeMap<String, f64>, VenueError> {
         Err(VenueError::NotWired)
     }
+    /// Top of book and tick ladder for ONE market, from the venue's public
+    /// listing — the only quote a process can get for a market it does not
+    /// subscribe to.
+    ///
+    /// THE READ THIS EXISTS FOR. `positions::recon` reconciles every registry
+    /// pair, while the engine's book feed covers only the relationships its
+    /// `--rel-prefix` selected, so a naked leg is routinely on a market this
+    /// process holds no book for. `BookBuilder` cannot answer for it and never
+    /// will; this can.
+    ///
+    /// The default REFUSES, like [`Self::net_positions`] and
+    /// [`Self::order_filled_qty`] and for the same reason: the caller acts on
+    /// the answer by sending an order, so a fabricated "no quote" would be a
+    /// claim about a book nobody read.
+    fn market_quote(&self, _market: &str) -> Result<Quote, VenueError> {
+        Err(VenueError::NotWired)
+    }
+}
+
+/// One market's top of book and its tick ladder, venue-neutral.
+///
+/// PRICES STAY STRINGS, and the ladder is handed over RAW rather than collapsed
+/// to a single tick. Kalshi's ladder is genuinely tapered on 7,224 of the 35,640
+/// markets captured in `data/catalogs/` — 0.0010 below $0.10, 0.0100 between
+/// $0.10 and $0.90, 0.0010 above — so "the tick" is a function of the price, not
+/// a property of the market. `scripts/hedge_naked_legs.py:95-99` takes the FIRST
+/// rung's step and uses it everywhere, which on a tapered market prices a $0.42
+/// order to the tenth of a cent; the venue rejects that ("penny markets 400
+/// anything finer", says the same function's own docstring). Collapsing here
+/// would bake that in, so the choice is left to the caller that knows the price.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Quote {
+    pub market: String,
+    /// The venue's own status word. Only `active` is tradable on Kalshi; the
+    /// other three seen in the captures are `finalized`, `inactive`, `closed`.
+    pub status: String,
+    /// Best YES bid, or `None` when the venue reports NO bid.
+    ///
+    /// Kalshi spells an empty side `"0.0000"` rather than omitting the field
+    /// (1,742 of 35,640 captured rows), and that is the distinction this
+    /// `Option` carries. The Python reads it as the NUMBER zero and compares
+    /// against it, so an untraded market answers "the ask is 0" — which passes
+    /// any `ask <= limit` test ever written.
+    pub yes_bid: Option<String>,
+    /// Best YES ask, or `None` when the venue reports NO ask. See `yes_bid`.
+    pub yes_ask: Option<String>,
+    /// `(start, end, step)` rungs, verbatim and in the venue's order.
+    pub ladder: Vec<(String, String, String)>,
 }
 
 fn now_ns() -> u64 {

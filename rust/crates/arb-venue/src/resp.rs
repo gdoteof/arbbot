@@ -222,6 +222,52 @@ pub struct KalshiMarketPosition {
     pub fees_paid_dollars: Option<String>,
 }
 
+/// GET /markets?tickers=… — the PUBLIC market listing, which is the only place
+/// this stack can read a top-of-book for a ticker it does not subscribe to.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KalshiMarketsPage {
+    #[serde(default)]
+    pub markets: Vec<KalshiMarket>,
+}
+
+/// One market row, cut down to the four fields a quote needs.
+///
+/// The *_dollars fields arrive as STRINGS in every capture in
+/// `data/catalogs/kalshi-*.json` (35,640 rows), and the Python that reads them
+/// coerces with `Decimal(str(...))` — so [`money_string`] accepts a bare number
+/// too rather than failing on a shape the venue has not sent but the Python
+/// would have survived.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KalshiMarket {
+    pub ticker: String,
+    /// `active` / `finalized` / `inactive` / `closed` — the four values present
+    /// across those 35,640 rows. Required, because "I could not tell whether
+    /// this market is trading" must not read as "it is".
+    pub status: String,
+    #[serde(deserialize_with = "money_string")]
+    pub yes_bid_dollars: String,
+    #[serde(deserialize_with = "money_string")]
+    pub yes_ask_dollars: String,
+    /// The venue's own tick ladder, and it is a LADDER: 7,224 of those 35,640
+    /// rows are tapered (0.0010 below $0.10, 0.0100 in the middle, 0.0010 above
+    /// $0.90), so there is no single tick for the market. Required for the same
+    /// reason `status` is — a defaulted penny tick on a deci-cent market is a
+    /// price the venue rejects.
+    pub price_ranges: Vec<KalshiPriceRange>,
+}
+
+/// One rung: `[start, end)` at `step`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KalshiPriceRange {
+    pub start: String,
+    pub end: String,
+    pub step: String,
+}
+
+pub fn kalshi_markets(body: &str) -> Result<KalshiMarketsPage, VenueError> {
+    parse("kalshi:markets", body)
+}
+
 pub fn kalshi_order_envelope(body: &str) -> Result<KalshiOrderEnvelope, VenueError> {
     parse("kalshi:order", body)
 }
