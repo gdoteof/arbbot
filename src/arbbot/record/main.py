@@ -60,6 +60,31 @@ async def run(config_path: str) -> None:
             markets[(m.venue, m.market_id)] = m
             if m.status is not MarketStatus.CLOSED:
                 pmus_slugs.append(m.market_id)
+    # A REGISTRY market is subscribed whether or not the tag listing still
+    # returns it. Tag-driven alone is silently lossy: between 2026-07-27 and
+    # 07-31 the france and brazil election events fell out of the tag listing
+    # and 19 of the registry's 88 PM-US markets stopped being recorded — every
+    # `xvus-france-pres-27` leg, i.e. the family holding most of our capital,
+    # while their Kalshi legs ticked normally. Nothing said so; the engine
+    # simply could not price or exit those baskets.
+    #
+    # These get NO metadata (PM US has no by-slug metadata endpoint, which is
+    # why the universe was tag-driven in the first place), so they are absent
+    # from `markets` and `refresh_universe` cannot evict them on close — a
+    # closed one keeps its frozen book rebroadcast. That is the bounded cost,
+    # and it is much cheaper than not recording a market we hold.
+    registry_pmus = sorted(
+        mid for v, mid in registry.market_ids() if v is Venue.POLYMARKET_US
+    )
+    known = set(pmus_slugs)
+    untagged = [s for s in registry_pmus if s not in known]
+    if untagged:
+        pmus_slugs.extend(untagged)
+        print(f"polymarket_us: +{len(untagged)} registry market(s) the tag "
+              f"listing did not return, subscribed anyway (no metadata, so "
+              f"they are exempt from close-eviction): "
+              f"{', '.join(untagged[:6])}"
+              f"{' …' if len(untagged) > 6 else ''}", flush=True)
 
     Path(cfg.data_dir).mkdir(parents=True, exist_ok=True)
     writer = JsonlWriter(cfg.data_dir)
@@ -115,9 +140,6 @@ async def run(config_path: str) -> None:
         print("kalshi: REST polling (no recorder credentials)", flush=True)
 
     tasks = [
-        asyncio.create_task(
-            polymarket_ws_task(core, liveness, pm_tokens, clob)
-        ),
         asyncio.create_task(kalshi_task),
         asyncio.create_task(
             health_task(liveness, cfg.health_path, alert=alerter.alert,
@@ -125,6 +147,19 @@ async def run(config_path: str) -> None:
         ),
         asyncio.create_task(refresh_universe()),
     ]
+    if cfg.record_polymarket_intl:
+        tasks.insert(0, asyncio.create_task(
+            polymarket_ws_task(core, liveness, pm_tokens, clob)
+        ))
+    else:
+        # NOT a silent omission: `polymarket-ws` simply stops appearing in
+        # health.jsonl, and a watchdog that keys on feeds PRESENT would read
+        # that as healthy rather than absent. Say it once, loudly, at startup.
+        print(f"polymarket INTL: OFF by config — {len(pm_tokens)} token(s) NOT "
+              f"recorded, and `polymarket-ws` will be absent from health.jsonl "
+              f"(not stale, absent). INTL has no order path; re-enable with "
+              f"record_polymarket_intl: true in config/recorder.yaml",
+              flush=True)
     if pmus_slugs:
         # Authenticated WS (real-time full-book + trades) when the PM US key is
         # available; else credential-free REST polling. The WS key is trade-

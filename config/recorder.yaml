@@ -21,3 +21,6 @@ polymarket_us_tags:
   - culture
   - elections
   - politics
+# INTL has no order path and its ~313s sweep was 58 of 64 ntfy alerts in 6h.
+# Off on Geoff's call 2026-07-31; flip to true to bring it back.
+record_polymarket_intl: false
