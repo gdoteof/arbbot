@@ -122,7 +122,7 @@
 //! what the bar is" is true about the NUMBER and false about its safe
 //! DIRECTION, which is the part that matters:
 //!
-//!   * `risk.rs:509-511` answers a cap of zero with `utilization() == 1.0` —
+//!   * `RiskView::utilization` answers a cap of zero with `1.0` —
 //!     "A cap of zero reads as FULL, not empty". For an ENTRY that is
 //!     fail-closed: demand the ceiling of a new quote. For an EXIT the same
 //!     number pins the liquidation hurdle at its ceiling, which is maximally
@@ -537,8 +537,8 @@ fn consider(
 /// `Err` is a REFUSAL to decide anything at all, not an empty answer. Three
 /// things can force it, and all three are fail-CLOSED — selecting nothing:
 ///
-///   1. `class_cap_usd` is not a positive, finite number. That is the
-///      denominator `RiskView::utilization` divides by, and `risk.rs:509-511`
+///   1. `global_cap_usd` is not a positive, finite number. That is the
+///      denominator `RiskView::utilization` divides by, and it
 ///      answers a degenerate one with `1.0` — the CEILING hurdle, maximally
 ///      eager to liquidate. See §4: fail-closed for entry is fail-open for
 ///      exit, so the exit side must refuse rather than inherit the number.
@@ -557,13 +557,13 @@ fn consider(
 pub fn select(
     marks_json: &str,
     hurdle: f64,
-    class_cap_usd: f64,
+    global_cap_usd: f64,
     owned: &[String],
     now: f64,
 ) -> Result<(Vec<Exit>, Vec<Skip>), String> {
-    if !class_cap_usd.is_finite() || class_cap_usd <= 0.0 {
+    if !global_cap_usd.is_finite() || global_cap_usd <= 0.0 {
         return Err(format!(
-            "class cap is {class_cap_usd} — utilization() answers a degenerate cap with 1.0, \
+            "global cap is {global_cap_usd} — utilization() answers a degenerate cap with 1.0, \
              which pins the exit hurdle at its CEILING. Refusing to select."
         ));
     }
@@ -759,12 +759,12 @@ mod tests {
         let m = marks(&pos("longdated", 26, "2027-04-25", "12.6", "0.0312"));
         assert_eq!(select(&m, 16.0, CAP, &[], NOW).unwrap().0.len(), 1, "control");
 
-        // `RiskView::load` on a missing/unparseable exec.yaml: bankroll and
-        // per_class_cap both parse to 0.0, so the cap is 0.0 and utilization
-        // fabricates 1.0.
+        // `RiskView::load` on a missing/unparseable exec.yaml: the BANKROLL
+        // parses to 0.0, and every cap in that file is a fraction of it, so the
+        // cap is 0.0 and utilization fabricates 1.0.
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             let e = select(&m, 16.0, bad, &[], NOW).expect_err("a cap of {bad} is not a cap");
-            assert!(e.contains("class cap"), "and it names the input: {e}");
+            assert!(e.contains("global cap"), "and it names the input: {e}");
         }
 
         // ...and a hurdle that did not come off the utilization curve is
@@ -1018,8 +1018,9 @@ mod tests {
             std::collections::HashMap::new(),
         );
         // ...and that config is also what makes the cap REAL, which is the
-        // input `select` refuses without (§4).
-        assert_eq!(v.class_cap_usd(), 350.0);
+        // input `select` refuses without (§4). $1000 x GLOBAL_CAP 0.50; the
+        // per-class budget the check below fills is a separate, tighter $350.
+        assert_eq!(v.global_cap_usd(), 500.0);
         let rel = arb_core::scan::Rel {
             id: "r1".into(),
             rtype: arb_core::scan::RelType::CrossVenueEquivalent,
@@ -1041,8 +1042,9 @@ mod tests {
             arb_core::quoter::RiskGate::check(&v, &rel, arb_core::model::Venue::Kalshi, 20, None);
         assert!(empty.allowed, "fixture is not gating for the wrong reason: {:?}", empty.reasons);
 
-        // ...and now the class budget is full, and then some, as it is live.
-        v.record_open("already-open", "cross-venue-equivalent", v.class_cap_usd() + 1.0);
+        // ...and now the class budget ($1000 x 0.35) is full, and then some, as
+        // it is live.
+        v.record_open("already-open", "cross-venue-equivalent", 351.0);
         let d =
             arb_core::quoter::RiskGate::check(&v, &rel, arb_core::model::Venue::Kalshi, 20, None);
         assert!(!d.allowed, "the opening cap refuses the exit that would empty it");

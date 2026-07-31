@@ -485,13 +485,46 @@ impl RiskView {
         self.exposure.lock().expect("exposure").by_rel.get(rel_id).copied().unwrap_or(0.0)
     }
 
-    /// Utilization of the class budget, in [0, 1] — the term the floating APR
-    /// bar rides on. Port of `exec/main.py:_tt_refresh`:
+    /// How much of the capital this engine may deploy IS deployed, in [0, 1] —
+    /// the term the floating APR bar rides on (`Engine::apr_tick`, reported as
+    /// `maker_apr_bar`). Port of `exec/main.py:_tt_refresh`:
     ///
     /// ```python
     /// cap  = risk.config.bankroll * risk.config.per_class_cap
     /// util = min(max(risk.exposure.total / cap if cap else 1.0, 0.0), 1.0)
     /// ```
+    ///
+    /// THE PYTHON IS A GLOBAL NUMERATOR OVER A PER-CLASS DENOMINATOR, and this
+    /// no longer copies it. `risk.exposure.total` sums EVERY class; `bankroll *
+    /// per_class_cap` is what ONE class may hold ($343). Their ratio is not a
+    /// fraction of anything, and it is not bounded by 1 either — five classes
+    /// may each fill their own budget. A book holding 200 contracts of
+    /// `cross-venue-equivalent` and 143 of `exclusive`, with NEITHER class past
+    /// two thirds of its own $343, read 1.000 FULL and pinned the hurdle at the
+    /// 16%/yr ceiling.
+    ///
+    /// Live on 2026-07-31 the error was smaller and one-sided, because every
+    /// open relationship happens to be `cross-venue-equivalent`: $322 read 0.94
+    /// and charged 15.3%/yr, with $168 of the $490 this engine is allowed to
+    /// deploy still unspent. Against that $490 it is 0.66, and 11.9%/yr.
+    ///
+    /// `bankroll * GLOBAL_CAP` is the denominator because it bounds the SAME
+    /// quantity the numerator sums. `arb_core::risk`'s global check refuses
+    /// when `sum(by_relationship) + notional > bankroll * global_cap`, so 1.0
+    /// here means exactly "the next contract is refused" and 0.0 means an empty
+    /// book. Nothing about the per-class cap is weakened: it is a separate,
+    /// tighter check, measured per class against `by_class` — which is where a
+    /// per-class question belongs and is not what this scalar can answer, since
+    /// one bar is installed on every quoter regardless of class.
+    ///
+    /// NOT THE SAME NUMBER AS THE `util` IN AN `only_below_util` REFUSAL, from
+    /// here on. `arb_core::risk::check_order` computes its own for the topic
+    /// gate and still divides by the class cap — which is the denominator
+    /// `config/topics.yaml` documents that field with, and which two of the
+    /// Python-parity fixtures pin the printed value of. Repointing it is a
+    /// change to what a config key MEANS, with a frozen generator behind the
+    /// fixtures; it is not this change. At live exposure both readings sit
+    /// above every configured 0.5 gate, so no gate changes hands on it today.
     ///
     /// Exposure is in CONTRACTS and the cap in dollars, which is the same
     /// ~$1-a-contract equivalence `RiskGate::check` is built on and `risk.rs`
@@ -501,10 +534,16 @@ impl RiskView {
     /// RESERVATIONS ARE NOT COUNTED HERE. This is what the maker APR hurdle
     /// rides on (`Engine::apr_tick`), and floating that bar on capital that is
     /// only committed is a policy change, not a fix. The undischarged-hedge
-    /// seed DOES move it, though, because that seed is a `record_open` — today
-    /// with no effect, since the live book already clamps this to 1.000.
+    /// seed DOES move it, because that seed is a `record_open`.
+    ///
+    /// That exclusion matters MORE now, and the sentence this replaces said the
+    /// opposite: it argued the seed had "no effect, since the live book already
+    /// clamps this to 1.000", which was written at 346 open contracts against
+    /// $343. Nothing clamps at $490 — the live book reads 0.59 — so every
+    /// contract now moves the bar, and a book whose capital is committed to
+    /// RESTING quotes rather than fills still reads as idle here.
     pub fn utilization(&self) -> f64 {
-        let cap = self.class_cap_usd();
+        let cap = self.global_cap_usd();
         if cap <= 0.0 {
             return 1.0;
         }
@@ -513,7 +552,8 @@ impl RiskView {
     }
 
     /// The dollar denominator [`Self::utilization`] divides by: bankroll times
-    /// the per-class cap.
+    /// the GLOBAL cap — the same ceiling `arb_core::risk` bounds the same
+    /// whole-book exposure sum against.
     ///
     /// Extracted so a caller can ask whether that denominator is REAL before
     /// trusting a number derived from it. `utilization` answers a cap of zero
@@ -521,9 +561,11 @@ impl RiskView {
     /// more of a new quote) and the unsafe one for an EXIT (charge the ceiling
     /// hurdle, so liquidate everything): see `crate::unwind`. One definition,
     /// because two would drift.
-    pub fn class_cap_usd(&self) -> f64 {
-        self.bankroll.parse::<f64>().unwrap_or(0.0)
-            * self.per_class_cap.parse::<f64>().unwrap_or(0.0)
+    ///
+    /// A damaged `exec.yaml` is still degenerate here: `Caps::corrupt` forces
+    /// the BANKROLL to "0", and every cap in this file is a fraction of it.
+    pub fn global_cap_usd(&self) -> f64 {
+        self.bankroll.parse::<f64>().unwrap_or(0.0) * GLOBAL_CAP.parse::<f64>().unwrap_or(0.0)
     }
 
     pub fn stats(&self) -> (u64, u64) {
@@ -1075,6 +1117,160 @@ mod tests {
         let v = funded("low");
         assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
         assert_eq!(v.reserved_ct(), 0.0);
+    }
+
+    // ---- the capital-scarcity signal: a whole-book numerator needs a
+    //      whole-book denominator ----
+    //
+    // `utilization()` is what `crate::apr_bar` turns into the maker hurdle
+    // installed on every quoter and reported as `maker_apr_bar`. It summed
+    // EVERY class and divided by what ONE class may hold.
+
+    /// **FIVE CLASSES CAN EACH FILL THEIR OWN BUDGET, SO THEIR SUM IS NOT A
+    /// FRACTION OF ONE OF THEM.**
+    ///
+    /// The pure form of the defect, and the one that does not need a bad
+    /// config to show up: two classes, neither past two thirds of its own $343,
+    /// and the old denominator called the book 1.000 FULL and charged the
+    /// 16%/yr ceiling. `by_class` is maintained for exactly this reason and was
+    /// not consulted.
+    #[test]
+    fn a_book_spread_across_classes_is_not_full_because_two_classes_sum_past_one() {
+        let v = funded("low");
+        v.record_open("a", "cross-venue-equivalent", 200.0);
+        v.record_open("b", "exclusive", 143.0);
+
+        // 343 of the $490 this engine may deploy: 70%, not 100%.
+        assert!(
+            (v.utilization() - 343.0 / 490.0).abs() < 1e-9,
+            "343 across two classes: {}",
+            v.utilization()
+        );
+        assert!(
+            crate::apr_bar(v.utilization()) < crate::APR_CEIL - 3.0,
+            "a book with $147 unspent must not be charged the ceiling: {}",
+            crate::apr_bar(v.utilization())
+        );
+        // ...and the per-class cap is untouched by that reading: it is still
+        // checked per class, and it still has room here.
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
+    }
+
+    /// **THE LIVE 2026-07-31 BOOK IS NOT 94% OF ANYTHING.**
+    ///
+    /// `[risk] seeded 289 open contracts across 10 relationships`, plus the one
+    /// undischarged hedge leg seeded after it — and every one of them is
+    /// `cross-venue-equivalent`, so the live book is a single class and the old
+    /// reading was wrong in SIZE rather than in kind. It divided 290 by that
+    /// class's $343 and reported 0.845, charging 14.15%/yr, while $200 of the
+    /// $490 this engine may deploy sat unspent. Against $490: 0.592, 11.10%/yr.
+    ///
+    /// The earlier snapshot of the same day, $322, is the second row: 0.939 and
+    /// 15.27%/yr became 0.657 and 11.89%/yr.
+    #[test]
+    fn the_live_2026_07_31_book_reads_against_the_capital_it_may_deploy() {
+        for (open, want_util, want_bar) in [(290.0, 0.5918, 11.102), (322.0, 0.6571, 11.886)] {
+            let v = funded("low");
+            assert_eq!(v.global_cap_usd(), 490.0, "$980 x GLOBAL_CAP 0.50");
+            // The two biggest live relationships, then the rest in one lump —
+            // the seed line prints only the top five.
+            v.record_open("xvus-time-poty-26-zohranmamdani", "cross-venue-equivalent", 97.0);
+            v.record_open("xvus-france-pres-27-brunoretailleau", "cross-venue-equivalent", 84.0);
+            v.record_open("the-smaller-eight", "cross-venue-equivalent", open - 181.0);
+
+            let util = v.utilization();
+            assert!((util - want_util).abs() < 0.001, "{open} open reads {util}");
+            let bar = crate::apr_bar(util);
+            assert!((bar - want_bar).abs() < 0.01, "{open} open charges {bar}%/yr");
+            assert!(
+                util < open / 343.0,
+                "the class budget is not the denominator any more: {util}"
+            );
+        }
+    }
+
+    /// **1.0 MEANS "THE NEXT CONTRACT IS REFUSED", AND THAT IS WHY THIS IS THE
+    /// DENOMINATOR.**
+    ///
+    /// `arb_core::risk`'s global check refuses when
+    /// `sum(by_relationship) + notional > bankroll * global_cap` — the same sum
+    /// this divides, against the same ceiling — so the two agree at the edge.
+    /// Under the class budget they could not: at 489 contracts the old reading
+    /// was already clamped to 1.000 with $147 still admissible.
+    #[test]
+    fn utilization_reads_full_exactly_when_the_global_cap_has_no_headroom() {
+        let v = funded("low");
+        v.record_open("a", "cross-venue-equivalent", 200.0);
+        v.record_open("b", "exclusive", 200.0);
+        v.record_open("c", "implies", 89.0); // 489 of $490, no class near $343
+        assert!(v.utilization() < 1.0, "a dollar of headroom is not a full book");
+        assert!(
+            v.check(&rel("r1"), Venue::Kalshi, 1, None).allowed,
+            "and the cap agrees there is a dollar left"
+        );
+
+        v.record_open("c", "implies", 1.0); // 490 of $490
+        assert_eq!(v.utilization(), 1.0);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 1, None);
+        assert!(!d.allowed, "the cap agrees there is not");
+        assert!(d.reasons.iter().any(|r| r.contains("global cap")), "{:?}", d.reasons);
+    }
+
+    /// **A CAP THAT DID NOT LOAD READS AS FULL, NEVER AS EMPTY.**
+    ///
+    /// Preserved across the denominator change, and the direction is the whole
+    /// point: empty means "quote everything at the 4%/yr floor" on a config
+    /// nobody can trust. `Caps::corrupt` forces the BANKROLL to "0" and every
+    /// cap in this file is a fraction of it, so the global one is degenerate
+    /// for the same four failures the class one was.
+    #[test]
+    fn a_cap_that_did_not_load_reads_as_full_not_empty() {
+        let cases = [
+            ("missing", None),
+            ("unparseable", Some("bankroll_usd: 980\nper_class_cap: [0.35\n")),
+            ("tail-cut", Some("bankroll_usd: 980\n")),
+            ("zero-bankroll", Some("bankroll_usd: 0\nper_class_cap: 0.35\n")),
+        ];
+        for (tag, body) in cases {
+            let p = match body {
+                Some(b) => write_exec(&format!("util-{tag}"), b).to_string_lossy().into_owned(),
+                None => "/nonexistent/exec.yaml".to_string(),
+            };
+            let v = view_with_configs(
+                &p,
+                "/nonexistent/topics.yaml",
+                vec![("kalshi", "1000"), ("polymarket_us", "1000")],
+                "low",
+            );
+            assert_eq!(v.global_cap_usd(), 0.0, "{tag}");
+            // On an EMPTY book, which would otherwise be the 0.0 end of the
+            // clamp — the fail-closed answer has to beat the arithmetic.
+            assert_eq!(v.utilization(), 1.0, "{tag}: a $0 cap is not an empty book");
+            assert_eq!(crate::apr_bar(v.utilization()), crate::APR_CEIL, "{tag}");
+            if body.is_some() {
+                let _ = std::fs::remove_dir_all(std::path::Path::new(&p).parent().unwrap());
+            }
+        }
+    }
+
+    /// Both ends of the clamp. An over-cap book asks the ceiling and no more —
+    /// `apr_bar` clamps too, but a utilization above 1 would still be a lie in
+    /// every gauge that prints it.
+    #[test]
+    fn utilization_clamps_at_both_ends() {
+        let v = funded("low");
+        assert_eq!(v.utilization(), 0.0, "an empty book is empty");
+
+        for (i, class) in
+            ["cross-venue-equivalent", "exclusive", "implies", "date-ladder", "partition"]
+                .iter()
+                .enumerate()
+        {
+            v.record_open(&format!("r{i}"), class, 100.0);
+        }
+        assert_eq!(v.utilization(), 1.0, "500 of $490 is 1.0, not 1.02");
+        v.record_open("runaway", "exclusive", 10_000.0);
+        assert_eq!(v.utilization(), 1.0, "and it stays there");
     }
 
     // ---- C11: config/topics.yaml must not widen a cap when it breaks ----

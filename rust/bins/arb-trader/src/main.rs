@@ -2437,10 +2437,15 @@ relationships:
     ///
     /// A flat constant is wrong in the expensive direction. `utilization()`
     /// divides the exposure accumulator — CONTRACTS, as Python's
-    /// `risk.exposure.total` was — by the dollar class budget, and on
-    /// 2026-07-29 the ledger seeds 346 open contracts against $343, so util
-    /// clamps to 1.000 and the policy asks the CEILING. A flat 12.0 would have
-    /// rested quotes the policy refuses, exactly when capital is scarcest.
+    /// `risk.exposure.total` was — by the dollars this engine may deploy
+    /// ($980 x 0.50 = $490), and a book at or over that asks the CEILING. A
+    /// flat 12.0 would have rested quotes the policy refuses, exactly when
+    /// capital is scarcest.
+    ///
+    /// The $343 class budget is NOT that denominator, and this test used to
+    /// quote `346 / 343` as "the live figure" for the clamp. It is not one:
+    /// 346 contracts is 71% of what may be deployed, and the clamp above it
+    /// belongs to a book that has genuinely run out.
     #[test]
     fn the_hurdle_floats_with_capital_utilization() {
         assert_eq!(apr_bar(0.0), APR_FLOOR, "idle capital takes the floor");
@@ -2448,8 +2453,8 @@ relationships:
         // Geoff's 8% reference sits at ~1/3 utilization (exec/main.py:47-51).
         assert!((apr_bar(1.0 / 3.0) - 8.0).abs() < 0.01, "{}", apr_bar(1.0 / 3.0));
 
-        // The live figure, and the crossing that makes a flat 12.0 unsafe.
-        let live = apr_bar(346.0 / 343.0);
+        // A book past the global cap, and the crossing that makes 12.0 unsafe.
+        let live = apr_bar(496.0 / 490.0);
         assert_eq!(live, APR_CEIL, "an over-cap book is clamped to the ceiling");
         assert!(live > 12.0, "a flat 12.0 would UNDER-charge a full book: {live}");
         // 12.0 is the bar only at util 2/3, and take-take's own DEFAULT_BAR_APR
