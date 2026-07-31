@@ -991,6 +991,7 @@ mod hedge_deadline_tests {
             }),
             take_take: None,
             unwind: None,
+            marks_out: None,
             armed: false,
             hedges_undischarged: 0,
         };
@@ -1105,6 +1106,7 @@ mod hedge_deadline_tests {
             }),
             take_take: None,
             unwind: None,
+            marks_out: None,
             armed: false,
             hedges_undischarged: 0,
         };

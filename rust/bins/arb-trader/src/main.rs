@@ -39,6 +39,7 @@ mod feed;
 mod fills;
 mod hist;
 mod ledger;
+mod marks;
 mod naked_act;
 mod orphan;
 mod positions;
@@ -128,6 +129,15 @@ struct Args {
     tt_max_clip: i64,
     /// Marks file the blended-APR bar is derived from.
     marks: String,
+    /// WRITE marks to this path, from the live books, instead of leaving it to
+    /// `arbbot-marks.timer` (`crate::marks`). `None` = off, and off is the
+    /// default: nothing about this engine changes until a path is given.
+    ///
+    /// Pointing it at `--marks` is the end state after that timer retires, and
+    /// it is the one spelling that changes what this engine TRADES — the bar it
+    /// reads becomes one it wrote. That is why it is a separate flag rather than
+    /// a mode of `--marks`: an operator has to say it.
+    marks_out: Option<String>,
     /// MAKER APR hurdle, %/yr: the extra per-contract lock a resting quote must
     /// carry so that a fill annualizes to at least this over the hold to
     /// resolution (`Quoter::set_apr`). `None` FLOATS it with capital
@@ -248,6 +258,7 @@ fn default_args() -> Args {
         tt_max_ct_per_rel: 50,
         tt_max_clip: 20,
         marks: "data/exec/marks.json".into(),
+        marks_out: None,
         min_apr: None, // float with utilization; see `apr_bar`
         apr_asof: None,
         toxgate: None,
@@ -328,6 +339,7 @@ fn parse_args() -> Args {
                 a.tt_max_clip = it.next().and_then(|v| v.parse().ok()).expect("--tt-max-clip value")
             }
             "--marks" => a.marks = it.next().expect("--marks value"),
+            "--marks-out" => a.marks_out = Some(it.next().expect("--marks-out value")),
             "--min-apr" => {
                 a.min_apr = Some(it.next().expect("pct").parse().expect("float"))
             }
@@ -1621,6 +1633,25 @@ fn run_cfg(
             // The live answer is "none of them" and that is the finding —
             // `crate::unwind` §1.
             owned_prefixes: args.rel_prefixes.clone(),
+        }),
+        // Off in bench/replay for a third reason on top of the two above: it
+        // WRITES a file. A replay whose job is to prove a refactor changed no
+        // decision must not also rewrite the book's marks.
+        marks_out: (!bench).then_some(args.marks_out).flatten().map(|out_path| engine::MarksOut {
+            out_path,
+            ledger_path: args.ledger.clone(),
+            // One second, against a measured ~1.15 marked-market book events per
+            // second on the 2026-07-31 book: close enough to "every event" that
+            // the coalescing is invisible, far enough from it that the file is
+            // rewritten ~86k times a day rather than ~100k, on a box whose
+            // recorder stalls under I/O.
+            min_interval_s: 1.0,
+            // The heartbeat, and it is `arbbot-marks.timer`'s own period on
+            // purpose: whatever this replaces, `generated_at` is never staler
+            // than the thing it replaced. `taketake::MAX_MARKS_AGE_S` is 900s,
+            // so this leaves seven missed writes of margin, exactly as the
+            // timer did.
+            max_idle_s: 120.0,
         }),
         armed,
     }
