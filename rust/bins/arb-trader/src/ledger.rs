@@ -102,6 +102,135 @@ pub fn open_exposure(records: Vec<Value>) -> HashMap<String, f64> {
     out
 }
 
+/// What this engine stamps every basket it authors with.
+///
+/// The single-author rule reads off this field: a record carrying it was written
+/// by `arb-trader`, anything else was written by somebody else.
+pub const SOURCE: &str = "arb-trader";
+
+/// How close in time two bookings of the same relationship-and-markets have to
+/// be before the second one is treated as a possible double-book rather than a
+/// second trade.
+///
+/// 300s because that is `arbbot-hedge.timer`'s period: the frozen Python hedger
+/// wakes every 5 minutes, reads venue positions, and completes any PM-US short
+/// it finds uncovered — which is the same naked leg this engine's own hedge
+/// retry is chasing. One timer period is therefore the whole window in which
+/// the two can be working the same leg without either knowing.
+pub const CONTEST_WINDOW_S: f64 = 300.0;
+
+/// A basket's identity INDEPENDENT of how its author spells leg sides.
+///
+/// This is the crux of catching a cross-writer double-book. The two writers
+/// describe one position in two vocabularies: this engine records the ORDER it
+/// sent (`polymarket_us side=ask` / `kalshi side=bid`), the Python hedger
+/// records the POSITION that resulted (`kalshi side=yes` / `polymarket_us
+/// side=no`). Leg order differs too. Everything that survives both spellings is
+/// the relationship and the set of markets, so that is the key — and comparing
+/// on anything richer would silently stop matching the very record it exists to
+/// find.
+fn identity(r: &Value) -> Option<(String, Vec<String>)> {
+    let rel = rel_of(r)?.to_string();
+    let mut markets: Vec<String> = r
+        .get("legs")?
+        .as_array()?
+        .iter()
+        .filter_map(|l| l.get("market_id").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    if markets.is_empty() {
+        return None;
+    }
+    markets.sort();
+    Some((rel, markets))
+}
+
+/// Every record in the file that parses, skipping the ones that do not.
+///
+/// Deliberately LENIENT where [`read`] is strict, and the difference is which
+/// question is being asked. `read` gates ARMING: a line it cannot parse is
+/// unknown exposure, so it refuses and nothing trades. This one gates a
+/// duplicate check on a basket that has ALREADY traded — both legs are filled
+/// and the money is spent — so refusing to write it because some unrelated line
+/// is torn would lose the basket outright, which is the one outcome worse than
+/// booking it twice. A missing file reads as empty for the same reason: the
+/// first basket ever booked must not be blocked by the absence of the file it
+/// is about to create.
+fn parsed_records(path: &str) -> Vec<Value> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// What happened to a basket offered to [`append_basket`].
+#[derive(Debug, PartialEq)]
+pub enum Booking {
+    /// Written, and nothing else in the ledger describes this position.
+    Booked,
+    /// NOT written: `(relationship_id, ts)` is already in the file.
+    AlreadyBooked,
+    /// Written, but another author has an open basket on the same relationship
+    /// and the same markets inside [`CONTEST_WINDOW_S`] — their `ts`.
+    Contested(Vec<f64>),
+}
+
+/// Append a basket under the single-author rule.
+///
+/// 2026-07-30 is why this is not just [`append`]. Kalshi went
+/// `409 trading_is_paused` for 31 minutes with a take-take's PM-US leg already
+/// short one contract. This engine retried its hedge 336 times; the frozen
+/// Python hedger, which reads VENUE POSITIONS and completes any uncovered PM-US
+/// short, woke every 5 minutes and retried the same hedge. When the venue
+/// reopened both got through 600ms apart, and the ledger took TWO complete
+/// baskets for one PM-US leg — `n_open` 30 -> 32 for a position that had only
+/// grown by one.
+///
+/// Two guards, because the two failures are not equally decidable:
+///
+///   * `(relationship_id, ts)` already present -> REFUSE. That pair is the key
+///     `apply_corrections` matches `corrects_ts` on and `open_exposure` matches
+///     `closes_ts` on, so a duplicate does not merely double-count: it makes
+///     every future correction and unwind ambiguous about which record it
+///     addresses. Nothing legitimate needs to write it twice.
+///
+///   * same identity, different author, inside the window -> WRITE ANYWAY, and
+///     say so. Content cannot tell "one position booked twice" from "two real
+///     fills seconds apart" — on 2026-07-30 it was the second, and both
+///     contracts are still in the account — so suppressing here would delete
+///     exposure on a guess. The record goes in, carries `contested_with_ts`
+///     naming the other, and the caller alarms with the correction to append if
+///     a human finds it really was one position.
+pub fn append_basket(path: &str, mut rec: Value) -> Result<Booking, String> {
+    let existing = parsed_records(path);
+
+    if let Some(k) = key_of(rel_of(&rec), f64_of(&rec, "ts")) {
+        if existing.iter().any(|r| key_of(rel_of(r), f64_of(r, "ts")) == Some(k.clone())) {
+            return Ok(Booking::AlreadyBooked);
+        }
+    }
+
+    let ts = f64_of(&rec, "ts");
+    let contested: Vec<f64> = match (identity(&rec), ts) {
+        (Some(id), Some(ts)) => existing
+            .iter()
+            .filter(|r| status_of(r) == "open")
+            .filter(|r| r.get("source").and_then(|v| v.as_str()) != Some(SOURCE))
+            .filter(|r| identity(r).as_ref() == Some(&id))
+            .filter_map(|r| f64_of(r, "ts"))
+            .filter(|t| (ts - t).abs() <= CONTEST_WINDOW_S)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if !contested.is_empty() {
+        if let Some(obj) = rec.as_object_mut() {
+            obj.insert("contested_with_ts".to_string(), serde_json::json!(contested));
+        }
+    }
+
+    append(path, &rec)?;
+    Ok(if contested.is_empty() { Booking::Booked } else { Booking::Contested(contested) })
+}
+
 /// Append one money record ATOMICALLY.
 ///
 /// One `write(2)` for the whole line. What this used to do — `writeln!(f,
@@ -578,5 +707,153 @@ mod tests {
         let e = append("/proc/trades.jsonl", &v(r#"{"status":"open"}"#))
             .expect_err("must not report success");
         assert!(e.contains("open /proc/trades.jsonl"), "{e}");
+    }
+
+    /// The 2026-07-30 Kuleba pair, byte-for-byte off the live ledger: the
+    /// Python hedger's record (position sides `yes`/`no`, Kalshi leg first, no
+    /// `source`) and this engine's (order sides `bid`/`ask`, PM-US leg first).
+    /// They are the two spellings `identity` has to see through.
+    fn kuleba_python() -> Value {
+        v(r#"{"ts":1785402005.539014,"relationship_id":"xvus-nobel-peace-26-mykolakuleba",
+            "title":"xvus-nobel-peace-26-mykolakuleba (naked-leg hedge)","qty":1,
+            "strategy":"take-take","status":"open","cost_usd":0.72,"profit_usd":0.28,
+            "legs":[{"venue":"kalshi","market_id":"KXNOBELPEACE-27-MKUL","side":"yes",
+                     "role":"taker","qty":1,"yes_price":"0.0800"},
+                    {"venue":"polymarket_us","market_id":"tac-nobel-peace-2026-10-09-mykkul",
+                     "side":"no","role":"taker","qty":1,"yes_price":"0.36"}]}"#)
+    }
+
+    fn kuleba_engine(ts: f64) -> Value {
+        let mut r = v(r#"{"relationship_id":"xvus-nobel-peace-26-mykolakuleba","qty":1,
+            "strategy":"take-take","status":"open","source":"arb-trader","fees_pending":true,
+            "legs":[{"venue":"polymarket_us","market_id":"tac-nobel-peace-2026-10-09-mykkul",
+                     "side":"ask","role":"taker","qty":1,"yes_price":"0.3600"},
+                    {"venue":"kalshi","market_id":"KXNOBELPEACE-27-MKUL","side":"bid",
+                     "role":"taker","qty":1,"yes_price":"0.0800"}]}"#);
+        r.as_object_mut().unwrap().insert("ts".into(), serde_json::json!(ts));
+        r
+    }
+
+    /// THE DEFECT. Two writers, two vocabularies, one relationship, 1.7s apart —
+    /// and `open_exposure` counted two baskets for a leg that had grown by one.
+    /// Matching on anything that includes leg SIDE or leg ORDER misses this.
+    #[test]
+    fn the_python_hedgers_spelling_of_the_same_basket_is_recognised() {
+        let dir = tmp("contested");
+        let p = dir.join("trades.jsonl");
+        let path = p.to_str().unwrap();
+        append(path, &kuleba_python()).expect("seed the other writer's record");
+
+        let out = append_basket(path, kuleba_engine(1785402003.8191998)).expect("book");
+        assert_eq!(
+            out,
+            Booking::Contested(vec![1785402005.539014]),
+            "the other author's booking must be named, not missed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A contested basket is STILL WRITTEN. On 2026-07-30 both fills were real —
+    /// the engine's own hedge and the Python hedger's IOC both traded when
+    /// Kalshi came back from `trading_is_paused` — so suppressing the second
+    /// record would have deleted a contract the account actually holds. The
+    /// record goes in, carries the pointer, and the caller alarms.
+    #[test]
+    fn a_contested_basket_is_written_and_still_counts_as_exposure() {
+        let dir = tmp("contested-written");
+        let p = dir.join("trades.jsonl");
+        let path = p.to_str().unwrap();
+        append(path, &kuleba_python()).expect("seed");
+        append_basket(path, kuleba_engine(1785402003.8191998)).expect("book");
+
+        let recs = read(path).expect("clean");
+        assert_eq!(recs.len(), 2, "nothing was suppressed");
+        let ours = recs.iter().find(|r| r["source"] == "arb-trader").expect("ours");
+        assert_eq!(
+            ours["contested_with_ts"],
+            serde_json::json!([1785402005.539014]),
+            "the record names what it may be a duplicate of"
+        );
+        assert_eq!(
+            open_exposure(recs).get("xvus-nobel-peace-26-mykolakuleba"),
+            Some(&2.0),
+            "both contracts stay visible to the caps until a human decides"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `(relationship_id, ts)` is what `corrects_ts` and `closes_ts` address a
+    /// basket by. Two records under one key make every future correction and
+    /// unwind ambiguous, so the second is refused outright.
+    #[test]
+    fn the_same_key_is_never_written_twice() {
+        let dir = tmp("samekey");
+        let p = dir.join("trades.jsonl");
+        let path = p.to_str().unwrap();
+        assert_eq!(append_basket(path, kuleba_engine(1.0)).unwrap(), Booking::Booked);
+        assert_eq!(append_basket(path, kuleba_engine(1.0)).unwrap(), Booking::AlreadyBooked);
+        assert_eq!(read(path).unwrap().len(), 1, "the replay wrote nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Our OWN earlier basket is not a contest. A hedge obligation can fill in
+    /// two parts and book twice, and the maker path books a fresh basket every
+    /// time a quote fills — flagging those would cry wolf on ordinary trading.
+    #[test]
+    fn our_own_earlier_basket_is_not_a_contest() {
+        let dir = tmp("ourown");
+        let p = dir.join("trades.jsonl");
+        let path = p.to_str().unwrap();
+        assert_eq!(append_basket(path, kuleba_engine(1.0)).unwrap(), Booking::Booked);
+        assert_eq!(append_basket(path, kuleba_engine(2.0)).unwrap(), Booking::Booked);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Different markets, and an older booking on the same markets, are both
+    /// ordinary. The window is one `arbbot-hedge.timer` period because that is
+    /// how long the two hedgers can be working the same leg unaware.
+    #[test]
+    fn a_different_basket_or_an_old_one_is_not_a_contest() {
+        let dir = tmp("nocontest");
+        let p = dir.join("trades.jsonl");
+        let path = p.to_str().unwrap();
+
+        let mut elsewhere = kuleba_python();
+        elsewhere.as_object_mut().unwrap().insert("relationship_id".into(), "other".into());
+        append(path, &elsewhere).expect("seed");
+        assert_eq!(
+            append_basket(path, kuleba_engine(1785402003.8191998)).unwrap(),
+            Booking::Booked,
+            "another relationship is another position"
+        );
+
+        let dir2 = tmp("nocontest-old");
+        let p2 = dir2.join("trades.jsonl");
+        let path2 = p2.to_str().unwrap();
+        append(path2, &kuleba_python()).expect("seed");
+        assert_eq!(
+            append_basket(path2, kuleba_engine(1785402005.539014 + CONTEST_WINDOW_S + 1.0))
+                .unwrap(),
+            Booking::Booked,
+            "past the window it is a second trade, not a double-book"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// The duplicate check must FAIL OPEN. By the time `book_basket` is called
+    /// both legs have filled and the money is spent, so refusing to write it
+    /// because some unrelated line is torn would lose the basket outright —
+    /// which is the one outcome worse than booking it twice.
+    #[test]
+    fn a_torn_line_elsewhere_does_not_block_the_book() {
+        let dir = tmp("failopen");
+        let p = dir.join("trades.jsonl");
+        let path = p.to_str().unwrap();
+        std::fs::write(&p, "{\"status\":\"open\",\"relationship_id\"\n").unwrap();
+        assert_eq!(append_basket(path, kuleba_engine(1.0)).unwrap(), Booking::Booked);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text.lines().count(), 2, "the basket was written: {text:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
