@@ -25,13 +25,20 @@
 # at startup instead of trusting this line. The shadow can't — it holds no
 # credentials, which is why the flag exists at all.
 #
-# It subscribes to the PYTHON recorder's socket (data/arbbot.sock) — the Rust
-# shadow recorder is not running, and both speak the same line-JSON protocol,
-# which is what the P1 parity work established. Point --socket at
-# data/arbbot-rs.sock instead if the Rust recorder is brought back up.
+# It subscribes to data/arbbot.sock, which since 2026-07-31 is served by
+# `arb-recorder` — the Python recorder is retired. The socket path did not
+# change, which is why this unit did not either.
 #
 # The recorder fans out to any number of subscribers and drops slow ones, so
 # adding this costs the live stack nothing.
+#
+# --marks-out writes data/exec/marks-rs.json, the SHADOW of the file
+# arbbot-marks.timer writes at data/exec/marks.json every 2 minutes. It is here
+# and not on the armed engine deliberately: marks is a pure read of the ledger
+# plus the book, so a shadow producing it costs nothing and proves parity
+# against the writer being retired without putting the armed engine's re-mark
+# loop on trial at the same time. Retiring arbbot-marks.timer means moving this
+# flag to the armed unit and pointing it at data/exec/marks.json.
 
 [Unit]
 Description=arbbot Rust dry-run engine (intents only, no order path)
@@ -49,6 +56,7 @@ ExecStart=%h/claude/arbbot/rust/target/release/arb-trader \
     --balance kalshi=340.09 \
     --balance polymarket_us=349.42 \
     --out data/trader-rs/intents.jsonl \
+    --marks-out data/exec/marks-rs.json \
     --stats-every 300
 Restart=always
 RestartSec=5
