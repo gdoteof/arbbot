@@ -128,10 +128,10 @@ pub enum CancelBy {
 /// keeps a bare word that happens to start with `t` from reading as ours.
 pub fn is_ours(client_order_id: &str) -> bool {
     // `continue`, not `return`, on a prefix that matches but whose tail is not a
-    // counter. With today's six prefixes no id can reach a second arm, but
+    // counter. With today's seven prefixes no id can reach a second arm, but
     // `t` shadows any future `take-…` and the bug would be a SILENTLY NARROWER
     // sweep — the exact class this function exists to prevent.
-    for p in ["m", "h", "t", "n", "rehearse-", "sweep-"] {
+    for p in ["m", "h", "t", "n", "x", "rehearse-", "sweep-"] {
         if let Some(n) = client_order_id.strip_prefix(p) {
             if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
                 return true;

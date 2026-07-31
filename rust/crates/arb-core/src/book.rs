@@ -111,6 +111,22 @@ impl BookBuilder {
         self.books.get(&(venue, market_id.to_owned()))
     }
 
+    /// Every PM-US market this builder holds a book for, with its best YES ASK.
+    ///
+    /// The ONE price read `crate::maker_exit` has for the leg it closes: PM-US's
+    /// gateway has no `market_quote`, so the engine's own subscription is the
+    /// only PM-US book in the process. A market with an EMPTY ask side is
+    /// omitted rather than reported at zero — "no ask" and "an ask at zero" are
+    /// the mistake `arb_venue::gateway::Quote` documents on the other venue, and
+    /// a close priced at zero would read as free.
+    pub fn pm_us_asks(&self) -> Vec<(String, String)> {
+        self.books
+            .iter()
+            .filter(|((v, _), _)| *v == Venue::PolymarketUs)
+            .filter_map(|((_, m), b)| b.asks.first().map(|l| (m.clone(), l.price.clone())))
+            .collect()
+    }
+
     pub fn remove(&mut self, venue: Venue, market_id: &str) {
         self.books.remove(&(venue, market_id.to_owned()));
     }
