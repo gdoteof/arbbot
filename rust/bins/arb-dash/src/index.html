@@ -56,6 +56,9 @@
 
   /* --- now view --------------------------------------------------------- */
   .rowflex{display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start}
+  .banner{border:1px solid var(--warn);color:var(--warn);border-radius:6px;
+    padding:9px 12px;margin-bottom:12px;font-size:12px;line-height:1.6}
+  .banner code{color:inherit}
   .stat{min-width:96px}
   .bar{height:7px;background:var(--line);border-radius:99px;overflow:hidden}
   .bar i{display:block;height:100%;background:var(--ok);border-radius:99px}
@@ -1130,12 +1133,23 @@ function capBar(used, limit){
 }
 
 function nowHead(d){
-  const e = d.engine, w = d.window;
+  const e = d.engine, w = d.window, stale = d.stale_config || [];
+  /* The one banner on this page. A cap edited since the engine started is a
+     cap this dashboard reads and the engine does not enforce, and every
+     number below would otherwise be read as the one refusing orders. */
+  const warn = stale.length ? `<div class="banner">
+    <b>The engine is not using these files.</b> ${stale.map(c =>
+      `<code>${esc(c.path)}</code> changed ${dur(c.changed_ago_s)} ago; the engine
+       has been up ${dur(c.engine_up_s)} and reads it only at startup`).join('; ')}.
+    Budgets and caps shown below are what is ON DISK — the gates are still
+    refusing against the values loaded at launch. A restart is what closes the gap.
+  </div>` : '';
   const chip = !e.running ? '<span class="badge bad">NOT RUNNING</span>'
     : e.armed ? '<span class="badge ok">ARMED</span>'
               : '<span class="badge warn">DRY-RUN</span>';
   return $(`<section class="wide">
     <h2>Right now</h2>
+    ${warn}
     <div class="rowflex">
       <div class="stat"><div class="big ${w.places?'ok':'dim'}">${w.places}</div>
         <div class="sub">orders placed<br>in the last ${dur(w.seconds)}</div></div>

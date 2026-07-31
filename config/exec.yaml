@@ -2,4 +2,25 @@
 # consumed by the trader runner (RiskConfig bankroll) and the unwind executor
 # (class budget = bankroll_usd * per_class_cap).
 bankroll_usd: 980
-per_class_cap: 0.35
+# 0.35 -> 0.50 (Geoff, 2026-07-31). Class cap $343 -> $490.
+#
+# Read what this does before moving it again: $490 is EXACTLY the global cap
+# (`GLOBAL_CAP` is a hardcoded 0.50 in arb-trader/src/risk.rs, times the same
+# bankroll). At 0.50 the class dimension therefore stops being a separate
+# constraint — a single class can now run the whole book up to the whole-book
+# ceiling, and `class cap` can never fire before `global cap` does. That is a
+# structural change, not just a bigger number, and it is only benign while
+# essentially one class is in use (every live relationship is type `rel`).
+#
+# What it does NOT reach, measured at the time of the change:
+#   * the maker APR hurdle and the unwind hurdle both divide by the GLOBAL cap
+#     (`RiskView::utilization`), not this one — unmoved.
+#   * the low-utilisation gate divides by THIS cap (`arb_core::risk`), so
+#     util falls 0.85 -> 0.59. Still above the 0.5 gate, so `other` stays shut;
+#     it would take ~0.60 here to open it.
+#   * per-topic budgets are absolute dollars in topics.yaml — untouched, and
+#     `time-poty-26` at $150 was the gate firing most (4,103 refusals in 6h).
+#
+# Read ONCE, at `RiskView::load` (arb-trader/src/main.rs). A running engine
+# keeps the old value until it is restarted; the Now view flags that gap.
+per_class_cap: 0.50
