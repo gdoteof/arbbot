@@ -27,23 +27,33 @@ Consumers (scanner daemon, Python trader, dash freshness) just follow the
 socket; tape consumers are already format-gated by `--parse-check`
 (byte-identity) and the daily shadow gate.
 
-- Gate: 7 consecutive green shadow-gate days; gap counter <= Python's over
-  the same window; subscriber stability post-broadcaster-fix (zero
-  unexplained disconnects); parse-check PASS on every day in the window.
-  The gate is now `arb-shadow-gate` (`systemd/arbbot-shadow-gate.{service,
+- Gate: **one** green `arb-shadow-gate` run on the image being promoted; gap
+  counter <= Python's; subscriber stability post-broadcaster-fix (zero
+  unexplained disconnects); parse-check PASS over the window the gate reads.
+  The gate is `arb-shadow-gate` (`systemd/arbbot-shadow-gate.{service,
   timer}`). It checks subscriber stability by ATTACHING a subscriber, because
   the recorder hang of 2026-07-29 only ever appeared under CPU contention and
-  a tape diff would have been green through it. Two of the four clauses above
-  it does NOT check, and no amount of green runs should be read as covering
-  them: **"7 consecutive days"** is a manual grep in §1 of the runbook, since
-  the binary judges one day and knows nothing about any other run; and
-  **"parse-check PASS on every day"** is only partly covered — the gate
-  decodes a byte-bounded trailing slice of the CURRENT day (~1% of a 6 GB
-  tape) and never invokes `arb-recorder --parse-check`. The "gap counter <=
-  Python's" clause is not checkable as written: the two recorders' sequence
-  numbers do not measure the same thing (Rust synthesizes a +1 per-market
-  counter, Python's Kalshi tape carries the raw per-subscription wire seq), so
-  the gate requires the Rust tape's own count to be ZERO instead.
+  a tape diff would have been green through it.
+
+  **The "7 consecutive green days" clause was REMOVED on Geoff's call
+  2026-07-31.** It had never been satisfied — and, more to the point, never
+  could be by the machinery that existed: the clause was a manual grep in §1
+  of the runbook (the binary judges one day and knows nothing about any other
+  run), the gate that was supposed to feed it had been an uninstalled unit
+  emitting a 153-byte missing-file error since 2026-07-24, and the one run
+  that ever produced a verdict said FAIL. A week of green days is only
+  evidence if something is actually collecting them; what it bought in
+  practice was an indefinite hold. One green run against the promotion image
+  plus a two-minute rollback is the trade being made instead.
+
+  Still NOT checked, and one green run does not cover it any more than seven
+  would have: **"parse-check PASS"** is only partly covered — the gate decodes
+  a byte-bounded trailing slice of the CURRENT day (~1% of a 6 GB tape) and
+  never invokes `arb-recorder --parse-check`. The "gap counter <= Python's"
+  clause is not checkable as written: the two recorders' sequence numbers do
+  not measure the same thing (Rust synthesizes a +1 per-market counter,
+  Python's Kalshi tape carries the raw per-subscription wire seq), so the gate
+  requires the Rust tape's own count to be ZERO instead.
 - Risk: none to positions (read-only key; no order code path in binary).
 - Rollback: **not a unit swap.** The flip is two flags on the armed engine
   (`--socket`, `--health`) and both recorders keep running, so rollback is
@@ -114,7 +124,7 @@ a6ad626d) has produced the pinned accounting-parity digest.
 
 | First... | What | When |
 |---|---|---|
-| Python replaced | recorder (M1) | after 7 green gate days |
+| Python replaced | recorder (M1) | after one green gate run on the promotion image |
 | Rust touches an order | arb-order smoke, 1 contract post-only, immediately cancelled (M2) | after quirk tests land |
 | Rust trades with money | one-rel vertical slice at probe caps (M3) | after P4 build + rehearsal |
 | Python trader gone | M5 | when config says universe is empty |

@@ -1,11 +1,18 @@
 # M1 recorder cutover — runbook
 
-The exact sequence for moving the armed engine's market-data feed from the
-Python recorder to the Rust one, what to watch afterwards, and how to get back.
+The exact sequence for making the Rust recorder authoritative, retiring the
+Python one, what to watch afterwards, and how to get back.
 
-**This is a REPOINT, not a port.** Nothing is installed, ported or rewritten.
-Both recorders already run; the only thing that changes is which socket the
-consumers read. Proved by peer inode on 2026-07-29:
+**Scope changed on Geoff's call 2026-07-31.** This document used to describe a
+two-flag REPOINT of the armed engine with both recorders left running for a
+soak week. It now describes the **full authority swap**: `arb-recorder` takes
+the canonical paths and `arbbot-recorder.service` stops. The soak week went
+with the seven-green-days clause (see §1) — what replaces it is one green gate
+run against the promotion image and a rollback measured in minutes.
+
+**Still not a port.** Nothing is rewritten. Both recorders already run; what
+changes is which binary owns `data/arbbot.sock`, `data/health.jsonl` and
+`data/raw`. Peer inodes on 2026-07-29, before any of this:
 
 | socket | LISTEN | connected peers |
 |---|---|---|
@@ -20,44 +27,61 @@ until the gate in this runbook attached to it.
 
 ## 0. What flips, and what deliberately does not
 
-`docs/migration-plan.md` M1 is a **role swap, both recorders keep running** for
-a week. That is what this runbook does.
+**Nothing that reads the feed is edited.** That is the whole trick, and it is
+why the earlier two-flag repoint has been abandoned in favour of this: every
+consumer already names the canonical paths, so moving the *producer* onto them
+carries all of them across at once, with no per-consumer edit and no config key
+to argue about.
 
-FLIPS — the armed engine, `arbbot-trader-m3.service`:
+FLIPS — `arbbot-recorder.service` stops running Python and starts running
+`arb-recorder`, on the paths it already advertises:
 
-* `--socket data/arbbot.sock` → `data/arbbot-rs.sock`
-* `--health data/health.jsonl` → `data/health-rs.jsonl`
+* `--data-dir data/raw` (was `data/raw-rs`)
+* `--socket data/arbbot.sock` (was `data/arbbot-rs.sock`)
+* `--health data/health.jsonl` (was `data/health-rs.jsonl`)
+* `--shadow` comes OFF — it suppresses ntfy (`main.rs:166`), which is correct
+  for a shadow and wrong for the production recorder.
 
-**Both flags, or neither.** `--health` is easy to miss and is not cosmetic: it
-is the file the engine reads `stale` from, and `[engine] FEED STALE — quotes
-pulled` is driven by it. Repointing only `--socket` leaves the engine judging
-the freshness of a feed it is no longer consuming — it would pull quotes for a
-Python outage it cannot see and stay quoting through a Rust one. The two files
-are format-identical and carry the same three feed names (`kalshi-ws`,
-`polymarket-ws`, `polymarket_us-ws`), verified 2026-07-29.
+The unit that flips is **`arbbot-recorder.service`**, not
+`arbbot-recorder-rs.service`, and the choice is load-bearing: both trader units
+carry `After=arbbot-recorder.service` / `Wants=arbbot-recorder.service`.
+Promoting the `-rs` unit instead would leave the armed engine ordered against a
+dead unit. `arbbot-recorder-rs.service` is stopped and disabled by the same
+operation.
 
-DOES NOT FLIP:
+DOES NOT FLIP — and needs no edit, which is the point:
 
 * **`arbbot-scanner.service`.** `arbbot.scan.daemon` takes only `--config`; its
-  socket is `cfg.socket_path` from `config/recorder.yaml`. That same key is
-  what the PYTHON recorder BINDS, so editing it to move the scanner would move
-  the Python recorder's socket out from under everything else at the same
-  time. There is no per-process override. The scanner therefore stays on the
-  Python socket, which is fine and is what M1 already says — **and it is the
-  reason the Python recorder cannot be stopped at M1.** It also cannot be
-  changed without editing Python, which is frozen.
-* `arbbot-trader-rs.service` (the wide 40-relationship dry-run). Leave it on the
-  Python socket for the soak week: with the armed engine on Rust and the shadow
-  on Python, any divergence shows up as a difference between two live processes
-  instead of having to be reasoned about.
-* `arbbot-dash.service`, `arbbot-marks.timer`, `arbbot-settle.timer`,
-  `arbbot-hedge.timer`. None of them read the socket.
+  socket is `cfg.socket_path` from `config/recorder.yaml` — `data/arbbot.sock`.
+  Under the old repoint plan that key was the blocker, because it is also what
+  the Python recorder BINDS, so it could not be moved without moving the
+  recorder out from under everything else. Swapping the producer instead makes
+  that constraint evaporate: the key keeps its value, the scanner keeps its
+  line, and it reconnects to Rust without a Python edit. It was the stated
+  reason the Python recorder "cannot be stopped at M1"; it is not one any more.
+* `arbbot-trader-m3.service` (armed) and `arbbot-trader-rs.service`. Both
+  already say `--socket data/arbbot.sock --health data/health.jsonl`. They
+  follow.
+* Tape consumers. `data/raw` keeps its name and its files — `arb-tape`'s writer
+  opens `create(true).append(true)` (`writer.rs:30`), as does the health writer
+  (`health.rs:98`), so the day's Python tape is appended to, never truncated.
+* `arbbot-dash.service`, `arbbot-marks.timer`, `arbbot-settle.timer`. None of
+  them read the socket.
 
-LATER, AND NOT PART OF M1 — the full authority swap. When the Python recorder
-finally retires, the clean shape is to give `arb-recorder` the canonical paths
-(`--socket data/arbbot.sock --health data/health.jsonl --data-dir data/raw`)
-and change nothing else: the scanner, the config and every tape consumer follow
-without edits. Do not do this at M1; it removes the rollback target.
+**The health-file feed sets must match before the swap, and for two weeks they
+did not.** `record_polymarket_intl: false` (Geoff, 2026-07-31) was a
+Python-only key — `src/arbbot/ops/config.py:40`, nothing in `rust/` — so Python
+published two feeds and Rust three. Left alone that would have resumed INTL
+recording the moment `--shadow` came off, restoring the ntfy storm the key was
+set to stop (58 of 64 alerts in 6h). `arb-recorder` now honours the key, with
+Python's absent-not-stale semantics. Verify, do not assume:
+
+```bash
+for f in data/health.jsonl data/health-rs.jsonl; do
+    printf '%s ' "$f"
+    tail -1 "$f" | python3 -c "import sys,json;print(sorted(json.load(sys.stdin)['stale']))"
+done   # the two lists must be identical
+```
 
 ---
 
@@ -86,9 +110,10 @@ ls -l /proc/$(pgrep -f 'arb-recorder --config')/exe   # must NOT say "(deleted)"
 systemctl --user restart arbbot-recorder-rs.service   # if it does
 ```
 
-A restart resets the shadow's soak clock. **The 7 green days have to be seven
-green days of the image you intend to cut over to**, not of whatever was
-running when the evidence was gathered.
+A restart used to reset a soak clock. There is no soak clock any more — but the
+weaker claim that replaces it is the same one that mattered: **the green run
+has to be a green run of the image you intend to cut over to**, not of whatever
+was running when the evidence was gathered.
 
 ```bash
 cd ~/claude/arbbot
@@ -103,11 +128,7 @@ nice -n 19 rust/target/release/arb-shadow-gate \
     --window-s 900 --live-s 120 --load 6
 # last line must read: SHADOW GATE: PASS
 
-# 2. seven consecutive green days of it (migration-plan.md M1).
-#    THIS GREP IS THE ONLY THING THAT CHECKS THAT CLAUSE. The binary judges one
-#    day and knows nothing about any other run, so consecutiveness is checked
-#    here or nowhere. Read the FILENAMES, not just the verdicts: seven PASS
-#    lines can be seven runs in one afternoon.
+# 2. read the history anyway — one run is the GATE, not the whole picture.
 #    `shopt -s nullglob` so that a run before any report exists prints nothing
 #    instead of handing grep the literal string `data/reports/shadow-gate-*.txt`
 #    — which reads as "no such file", not as "no gate has ever run".
@@ -117,6 +138,27 @@ for f in data/reports/shadow-gate-*.txt; do
 done | tail -10
 shopt -u nullglob
 ```
+
+**The "7 consecutive green days" clause was removed on Geoff's call
+2026-07-31**, and the loop above is what used to enforce it. Keep reading the
+history: it is still the only place a run that was killed, or never fired at
+all, is visible. What it must no longer do is gate the flip.
+
+The clause is worth a paragraph rather than a silent deletion, because the way
+it failed is a pattern this stack has hit twice. It was never satisfied and,
+with the machinery that existed, never could be: the gate feeding it had been
+an **uninstalled unit** — `systemctl --user list-unit-files 'arbbot-shadow*'`
+returned nothing while `systemd/arbbot-shadow-gate.{service,timer}` sat in the
+repo — writing a 153-byte `can't open file` into `data/reports/` daily and
+exiting 0, from 2026-07-24 until it stopped running entirely on 07-26. The one
+run that ever printed a verdict, 2026-07-23, said FAIL, on a parse bug
+(`c292f04`) fixed six days ago. So the clause was not holding a bar; it was
+holding a door, and nothing was ever going to open it. A week of green days is
+only evidence if something is collecting them.
+
+One green run against the promotion image, plus §4's rollback, is the trade
+being made instead. It is a smaller amount of evidence and it is being taken
+knowingly.
 
 Each report may hold several runs (the unit appends), so the LAST `SHADOW GATE:`
 line in a file is that file's verdict — which is what the loop prints. Four
@@ -140,9 +182,15 @@ instruction to loop.
 
 ```bash
 # 3. nothing in flight. An unhedged leg across a feed change is the one thing
-#    that turns a clean restart into a position problem.
+#    that turns a clean restart into a position problem. `hedges_undischarged`
+#    in the 60s stats line is the number that counts; the log grep is a
+#    cross-check, not the source.
 journalctl --user -u arbbot-trader-m3.service -n 200 --no-pager | grep -i undischarged
-systemctl --user list-timers arbbot-hedge.timer
+#    arbbot-hedge.timer was RETIRED 2026-07-31 (PR #56 ef302ca); naked-leg
+#    completion is --positions-recon-act inside the engine, so there is no
+#    second owner to interlock with any more. Left as a check that it has not
+#    been re-enabled, which would be a double hedge, not a backup.
+systemctl --user is-enabled arbbot-hedge.timer    # must say: disabled
 
 # 4. the Rust recorder is healthy and has been up long enough to have books
 systemctl --user status arbbot-recorder-rs.service --no-pager | head -5
@@ -160,33 +208,72 @@ Do it during a quiet window. The engine holds no quotes while it is down.
 
 ---
 
-## 2. The flip
+## 2. The swap
 
-The armed engine's arming lives in a drop-in that is deliberately **not** in the
-repo: `~/.config/systemd/user/arbbot-trader-m3.service.d/arm.conf`. That file's
-`ExecStart=` is the lever.
+**Order matters, and it is not the obvious one.** The armed engine comes down
+FIRST and goes up LAST. Between those two points the socket disappears and
+comes back owned by a different process — which the engine's reconnect loop
+would survive, but surviving it means flapping quotes across a window where
+neither recorder is authoritative. Taking it down cleanly instead costs one
+verified venue sweep and makes the whole middle section unobserved-by-anything.
 
 ```bash
-# 1. edit the drop-in: change the two flags, nothing else
-#      --socket data/arbbot.sock      ->  --socket data/arbbot-rs.sock
-#      --health data/health.jsonl     ->  --health data/health-rs.jsonl
-$EDITOR ~/.config/systemd/user/arbbot-trader-m3.service.d/arm.conf
-systemctl --user daemon-reload
-
-# 2. stop, and WATCH IT PROVE THE BOOK CLEAN before it exits.
+# 1. ARMED ENGINE DOWN, and watch it prove the book clean before it exits.
 #    SIGTERM cancels every venue and polls the resting list; `stop` is the
 #    right way (corrected 2026-07-28 — the old touch-data/KILL-first advice
 #    was the worse path).
 systemctl --user stop arbbot-trader-m3.service
 journalctl --user -u arbbot-trader-m3.service -n 20 --no-pager | grep -i 'clean at exit'
 
-# 3. start it on the new feed
+# 2. RUN THE GATE NOW, at full load. This is the window in which `--load 6` is
+#    free: the six CPU burners exist to prove the recorder does not shed a
+#    subscriber under contention, and with the engine down there is no live
+#    feed for them to starve. Outside this window, drop to --load 0.
+nice -n 19 rust/target/release/arb-shadow-gate \
+    --py-dir data/raw --rs-dir data/raw-rs --socket data/arbbot-rs.sock \
+    --window-s 900 --live-s 120 --load 6
+# SHADOW GATE: PASS, or stop here.
+
+# 3. PYTHON RECORDER DOWN, and disabled so a reboot cannot bring it back to
+#    fight for the socket.
+systemctl --user stop arbbot-recorder.service
+systemctl --user disable arbbot-recorder.service
+ss -x -p | grep arbbot.sock    # must be empty: the socket is now unowned
+
+# 4. SHADOW DOWN. It is about to be replaced by the promoted unit, and two
+#    arb-recorder processes on one PM-US key is the contention the shadow unit
+#    header warns about.
+systemctl --user stop arbbot-recorder-rs.service
+systemctl --user disable arbbot-recorder-rs.service
+
+# 5. PROMOTE. arbbot-recorder.service now runs arb-recorder on the canonical
+#    paths, with --shadow removed so ntfy is live again.
+cp systemd/arbbot-recorder.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now arbbot-recorder.service
+journalctl --user -u arbbot-recorder.service -n 15 --no-pager
+
+# 6. PROVE IT OWNS THE SOCKET before anything subscribes to it.
+ss -xlp | grep arbbot.sock     # LISTEN, users:(("arb-recorder",...))
+
+# 7. RECONNECT THE READ-ONLY CONSUMERS FIRST. They are the cheap canary: if
+#    the socket is wrong, find out on the scanner, not on the armed engine.
+systemctl --user restart arbbot-scanner.service arbbot-trader-rs.service
+journalctl --user -u arbbot-recorder.service -n 5 --no-pager | grep subscribers
+
+# 8. ARMED ENGINE UP, last.
 systemctl --user start arbbot-trader-m3.service
 journalctl --user -u arbbot-trader-m3.service -f
 ```
 
-`Restart=no` is on purpose: if it dies, read why before it starts cancelling
-and re-quoting.
+`Restart=no` on the engine is on purpose: if it dies, read why before it starts
+cancelling and re-quoting.
+
+**Do not skip step 4.** `arbbot-recorder-rs.service` and the promoted
+`arbbot-recorder.service` are the same binary reading the same PM-US key. The
+`-rs` unit's own header is explicit that a second WS session on a shared key is
+the contention to avoid; after the swap the `rs` credential suffix has nothing
+left to isolate it from.
 
 ---
 
@@ -201,7 +288,7 @@ After the flip, **only the `[feed]` line may differ.**
 [risk] seeded 346 open contracts across 10 relationships from data/exec/trades.jsonl
 [apr] maker hurdle 16.00%/yr = 4 + 12*util at util 1.000, holds measured from ...
 arb-trader up: 16 quoters, 32 markets, mode=shadow
-[feed] connected data/arbbot-rs.sock          <-- THE ONE LINE THAT CHANGES
+[feed] connected data/arbbot.sock             <-- UNCHANGED. That is the point.
 [exec] ORDERS ARMED — this process can place real orders
 [exec] PolymarketUs: book is clean
 [exec] Kalshi: book is clean
@@ -210,11 +297,17 @@ arb-trader up: 16 quoters, 32 markets, mode=shadow
 [engine] feeds healthy — quoting resumes
 ```
 
+**Under the swap, NO line above should differ — including the `[feed]` one.**
+The engine's flags never changed; the process on the other end of the socket
+did. That makes the banner a weaker check than it was under the repoint, where
+a wrong socket was visible in the log. The replacement check is §2 step 6:
+prove `arb-recorder` owns `data/arbbot.sock` *before* the engine subscribes.
+Read the banner for the things below, and read `ss -xlp` for the identity.
+
 Check, in this order:
 
-1. **`[feed] connected data/arbbot-rs.sock`.** If it says `arbbot.sock`, the
-   drop-in edit did not take — `daemon-reload` was skipped, or the edit went
-   into the tracked unit rather than the drop-in, which the drop-in overrides.
+1. **`[feed] connected data/arbbot.sock`.** Same string as before the stop. If
+   it is missing entirely, nothing is bound — go back to §2 step 6.
 2. **`16 quoters, 32 markets`.** This comes from the registry and the tradable
    allowlist, not from the feed, so it must be **identical**. A different number
    means something other than the feed changed.
@@ -224,10 +317,12 @@ Check, in this order:
    first, then `Kalshi`. A missing one is a sweep that did not complete, and
    the engine is then quoting over a book it has not proven empty.
 5. **`[engine] feeds healthy — quoting resumes`, within ~10s.** This is the
-   line that says the new welcome burst landed and the new health file is
-   being read. If it never comes, or `FEED STALE` repeats, `--health` is
-   pointing at the wrong file — that is the failure this flip is most likely to
-   produce.
+   line that says the welcome burst landed and `data/health.jsonl` is being
+   written by its new owner. If it never comes, or `FEED STALE` repeats, the
+   promoted recorder is not writing the health file — check that `--health`
+   in the promoted unit says `data/health.jsonl` and not `data/health-rs.jsonl`.
+   That is the failure this swap is most likely to produce, and unlike the old
+   repoint it is invisible in the engine's own banner.
 6. **`[risk] seeded 346 open contracts`** — from `data/exec/trades.jsonl`,
    nothing to do with the feed. It must match what it said before the stop.
 
@@ -237,39 +332,58 @@ Then, for the first hour:
 # the stats line every 60s: gaps and staleness are the feed's report card
 journalctl --user -u arbbot-trader-m3.service -f | grep -E 'FEED STALE|feeds healthy|subscription ended|EOF'
 # and from the other side — the ONLY place an eviction is announced
-journalctl --user -u arbbot-recorder-rs.service -f | grep -E 'DROPPED subscriber|hb'
+journalctl --user -u arbbot-recorder.service -f | grep -E 'DROPPED subscriber|hb'
 ```
 
-`[hb] gaps=N subscribers=1` on the recorder is the confirmation that it now has
-a consumer. It read `subscribers=0` for the whole of its life before this.
+`[hb] gaps=N subscribers=3` on the recorder is the confirmation that it has its
+consumers: armed trader, dry-run trader, scanner. It read `subscribers=0` for
+the whole of its life as a shadow, so this number going from 0 to 3 is the
+single clearest signal the swap took.
 
 ---
 
 ## 4. Rollback
 
-**Time to restore: one edit, `daemon-reload`, stop, start — under two minutes,
-and the two minutes are almost entirely the venue sweeps at stop and start.**
-The Python recorder never stopped, its socket never closed, and `data/raw` kept
-being written throughout, so there is nothing to catch up and no hole to
-backfill.
+**This is the part that got more expensive, and it is the price of the swap.**
+Under the old repoint the Python recorder never stopped and rollback was two
+flags. Now Python is stopped, so rollback is a restart of it — call it three to
+four minutes, still almost all of it venue sweeps.
+
+What has NOT changed is that nothing is destroyed. `git checkout` restores the
+Python unit; the venv, the code and `config/recorder.yaml` are untouched; and
+`data/raw` is append-only under both writers, so the tape has a seam at the
+swap, not a hole. Nothing needs backfilling.
 
 ```bash
-$EDITOR ~/.config/systemd/user/arbbot-trader-m3.service.d/arm.conf   # both flags back
-systemctl --user daemon-reload
 systemctl --user stop  arbbot-trader-m3.service    # proves the book clean on the way out
+systemctl --user stop  arbbot-recorder.service     # release data/arbbot.sock
+
+# put the Python unit back and start it
+git -C ~/claude/arbbot checkout systemd/arbbot-recorder.service
+cp ~/claude/arbbot/systemd/arbbot-recorder.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now arbbot-recorder.service
+ss -xlp | grep arbbot.sock                        # users:(("python",...))
+
+systemctl --user restart arbbot-scanner.service arbbot-trader-rs.service
 systemctl --user start arbbot-trader-m3.service
 journalctl --user -u arbbot-trader-m3.service -n 30 --no-pager | grep -E 'feed. connected|book is clean|feeds healthy'
 ```
 
 Roll back on any of:
 
-* an eviction notice on the recorder's journal (`DROPPED subscriber #N`) — the
-  engine has just had every resting quote pulled and is reconnecting;
+* an eviction notice on the recorder's journal (`DROPPED subscriber #N`) — a
+  subscriber has just had every resting quote pulled and is reconnecting;
 * `FEED STALE` that does not clear within ~30s, or that does not correspond to
-  a real venue outage in `data/health-rs.jsonl`;
+  a real venue outage in `data/health.jsonl`;
 * gap counters climbing in the 60s stats line where they were flat before;
 * the recorder restarting for any reason (`Restart=always` means it will come
-  back, but the engine's feed dies with it).
+  back, but every subscriber's feed dies with it).
+
+**Rolling back is not free of its own risk:** `arbbot-recorder.service` is now
+the name of a *Rust* unit, so a rollback that forgets the `git checkout` will
+"restart the recorder" straight back into the thing being rolled back. Check
+`ss -xlp` says `python`, not `arb-recorder`, before believing the rollback took.
 
 **Do not roll back by stopping the Rust recorder.** That closes the socket
 under the armed engine. Move the engine first; the recorder can be dealt with

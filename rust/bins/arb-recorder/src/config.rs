@@ -18,10 +18,19 @@ pub struct RecorderConfig {
     pub ntfy_topic: String,
     #[serde(default)]
     pub polymarket_us_tags: Vec<String>,
+    /// Defaults to TRUE, matching `record_polymarket_intl: bool = True` in
+    /// ops/config.py — a recorder.yaml that predates the key must keep
+    /// recording INTL, not silently stop.
+    #[serde(default = "default_record_polymarket_intl")]
+    pub record_polymarket_intl: bool,
 }
 
 fn default_poll_interval() -> f64 {
     5.0
+}
+
+fn default_record_polymarket_intl() -> bool {
+    true
 }
 
 pub fn load_recorder_config(path: &str) -> Result<RecorderConfig> {
@@ -92,4 +101,46 @@ pub fn load_credential(name: &str) -> Option<Vec<u8>> {
 
 pub fn load_credential_str(name: &str) -> Option<String> {
     load_credential(name).map(|b| String::from_utf8_lossy(&b).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MINIMAL: &str = "registry_path: config/registry.yaml\n\
+                           data_dir: data/raw\n\
+                           health_path: data/health.jsonl\n\
+                           socket_path: data/arbbot.sock\n";
+
+    /// The default is the whole safety property: a recorder.yaml written
+    /// before the key existed must keep recording INTL. Defaulting to false
+    /// would silently drop a venue on every config that has not been updated.
+    #[test]
+    fn record_polymarket_intl_defaults_to_true_when_absent() {
+        let cfg: RecorderConfig = serde_yaml::from_str(MINIMAL).expect("parse");
+        assert!(
+            cfg.record_polymarket_intl,
+            "absent key must mean ON, matching ops/config.py's `bool = True`"
+        );
+    }
+
+    #[test]
+    fn record_polymarket_intl_false_is_honored() {
+        let text = format!("{MINIMAL}record_polymarket_intl: false\n");
+        let cfg: RecorderConfig = serde_yaml::from_str(&text).expect("parse");
+        assert!(!cfg.record_polymarket_intl);
+    }
+
+    /// The live config/recorder.yaml is the file this binary is promoted
+    /// against; if it stops parsing, the recorder does not start.
+    #[test]
+    fn live_recorder_yaml_parses_and_has_intl_off() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../config/recorder.yaml");
+        let cfg = load_recorder_config(path).expect("live recorder.yaml parses");
+        assert!(
+            !cfg.record_polymarket_intl,
+            "INTL was turned off on Geoff's call 2026-07-31; if this flips back \
+             on, the promoted recorder resumes the ntfy alert storm"
+        );
+    }
 }
