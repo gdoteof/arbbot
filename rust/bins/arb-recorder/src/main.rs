@@ -212,6 +212,32 @@ async fn main() -> Result<()> {
             Err(e) => eprintln!("[recorder] pmus catalog failed at startup: {e:#}"),
         }
     }
+    // A REGISTRY market is subscribed whether or not the tag listing returns
+    // it — see `Universe::pmus_slugs` for the four days that cost. These carry
+    // no catalog metadata (PM-US has no by-slug metadata endpoint, which is why
+    // the universe is tag-driven at all), so they are exempt from
+    // close-eviction: a closed one keeps a frozen book. That is the bounded
+    // cost, and it is cheaper than not recording a market we hold.
+    {
+        let known: std::collections::HashSet<&str> =
+            pmus_slugs.iter().map(String::as_str).collect();
+        let untagged: Vec<String> = universe
+            .pmus_slugs
+            .iter()
+            .filter(|s| !known.contains(s.as_str()))
+            .cloned()
+            .collect();
+        if !untagged.is_empty() {
+            println!(
+                "polymarket_us: +{} registry market(s) the tag listing did not return, \
+                 subscribed anyway (no metadata, so they are exempt from close-eviction): {}{}",
+                untagged.len(),
+                untagged.iter().take(6).cloned().collect::<Vec<_>>().join(", "),
+                if untagged.len() > 6 { " …" } else { "" }
+            );
+            pmus_slugs.extend(untagged);
+        }
+    }
 
     let mut tasks = Vec::new();
 
@@ -320,6 +346,7 @@ async fn main() -> Result<()> {
                     liveness.clone(),
                     pmus_slugs.clone(),
                     signer,
+                    pmus_catalog.clone(),
                 )));
             }
             _ => {

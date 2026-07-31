@@ -169,13 +169,101 @@ impl PmusCatalog {
 
 // ---------- tasks ----------
 
+/// How long to let the WS deliver its own snapshots before REST-seeding the
+/// rest. On a fresh connect NOTHING has a book, so seeding immediately would
+/// spend a request on all 1110 markets instead of the ~360 that never tick.
+const SEED_SETTLE_S: u64 = 45;
+
+/// Pause between seed requests. ~360 markets at 100ms is ~36s, on a public
+/// credential-free endpoint, once per WS session. Deliberately serial: this
+/// shares an API budget with the armed engine and has 429'd before.
+const SEED_SPACING_MS: u64 = 100;
+
+/// REST-fetch a book for every subscribed market the recorder has none for.
+///
+/// Runs ONCE per WS session — startup and reconnect — and never on a timer.
+/// REST is the recovery path here, not the steady-state one: after this pass
+/// the market's book is maintained by the WS like any other, and a market that
+/// never ticks keeps the seeded book rather than having no book at all.
+///
+/// Without it the recorder's book set is "whatever traded since connect", which
+/// is what left every france-pres-27 leg unpriceable while `mark_positions.py`,
+/// which fetches per-market over REST, priced all 25 rows of the same portfolio.
+async fn seed_missing_books(core: &Core, catalog: &PmusCatalog, slugs: &[String]) {
+    tokio::time::sleep(Duration::from_secs(SEED_SETTLE_S)).await;
+    let missing: Vec<&String> = slugs
+        .iter()
+        .filter(|s| !core.has_book(arb_core::model::Venue::PolymarketUs, s))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    println!(
+        "[pmus-seed] {} of {} subscribed market(s) have no book after {}s — REST-seeding",
+        missing.len(),
+        slugs.len(),
+        SEED_SETTLE_S
+    );
+    let mut seq = SeqCounter::default();
+    let (mut ok, mut failed) = (0usize, 0usize);
+    for slug in missing {
+        match catalog.book(slug, seq.next(slug)).await {
+            Ok(snap) => {
+                core.on_event(&snap);
+                ok += 1;
+            }
+            // Not fatal and not retried: a slug the catalog no longer answers
+            // for is a market that closed, which is the common case here.
+            Err(e) => {
+                if failed < 5 {
+                    eprintln!("[pmus-seed] {slug}: {e:#}");
+                }
+                failed += 1;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(SEED_SPACING_MS)).await;
+    }
+    println!("[pmus-seed] seeded {ok} book(s), {failed} unavailable");
+}
+
+/// Keeps a flapping socket from stacking seed passes on top of each other.
+static SEEDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub async fn ws_task(
     core: Arc<Core>,
     liveness: Arc<Liveness>,
     slugs: Vec<String>,
     signer: PmusSigner,
+    catalog: Arc<PmusCatalog>,
 ) {
-    reconnect_forever("pmus-ws", || ws_session(&core, &liveness, &slugs, &signer)).await
+    let signer = Arc::new(signer);
+    reconnect_forever("pmus-ws", || {
+        // One seed pass per session: a reconnect starts a new session and a new
+        // pass, which is the "failure recovery" half of the seeding contract.
+        let (core, catalog, slugs) = (core.clone(), catalog.clone(), slugs.clone());
+        let (liveness, signer) = (liveness.clone(), signer.clone());
+        async move {
+            use std::sync::atomic::Ordering::SeqCst;
+            // SPAWNED, not selected. `tokio::select!` CANCELS the losing
+            // branch, so pairing the seed against the session meant that the
+            // moment the seed finished its arm won, dropped `ws_session`, and
+            // closed the socket — then parked on `pending()` so
+            // `reconnect_forever` never saw an error to reconnect from. PM-US
+            // went stale with no log line and the armed engine pulled quotes.
+            // Caught live 2026-07-31 16:15, ~90 seconds after it shipped.
+            //
+            // The seed must simply run beside the read loop and end on its own.
+            if SEEDING.compare_exchange(false, true, SeqCst, SeqCst).is_ok() {
+                let (c, cat, sl) = (core.clone(), catalog.clone(), slugs.clone());
+                tokio::spawn(async move {
+                    seed_missing_books(&c, &cat, &sl).await;
+                    SEEDING.store(false, SeqCst);
+                });
+            }
+            ws_session(&core, &liveness, &slugs, &signer).await
+        }
+    })
+    .await
 }
 
 async fn ws_session(

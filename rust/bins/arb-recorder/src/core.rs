@@ -350,6 +350,19 @@ impl Core {
         self.inner.lock().expect("core lock").evicted.contains(&(venue, market_id.to_owned()))
     }
 
+    /// Whether a book exists for this market at all.
+    ///
+    /// Subscribing to a market is NOT the same as having a book for it: the
+    /// venue feeds push nothing for a market that never trades, so the book set
+    /// is "markets that have ticked since connect", not "markets we asked for".
+    /// On 2026-07-31 that was 750 of 1110 subscribed PM-US markets, and 19 of
+    /// the registry's 88 — every france-pres-27 leg among them — which no
+    /// event-driven consumer could price or exit. This is what the REST seed in
+    /// `pmus::seed_missing_books` asks before spending a request.
+    pub fn has_book(&self, venue: arb_core::model::Venue, market_id: &str) -> bool {
+        self.inner.lock().expect("core lock").books.get(venue, market_id).is_some()
+    }
+
     pub fn gap_count(&self) -> u64 {
         self.inner.lock().expect("core lock").gap_count
     }
@@ -419,6 +432,23 @@ mod tests {
             ts_local_ns: 1,
             ts_venue: None,
         }
+    }
+
+    /// Subscribing is not having. The REST seed spends a request per market
+    /// this returns false for, so a `has_book` that reported optimistically
+    /// would skip exactly the markets that need seeding.
+    #[test]
+    fn has_book_is_false_until_an_event_arrives() {
+        let d = tmpdir("hasbook");
+        let core = new_core(&d);
+        assert!(
+            !core.has_book(Venue::Kalshi, "NEVER-TICKED"),
+            "a market with no event must report no book"
+        );
+        core.on_event(&snap("NEVER-TICKED", 1));
+        assert!(core.has_book(Venue::Kalshi, "NEVER-TICKED"));
+        // and a DIFFERENT market is still bookless — not a global flag
+        assert!(!core.has_book(Venue::Kalshi, "OTHER"));
     }
 
     fn delta(seq: u64) -> TapeEvent {
