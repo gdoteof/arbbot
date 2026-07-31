@@ -2316,11 +2316,19 @@ impl Engine {
             if marked.no_book.is_empty() {
                 eprintln!("[marks] every held market is on the feed again");
             } else {
+                // The old text here blamed the recorder's tag-driven PM-US
+                // universe and pointed at mark_positions.py as the way out.
+                // Both are wrong now: the cause was that the recorder's book set
+                // was "markets that ticked since connect", fixed by the REST
+                // seed in PR #60, and mark_positions.py is retired. Left
+                // pointing at what an operator can actually check.
                 eprintln!(
                     "[marks] NO BOOK for {} market(s) the open baskets hold — {} row(s) \
-                     published UNPRICED: {}. The recorder does not carry them (its PM-US \
-                     universe is tag-driven, not registry-driven), so nothing here can price \
-                     them; mark_positions.py can, over REST.",
+                     published UNPRICED: {}. Expected only in the seconds after a \
+                     (re)connect, before the welcome burst lands; if it persists, the \
+                     recorder is not carrying a market we hold — check its \
+                     `[pmus-seed] seeded N book(s)` line and that the market is in \
+                     config/registry.yaml.",
                     marked.no_book.len(),
                     self.marks_unpriced_rows,
                     marked.no_book.iter().cloned().collect::<Vec<_>>().join(", ")

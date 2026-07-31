@@ -1,8 +1,16 @@
 //! Marking open baskets to the LIVE BOOK, in-process.
 //!
-//! Port of `scripts/mark_positions.py`, which `arbbot-marks.timer` runs every
-//! two minutes: it re-reads `data/exec/trades.jsonl`, fetches top-of-book for
-//! every open basket over REST, and rewrites `data/exec/marks.json`.
+//! Port of `scripts/mark_positions.py`, which `arbbot-marks.timer` ran every
+//! two minutes: it re-read `data/exec/trades.jsonl`, fetched top-of-book for
+//! every open basket over REST, and rewrote `data/exec/marks.json`.
+//!
+//! **THIS IS NOW THE ONLY WRITER.** `arbbot-marks.timer` was stopped and
+//! disabled 2026-07-31; the armed engine runs with `--marks-out
+//! data/exec/marks.json` and writes the file it also reads its take-take bar
+//! from. Parity was proved first, from the dry-run shadow beside the live timer:
+//! 25 of 25 rows, identical row set AND order, 14 of 15 numeric fields
+//! bit-identical, the 15th (`unwind_apr`) differing only by the write gap it is
+//! measured from. Both wrote ZERO unpriced rows.
 //!
 //! THE ENGINE ALREADY HAS THE BOOK. It holds a live `BookBuilder` fed by the
 //! recorder's socket, so a mark it computes is current as of the last event on
@@ -41,8 +49,10 @@
 //! appends one line per run there and the dashboard's Exits view reads it; at
 //! this module's re-mark rate that file would grow about a hundred times
 //! faster, so the port stops at the snapshot. **Retiring `arbbot-marks.timer`
-//! therefore stops the Exits history**, which is a sequencing fact for whoever
-//! retires it, not a defect here.
+//! therefore stopped the Exits history** — that happened on 2026-07-31, so the
+//! dashboard's Exits view now has a file that ends rather than one that grows.
+//! Known and accepted, not a defect here; restoring it wants a rate-limited
+//! appender, not a re-mark-rate one.
 //!
 //! # Deliberate divergences from the Python
 //!
