@@ -2036,7 +2036,7 @@ impl Engine {
         // exit hurdle at its CEILING. No risk view at all (bench/replay) is the
         // same refusal for the same reason: there is no cap, so there is no
         // opportunity cost to charge.
-        let cap = self.cfg.risk.as_ref().map_or(0.0, |r| r.class_cap_usd());
+        let cap = self.cfg.risk.as_ref().map_or(0.0, |r| r.global_cap_usd());
         // `self.apr_bar` and not a fresh `apr_bar(utilization())`: the exit is
         // measured against the hurdle a fresh quote is ACTUALLY being held to
         // right now, which is the one `apr_tick` installed on the quoters. Two
@@ -3791,8 +3791,10 @@ mod apr_refresh_tests {
             eng.apr_bar
         );
 
-        // Half the $343 class budget goes to work.
-        risk.record_open("xvus-france-pres-27-test", "cross-venue-equivalent", 171.5);
+        // Half the $490 the engine may deploy ($980 x GLOBAL_CAP 0.50) goes to
+        // work. NOT half the $343 class budget: `utilization()` sums every
+        // class, so it divides by the cap that bounds every class.
+        risk.record_open("xvus-france-pres-27-test", "cross-venue-equivalent", 245.0);
         eng.apr_tick(&mut quoters);
         let want = crate::apr_bar(0.5);
         assert!(
@@ -3900,7 +3902,7 @@ mod unwind_scan_tests {
     /// refuses without. Read from a written file because `RiskView::load`
     /// answers a missing one with a $0 bankroll — and a $0 bankroll is exactly
     /// the degenerate cap under test in
-    /// [`a_degenerate_class_cap_refuses_the_scan_instead_of_liquidating`].
+    /// [`a_degenerate_global_cap_refuses_the_scan_instead_of_liquidating`].
     fn risk_with_cap(name: &str) -> Arc<crate::risk::RiskView> {
         let p = scratch(name);
         std::fs::write(&p, "bankroll_usd: 1000\nper_class_cap: 0.35\n").unwrap();
@@ -4021,13 +4023,13 @@ mod unwind_scan_tests {
         );
     }
 
-    /// **A DEGENERATE CLASS CAP REFUSES THE SCAN.** `utilization()` answers a
+    /// **A DEGENERATE CAP REFUSES THE SCAN.** `utilization()` answers a
     /// cap of zero with `1.0`, which is fail-closed for an entry and fail-OPEN
     /// for an exit: it pins the liquidation hurdle at its ceiling. A missing or
     /// corrupt `exec.yaml` — or no risk view at all — must therefore select
     /// NOTHING and name the reason, not liquidate the book.
     #[test]
-    fn a_degenerate_class_cap_refuses_the_scan_instead_of_liquidating() {
+    fn a_degenerate_global_cap_refuses_the_scan_instead_of_liquidating() {
         let mut eng = engine_with_marks("uw-cap.json");
         eng.unwind_tick();
         assert_eq!(eng.n_unwind, 1, "control: a real cap selects");
@@ -4047,7 +4049,7 @@ mod unwind_scan_tests {
         eng.unwind_tick();
         assert_eq!(eng.n_unwind, 0, "a fabricated utilization decides nothing");
         assert!(
-            eng.unwind_refused.as_deref().unwrap_or_default().contains("class cap"),
+            eng.unwind_refused.as_deref().unwrap_or_default().contains("global cap"),
             "and it says which input: {:?}",
             eng.unwind_refused
         );
@@ -4058,7 +4060,7 @@ mod unwind_scan_tests {
         let s = eng.summary();
         assert_eq!(s["unwind_candidates"], serde_json::json!(0), "{s}");
         assert!(
-            s["unwind_refused"].as_str().unwrap_or_default().contains("class cap"),
+            s["unwind_refused"].as_str().unwrap_or_default().contains("global cap"),
             "a refusal that is invisible in the summary is a subsystem that went quiet: {s}"
         );
 
