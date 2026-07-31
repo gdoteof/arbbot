@@ -990,7 +990,10 @@ mod hedge_deadline_tests {
                 alarm_after_s: 0.1,
             }),
             take_take: None,
+            suppress: Default::default(),
+            maker_exit_view: false,
             unwind: None,
+            marks_out: None,
             armed: false,
             hedges_undischarged: 0,
         };
@@ -1104,7 +1107,10 @@ mod hedge_deadline_tests {
                 alarm_after_s: 0.1,
             }),
             take_take: None,
+            suppress: Default::default(),
+            maker_exit_view: false,
             unwind: None,
+            marks_out: None,
             armed: false,
             hedges_undischarged: 0,
         };

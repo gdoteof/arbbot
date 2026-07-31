@@ -86,6 +86,20 @@ pub struct RunCfg {
     /// Opportunistic-unwind policy. `None` = the scan never runs, which is the
     /// default: this is a new strategy on real money, not a defect fix.
     pub unwind: Option<Unwind>,
+    /// In-process position marking (`crate::marks`). `None` = off, and off is
+    /// the default: with no path given this engine writes no marks file and
+    /// behaves exactly as it did before.
+    pub marks_out: Option<MarksOut>,
+    /// The operator's STATIC `--suppress` declaration, carried so
+    /// `maker_exit_tick` can add the exit's own (market, Ask) to it without
+    /// dropping it. `Quoter::set_suppress` replaces wholesale, so a tick that
+    /// installed only the exit's pair would silently revoke every side another
+    /// order-owner had declared.
+    pub suppress: std::collections::HashSet<(String, arb_core::model::BookSide)>,
+    /// Publish the hurdle, the cap, the PM-US book and the yielded Kalshi asks
+    /// for `crate::maker_exit`. `false` = never published, which is how that
+    /// module's fail-closed read keeps it inert. Off in bench/replay.
+    pub maker_exit_view: bool,
     /// Whether the venue order path is live. Reported in the stats `mode`.
     ///
     /// This existed only as an inference before (`ledger_path.is_some()`), so
@@ -154,6 +168,45 @@ pub struct Unwind {
     /// and a report that hid that would be a work queue of things that cannot
     /// be worked. See `crate::unwind` §1.
     pub owned_prefixes: Vec<String>,
+}
+
+/// Mark open baskets to the live book and rewrite `marks.json` here
+/// (`crate::marks`), instead of `arbbot-marks.timer` doing it every 2 minutes
+/// off two REST round trips.
+///
+/// The re-mark TRIGGER is a book event on a market an open basket has a leg on
+/// — measured at ~1.15/s across the 14 markets the 2026-07-31 book holds, of
+/// which ~1.08/s is PM-US. The write is COALESCED to at most one per
+/// [`MarksOut::min_interval_s`], because a 15 KB rewrite at book-event rate is
+/// pure I/O on a box whose recorder feeds an armed trader; and it happens at
+/// LEAST once per [`MarksOut::max_idle_s`], because `generated_at` is what
+/// `taketake::MAX_MARKS_AGE_S` ages, and a book that goes quiet overnight must
+/// not age its own bar out.
+///
+/// It rides a deadline rather than the feed arm for the reason stated at the
+/// top of this file: time-based behavior runs on deadlines, never on per-event
+/// syscalls. The feed arm only sets a bit.
+#[derive(Clone)]
+pub struct MarksOut {
+    /// Where to write. Pointing this at the SAME file `--marks` reads makes the
+    /// engine derive its own take-take bar from marks it wrote — which is the
+    /// end state after `arbbot-marks.timer` retires, and a change of TRADING
+    /// behaviour, so it is an operator's explicit act and never a default.
+    ///
+    /// It does not create a price feedback loop: `taketake::blended_apr` reads
+    /// only `cost_usd`, `locked_profit_usd` and `resolves_by`, none of which is
+    /// marked to market. It does make the staleness guard self-referential —
+    /// see `marks_tick`.
+    pub out_path: String,
+    /// The append-only trade ledger to fold open baskets out of. Re-read when
+    /// its (len, mtime) changes, so a basket booked by this engine or appended
+    /// by another writer shows up without a restart.
+    pub ledger_path: String,
+    /// Floor between writes, seconds.
+    pub min_interval_s: f64,
+    /// Ceiling between writes, seconds — the heartbeat that keeps
+    /// `generated_at` fresh when no marked market has ticked.
+    pub max_idle_s: f64,
 }
 
 /// What the maker APR hurdle is sized from, kept so it can be re-sized.
@@ -478,11 +531,53 @@ struct Engine {
     /// SORTED, because `select`'s display order ties on both its keys for
     /// identically-sized baskets on one relationship and a reorder is not a
     /// change.
+    /// When each Kalshi ask was FIRST yielded to `crate::maker_exit`. Not
+    /// re-stamped while the request stands, because the reader's settle window
+    /// measures how long the quoter has been out of the side.
+    maker_exit_suppressed: std::collections::BTreeMap<String, std::time::Instant>,
     unwind_seen: Option<UnwindReport>,
     /// Why the last scan refused to decide, when it did. Same shape and same
     /// reason as `tox_reason`: a subsystem that has gone quiet must be able to
     /// say what silenced it.
     unwind_refused: Option<String>,
+    /// A marked market has moved since the last mark was written.
+    ///
+    /// The ONLY thing the feed arm does for marking, and deliberately so: a set
+    /// lookup and a bool store per book event, with the rebuild and the write on
+    /// `marks_tick`'s deadline.
+    marks_dirty: bool,
+    /// Wall time of the last successful marks write. Drives both bounds.
+    marks_written_at: f64,
+    /// The open ledger records the last mark was built from, and the
+    /// `(len, mtime_ns)` of the file they came from. Re-read on change rather
+    /// than per write: the ledger is ~200 lines and grows by a handful a day,
+    /// but re-parsing it every second for nothing is still a syscall and an
+    /// allocation the marked markets never asked for.
+    marks_records: Vec<serde_json::Value>,
+    marks_ledger_stamp: Option<(u64, i64)>,
+    /// The markets an open basket has a leg on, by venue — what makes a book
+    /// event a re-mark trigger. Rebuilt with `marks_records`.
+    marks_watch: HashMap<Venue, std::collections::HashSet<String>>,
+    /// Marks files written, and why the last write failed if one did.
+    ///
+    /// The failure is held as a REASON for the same purpose `tox_reason` and
+    /// `unwind_refused` are: this file is an input to the engine's own take-take
+    /// bar, so a marking path that has silently stopped writing is the exact
+    /// shape of the 2026-07-28 incident. A monitor reads the summary JSON, not
+    /// stderr.
+    n_marks: u64,
+    marks_error: Option<String>,
+    /// Rows the last mark could not price, and the markets that is because of.
+    ///
+    /// A null row is the honest answer to "no book", and it is also
+    /// indistinguishable from every other reason a row goes null, so the two
+    /// are reported separately: the count is how much of the book this engine
+    /// has stopped marking, and the set is WHY. See
+    /// [`crate::marks::Marked::no_book`] — on 2026-07-31 this is 8 rows and two
+    /// PM-US markets the recorder does not carry, and it is the thing that
+    /// blocks retiring `arbbot-marks.timer`.
+    marks_unpriced_rows: usize,
+    marks_no_book: std::collections::BTreeSet<String>,
     /// The engine's own subscription to the recorder, tracked separately from
     /// what the recorder says about the venues: a bench tape cannot disconnect,
     /// a socket can and did (ten times on 2026-07-28).
@@ -672,6 +767,25 @@ impl Engine {
                 u.marks_path
             );
         }
+        if let Some(m) = cfg.marks_out.as_ref() {
+            eprintln!(
+                "[marks] marking to the live book -> {} (ledger {}, at most 1/{:.0}s, \
+                 at least 1/{:.0}s){}",
+                m.out_path,
+                m.ledger_path,
+                m.min_interval_s,
+                m.max_idle_s,
+                // The one configuration that changes what this engine TRADES:
+                // the bar it reads back is then one it wrote.
+                if cfg.take_take.as_ref().is_some_and(|t| t.marks_path == m.out_path)
+                    || cfg.unwind.as_ref().is_some_and(|u| u.marks_path == m.out_path)
+                {
+                    " — THIS IS THE FILE THIS ENGINE ALSO DECIDES FROM"
+                } else {
+                    ""
+                }
+            );
+        }
         let feed_reason: Option<String> =
             cfg.health_file.is_some().then(|| "startup — feeds not yet proven healthy".to_string());
         // Same read `install_policy` just made, for the other half of the
@@ -738,8 +852,21 @@ impl Engine {
             n_unwind_near_floor: 0,
             n_unwind_near_miss: 0,
             unwind_near_miss_usd: 0.0,
+            maker_exit_suppressed: std::collections::BTreeMap::new(),
             unwind_seen: None,
             unwind_refused: None,
+            marks_dirty: false,
+            // 0.0, not `wall_now()`: the first `marks_tick` must write
+            // immediately, so a restart cannot leave the previous writer's file
+            // aging while this one waits out a heartbeat.
+            marks_written_at: 0.0,
+            marks_records: Vec::new(),
+            marks_ledger_stamp: None,
+            marks_watch: HashMap::new(),
+            n_marks: 0,
+            marks_error: None,
+            marks_unpriced_rows: 0,
+            marks_no_book: std::collections::BTreeSet::new(),
             link,
             stale_seen: HashMap::new(),
             last_now: 0.0,
@@ -1181,6 +1308,61 @@ impl Engine {
         }
     }
 
+    /// Publish what `crate::maker_exit` cannot derive, and install what it asks
+    /// for.
+    ///
+    /// TWO DIRECTIONS, ONE TICK, and they belong together: the exit loop asks
+    /// for a Kalshi ask to be yielded, and the only honest answer to "has it
+    /// been" is one published by the code that did the yielding. Split across
+    /// two ticks they could disagree about whether the entry quoter is out.
+    ///
+    /// SILENT WHEN HALTED, and that is the whole halt path for the exit loop.
+    /// `crate::maker_exit::VIEW_MAX_AGE` refuses a view older than three of
+    /// these, so a killed or feed-pulled engine makes every exit decision refuse
+    /// and makes the loop PULL what it has resting — without this module having
+    /// to reach into it. `unwind_tick` documents the same gate for the same
+    /// reason: an exit is still an order.
+    pub(super) fn maker_exit_tick(&mut self, quoters: &mut [Quoter]) {
+        if !self.cfg.maker_exit_view {
+            return;
+        }
+        if self.killed || self.feed_reason.is_some() {
+            return;
+        }
+        let asked = crate::maker_exit::suppress_requests();
+        // Base + asked, never asked alone: `set_suppress` replaces the whole
+        // set and the operator's `--suppress` declaration must survive.
+        let mut want = self.cfg.suppress.clone();
+        for m in &asked {
+            want.insert((m.clone(), BookSide::Ask));
+        }
+        for q in quoters.iter_mut() {
+            q.set_suppress(want.clone());
+        }
+        let now = std::time::Instant::now();
+        // FIRST installed, not most recently confirmed: the settle window the
+        // reader applies is "how long has the quoter been out of this side",
+        // and re-stamping it every tick would make that window never elapse.
+        self.maker_exit_suppressed.retain(|m, _| asked.contains(m));
+        for m in &asked {
+            self.maker_exit_suppressed.entry(m.clone()).or_insert(now);
+        }
+        // PM-US top-of-book ASK for every market this engine holds a book for.
+        // The engine's book is the ONLY PM-US price read in this process —
+        // `PmusGateway` has no `market_quote` — so an exit priced without it
+        // would be a two-leg trade with one leg valued.
+        let mut pm_ask = std::collections::BTreeMap::new();
+        for (market, ask) in self.books.pm_us_asks() {
+            pm_ask.insert(market, ask);
+        }
+        crate::maker_exit::publish_view(crate::maker_exit::EngineView {
+            apr_bar: self.apr_bar,
+            global_cap_usd: self.cfg.risk.as_ref().map_or(0.0, |r| r.global_cap_usd()),
+            pm_ask,
+            suppressed_at: self.maker_exit_suppressed.clone(),
+        });
+    }
+
     fn summary(&self) -> serde_json::Value {
         let elapsed = self.t_start.elapsed().as_secs_f64();
         serde_json::json!({
@@ -1220,6 +1402,14 @@ impl Engine {
             // that says why selecting on it would be a losing strategy.
             "unwind_near_miss": self.n_unwind_near_miss,
             "unwind_near_miss_usd": self.unwind_near_miss_usd,
+            // The maker-exit placer (`--maker-exit` only; 0 forever without it).
+            // `maker_exit_unresolved` MUST STAY 0: it counts a Kalshi exit that
+            // FILLED and whose PM-US leg did not close, which is a naked short
+            // the ledger still records as a hedged basket.
+            "maker_exit_placed": crate::maker_exit::placed(),
+            "maker_exit_closed": crate::maker_exit::closed(),
+            "maker_exit_refused": crate::maker_exit::refused(),
+            "maker_exit_unresolved": crate::maker_exit::unresolved(),
             // ...and WHY the scan decided nothing, when it refused to decide at
             // all. `null` = it ran. Every gauge above reads zero on a converged
             // book AND on a degenerate class cap, an off-band hurdle and torn
@@ -1228,6 +1418,26 @@ impl Engine {
             // one level more informative: a subsystem that has gone quiet must
             // be able to say what silenced it, in the file that is read.
             "unwind_refused": self.unwind_refused.as_deref(),
+            // Marks files written this run, and why the last write failed if it
+            // did. 0 while `--marks-out` is off, which is the default.
+            //
+            // `marks_written` RISING is the health signal — this engine is the
+            // input to its own take-take bar when it writes the file the bar is
+            // read from, so a flat counter is the 2026-07-28 incident in
+            // advance. `marks_error` is `null` when the last write succeeded,
+            // and it is here rather than only on stderr for the reason every
+            // other reason-string in this block is (PR #46): the monitors read
+            // this JSON.
+            "marks_written": self.n_marks,
+            "marks_error": self.marks_error.as_deref(),
+            // Rows the last mark published UNPRICED, and the markets that is
+            // because of. Non-zero means this engine is publishing a marks file
+            // that covers LESS of the book than `mark_positions.py`'s would —
+            // which is a fact about the recorder's universe, not about this
+            // code, and the reason both numbers are here rather than in a log
+            // line nobody greps.
+            "marks_unpriced_rows": self.marks_unpriced_rows,
+            "marks_no_book": self.marks_no_book.len(),
             "risk_allowed": self.cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
             "risk_rejected": self.cfg.risk.as_ref().map(|r| r.stats().1).unwrap_or(0),
             // Contracts held against the caps by quotes that are RESTING and
@@ -1637,6 +1847,16 @@ impl Engine {
             _ => return,
         }
         self.n_book += 1;
+        // The re-mark trigger. A set lookup and a bool store — the rebuild and
+        // the file write are `marks_tick`'s, on a deadline. UNGATED by `killed`
+        // and `feed_reason`, unlike quoting and take-take below: a halted engine
+        // still holds positions, and freezing their marks is how the take-take
+        // bar goes stale while the process is alive to keep it fresh.
+        if !self.marks_dirty
+            && self.marks_watch.get(&venue).is_some_and(|s| s.contains(market_id.as_str()))
+        {
+            self.marks_dirty = true;
+        }
         let now = ts_local_ns as f64 / 1e9;
         self.last_now = now;
         if !self.killed && self.feed_reason.is_none() {
@@ -1999,6 +2219,130 @@ impl Engine {
         }
     }
 
+    /// Rewrite `marks.json` from the live books, if a marked market has moved
+    /// since the last write or the heartbeat is due.
+    ///
+    /// The DECISION about when is here; the arithmetic is `crate::marks`. It
+    /// returns nothing and prints nothing on the happy path: this runs at up to
+    /// 1 Hz, and a line per write would be 86,400 lines a day saying "still
+    /// working". What it does emit is edge-triggered, and it is the failure —
+    /// the standing signal is `marks_error` in the summary JSON.
+    ///
+    /// **NOT gated on `killed` / `feed_reason`, unlike `unwind_tick`.** Those
+    /// gates exist because an exit is an order, and a halting engine stops
+    /// sending orders. Marking sends nothing. A halted engine still HOLDS the
+    /// positions, and it is the only process left that can keep their marks
+    /// current — freezing them is precisely how a stale bar outlives the
+    /// condition that caused it.
+    ///
+    /// **The staleness guard becomes self-referential when `out_path` is the
+    /// file this engine also reads.** `taketake::MAX_MARKS_AGE_S` exists because
+    /// `mark_positions.py` died on 2026-07-28 and the armed engine spent four
+    /// hours trading against the frozen bar it left behind. Pointed at its own
+    /// output, the engine can no longer be the thing that NOTICES a dead marker
+    /// — but the guard is not thereby useless, and the distinction matters: it
+    /// still catches this loop wedging while the process lives (the write stops,
+    /// `generated_at` freezes, 900 s later take-take refuses), which is the case
+    /// it can act on. What it cannot catch is the process dying, and a dead
+    /// process is not trading either.
+    fn marks_tick(&mut self) {
+        let Some(m) = self.cfg.marks_out.clone() else { return };
+        let now = wall_now();
+        let since = now - self.marks_written_at;
+        if since < m.min_interval_s {
+            return;
+        }
+        if !self.marks_dirty && since < m.max_idle_s {
+            return;
+        }
+        // Re-read the ledger only when it has actually changed. `marks_dirty`
+        // tracks the BOOKS; a basket booked by this engine or appended by
+        // another writer moves neither the books nor that bit, so this stat is
+        // the only thing that notices it — and it is why the heartbeat exists
+        // as well as the trigger.
+        let stamp = std::fs::metadata(&m.ledger_path).ok().map(|md| {
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos() as i64);
+            (md.len(), mtime)
+        });
+        if stamp != self.marks_ledger_stamp {
+            self.marks_ledger_stamp = stamp;
+            // The LENIENT read (`ledger::read` is the strict one, and it gates
+            // ARMING). A torn line here must not stop the whole book being
+            // marked: the strict reader already refused to arm on it, and
+            // withholding every other position's mark on top of that would take
+            // the take-take bar down with it.
+            self.marks_records = match std::fs::read_to_string(&m.ledger_path) {
+                Ok(text) => {
+                    text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+                }
+                Err(_) => Vec::new(),
+            };
+            self.marks_watch = crate::marks::watched_markets(self.marks_records.clone());
+        }
+        // NOT YET, if this process has never seen a book. The first tick is due
+        // immediately and `socket_feed`'s welcome snapshot burst takes about a
+        // second to land, so without this a restart publishes one marks file in
+        // which EVERY row is unpriced — throwing away the prices the previous
+        // writer had put there — and shouts `NO BOOK` naming all 14 held
+        // markets, when in truth it has simply not looked yet. Observed exactly
+        // that on the 2026-07-31 live run.
+        //
+        // Below the ledger read on purpose: the watch set is what makes a book
+        // event a trigger, so returning above it would mean no book event ever
+        // arms a mark and this guard would never lift.
+        //
+        // `n_marks` and not a flag: once this engine has written once it is
+        // committed to keeping the file current, halted or not (see above).
+        if self.n_marks == 0 && self.n_book == 0 {
+            return;
+        }
+        let marked = crate::marks::build(
+            &mut self.cx,
+            &self.fees,
+            self.marks_records.clone(),
+            &self.books,
+            now,
+        );
+        self.marks_unpriced_rows =
+            marked.doc.positions.iter().filter(|p| p.liq_value_usd.is_none()).count();
+        // Edge-triggered on the SET, not the count: two markets going dark and
+        // two different ones coming back is a change worth a line, and the count
+        // alone cannot see it.
+        if marked.no_book != self.marks_no_book {
+            if marked.no_book.is_empty() {
+                eprintln!("[marks] every held market is on the feed again");
+            } else {
+                eprintln!(
+                    "[marks] NO BOOK for {} market(s) the open baskets hold — {} row(s) \
+                     published UNPRICED: {}. The recorder does not carry them (its PM-US \
+                     universe is tag-driven, not registry-driven), so nothing here can price \
+                     them; mark_positions.py can, over REST.",
+                    marked.no_book.len(),
+                    self.marks_unpriced_rows,
+                    marked.no_book.iter().cloned().collect::<Vec<_>>().join(", ")
+                );
+            }
+            self.marks_no_book = marked.no_book;
+        }
+        let err = crate::marks::write_atomic(&m.out_path, &marked.doc.to_json()).err();
+        if err.is_some() != self.marks_error.is_some() {
+            match &err {
+                Some(why) => eprintln!("[marks] WRITE FAILED — {why}"),
+                None => eprintln!("[marks] writing again"),
+            }
+        }
+        self.marks_error = err;
+        if self.marks_error.is_none() {
+            self.n_marks += 1;
+            self.marks_written_at = now;
+        }
+        self.marks_dirty = false;
+    }
+
     /// The opportunistic-unwind scan: which open baskets have stopped being the
     /// best use of the capital they lock.
     ///
@@ -2229,6 +2573,14 @@ pub async fn run(
     // minute is ample; what matters is that it moves at all.
     let mut apr_iv = tokio::time::interval(std::time::Duration::from_secs(60));
     apr_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Marking is BOOK-driven; this deadline only bounds how often the file is
+    // rewritten (`marks_tick` owns both bounds and returns immediately when
+    // neither is due). 500ms so the `min_interval_s` floor is met promptly
+    // rather than up to a second late — a timer coarser than the floor would
+    // make the real cadence the timer's, not the policy's.
+    let mut marks_iv = tokio::time::interval(std::time::Duration::from_millis(500));
+    marks_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let marking = eng.cfg.marks_out.is_some();
 
     // Unbounded in bench/replay: the budget never reaches zero, so both guards
     // below are constant, the select polls exactly the arms it polled before in
@@ -2276,7 +2628,13 @@ pub async fn run(
             // Same rule: `cfg.apr` is already None in bench, and re-sizing a
             // hurdle mid-replay off a moving utilization would break the
             // digest even if it were not.
-            _ = apr_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.apr_tick(&mut quoters); eng.record_tick("apr", t); }
+            _ = apr_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.apr_tick(&mut quoters); eng.maker_exit_tick(&mut quoters); eng.record_tick("apr", t); }
+            // Same rule as the three above: it reads the wall clock and a
+            // ledger another process appends to, and it writes a file — none of
+            // which a byte-deterministic replay can reproduce. `marking` is
+            // already false in bench (`run_cfg`); the guard is belt to that
+            // brace, and it keeps the arm out of the poll set entirely.
+            _ = marks_iv.tick(), if marking && !bench => { let t = std::time::Instant::now(); eng.marks_tick(); eng.record_tick("marks", t); }
             _ = stats_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.stats_tick(); eng.record_tick("stats", t); }
             // The budget is spent and every deadline that was DUE has now had
             // its turn: the arms above are polled first and this one is always
@@ -2316,7 +2674,10 @@ fn test_cfg() -> RunCfg {
         ledger_path: None,
         hedge_retry: None,
         take_take: None,
+        suppress: Default::default(),
+        maker_exit_view: false,
         unwind: None,
+        marks_out: None,
         armed: false,
         hedges_undischarged: 0,
     }
@@ -2509,7 +2870,10 @@ mod feed_wiring_tests {
                 alarm_after_s: 60.0,
             }),
             take_take,
+            suppress: Default::default(),
+            maker_exit_view: false,
             unwind: None,
+            marks_out: None,
             armed: false,
             hedges_undischarged: 0,
         }
@@ -3842,6 +4206,199 @@ mod apr_refresh_tests {
     }
 }
 
+/// **The maker-exit seam.** What the engine publishes for `crate::maker_exit`,
+/// and what it installs on the quoters when that module asks for a side.
+#[cfg(test)]
+mod maker_exit_seam_tests {
+    use super::*;
+    use crate::engine::toxgate_reload_tests::quoter_and_books;
+
+    fn armed_cfg() -> RunCfg {
+        RunCfg { maker_exit_view: true, bench: false, ..test_cfg() }
+    }
+
+    /// `RunCfg` is not `Clone` (it carries an `Arc<RiskView>` and a file path
+    /// set the engine owns), and only the fields this test varies need copying.
+    trait CloneForTest {
+        fn clone_for_test(&self) -> RunCfg;
+    }
+    impl CloneForTest for RunCfg {
+        fn clone_for_test(&self) -> RunCfg {
+            RunCfg { suppress: self.suppress.clone(), ..armed_cfg() }
+        }
+    }
+
+    /// A book on which the entry quoter genuinely WANTS the Kalshi ask.
+    ///
+    /// `quoter_and_books`' shared fixture does not: its PM-US ask is 0.99, so
+    /// the inverted basket that side would open (sell Kalshi YES, buy PM YES)
+    /// costs more than the dollar it pays, and the quoter declines for reasons
+    /// that have nothing to do with suppression. Selling Kalshi YES at 0.98
+    /// leaves 0.02 of NO against a PM YES at 0.20 — 0.22 for a dollar — which it
+    /// quotes without hesitation.
+    fn books_where_the_kalshi_ask_pays() -> BookBuilder {
+        let lvl = |p: &str, s: &str| Level { price: p.into(), size: s.into() };
+        let mut bb = BookBuilder::new();
+        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.60", "500")], vec![lvl("0.99", "500")],
+            1, 1_000_000_000, None);
+        bb.apply_snapshot(Venue::PolymarketUs, "P", vec![lvl("0.10", "500")],
+            vec![lvl("0.20", "500")], 1, 1_000_000_000, None);
+        bb
+    }
+
+    /// Does the entry quoter still want to REST on the Kalshi ask?
+    ///
+    /// Asked through `on_book`, the public door, rather than through
+    /// `Quoter::target`, which is private — and that is the better question
+    /// anyway: what matters is whether a Place reaches the executor, not what an
+    /// internal helper returned.
+    fn quotes_kalshi_ask(quoters: &mut [Quoter], books: &BookBuilder) -> bool {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        quoters[0].on_book(&mut cx, &fees, books, wall_now(), &mut oid, &mut intents);
+        intents.iter().any(|i| match i {
+            Intent::Place(p) => p.venue == Venue::Kalshi && p.side == BookSide::Ask,
+            _ => false,
+        })
+    }
+
+    /// THE VIEW IS THE MODULE'S ONLY INPUT, so publishing it is the whole of the
+    /// wiring: without it `maker_exit::engine_view` fails closed and the loop
+    /// decides nothing. A run without either flag must publish NOTHING, which is
+    /// how an unflagged binary keeps the feature inert even if the loop were
+    /// somehow spawned.
+    #[test]
+    fn the_view_is_published_only_when_a_flag_asked_for_it() {
+        let _g = crate::maker_exit::test_serial();
+        crate::maker_exit::reset_view();
+        let (mut quoters, _) = quoter_and_books();
+
+        let mut off = test_engine(test_cfg()); // maker_exit_view: false
+        off.maker_exit_tick(&mut quoters);
+        assert!(
+            crate::maker_exit::engine_view().is_err(),
+            "an unflagged engine must publish nothing"
+        );
+
+        let mut on = test_engine(armed_cfg());
+        on.apr_bar = 14.5;
+        on.maker_exit_tick(&mut quoters);
+        let v = crate::maker_exit::engine_view().expect("published");
+        assert_eq!(v.apr_bar, 14.5, "the hurdle in force, not a second derivation of it");
+        crate::maker_exit::reset_view();
+    }
+
+    /// A HALTED ENGINE PUBLISHES NOTHING, AND THAT IS THE EXIT'S HALT PATH.
+    ///
+    /// `unwind_tick` states the rule — an exit is still an order, so a killed or
+    /// feed-pulled engine stops deciding them — but the exit loop is a separate
+    /// task and cannot read `self.killed`. Silence is how it is told: the view
+    /// ages out, every decision refuses, and the loop PULLS what it has resting.
+    #[test]
+    fn a_killed_or_feed_pulled_engine_stops_publishing() {
+        let _g = crate::maker_exit::test_serial();
+        let (mut quoters, _) = quoter_and_books();
+        for (killed, feed) in [(true, None), (false, Some("recorder stale".to_string()))] {
+            crate::maker_exit::reset_view();
+            let mut eng = test_engine(armed_cfg());
+            eng.killed = killed;
+            eng.feed_reason = feed.clone();
+            eng.maker_exit_tick(&mut quoters);
+            assert!(
+                crate::maker_exit::engine_view().is_err(),
+                "killed={killed} feed={feed:?} must go silent, not publish a stale hurdle"
+            );
+        }
+        crate::maker_exit::reset_view();
+    }
+
+    /// THE ENTRY QUOTER YIELDS THE SIDE, AND THE OPERATOR'S OWN `--suppress`
+    /// SURVIVES IT.
+    ///
+    /// `Quoter::set_suppress` REPLACES the whole set, so a tick that installed
+    /// only the exit's pair would silently revoke every side another order-owner
+    /// had declared — a quoter quoting into somebody else's book, caused by a
+    /// feature that never mentions it.
+    #[test]
+    fn a_requested_side_is_yielded_without_dropping_the_operators_declaration() {
+        let _g = crate::maker_exit::test_serial();
+        crate::maker_exit::reset_view();
+        let mut cfg = armed_cfg();
+        cfg.suppress = [("OTHER".to_string(), BookSide::Bid)].into_iter().collect();
+
+        // THE CONTROL FIRST, and it is not ceremony: `!quotes_kalshi_ask` is
+        // satisfied by a fixture that never quotes that side at all, so without
+        // this the suppression assertion below would pass against a quoter that
+        // was silent for a completely unrelated reason.
+        crate::maker_exit::request_suppress(std::collections::BTreeSet::new());
+        let (mut quoters, _) = quoter_and_books();
+        let books = books_where_the_kalshi_ask_pays();
+        let mut eng = test_engine(cfg.clone_for_test());
+        eng.maker_exit_tick(&mut quoters);
+        assert!(
+            quotes_kalshi_ask(&mut quoters, &books),
+            "the fixture must quote the Kalshi ask, or the suppression test proves nothing"
+        );
+
+        // ...now ask for it, on a FRESH quoter: the entry quoter is a state
+        // machine over its own resting orders, and reusing one that has already
+        // been cancelled would test that machine rather than this seam.
+        let (mut quoters, _) = quoter_and_books();
+        let books = books_where_the_kalshi_ask_pays();
+        let mut eng = test_engine(cfg);
+        crate::maker_exit::request_suppress(["K".to_string()].into_iter().collect());
+        eng.maker_exit_tick(&mut quoters);
+        assert!(
+            !quotes_kalshi_ask(&mut quoters, &books),
+            "the exit's side must be yielded before anything rests on it"
+        );
+        // ...and the operator's own declaration survived the install, which
+        // `set_suppress`'s replace-wholesale semantics make easy to lose.
+        let v = crate::maker_exit::engine_view().expect("published");
+        assert!(v.suppressed_at.contains_key("K"));
+        let first = v.suppressed_at["K"];
+
+        // A SECOND tick must not re-stamp it: the reader's settle window
+        // measures how long the quoter has been OUT of the side, and a stamp
+        // refreshed every 60s is a window that never elapses.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        eng.maker_exit_tick(&mut quoters);
+        let v = crate::maker_exit::engine_view().expect("published");
+        assert_eq!(v.suppressed_at["K"], first, "the install instant must not move");
+
+        // ...and withdrawing the request releases it, so the settle clock
+        // restarts rather than crediting an exit with a side it gave back.
+        crate::maker_exit::request_suppress(std::collections::BTreeSet::new());
+        eng.maker_exit_tick(&mut quoters);
+        let v = crate::maker_exit::engine_view().expect("published");
+        assert!(v.suppressed_at.is_empty(), "a withdrawn request is forgotten, not remembered");
+        crate::maker_exit::reset_view();
+    }
+
+    /// THE PM-US ASK IS THE ONLY PRICE READ THE CLOSE LEG HAS, because
+    /// `PmusGateway` has no `market_quote`. An empty ask side must be ABSENT
+    /// rather than reported at zero: a close priced at $0.00 reads as free, and
+    /// "no ask" spelled as a price is the same mistake `Quote::yes_bid`
+    /// documents on the other venue.
+    #[test]
+    fn an_empty_pm_ask_side_is_absent_rather_than_a_price_of_zero() {
+        let mut bb = BookBuilder::new();
+        let lvl = |p: &str, s: &str| Level { price: p.into(), size: s.into() };
+        bb.apply_snapshot(
+            Venue::PolymarketUs, "P", vec![lvl("0.30", "500")], vec![lvl("0.34", "9")],
+            1, 1_000_000_000, None,
+        );
+        bb.apply_snapshot(Venue::PolymarketUs, "DARK", vec![lvl("0.10", "5")], vec![],
+            1, 1_000_000_000, None);
+        // A Kalshi book must never leak into the PM map.
+        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.60", "5")], vec![lvl("0.61", "5")],
+            1, 1_000_000_000, None);
+        let asks = bb.pm_us_asks();
+        assert_eq!(asks, vec![("P".to_string(), "0.34".to_string())], "{asks:?}");
+    }
+}
+
 /// **The opportunistic-unwind scan.** Off by default, detect-only when on, and
 /// silent while the engine is halted — see `Engine::unwind_tick`.
 #[cfg(test)]
@@ -4138,5 +4695,230 @@ mod unwind_scan_tests {
         eng.unwind_tick();
         assert!(eng.unwind_refused.is_some(), "a torn write is a fault and must be named");
         assert_eq!(eng.n_unwind, 0);
+    }
+}
+
+/// In-process marking, WIRED — the half `crate::marks` cannot test.
+///
+/// That module tests the arithmetic and the schema against a pure function.
+/// What is only decidable here is WHEN a mark is rebuilt: which book event arms
+/// it, which one does not, and the two bounds that keep the rewrite off the
+/// decision path without letting `generated_at` age out of
+/// `taketake::MAX_MARKS_AGE_S`.
+#[cfg(test)]
+mod marks_wiring_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("arb-trader-marks-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d.join(name)
+    }
+
+    /// One open basket on `K` / `P`, with a cost basis so it produces a row.
+    fn ledger(name: &str) -> String {
+        let p = scratch(name);
+        std::fs::write(
+            &p,
+            "{\"ts\":1785402005.539014,\"relationship_id\":\"xvus-nobel-peace-26-b4b\",\
+             \"qty\":1,\"status\":\"open\",\"cost_usd\":0.72,\"profit_usd\":0.28,\
+             \"legs\":[{\"venue\":\"kalshi\",\"market_id\":\"K\",\"side\":\"yes\"},\
+             {\"venue\":\"polymarket_us\",\"market_id\":\"P\",\"side\":\"no\"}]}\n",
+        )
+        .unwrap();
+        p.to_string_lossy().into_owned()
+    }
+
+    fn marks_cfg(tag: &str, min_interval_s: f64, max_idle_s: f64) -> (RunCfg, String) {
+        let out = scratch(&format!("{tag}-marks.json"));
+        let out_path = out.to_string_lossy().into_owned();
+        let cfg = RunCfg {
+            marks_out: Some(MarksOut {
+                out_path: out_path.clone(),
+                ledger_path: ledger(&format!("{tag}-trades.jsonl")),
+                min_interval_s,
+                max_idle_s,
+            }),
+            ..test_cfg()
+        };
+        (cfg, out_path)
+    }
+
+    fn snapshot(venue: &str, market: &str) -> String {
+        json!({"kind": "snapshot", "venue": venue, "market_id": market,
+               "bids": [{"price": "0.05", "size": "50"}],
+               "asks": [{"price": "0.08", "size": "50"}],
+               "seq": 1, "ts_local_ns": 1_785_402_100_000_000_000i64})
+        .to_string()
+    }
+
+    fn feed(eng: &mut Engine, line: &str) {
+        eng.on_feed_line(line, &mut [], &HashMap::new());
+    }
+
+    /// **THE TRIGGER.** A book event on a market an open basket holds arms the
+    /// re-mark; one on any other market does not.
+    ///
+    /// This is the whole difference between this and `arbbot-marks.timer`. The
+    /// engine sees ~250 book events a second and holds legs on 14 markets, so
+    /// an unfiltered trigger would rewrite a 15 KB file at feed rate on a box
+    /// whose recorder stalls under I/O — and a trigger that missed the held
+    /// markets would leave the file frozen at whatever the heartbeat last wrote.
+    #[test]
+    fn a_book_event_on_a_held_market_arms_the_remark_and_nothing_else_does() {
+        let (cfg, _) = marks_cfg("trigger", 0.0, 0.0);
+        let mut eng = test_engine(cfg);
+        // The first tick loads the ledger — and so builds the watch set — but
+        // writes nothing, because no book has arrived yet.
+        eng.marks_tick();
+        assert_eq!(eng.n_marks, 0, "a process that has not seen a book has nothing to mark");
+
+        feed(&mut eng, &snapshot("kalshi", "SOMETHING-ELSE"));
+        assert!(!eng.marks_dirty, "a market no basket holds is not a re-mark");
+        feed(&mut eng, &snapshot("polymarket_us", "P"));
+        assert!(eng.marks_dirty, "a market a basket DOES hold is");
+        eng.marks_tick();
+        assert_eq!(eng.n_marks, 1, "and the tick spends it");
+        assert!(!eng.marks_dirty, "clearing the bit");
+
+        // ...and the Kalshi leg arms it just the same, which the live book needs:
+        // its Kalshi legs tick and its PM-US legs sometimes are not carried at all.
+        feed(&mut eng, &snapshot("kalshi", "K"));
+        assert!(eng.marks_dirty);
+    }
+
+    /// **A RESTART DOES NOT BLANK THE FILE IT INHERITS.**
+    ///
+    /// The first deadline is due immediately and the welcome snapshot burst
+    /// takes about a second to arrive, so a marking engine that wrote on that
+    /// first tick would replace a perfectly good marks file with one where every
+    /// row is unpriced — and, worse, report every held market as uncarried. Seen
+    /// live on 2026-07-31 before this guard existed.
+    ///
+    /// It lifts on the first book event, not on a timer, so an engine whose feed
+    /// never comes up never writes at all — which is the correct answer: it has
+    /// nothing to say about prices it has not seen.
+    #[test]
+    fn nothing_is_written_until_a_book_has_actually_arrived() {
+        let (cfg, out) = marks_cfg("cold", 0.0, 0.0);
+        let mut eng = test_engine(cfg);
+        for _ in 0..5 {
+            eng.marks_tick();
+        }
+        assert_eq!(eng.n_marks, 0, "five ticks and no feed is still nothing to say");
+        assert!(!std::path::Path::new(&out).exists(), "and the inherited file is untouched");
+        assert!(eng.marks_no_book.is_empty(), "nothing is reported as uncarried either");
+
+        feed(&mut eng, &snapshot("kalshi", "K"));
+        eng.marks_tick();
+        assert_eq!(eng.n_marks, 1, "the first book lifts it");
+    }
+
+    /// **THE TWO BOUNDS.** A quiet book still gets a heartbeat; a busy one does
+    /// not get a rewrite per event.
+    ///
+    /// The heartbeat is not cosmetic: `generated_at` is what
+    /// `taketake::MAX_MARKS_AGE_S` ages, so a book that goes quiet for 900
+    /// seconds with no heartbeat would age out the engine's OWN take-take bar
+    /// and refuse take-take entirely — a marking loop that switched trading off
+    /// by being idle.
+    #[test]
+    fn the_write_is_floored_by_the_interval_and_forced_by_the_heartbeat() {
+        // A floor of an hour, a heartbeat of a day: nothing may write twice.
+        // A floor of an hour: the first write lands, the second cannot.
+        let (cfg, _) = marks_cfg("floor", 3600.0, 86_400.0);
+        let mut eng = test_engine(cfg);
+        eng.marks_tick(); // loads the ledger; no book yet
+        feed(&mut eng, &snapshot("kalshi", "K"));
+        eng.marks_tick();
+        assert_eq!(eng.n_marks, 1);
+        feed(&mut eng, &snapshot("kalshi", "K"));
+        assert!(eng.marks_dirty, "the book moved again");
+        eng.marks_tick();
+        assert_eq!(eng.n_marks, 1, "...and the floor refused the rewrite");
+        assert!(eng.marks_dirty, "the trigger is REMEMBERED, not spent");
+
+        // No floor, no idle allowance, and NOTHING dirty: the heartbeat writes
+        // anyway, which is the case that keeps the bar alive on a dead book.
+        let (cfg, out) = marks_cfg("beat", 0.0, 0.0);
+        let mut eng = test_engine(cfg);
+        feed(&mut eng, &snapshot("kalshi", "K"));
+        eng.marks_dirty = false;
+        eng.marks_tick();
+        eng.marks_tick();
+        assert_eq!(eng.n_marks, 2, "not dirty, and still written twice");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        assert_eq!(doc["totals"]["n_open"], json!(1));
+        assert_eq!(doc["positions"].as_array().unwrap().len(), 1);
+    }
+
+    /// A HALTED engine keeps marking. `unwind_tick` stops under the same
+    /// conditions because an exit is an order; marking sends nothing, and the
+    /// halted process is the only thing left that can keep the marks — and so
+    /// the bar derived from them — current.
+    #[test]
+    fn a_halted_engine_still_marks() {
+        let (cfg, _) = marks_cfg("halted", 0.0, 0.0);
+        let mut eng = test_engine(cfg);
+        feed(&mut eng, &snapshot("kalshi", "K"));
+        eng.killed = true;
+        eng.feed_reason = Some("FEED DOWN".into());
+        eng.marks_tick();
+        assert_eq!(eng.n_marks, 1, "a halt silences orders, not marks");
+    }
+
+    /// A write that cannot happen is NAMED in the summary, not swallowed.
+    ///
+    /// This file is an input to the engine's own take-take bar. A marking path
+    /// that has silently stopped writing is the 2026-07-28 incident with the
+    /// blame moved in-process, and `marks_written` frozen beside a null
+    /// `marks_error` would say nothing at all about it.
+    #[test]
+    fn a_write_that_fails_is_reported_rather_than_swallowed() {
+        let (mut cfg, _) = marks_cfg("failing", 0.0, 0.0);
+        // /proc exists and is writable by nobody, so the path is well-formed
+        // and the write cannot succeed.
+        cfg.marks_out.as_mut().unwrap().out_path = "/proc/marks.json".into();
+        let mut eng = test_engine(cfg);
+        feed(&mut eng, &snapshot("kalshi", "K"));
+        eng.marks_tick();
+        assert_eq!(eng.n_marks, 0, "a failed write is not a write");
+        let s = eng.summary();
+        assert_eq!(s["marks_written"], json!(0));
+        assert!(
+            s["marks_error"].as_str().unwrap_or_default().contains("/proc/marks"),
+            "the reason a monitor reads: {s}"
+        );
+    }
+
+    /// The coverage gap, wired: a held market the engine has no book for leaves
+    /// its row UNPRICED and says which market by name.
+    ///
+    /// On 2026-07-31 this is the live state for every `xvus-france-pres-27`
+    /// basket — 8 of 25 rows — because the recorder's PM-US universe is
+    /// tag-driven and those two slugs are not in it. `mark_positions.py` prices
+    /// them over REST, so this is a REGRESSION against the writer being
+    /// retired, and it has to be visible in the summary a monitor reads.
+    #[test]
+    fn a_held_market_with_no_book_is_counted_and_named() {
+        let (cfg, _) = marks_cfg("nobook", 0.0, 0.0);
+        let mut eng = test_engine(cfg);
+        // Kalshi arrives; the PM-US leg never does.
+        feed(&mut eng, &snapshot("kalshi", "K"));
+        eng.marks_tick();
+        let s = eng.summary();
+        assert_eq!(s["marks_unpriced_rows"], json!(1), "the row is published, unpriced: {s}");
+        assert_eq!(s["marks_no_book"], json!(1), "and the market is counted: {s}");
+        assert!(eng.marks_no_book.contains("polymarket_us:P"), "by name: {:?}", eng.marks_no_book);
+
+        // ...and once it does arrive, both go back to zero.
+        feed(&mut eng, &snapshot("polymarket_us", "P"));
+        eng.marks_tick();
+        let s = eng.summary();
+        assert_eq!(s["marks_unpriced_rows"], json!(0), "{s}");
+        assert_eq!(s["marks_no_book"], json!(0), "{s}");
+        assert!(eng.marks_no_book.is_empty());
     }
 }

@@ -29,6 +29,15 @@ class RecorderConfig(BaseModel):
     ntfy_topic: str = ""  # empty = alerts disabled
     min_edge_per_contract: Decimal = Decimal("0")
     polymarket_mode: str = "intl"  # "intl" (Geoff's account) | "us"
+    # Record the Polymarket INTL websocket at all. False = do not open it.
+    # INTL has no order path (quirk: the trade-capable key is US-only), so the
+    # feed is data we cannot act on, and it is expensive twice over: ~222
+    # markets of write load on the filesystem whose ext4 journal stalls the
+    # recorder, and a ~313s sweep that trips the staleness alerter roughly
+    # every 6 minutes — 58 of 64 ntfy alerts in the 6h to 2026-07-31 were this
+    # one feed. Turned off on Geoff's call 2026-07-31, to come back when there
+    # is something to do with it.
+    record_polymarket_intl: bool = True
     # Polymarket US tag_slugs to record (credential-free REST poll). Empty =
     # PM US feed off. e.g. ["fed-decision", "cpi"].
     polymarket_us_tags: list[str] = Field(default_factory=list)
