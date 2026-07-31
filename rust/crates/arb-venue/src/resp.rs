@@ -197,6 +197,15 @@ pub struct KalshiBalance {
 pub struct KalshiPositions {
     #[serde(default)]
     pub market_positions: Vec<KalshiMarketPosition>,
+    /// Kalshi's paging convention, the same one `KalshiOrdersPage` and
+    /// `KalshiFillsPage` carry: a non-empty cursor means MORE ROWS, and the
+    /// last page sends `""` or omits it. It was absent from this struct while
+    /// the endpoint's one caller wanted a single page, which made a truncated
+    /// position list indistinguishable from a complete one — see
+    /// `KalshiGateway::net_positions`, which is the caller that cannot survive
+    /// that.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 /// `position_fp` is a SIGNED contract count string; the *_dollars are money.
@@ -403,11 +412,27 @@ pub fn pmus_order(body: &str) -> Result<PmOrder, VenueError> {
 }
 
 /// GET /v1/portfolio/positions — a dict KEYED BY SLUG with string netPosition.
+///
+/// THE PAGING FIELDS ARE UNVERIFIED. Nothing in this repo has ever seen this
+/// endpoint return one: no fixture carries them, the Python reader
+/// (`PmusSession.get_positions`) does not look for either, and
+/// `docs/venue-quirks.md` §`pmus-positions-dict-keyed-by-slug` does not mention
+/// paging. They are read anyway because `PmusGateway::net_positions` refuses a
+/// map that says it is partial, and a guard that costs nothing is worth having
+/// against an endpoint documented to serve partial sets for OTHER reasons.
+///
+/// The `alias` is part of that, and is a guess with a stated basis rather than
+/// a fact: every other field this venue sends is camelCase (`netPosition`,
+/// `costPerShare`, `qtyBought`, `avgPx`, `buyingPower`), so `nextCursor` is the
+/// far likelier spelling of the two. Accepting both costs one attribute and
+/// cannot break a parse. Treat the guard as a belt, not a proof: if this
+/// endpoint ever does paginate under a third spelling, the map goes short and
+/// nothing here notices.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PmPositions {
     #[serde(default)]
     pub positions: BTreeMap<String, PmPosition>,
-    #[serde(default)]
+    #[serde(default, alias = "nextCursor")]
     pub next_cursor: Option<String>,
     #[serde(default)]
     pub eof: Option<bool>,

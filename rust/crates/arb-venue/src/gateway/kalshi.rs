@@ -11,7 +11,7 @@ use crate::sign::KalshiSigner;
 use crate::transport::{NotWired, Transport};
 use crate::wire;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
 
 /// Kalshi V2 API paths. The signature covers the FULL path including the
@@ -49,6 +49,14 @@ const K_FILLS_MAX_PAGES: usize = 5;
 /// the hundreds, so reaching it means the cursor is not terminating.
 const K_ORDERS_MAX_PAGES: usize = 50;
 const K_POSITIONS: &str = "/trade-api/v2/portfolio/positions";
+/// Pages of the POSITION list one [`KalshiGateway::net_positions`] will walk.
+///
+/// An ERROR, not a truncated map, for the same reason as [`K_FILLS_MAX_PAGES`]
+/// — and the consequence here is the sharper one. A position list read short
+/// reports the tickers it left out as ZERO, and zero on our side of a basket
+/// whose other leg IS read is exactly the shape of a naked leg. 20 pages is
+/// well past any position count this account has held.
+const K_POSITIONS_MAX_PAGES: usize = 20;
 
 /// Kalshi gateway. Generic over its [`Transport`]; the default is
 /// [`NotWired`], so a gateway built with [`KalshiGateway::new`] still cannot
@@ -980,5 +988,72 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
             });
         }
         resp::kalshi_positions(&r.body)
+    }
+
+    /// Ticker -> signed contract count, over the WHOLE position list.
+    ///
+    /// Walks the cursor, unlike [`Self::positions`], which reads one page and
+    /// ignores it. That single page is one of the four objections `orphan.rs`
+    /// raises against reconciling anything from venue positions — "`positions()`
+    /// on both gateways reads ONE PAGE and ignores the cursor" — and it is fatal
+    /// HERE and not in the balance-shaped callers, because a ticker left off the
+    /// last page comes back as no entry at all, a caller reads that as zero, and
+    /// zero on our side of a basket whose other leg WAS read is precisely the
+    /// shape of a naked leg. Running out of pages is an error, not a short map
+    /// (see [`K_POSITIONS_MAX_PAGES`]).
+    ///
+    /// `position_fp` ABSENT is 0 — that is what
+    /// `scripts/hedge_naked_legs.py:57` does (`float(p.get("position_fp") or
+    /// 0)`) and the field is optional in the wire shape. `position_fp` PRESENT
+    /// and unparseable is an error: a count folded to zero by a decoder is the
+    /// same false-naked reading as one dropped by a truncated page, and this is
+    /// the one place in the file where a `0` default would be a claim rather
+    /// than a blank.
+    fn net_positions(&self) -> Result<BTreeMap<String, f64>, VenueError> {
+        let mut out: BTreeMap<String, f64> = BTreeMap::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            if pages >= K_POSITIONS_MAX_PAGES {
+                return Err(VenueError::Status {
+                    endpoint: "kalshi positions",
+                    status: 0,
+                    body: format!(
+                        "the position list still has a cursor after {K_POSITIONS_MAX_PAGES} \
+                         pages; refusing to return a truncated map, whose missing tickers a \
+                         caller cannot tell from a flat account"
+                    ),
+                });
+            }
+            // No query on the FIRST page: that is the request this endpoint has
+            // always been sent, and a `limit` the venue happens to reject would
+            // fail a read that works today. Paging only adds the cursor.
+            let q = cursor.as_ref().map(|c| format!("cursor={c}"));
+            let r = self.call(Priority::Background, "GET", K_POSITIONS, q.as_deref(), None)?;
+            pages += 1;
+            if r.status != 200 {
+                return Err(VenueError::Status {
+                    endpoint: "kalshi positions",
+                    status: r.status,
+                    body: r.body,
+                });
+            }
+            let page = resp::kalshi_positions(&r.body)?;
+            for p in page.market_positions {
+                let q = match p.position_fp.as_deref() {
+                    None => 0.0,
+                    Some(s) => s.trim().parse::<f64>().map_err(|_| VenueError::Parse {
+                        endpoint: "kalshi positions",
+                        detail: format!("{}: position_fp {s:?} is not a number", p.ticker),
+                    })?,
+                };
+                out.insert(p.ticker, q);
+            }
+            match page.cursor {
+                Some(c) if !c.is_empty() => cursor = Some(c),
+                _ => break,
+            }
+        }
+        Ok(out)
     }
 }

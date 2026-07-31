@@ -40,6 +40,7 @@ mod fills;
 mod hist;
 mod ledger;
 mod orphan;
+mod positions;
 mod risk;
 mod taketake;
 mod sink;
@@ -148,6 +149,16 @@ struct Args {
     /// (`Intent` has no exit and `book_basket` writes `status: "open"`). A
     /// `--unwind` that placed would be a claim this binary cannot honour.
     unwind_detect_only: bool,
+    /// Reconcile registry pairs against BOTH venues' actual positions every 5
+    /// minutes and REPORT naked legs (`positions::recon_loop`).
+    ///
+    /// OFF by default, and there is no armed spelling — the same posture as
+    /// `--unwind-detect-only`, for a stronger reason: `arbbot-hedge.timer`
+    /// already acts on this read, and a second actor on the same Kalshi key is
+    /// a double hedge rather than a backup (`orphan.rs`). It also needs
+    /// `--enable-orders`, not because it writes anything but because the venue
+    /// READ handle is the order sink; see where it is spawned.
+    positions_recon: bool,
 }
 
 /// The floating maker APR bar (Geoff 2026-07-22, card 80ff7987), port of
@@ -225,6 +236,7 @@ fn default_args() -> Args {
         toxgate: None,
         suppress: Vec::new(),
         unwind_detect_only: false,
+        positions_recon: false,
     }
 }
 
@@ -310,6 +322,7 @@ fn parse_args() -> Args {
                 a.suppress.push((m.to_string(), side));
             }
             "--unwind-detect-only" => a.unwind_detect_only = true,
+            "--positions-recon" => a.positions_recon = true,
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(2);
@@ -1379,6 +1392,59 @@ fn spawn_fill_feeds(
     }
 }
 
+/// The venue-truth positions reconciliation (`--positions-recon`), which is
+/// OFF unless asked for and never places anything. See `positions`.
+///
+/// It reads through the SINKS rather than building its own gateways, which is
+/// what ties it to `--enable-orders` even though it writes nothing: the sinks
+/// are where this process's per-venue credentials and — the part that matters
+/// — its single background token bucket live (quirk `xv-shared-api-budget`). A
+/// private gateway for a read-only feature would be a second bucket against
+/// the same account, which is the thing that budget exists to prevent. That it
+/// therefore cannot run in the unarmed shadow is a real limitation and the
+/// seam to reopen if the shadow is where this should first be watched.
+///
+/// BOTH venues or nothing. A one-venue reconciliation has no imbalance to
+/// compute; it would only be able to list positions.
+fn spawn_positions_recon(
+    args: &Args,
+    sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
+) {
+    if !args.positions_recon {
+        return;
+    }
+    let (Some(k), Some(p)) =
+        (sinks.get(&Venue::Kalshi), sinks.get(&Venue::PolymarketUs))
+    else {
+        eprintln!(
+            "[recon] --positions-recon REFUSED: needs a read handle on BOTH venues \
+             (kalshi={}, polymarket_us={})",
+            sinks.contains_key(&Venue::Kalshi),
+            sinks.contains_key(&Venue::PolymarketUs)
+        );
+        return;
+    };
+    let pairs = positions::pairs_from_registry(&args.registry);
+    if pairs.is_empty() {
+        eprintln!(
+            "[recon] --positions-recon REFUSED: {} has no relationship with both a kalshi and \
+             a polymarket_us leg",
+            args.registry
+        );
+        return;
+    }
+    eprintln!(
+        "[recon] venue-truth positions reconciliation ON — {} pair(s), every 5 min, \
+         DETECTION ONLY (it places nothing; arbbot-hedge.timer still owns acting)",
+        pairs.len()
+    );
+    tokio::spawn(positions::recon_loop(
+        positions::Recon::new(pairs),
+        k.clone(),
+        p.clone(),
+    ));
+}
+
 /// What the engine is allowed to do this run. Every "off in bench/replay" and
 /// "off unless armed" decision is spelled out here rather than inferred later.
 fn run_cfg(
@@ -1550,6 +1616,11 @@ async fn main() {
         spawn_shutdown_sweep();
         spawn_fill_feeds(&args, tx_acks.as_ref(), sinks.get(&Venue::Kalshi).cloned());
     }
+    // OUTSIDE the armed block on purpose. It can only run with sinks, but a
+    // `--positions-recon` that is silently ignored on an unarmed run is worse
+    // than one that refuses out loud: the operator believes the engine is
+    // watching venue truth and it is not.
+    spawn_positions_recon(&args, &sinks);
 
     let armed = !sinks.is_empty();
     // Before the first quote: what did the LAST run of this unit leave naked?
@@ -1704,6 +1775,34 @@ relationships:
         // asking for an agent-only rel by prefix still does NOT quote it
         let got = ids(reg.to_str().unwrap(), allow.to_str().unwrap(), &["agent".to_string()]);
         assert!(got.is_empty(), "prefix must not bypass the gate, got {got:?}");
+    }
+
+    /// The venue-truth reconciliation reads the WHOLE registry, not the
+    /// quoting subset. The two gates answer different questions:
+    /// `load_quoters` asks what this engine may PLACE on, and a naked leg on a
+    /// pair that has since been revoked, de-allowlisted or only agent-vetted
+    /// is still a real position at a real venue. Narrowing this to the
+    /// tradable set would blind it to exactly the pairs most likely to have
+    /// been left behind.
+    #[test]
+    fn the_reconciliation_covers_the_whole_registry_not_the_quotable_subset() {
+        let d = scratch("recon-pairs");
+        let reg = d.join("registry.yaml");
+        std::fs::write(&reg, REGISTRY).unwrap();
+        let allow = d.join("tradable.yaml");
+        std::fs::write(&allow, "allow:\n  - allowlisted\n").unwrap();
+
+        let quotable = ids(reg.to_str().unwrap(), allow.to_str().unwrap(), &[]);
+        let pairs = positions::pairs_from_registry(reg.to_str().unwrap());
+        assert_eq!(pairs.len(), 6, "every relationship with both legs: {pairs:?}");
+        assert!(pairs.len() > quotable.len(), "and strictly more than this run quotes");
+        for id in ["rejected-one", "agent-only", "rejected-and-allowlisted"] {
+            assert!(
+                pairs.iter().any(|p| p.rel_id == id),
+                "{id} cannot be quoted, and can still be naked"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 
@@ -2024,6 +2123,14 @@ mod precondition_tests {
             Err(m) => m.join("\n"),
         };
         assert!(err.contains("bench/replay"), "{err}");
+    }
+
+    /// The venue-truth positions reconciliation is OFF unless asked for. It
+    /// spends a shared background budget on two venues every 5 minutes, and
+    /// nothing about today's running unit may change because this landed.
+    #[test]
+    fn the_positions_reconciliation_is_off_by_default() {
+        assert!(!default_args().positions_recon);
     }
 }
 
