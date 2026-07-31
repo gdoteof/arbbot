@@ -307,6 +307,22 @@ pub trait OrderSink: Send + Sync {
     fn filled_qty(&self, _order_id: &str) -> Result<i64, VenueError> {
         Err(VenueError::NotWired)
     }
+    /// Venue truth for POSITIONS: market id -> signed contract count, over the
+    /// whole account. Where `fills_since` is history for a window and
+    /// `filled_qty` is one order, this is the standing state — the only read
+    /// that can see a position however it arose, including from a fill this
+    /// process never attributed.
+    ///
+    /// Through the SINK for the same reason `fills_since` is: one gateway per
+    /// venue per process, so this spends the same background token bucket as
+    /// every other read (quirk `xv-shared-api-budget`).
+    ///
+    /// The default REFUSES — see [`arb_venue::gateway::VenueGateway::net_positions`],
+    /// which explains why an empty map is the one answer this must never
+    /// invent.
+    fn net_positions(&self) -> Result<std::collections::BTreeMap<String, f64>, VenueError> {
+        Err(VenueError::NotWired)
+    }
 }
 
 /// Every gateway is a sink. The adapter is the same four delegations for both
@@ -345,6 +361,9 @@ where
     }
     fn filled_qty(&self, order_id: &str) -> Result<i64, VenueError> {
         VenueGateway::order_filled_qty(self, order_id)
+    }
+    fn net_positions(&self) -> Result<std::collections::BTreeMap<String, f64>, VenueError> {
+        VenueGateway::net_positions(self)
     }
 }
 

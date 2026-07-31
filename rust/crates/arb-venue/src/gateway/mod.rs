@@ -26,7 +26,7 @@ pub use pmus::PmusGateway;
 use crate::error::VenueError;
 use crate::ratelimit::{Priority, RateLimiter};
 use crate::resp;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
 
 /// Raw venue side on the YES price axis. `Bid` buys YES; `Ask` sells YES
@@ -260,6 +260,28 @@ pub trait VenueGateway {
     fn rehearse(&self, market: &str) -> Result<String, VenueError>;
     fn balances(&self) -> Result<Self::Balances, VenueError>;
     fn positions(&self) -> Result<Self::Positions, VenueError>;
+    /// The account's CURRENT net contract count per market, under ONE name and
+    /// one sign convention: Kalshi keys by ticker and signs `position_fp`,
+    /// PM-US keys by slug and signs `netPosition`. A caller asking "are these
+    /// two legs still offset?" needs that the same way it needs
+    /// [`Self::order_id`], and [`Self::positions`] cannot give it — its type is
+    /// per-venue by construction.
+    ///
+    /// SIGNED CONTRACT COUNTS, NOT MONEY. `f64` is the carrier because that is
+    /// what a count is here and it is nowhere near a price: both venues report
+    /// fractional positions (Kalshi splits a fill across price levels, PM-US's
+    /// are genuinely fractional — `docs/venue-quirks.md`
+    /// §`pmus-positions-dict-keyed-by-slug`), and the only consumer's deadband
+    /// is half a contract. Prices stay strings end to end.
+    ///
+    /// The default REFUSES rather than answering an empty map, for exactly the
+    /// reason [`Self::order_filled_qty`] refuses rather than answering 0: an
+    /// empty map is not inert. It is an affirmative claim that this account
+    /// holds nothing, and a caller reconciling two venues reads that as every
+    /// position on the OTHER venue being naked.
+    fn net_positions(&self) -> Result<BTreeMap<String, f64>, VenueError> {
+        Err(VenueError::NotWired)
+    }
 }
 
 fn now_ns() -> u64 {

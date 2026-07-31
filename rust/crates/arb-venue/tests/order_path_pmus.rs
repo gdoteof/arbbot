@@ -594,3 +594,72 @@ fn a_numeric_price_is_kept_as_an_exact_string() {
         arb_venue::resp::PmFillState::Filled { cum_quantity: 2, avg_px: "0.4225".into() }
     );
 }
+
+// ---------------------------------------- net_positions (naked-leg recon) ---
+
+/// The normalized read: slug -> SIGNED contract count, from the string
+/// `netPosition`.
+#[test]
+fn net_positions_are_signed_counts_keyed_by_slug() {
+    let g = gw(vec![(
+        200,
+        r#"{"positions":{"will-x":{"netPosition":"-25"},"will-y":{"netPosition":"3.5"}}}"#,
+    )]);
+    let p = g.net_positions().expect("read");
+    assert_eq!(p["will-x"], -25.0, "shorts keep their sign");
+    assert_eq!(p["will-y"], 3.5, "and PM positions are genuinely fractional");
+}
+
+/// THE EMPTY GLITCH (`pmus-positions-empty-glitch`). This endpoint serves an
+/// empty map while positions are held, and the documented consequence is false
+/// NAKED alerts. It must error so a caller re-fetches, exactly as
+/// `PmusSession.get_positions` raises unless `allow_empty`.
+#[test]
+fn an_empty_positions_map_is_the_glitch_not_a_flat_account() {
+    let g = gw(vec![(200, r#"{"positions":{}}"#)]);
+    match g.net_positions() {
+        Err(VenueError::Status { body, .. }) => assert!(body.contains("EMPTY"), "{body}"),
+        other => panic!("an empty read must not be reported as a flat account: {other:?}"),
+    }
+    // ...and the RAW read is unchanged: `positions()` is still the honest
+    // primitive, so nothing that already reads it starts erroring.
+    let g = gw(vec![(200, r#"{"positions":{}}"#)]);
+    assert!(g.positions().expect("raw read still works").positions.is_empty());
+}
+
+/// A partial map is refused for the same reason: missing slugs read as zero,
+/// and this endpoint is documented to serve partial sets during incidents.
+#[test]
+fn a_truncated_positions_map_is_refused() {
+    for body in [
+        r#"{"positions":{"will-x":{"netPosition":"-25"}},"next_cursor":"c1"}"#,
+        // ...and the camelCase spelling this venue actually uses everywhere
+        // else, which is the one it would send if it ever paginated at all.
+        r#"{"positions":{"will-x":{"netPosition":"-25"}},"nextCursor":"c1"}"#,
+        r#"{"positions":{"will-x":{"netPosition":"-25"}},"eof":false}"#,
+    ] {
+        let g = gw(vec![(200, body)]);
+        match g.net_positions() {
+            Err(VenueError::Status { body: b, .. }) => assert!(b.contains("TRUNCATED"), "{b}"),
+            other => panic!("a partial map must be refused: {other:?}"),
+        }
+    }
+}
+
+/// A `netPosition` that will not parse is an error, never 0.
+#[test]
+fn an_unreadable_net_position_is_not_zero() {
+    let g = gw(vec![(200, r#"{"positions":{"will-x":{"netPosition":"many"}}}"#)]);
+    match g.net_positions() {
+        Err(VenueError::Parse { detail, .. }) => assert!(detail.contains("will-x"), "{detail}"),
+        other => panic!("a count we cannot read must not become 0: {other:?}"),
+    }
+}
+
+/// THE 2026-07-31 SHAPE: `/v1/portfolio/positions` answering 503, repeatedly.
+/// The one answer it must never produce is "nothing held".
+#[test]
+fn a_503_is_not_an_empty_portfolio() {
+    let g = gw(vec![(503, "upstream unavailable")]);
+    assert!(g.net_positions().is_err());
+}
