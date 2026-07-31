@@ -257,12 +257,28 @@ async fn main() -> Result<()> {
 
     // Polymarket intl: public WS
     if !universe.pm_tokens.is_empty() {
-        tasks.push(tokio::spawn(pmintl::ws_task(
-            core.clone(),
-            liveness.clone(),
-            universe.pm_tokens.clone(),
-            clob.clone(),
-        )));
+        if cfg.record_polymarket_intl {
+            tasks.push(tokio::spawn(pmintl::ws_task(
+                core.clone(),
+                liveness.clone(),
+                universe.pm_tokens.clone(),
+                clob.clone(),
+            )));
+        } else {
+            // NOT a silent omission. `liveness.beat("polymarket-ws")` lives
+            // inside ws_task, so skipping the spawn makes the feed ABSENT from
+            // health.jsonl rather than stale — and a watchdog keying on feeds
+            // PRESENT reads absent as healthy. Say it once, loudly, like
+            // record/main.py does.
+            println!(
+                "polymarket INTL: OFF by config — {} token(s) NOT recorded, and \
+                 `polymarket-ws` will be absent from {} (not stale, absent). INTL \
+                 has no order path; re-enable with record_polymarket_intl: true in {}",
+                universe.pm_tokens.len(),
+                cfg.health_path,
+                args.config
+            );
+        }
     }
 
     // Polymarket US: authed WS when the key exists, else REST poll.

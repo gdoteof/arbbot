@@ -1,3 +1,9 @@
+# RETIRED 2026-07-31 — stopped and disabled. arb-recorder was promoted to
+# arbbot-recorder.service (the canonical paths); this unit is the same binary,
+# and running both would open a second WS session on the same PM-US key, which
+# is exactly the contention the note below warns about. Kept, not deleted,
+# because it is the shape a future shadow should be re-cut from.
+#
 # Rust recorder SHADOW unit (P1). Runs beside arbbot-recorder.service with
 # isolated outputs (data/raw-rs, arbbot-rs.sock, health-rs.jsonl).
 #

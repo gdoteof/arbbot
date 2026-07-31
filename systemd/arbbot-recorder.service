@@ -1,8 +1,31 @@
 # systemd USER unit: systemctl --user enable --now arbbot-recorder
 # (loginctl enable-linger <user>  # so it survives logout)
-# Credential-free by design — the recorder never receives trading keys.
+#
+# THE PRODUCTION RECORDER. Runs `arb-recorder`; ran `python -m arbbot.record.main`
+# until 2026-07-31. See docs/recorder-cutover-runbook.md for the swap and for
+# how to put Python back (`git checkout` this file first — the unit NAME did not
+# change, so a rollback that skips that step restarts the Rust binary).
+#
+# WHY THIS UNIT AND NOT arbbot-recorder-rs.service: both trader units carry
+# `After=arbbot-recorder.service` / `Wants=arbbot-recorder.service`. Promoting
+# the -rs unit would have left the armed engine ordered against a dead unit.
+# arbbot-recorder-rs.service is stopped and disabled; it is the same binary and
+# a second copy would open a second WS session on the same PM-US key.
+#
+# CREDENTIALS: the `rs`-suffixed keys, deliberately — they are what the shadow
+# ran on and what the promotion gate tested, and a live swap should not change
+# two things at once. Kalshi's rs key is the READ-ONLY tier. PM-US has no
+# read-only tier so its key is trade-capable, acceptable here for the same
+# structural reason it always was: this binary contains no order code path.
+# Consolidating back onto the unsuffixed keys is cleanup, not urgent, and wants
+# its own restart.
+#
+# Still credential-free of TRADING keys: LoadCredential names exactly four
+# market-data credentials, so nothing else in ~/.arbbot-credentials is visible
+# to the process — including polymarket_usa_rs_trader_*, which the armed engine
+# uses and this must never see.
 [Unit]
-Description=arbbot market-data recorder + scanner (Stage 1)
+Description=arbbot market-data recorder (Rust; authoritative tape + socket)
 After=network-online.target
 Wants=network-online.target
 
@@ -10,18 +33,29 @@ Wants=network-online.target
 CPUAffinity=0-7 10-31
 Type=simple
 WorkingDirectory=%h/claude/arbbot
-Environment=PYTHONFAULTHANDLER=1
-LoadCredential=kalshi_recorder_api_key_id:%h/.arbbot-credentials/kalshi_recorder_api_key_id
-LoadCredential=kalshi_recorder_private_key.pem:%h/.arbbot-credentials/kalshi_recorder_private_key.pem
-# PM US market-data WS needs auth and PM US has no read-only key, so the
-# recorder gets the (trade-capable) PM US key — used only to sign the WS
-# handshake; the recorder has no order-placement code path.
-LoadCredential=polymarket_usa_key_id:%h/.arbbot-credentials/polymarket_usa_key_id
-LoadCredential=polymarket_usa_private_key:%h/.arbbot-credentials/polymarket_usa_private_key
-ExecStart=%h/claude/arbbot/.venv313/bin/python -m arbbot.record.main --config config/recorder.yaml
+LoadCredential=kalshi_recorder_rs_api_key_id:%h/.arbbot-credentials/kalshi_recorder_rs_api_key_id
+LoadCredential=kalshi_recorder_rs_private_key.pem:%h/.arbbot-credentials/kalshi_recorder_rs_private_key.pem
+LoadCredential=polymarket_usa_rs_key_id:%h/.arbbot-credentials/polymarket_usa_rs_key_id
+LoadCredential=polymarket_usa_rs_private_key:%h/.arbbot-credentials/polymarket_usa_rs_private_key
+# The canonical paths, which every consumer already names: the scanner binds
+# cfg.socket_path from config/recorder.yaml, and both traders pass
+# `--socket data/arbbot.sock --health data/health.jsonl` literally. No --shadow:
+# it suppresses ntfy (arb-recorder/src/main.rs:166), which is right for a shadow
+# and wrong for the recorder everything else depends on.
+ExecStart=%h/claude/arbbot/rust/target/release/arb-recorder \
+    --config config/recorder.yaml \
+    --data-dir data/raw \
+    --socket data/arbbot.sock \
+    --health data/health.jsonl \
+    --kalshi-cred-suffix rs \
+    --pmus-cred-suffix rs
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
+# A backstop, not a budget: observed RSS is ~40 MB with INTL off (the Python
+# recorder it replaces held ~200 MB). Set far above that because OOM-killing the
+# recorder takes the armed engine's feed with it.
+MemoryMax=4G
 
 [Install]
 WantedBy=default.target
