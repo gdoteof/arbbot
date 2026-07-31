@@ -1413,3 +1413,72 @@ fn the_fill_history_read_spends_the_background_budget() {
     );
     assert!(g.transport.sent().is_empty(), "and refuse it BEFORE the wire");
 }
+
+// ---------------------------------------- net_positions (naked-leg recon) ---
+
+/// The normalized read: ticker -> SIGNED contract count, `position_fp` parsed
+/// as the number it is.
+#[test]
+fn net_positions_are_signed_counts_keyed_by_ticker() {
+    let g = gw(vec![(
+        200,
+        r#"{"market_positions":[{"ticker":"KXA","position_fp":"25.00"},
+                                {"ticker":"KXB","position_fp":"-3.5"}]}"#,
+    )]);
+    let p = g.net_positions().expect("read");
+    assert_eq!(p["KXA"], 25.0);
+    assert_eq!(p["KXB"], -3.5, "shorts keep their sign");
+    assert_eq!(g.transport.sent()[0].query, None, "no query on the first page");
+}
+
+/// An ABSENT `position_fp` is 0 — the field is optional in the wire shape and
+/// that is what `hedge_naked_legs.py:57` does (`float(p.get("position_fp") or 0)`).
+#[test]
+fn an_absent_position_count_is_zero() {
+    let g = gw(vec![(200, r#"{"market_positions":[{"ticker":"KXA"}]}"#)]);
+    assert_eq!(g.net_positions().expect("read")["KXA"], 0.0);
+}
+
+/// ...but a PRESENT one that will not parse is an ERROR, never 0. A count
+/// folded to zero on our side of a basket makes the other side look naked,
+/// and that is the reading a hedger acts on by buying contracts.
+#[test]
+fn an_unreadable_position_count_is_not_zero() {
+    let g = gw(vec![(200, r#"{"market_positions":[{"ticker":"KXA","position_fp":"lots"}]}"#)]);
+    match g.net_positions() {
+        Err(VenueError::Parse { detail, .. }) => assert!(detail.contains("KXA"), "{detail}"),
+        other => panic!("a count we cannot read must not become 0: {other:?}"),
+    }
+}
+
+/// The cursor is FOLLOWED, unlike `positions()`, which reads one page and
+/// ignores it. A ticker on a page nobody read comes back as no entry at all,
+/// and a caller reads no entry as zero.
+#[test]
+fn net_positions_walks_the_cursor() {
+    let g = gw(vec![
+        (200, r#"{"market_positions":[{"ticker":"KXA","position_fp":"1"}],"cursor":"c1"}"#),
+        (200, r#"{"market_positions":[{"ticker":"KXB","position_fp":"2"}],"cursor":""}"#),
+    ]);
+    let p = g.net_positions().expect("both pages");
+    assert_eq!(p.len(), 2, "the second page is not optional: {p:?}");
+    assert_eq!(g.transport.sent()[1].query.as_deref(), Some("cursor=c1"));
+}
+
+/// A cursor that never terminates is an error, not a short map.
+#[test]
+fn a_position_cursor_that_never_ends_is_refused() {
+    let page = r#"{"market_positions":[{"ticker":"KXA","position_fp":"1"}],"cursor":"c"}"#;
+    let g = gw(vec![(200, page); 20]);
+    match g.net_positions() {
+        Err(VenueError::Status { body, .. }) => assert!(body.contains("truncated"), "{body}"),
+        other => panic!("a truncated position map must be refused: {other:?}"),
+    }
+}
+
+/// A venue that will not answer is not a flat account.
+#[test]
+fn a_failed_positions_read_is_an_error_not_an_empty_map() {
+    let g = gw(vec![(503, "service unavailable")]);
+    assert!(g.net_positions().is_err(), "503 must never read as 'nothing held'");
+}

@@ -1347,6 +1347,37 @@ impl Engine {
             // under a mismatch the same id repeats on every reconcile for the
             // life of the process, under lag it merges once REST catches up.
             "kalshi_reconcile_rejected": crate::fills::kalshi_reconcile_rejected(),
+            // Naked legs the venue-truth positions reconciliation
+            // (`--positions-recon`, OFF by default) has CONFIRMED across two
+            // cycles. Every gauge above this one is derived from fills this
+            // process saw; this is the only one derived from what the venues
+            // actually hold, so it is the only one that can see a leg the
+            // engine never attributed — or fail to see one another owner has
+            // since closed, which `hedges_naked` cannot (2026-07-30, where it
+            // read 1 for a leg arbbot-hedge.timer had already hedged).
+            //
+            // READ IT WITH `positions_recon_age_s`. A 0 here is "no naked leg
+            // in the last snapshot", not "no naked leg", and the difference is
+            // exactly how old that snapshot is.
+            "positions_recon_naked": crate::positions::naked(),
+            // ...and imbalances seen once but not yet by a second cycle. A
+            // transient count is the guard working (a venue read that did not
+            // reproduce, or a hedge in flight); one that never converts is
+            // venue noise being absorbed rather than reported.
+            "positions_recon_unconfirmed": crate::positions::unconfirmed(),
+            // Cycles abandoned because a read could not be trusted: a venue
+            // refusal (PM-US served 503s in runs on 2026-07-31), a spent
+            // background budget, or two position reads that would not agree.
+            // Not must-stay-0 — refusing IS the safe outcome — but it rising
+            // while the age below rises with it means the reconciliation is
+            // down and `positions_recon_naked` is a memory.
+            "positions_recon_failures": crate::positions::failures(),
+            // Seconds since a cycle last COMPLETED; -1 = never, which includes
+            // the default-off case. This is the gauge to alarm on: a
+            // reconciliation that cannot read a venue holds its last answer
+            // forever rather than inventing a clean one, and this is what says
+            // so.
+            "positions_recon_age_s": crate::positions::age_s(),
             "would_place": self.exec_stats.placed.load(std::sync::atomic::Ordering::Relaxed),
             "would_cancel": self.exec_stats.cancelled.load(std::sync::atomic::Ordering::Relaxed),
             "exec_dropped": self.exec_stats.dropped.load(std::sync::atomic::Ordering::Relaxed),

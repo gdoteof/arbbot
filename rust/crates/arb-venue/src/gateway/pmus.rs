@@ -11,7 +11,7 @@ use crate::sign::PmusSigner;
 use crate::transport::{NotWired, Transport};
 use crate::wire;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
 
 /// PM-US (QCX) paths. Unlike Kalshi there is no API prefix on the base
@@ -442,6 +442,70 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
             });
         }
         resp::pmus_positions(&r.body)
+    }
+
+    /// Slug -> signed contract count, with the two guards the raw endpoint
+    /// needs and [`Self::positions`] deliberately does not apply.
+    ///
+    /// EMPTY IS AN ERROR, not an empty map. `GET /v1/portfolio/positions`
+    /// transiently serves an EMPTY positions map while positions are actually
+    /// held (`docs/venue-quirks.md` §`pmus-positions-empty-glitch`, seen 4x on
+    /// 2026-07-22), and the documented failure is not hypothetical: it "painted
+    /// false NAKED alerts". This is the same call Python makes and the same
+    /// answer Python gives — `PmusSession.get_positions` raises unless
+    /// `allow_empty`, precisely so its callers' retry loops re-fetch instead of
+    /// trusting the snapshot. The cost is that a genuinely FLAT PM-US account
+    /// cannot be expressed here; that is Python's trade too, and it is the safe
+    /// direction, since the caller of a naked-leg reconciliation reads "no
+    /// positions" as "every leg on the other venue is unhedged".
+    ///
+    /// A TRUNCATED read is an error for the same reason (`nextCursor` set, or
+    /// `eof` explicitly false). Missing slugs read as zero, and this endpoint is
+    /// documented to serve PARTIAL sets during platform incidents
+    /// (§`pmus-positions-partial-stale-sticky`). Nothing here follows the
+    /// cursor: no read this stack has taken has come back with one, so a walk
+    /// would be untested code on a money path — refusing says so out loud
+    /// instead of guessing at the paging contract.
+    ///
+    /// What is NOT handled here, because it cannot be: the STICKY hours-stale
+    /// snapshot from that same quirk. A server-side cache survives back-to-back
+    /// reads, so no guard inside one read — and no consensus across two of them
+    /// — can see it. That one belongs to the caller and needs separated reads;
+    /// see `arb-trader`'s `positions::Recon`.
+    fn net_positions(&self) -> Result<BTreeMap<String, f64>, VenueError> {
+        let p = self.positions()?;
+        if p.next_cursor.as_deref().map(|c| !c.is_empty()).unwrap_or(false)
+            || p.eof == Some(false)
+        {
+            return Err(VenueError::Status {
+                endpoint: "pmus positions",
+                status: 0,
+                body: "the position map is TRUNCATED (nextCursor/eof); refusing to return a \
+                       partial map, whose missing slugs a caller cannot tell from a flat account"
+                    .into(),
+            });
+        }
+        if p.positions.is_empty() {
+            return Err(VenueError::Status {
+                endpoint: "pmus positions",
+                status: 0,
+                body: "EMPTY positions map — the pmus-positions-empty-glitch read. Refusing \
+                       rather than reporting a flat account; retry."
+                    .into(),
+            });
+        }
+        let mut out: BTreeMap<String, f64> = BTreeMap::new();
+        for (slug, v) in p.positions {
+            // `netPosition` is REQUIRED in the wire shape, so unlike Kalshi's
+            // optional `position_fp` there is no absent case to default — only
+            // a present one that must not be folded to 0.
+            let q = v.net_position.trim().parse::<f64>().map_err(|_| VenueError::Parse {
+                endpoint: "pmus positions",
+                detail: format!("{slug}: netPosition {:?} is not a number", v.net_position),
+            })?;
+            out.insert(slug, q);
+        }
+        Ok(out)
     }
 }
 
