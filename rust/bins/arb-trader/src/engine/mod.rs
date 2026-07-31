@@ -86,6 +86,16 @@ pub struct RunCfg {
     /// Opportunistic-unwind policy. `None` = the scan never runs, which is the
     /// default: this is a new strategy on real money, not a defect fix.
     pub unwind: Option<Unwind>,
+    /// The operator's STATIC `--suppress` declaration, carried so
+    /// `maker_exit_tick` can add the exit's own (market, Ask) to it without
+    /// dropping it. `Quoter::set_suppress` replaces wholesale, so a tick that
+    /// installed only the exit's pair would silently revoke every side another
+    /// order-owner had declared.
+    pub suppress: std::collections::HashSet<(String, arb_core::model::BookSide)>,
+    /// Publish the hurdle, the cap, the PM-US book and the yielded Kalshi asks
+    /// for `crate::maker_exit`. `false` = never published, which is how that
+    /// module's fail-closed read keeps it inert. Off in bench/replay.
+    pub maker_exit_view: bool,
     /// Whether the venue order path is live. Reported in the stats `mode`.
     ///
     /// This existed only as an inference before (`ledger_path.is_some()`), so
@@ -478,6 +488,10 @@ struct Engine {
     /// SORTED, because `select`'s display order ties on both its keys for
     /// identically-sized baskets on one relationship and a reorder is not a
     /// change.
+    /// When each Kalshi ask was FIRST yielded to `crate::maker_exit`. Not
+    /// re-stamped while the request stands, because the reader's settle window
+    /// measures how long the quoter has been out of the side.
+    maker_exit_suppressed: std::collections::BTreeMap<String, std::time::Instant>,
     unwind_seen: Option<UnwindReport>,
     /// Why the last scan refused to decide, when it did. Same shape and same
     /// reason as `tox_reason`: a subsystem that has gone quiet must be able to
@@ -738,6 +752,7 @@ impl Engine {
             n_unwind_near_floor: 0,
             n_unwind_near_miss: 0,
             unwind_near_miss_usd: 0.0,
+            maker_exit_suppressed: std::collections::BTreeMap::new(),
             unwind_seen: None,
             unwind_refused: None,
             link,
@@ -1181,6 +1196,61 @@ impl Engine {
         }
     }
 
+    /// Publish what `crate::maker_exit` cannot derive, and install what it asks
+    /// for.
+    ///
+    /// TWO DIRECTIONS, ONE TICK, and they belong together: the exit loop asks
+    /// for a Kalshi ask to be yielded, and the only honest answer to "has it
+    /// been" is one published by the code that did the yielding. Split across
+    /// two ticks they could disagree about whether the entry quoter is out.
+    ///
+    /// SILENT WHEN HALTED, and that is the whole halt path for the exit loop.
+    /// `crate::maker_exit::VIEW_MAX_AGE` refuses a view older than three of
+    /// these, so a killed or feed-pulled engine makes every exit decision refuse
+    /// and makes the loop PULL what it has resting — without this module having
+    /// to reach into it. `unwind_tick` documents the same gate for the same
+    /// reason: an exit is still an order.
+    pub(super) fn maker_exit_tick(&mut self, quoters: &mut [Quoter]) {
+        if !self.cfg.maker_exit_view {
+            return;
+        }
+        if self.killed || self.feed_reason.is_some() {
+            return;
+        }
+        let asked = crate::maker_exit::suppress_requests();
+        // Base + asked, never asked alone: `set_suppress` replaces the whole
+        // set and the operator's `--suppress` declaration must survive.
+        let mut want = self.cfg.suppress.clone();
+        for m in &asked {
+            want.insert((m.clone(), BookSide::Ask));
+        }
+        for q in quoters.iter_mut() {
+            q.set_suppress(want.clone());
+        }
+        let now = std::time::Instant::now();
+        // FIRST installed, not most recently confirmed: the settle window the
+        // reader applies is "how long has the quoter been out of this side",
+        // and re-stamping it every tick would make that window never elapse.
+        self.maker_exit_suppressed.retain(|m, _| asked.contains(m));
+        for m in &asked {
+            self.maker_exit_suppressed.entry(m.clone()).or_insert(now);
+        }
+        // PM-US top-of-book ASK for every market this engine holds a book for.
+        // The engine's book is the ONLY PM-US price read in this process —
+        // `PmusGateway` has no `market_quote` — so an exit priced without it
+        // would be a two-leg trade with one leg valued.
+        let mut pm_ask = std::collections::BTreeMap::new();
+        for (market, ask) in self.books.pm_us_asks() {
+            pm_ask.insert(market, ask);
+        }
+        crate::maker_exit::publish_view(crate::maker_exit::EngineView {
+            apr_bar: self.apr_bar,
+            global_cap_usd: self.cfg.risk.as_ref().map_or(0.0, |r| r.global_cap_usd()),
+            pm_ask,
+            suppressed_at: self.maker_exit_suppressed.clone(),
+        });
+    }
+
     fn summary(&self) -> serde_json::Value {
         let elapsed = self.t_start.elapsed().as_secs_f64();
         serde_json::json!({
@@ -1220,6 +1290,14 @@ impl Engine {
             // that says why selecting on it would be a losing strategy.
             "unwind_near_miss": self.n_unwind_near_miss,
             "unwind_near_miss_usd": self.unwind_near_miss_usd,
+            // The maker-exit placer (`--maker-exit` only; 0 forever without it).
+            // `maker_exit_unresolved` MUST STAY 0: it counts a Kalshi exit that
+            // FILLED and whose PM-US leg did not close, which is a naked short
+            // the ledger still records as a hedged basket.
+            "maker_exit_placed": crate::maker_exit::placed(),
+            "maker_exit_closed": crate::maker_exit::closed(),
+            "maker_exit_refused": crate::maker_exit::refused(),
+            "maker_exit_unresolved": crate::maker_exit::unresolved(),
             // ...and WHY the scan decided nothing, when it refused to decide at
             // all. `null` = it ran. Every gauge above reads zero on a converged
             // book AND on a degenerate class cap, an off-band hurdle and torn
@@ -2276,7 +2354,7 @@ pub async fn run(
             // Same rule: `cfg.apr` is already None in bench, and re-sizing a
             // hurdle mid-replay off a moving utilization would break the
             // digest even if it were not.
-            _ = apr_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.apr_tick(&mut quoters); eng.record_tick("apr", t); }
+            _ = apr_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.apr_tick(&mut quoters); eng.maker_exit_tick(&mut quoters); eng.record_tick("apr", t); }
             _ = stats_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.stats_tick(); eng.record_tick("stats", t); }
             // The budget is spent and every deadline that was DUE has now had
             // its turn: the arms above are polled first and this one is always
@@ -2316,6 +2394,8 @@ fn test_cfg() -> RunCfg {
         ledger_path: None,
         hedge_retry: None,
         take_take: None,
+        suppress: Default::default(),
+        maker_exit_view: false,
         unwind: None,
         armed: false,
         hedges_undischarged: 0,
@@ -2509,6 +2589,8 @@ mod feed_wiring_tests {
                 alarm_after_s: 60.0,
             }),
             take_take,
+            suppress: Default::default(),
+            maker_exit_view: false,
             unwind: None,
             armed: false,
             hedges_undischarged: 0,
@@ -3839,6 +3921,199 @@ mod apr_refresh_tests {
         let mut eng = test_engine(test_cfg()); // apr: None
         eng.apr_tick(&mut quoters);
         assert_eq!(eng.apr_bar, 0.0, "bench must not acquire a hurdle mid-replay");
+    }
+}
+
+/// **The maker-exit seam.** What the engine publishes for `crate::maker_exit`,
+/// and what it installs on the quoters when that module asks for a side.
+#[cfg(test)]
+mod maker_exit_seam_tests {
+    use super::*;
+    use crate::engine::toxgate_reload_tests::quoter_and_books;
+
+    fn armed_cfg() -> RunCfg {
+        RunCfg { maker_exit_view: true, bench: false, ..test_cfg() }
+    }
+
+    /// `RunCfg` is not `Clone` (it carries an `Arc<RiskView>` and a file path
+    /// set the engine owns), and only the fields this test varies need copying.
+    trait CloneForTest {
+        fn clone_for_test(&self) -> RunCfg;
+    }
+    impl CloneForTest for RunCfg {
+        fn clone_for_test(&self) -> RunCfg {
+            RunCfg { suppress: self.suppress.clone(), ..armed_cfg() }
+        }
+    }
+
+    /// A book on which the entry quoter genuinely WANTS the Kalshi ask.
+    ///
+    /// `quoter_and_books`' shared fixture does not: its PM-US ask is 0.99, so
+    /// the inverted basket that side would open (sell Kalshi YES, buy PM YES)
+    /// costs more than the dollar it pays, and the quoter declines for reasons
+    /// that have nothing to do with suppression. Selling Kalshi YES at 0.98
+    /// leaves 0.02 of NO against a PM YES at 0.20 — 0.22 for a dollar — which it
+    /// quotes without hesitation.
+    fn books_where_the_kalshi_ask_pays() -> BookBuilder {
+        let lvl = |p: &str, s: &str| Level { price: p.into(), size: s.into() };
+        let mut bb = BookBuilder::new();
+        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.60", "500")], vec![lvl("0.99", "500")],
+            1, 1_000_000_000, None);
+        bb.apply_snapshot(Venue::PolymarketUs, "P", vec![lvl("0.10", "500")],
+            vec![lvl("0.20", "500")], 1, 1_000_000_000, None);
+        bb
+    }
+
+    /// Does the entry quoter still want to REST on the Kalshi ask?
+    ///
+    /// Asked through `on_book`, the public door, rather than through
+    /// `Quoter::target`, which is private — and that is the better question
+    /// anyway: what matters is whether a Place reaches the executor, not what an
+    /// internal helper returned.
+    fn quotes_kalshi_ask(quoters: &mut [Quoter], books: &BookBuilder) -> bool {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        quoters[0].on_book(&mut cx, &fees, books, wall_now(), &mut oid, &mut intents);
+        intents.iter().any(|i| match i {
+            Intent::Place(p) => p.venue == Venue::Kalshi && p.side == BookSide::Ask,
+            _ => false,
+        })
+    }
+
+    /// THE VIEW IS THE MODULE'S ONLY INPUT, so publishing it is the whole of the
+    /// wiring: without it `maker_exit::engine_view` fails closed and the loop
+    /// decides nothing. A run without either flag must publish NOTHING, which is
+    /// how an unflagged binary keeps the feature inert even if the loop were
+    /// somehow spawned.
+    #[test]
+    fn the_view_is_published_only_when_a_flag_asked_for_it() {
+        let _g = crate::maker_exit::test_serial();
+        crate::maker_exit::reset_view();
+        let (mut quoters, _) = quoter_and_books();
+
+        let mut off = test_engine(test_cfg()); // maker_exit_view: false
+        off.maker_exit_tick(&mut quoters);
+        assert!(
+            crate::maker_exit::engine_view().is_err(),
+            "an unflagged engine must publish nothing"
+        );
+
+        let mut on = test_engine(armed_cfg());
+        on.apr_bar = 14.5;
+        on.maker_exit_tick(&mut quoters);
+        let v = crate::maker_exit::engine_view().expect("published");
+        assert_eq!(v.apr_bar, 14.5, "the hurdle in force, not a second derivation of it");
+        crate::maker_exit::reset_view();
+    }
+
+    /// A HALTED ENGINE PUBLISHES NOTHING, AND THAT IS THE EXIT'S HALT PATH.
+    ///
+    /// `unwind_tick` states the rule — an exit is still an order, so a killed or
+    /// feed-pulled engine stops deciding them — but the exit loop is a separate
+    /// task and cannot read `self.killed`. Silence is how it is told: the view
+    /// ages out, every decision refuses, and the loop PULLS what it has resting.
+    #[test]
+    fn a_killed_or_feed_pulled_engine_stops_publishing() {
+        let _g = crate::maker_exit::test_serial();
+        let (mut quoters, _) = quoter_and_books();
+        for (killed, feed) in [(true, None), (false, Some("recorder stale".to_string()))] {
+            crate::maker_exit::reset_view();
+            let mut eng = test_engine(armed_cfg());
+            eng.killed = killed;
+            eng.feed_reason = feed.clone();
+            eng.maker_exit_tick(&mut quoters);
+            assert!(
+                crate::maker_exit::engine_view().is_err(),
+                "killed={killed} feed={feed:?} must go silent, not publish a stale hurdle"
+            );
+        }
+        crate::maker_exit::reset_view();
+    }
+
+    /// THE ENTRY QUOTER YIELDS THE SIDE, AND THE OPERATOR'S OWN `--suppress`
+    /// SURVIVES IT.
+    ///
+    /// `Quoter::set_suppress` REPLACES the whole set, so a tick that installed
+    /// only the exit's pair would silently revoke every side another order-owner
+    /// had declared — a quoter quoting into somebody else's book, caused by a
+    /// feature that never mentions it.
+    #[test]
+    fn a_requested_side_is_yielded_without_dropping_the_operators_declaration() {
+        let _g = crate::maker_exit::test_serial();
+        crate::maker_exit::reset_view();
+        let mut cfg = armed_cfg();
+        cfg.suppress = [("OTHER".to_string(), BookSide::Bid)].into_iter().collect();
+
+        // THE CONTROL FIRST, and it is not ceremony: `!quotes_kalshi_ask` is
+        // satisfied by a fixture that never quotes that side at all, so without
+        // this the suppression assertion below would pass against a quoter that
+        // was silent for a completely unrelated reason.
+        crate::maker_exit::request_suppress(std::collections::BTreeSet::new());
+        let (mut quoters, _) = quoter_and_books();
+        let books = books_where_the_kalshi_ask_pays();
+        let mut eng = test_engine(cfg.clone_for_test());
+        eng.maker_exit_tick(&mut quoters);
+        assert!(
+            quotes_kalshi_ask(&mut quoters, &books),
+            "the fixture must quote the Kalshi ask, or the suppression test proves nothing"
+        );
+
+        // ...now ask for it, on a FRESH quoter: the entry quoter is a state
+        // machine over its own resting orders, and reusing one that has already
+        // been cancelled would test that machine rather than this seam.
+        let (mut quoters, _) = quoter_and_books();
+        let books = books_where_the_kalshi_ask_pays();
+        let mut eng = test_engine(cfg);
+        crate::maker_exit::request_suppress(["K".to_string()].into_iter().collect());
+        eng.maker_exit_tick(&mut quoters);
+        assert!(
+            !quotes_kalshi_ask(&mut quoters, &books),
+            "the exit's side must be yielded before anything rests on it"
+        );
+        // ...and the operator's own declaration survived the install, which
+        // `set_suppress`'s replace-wholesale semantics make easy to lose.
+        let v = crate::maker_exit::engine_view().expect("published");
+        assert!(v.suppressed_at.contains_key("K"));
+        let first = v.suppressed_at["K"];
+
+        // A SECOND tick must not re-stamp it: the reader's settle window
+        // measures how long the quoter has been OUT of the side, and a stamp
+        // refreshed every 60s is a window that never elapses.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        eng.maker_exit_tick(&mut quoters);
+        let v = crate::maker_exit::engine_view().expect("published");
+        assert_eq!(v.suppressed_at["K"], first, "the install instant must not move");
+
+        // ...and withdrawing the request releases it, so the settle clock
+        // restarts rather than crediting an exit with a side it gave back.
+        crate::maker_exit::request_suppress(std::collections::BTreeSet::new());
+        eng.maker_exit_tick(&mut quoters);
+        let v = crate::maker_exit::engine_view().expect("published");
+        assert!(v.suppressed_at.is_empty(), "a withdrawn request is forgotten, not remembered");
+        crate::maker_exit::reset_view();
+    }
+
+    /// THE PM-US ASK IS THE ONLY PRICE READ THE CLOSE LEG HAS, because
+    /// `PmusGateway` has no `market_quote`. An empty ask side must be ABSENT
+    /// rather than reported at zero: a close priced at $0.00 reads as free, and
+    /// "no ask" spelled as a price is the same mistake `Quote::yes_bid`
+    /// documents on the other venue.
+    #[test]
+    fn an_empty_pm_ask_side_is_absent_rather_than_a_price_of_zero() {
+        let mut bb = BookBuilder::new();
+        let lvl = |p: &str, s: &str| Level { price: p.into(), size: s.into() };
+        bb.apply_snapshot(
+            Venue::PolymarketUs, "P", vec![lvl("0.30", "500")], vec![lvl("0.34", "9")],
+            1, 1_000_000_000, None,
+        );
+        bb.apply_snapshot(Venue::PolymarketUs, "DARK", vec![lvl("0.10", "5")], vec![],
+            1, 1_000_000_000, None);
+        // A Kalshi book must never leak into the PM map.
+        bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.60", "5")], vec![lvl("0.61", "5")],
+            1, 1_000_000_000, None);
+        let asks = bb.pm_us_asks();
+        assert_eq!(asks, vec![("P".to_string(), "0.34".to_string())], "{asks:?}");
     }
 }
 

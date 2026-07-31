@@ -39,6 +39,7 @@ mod feed;
 mod fills;
 mod hist;
 mod ledger;
+mod maker_exit;
 mod naked_act;
 mod orphan;
 mod positions;
@@ -176,6 +177,23 @@ struct Args {
     /// `--positions-recon-act` when both are given, which is the safe direction
     /// and the one an operator would want from a typo.
     positions_recon_act_shadow: bool,
+    /// REST a maker offer that flattens a basket when the passive exit pays
+    /// against what we paid for it (`crate::maker_exit`).
+    ///
+    /// OFF by default and inert without `--enable-orders`. This is the armed
+    /// half of `--unwind-detect-only`: that flag says which baskets have stopped
+    /// being worth their capital, and this one quotes out of ONE of them at a
+    /// time, profitable-only against a cost basis taken from the ledger.
+    ///
+    /// It needs the engine, not just the sinks — the hurdle it decides against
+    /// and the PM-US book it prices the close leg with are both published by
+    /// `Engine::maker_exit_tick`, and a silent engine makes every decision here
+    /// refuse.
+    maker_exit: bool,
+    /// Decide and LOG, never place (`maker_exit::Live::shadow`). Wins over
+    /// `--maker-exit` when both are given — same rule, same reason, same
+    /// function as `--positions-recon-act-shadow`.
+    maker_exit_shadow: bool,
 }
 
 /// The floating maker APR bar (Geoff 2026-07-22, card 80ff7987), port of
@@ -256,6 +274,8 @@ fn default_args() -> Args {
         positions_recon: false,
         positions_recon_act: false,
         positions_recon_act_shadow: false,
+        maker_exit: false,
+        maker_exit_shadow: false,
     }
 }
 
@@ -344,6 +364,8 @@ fn parse_args() -> Args {
             "--positions-recon" => a.positions_recon = true,
             "--positions-recon-act" => a.positions_recon_act = true,
             "--positions-recon-act-shadow" => a.positions_recon_act_shadow = true,
+            "--maker-exit" => a.maker_exit = true,
+            "--maker-exit-shadow" => a.maker_exit_shadow = true,
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(2);
@@ -1453,6 +1475,100 @@ fn recon_act_shadow(act: bool, shadow: bool) -> Option<bool> {
     (act || shadow).then_some(shadow)
 }
 
+/// What the two maker-exit flags select: `None` = off, `Some(shadow)`.
+///
+/// SHADOW WINS, the same rule and the same reason as [`recon_act_shadow`]: a run
+/// given both flags was given contradictory instructions, and the one that
+/// spends no money is the one to obey. It is a separate function from that one
+/// rather than a shared helper only because the two could legitimately diverge;
+/// a test pins each.
+fn maker_exit_shadow(act: bool, shadow: bool) -> Option<bool> {
+    (act || shadow).then_some(shadow)
+}
+
+/// Spawn the maker-exit loop, if either flag asked for it.
+///
+/// It needs BOTH sinks — the Kalshi one rests and cancels the ask, the PM-US one
+/// closes the other leg — and it needs the engine to be publishing, which
+/// `run_cfg` ties to the same flags. Like `--positions-recon`, reaching the sink
+/// pair already means `--enable-orders` and every precondition passed, so there
+/// is no second arming check here that would read as a safety net while being
+/// unreachable.
+fn spawn_maker_exit(
+    args: &Args,
+    sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
+) {
+    let Some(shadow) = maker_exit_shadow(args.maker_exit, args.maker_exit_shadow) else {
+        return;
+    };
+    let (Some(k), Some(p)) = (sinks.get(&Venue::Kalshi), sinks.get(&Venue::PolymarketUs)) else {
+        eprintln!(
+            "[maker-exit] REFUSED: needs a handle on BOTH venues (kalshi={}, \
+             polymarket_us={}) — the ask rests on one and the close takes on the other, and \
+             an exit that can only do half of that is a way to end up one-legged on purpose.",
+            sinks.contains_key(&Venue::Kalshi),
+            sinks.contains_key(&Venue::PolymarketUs)
+        );
+        return;
+    };
+    let pm_market: std::collections::BTreeMap<String, String> =
+        positions::pairs_from_registry(&args.registry)
+            .into_iter()
+            .map(|x| (x.rel_id, x.pmus))
+            .collect();
+    if pm_market.is_empty() {
+        eprintln!(
+            "[maker-exit] REFUSED: {} has no relationship with both a kalshi and a \
+             polymarket_us leg",
+            args.registry
+        );
+        return;
+    }
+    if shadow {
+        eprintln!(
+            "[maker-exit] SHADOW — every {}s it selects, debounces, derives a cost basis from \
+             {}, prices the resting ask and PRINTS it. Nothing reaches a venue.{} Watch for \
+             `[maker-exit] SHADOW` lines; a candidate that never produces one is a candidate \
+             some guard is holding, and the same line says which.",
+            maker_exit::CYCLE_S,
+            args.ledger,
+            if args.maker_exit { " --maker-exit was ALSO passed and is overridden: shadow wins." } else { "" }
+        );
+    } else {
+        eprintln!(
+            "[maker-exit] *** ARMED *** — it will REST a post-only Kalshi ask that flattens \
+             ONE lot of ONE basket at a time, at a price that locks >= {}/ct against a cost \
+             basis taken from {} for BOTH legs, and close the PM-US leg with an IOC re-priced \
+             at fill time. Caps: {} contracts per exit, {} exit resting at once, and a \
+             candidate must hold for {:.0}s across {} scans before anything rests.",
+            maker_exit::MIN_LOCK,
+            args.ledger,
+            maker_exit::MAX_CLIP,
+            maker_exit::MAX_RESTING,
+            maker_exit::DEBOUNCE_S,
+            maker_exit::DEBOUNCE_SCANS,
+        );
+        eprintln!(
+            "[maker-exit] *** IT CAN LEAVE A NAKED LEG. *** Between the Kalshi ask filling and \
+             the PM-US IOC returning we are one-legged, and if that IOC fails we STAY \
+             one-legged with the ledger still calling the basket open. ALARM ON \
+             `maker_exit_unresolved`; it must stay 0. If --positions-recon-act is also armed \
+             the two WILL fight over that leg — it completes a PmShort by buying Kalshi back, \
+             which re-opens what this just exited."
+        );
+    }
+    tokio::spawn(maker_exit::exit_loop(
+        maker_exit::Live::new(shadow, args.ledger.clone()),
+        maker_exit::Cfg {
+            marks_path: args.marks.clone(),
+            rel_prefixes: args.rel_prefixes.clone(),
+            pm_market,
+        },
+        k.clone(),
+        p.clone(),
+    ));
+}
+
 fn spawn_positions_recon(
     args: &Args,
     sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
@@ -1614,6 +1730,14 @@ fn run_cfg(
         // Off in bench/replay for the same two reasons take-take is: it reads
         // the wall clock and a marks file, and its hurdle is the floating one
         // a bench run has no utilization to size.
+        // The operator's static declaration, carried so `maker_exit_tick` can
+        // add to it rather than replace it.
+        suppress: args.suppress.iter().cloned().collect(),
+        // Publishing is what makes `--maker-exit` able to decide at all, so the
+        // flag pair gates it: an unflagged run publishes nothing and the exit
+        // loop is not even spawned. Off in bench/replay, which read no wall
+        // clock and must stay byte-deterministic.
+        maker_exit_view: !bench && (args.maker_exit || args.maker_exit_shadow),
         unwind: (!bench && args.unwind_detect_only).then(|| engine::Unwind {
             marks_path: args.marks.clone(),
             // The SAME scope `load_quoters` filters the registry by, so the
@@ -1738,6 +1862,7 @@ async fn main() {
     // watching venue truth and it is not.
     let armed = !sinks.is_empty();
     spawn_positions_recon(&args, &sinks);
+    spawn_maker_exit(&args, &sinks);
 
     // Before the first quote: what did the LAST run of this unit leave naked?
     // ...and it does not merely REPORT it: an obligation the ledger cannot see
@@ -2268,6 +2393,84 @@ mod precondition_tests {
         assert_eq!(recon_act_shadow(true, false), Some(false), "armed");
         assert_eq!(recon_act_shadow(false, true), Some(true), "shadow");
         assert_eq!(recon_act_shadow(true, true), Some(true), "and shadow wins over armed");
+    }
+
+    /// THE MAKER EXIT IS OFF BY DEFAULT, both spellings.
+    ///
+    /// It rests a REAL ask on a live account and its fill leaves a leg one-sided
+    /// until the PM-US close returns, so a default that armed it would change
+    /// what today's running unit does on its next restart — which is the one
+    /// thing a new strategy must never do.
+    #[test]
+    fn the_maker_exit_is_off_by_default() {
+        assert!(!default_args().maker_exit);
+        assert!(!default_args().maker_exit_shadow);
+        assert_eq!(maker_exit_shadow(false, false), None, "neither flag places anything");
+        // ...and the engine publishes NOTHING without them, which is the second
+        // gate: `maker_exit::engine_view` fails closed on a view that was never
+        // published, so the loop could not decide even if it were spawned.
+        let cfg = run_cfg(
+            default_args(),
+            false,
+            true,
+            true,
+            None,
+            0,
+            Policy { toxgate_file: None, apr: None, apr_installed: (0.0, "d".into()) },
+        );
+        assert!(!cfg.maker_exit_view, "an unflagged run must publish no view");
+    }
+
+    /// SHADOW WINS FOR THE MAKER EXIT TOO. Same rule as the naked-leg completer
+    /// and a separate function, so the two can be changed independently and
+    /// neither can be changed silently.
+    #[test]
+    fn asking_for_both_maker_exit_and_its_shadow_gets_shadow() {
+        assert_eq!(maker_exit_shadow(true, false), Some(false), "armed");
+        assert_eq!(maker_exit_shadow(false, true), Some(true), "shadow");
+        assert_eq!(maker_exit_shadow(true, true), Some(true), "and shadow wins over armed");
+        // ...and it reaches the thing that actually decides to send: `Live`
+        // returns before the wire when `shadow` is set, so a wiring that lost
+        // the bit here would be a fat-fingered command line placing real asks.
+        let live =
+            maker_exit::Live::new(maker_exit_shadow(true, true).expect("some"), "/dev/null".into());
+        assert!(live.shadow, "shadow must survive the trip to the placer");
+    }
+
+    /// EITHER FLAG TURNS THE ENGINE'S PUBLISHER ON, because the shadow is
+    /// worthless without it: with no view every decision refuses, and a day of
+    /// shadow output saying "the engine has never published" answers nothing.
+    #[test]
+    fn either_maker_exit_flag_makes_the_engine_publish_its_view() {
+        for (act, shadow) in [(true, false), (false, true), (true, true)] {
+            let mut a = default_args();
+            a.maker_exit = act;
+            a.maker_exit_shadow = shadow;
+            let cfg = run_cfg(
+                a,
+                false,
+                true,
+                true,
+                None,
+                0,
+                Policy { toxgate_file: None, apr: None, apr_installed: (0.0, "d".into()) },
+            );
+            assert!(cfg.maker_exit_view, "act={act} shadow={shadow}");
+        }
+        // ...but NEVER in bench/replay: the view carries a wall clock and a live
+        // book, and the digest replay must stay byte-deterministic.
+        let mut a = default_args();
+        a.maker_exit = true;
+        let bench = run_cfg(
+            a,
+            true,
+            true,
+            true,
+            None,
+            0,
+            Policy { toxgate_file: None, apr: None, apr_installed: (0.0, "d".into()) },
+        );
+        assert!(!bench.maker_exit_view, "a digest replay must not acquire a publisher");
     }
 
     /// The caps are part of the safety argument, so they are pinned rather than
