@@ -627,6 +627,23 @@ pub fn json(a: &Args) -> String {
     recent.reverse();
     recent.truncate(RECENT);
 
+    // A cap the engine is not using is worse than no cap on the screen: every
+    // number on this page would be read as the one refusing orders. The engine
+    // reads these files ONCE, at `RiskView::load`, so a file touched since it
+    // started is a file it has never seen.
+    let stale_config: Vec<Value> = [a.exec_config.as_str(), a.topics_config.as_str()]
+        .iter()
+        .filter_map(|path| {
+            let changed = crate::endpoints::age_secs(path)?;
+            let up = proc.map(|x| x.up_s)?;
+            if changed < up {
+                Some(json!({ "path": path, "changed_ago_s": changed, "engine_up_s": up }))
+            } else {
+                None
+            }
+        })
+        .collect();
+
     let mut out = Map::new();
     out.insert(
         "engine".into(),
@@ -659,6 +676,7 @@ pub fn json(a: &Args) -> String {
         json!({ "window_s": if opp_first < f64::MAX { now - opp_first } else { 0.0 },
                 "scope": scope, "rows": opp_rows }),
     );
+    out.insert("stale_config".into(), Value::Array(stale_config));
     out.insert("recent".into(), Value::Array(recent));
     out.insert("booked".into(), Value::Array(booked));
     out.insert("generated_at".into(), json!(now));
@@ -761,6 +779,19 @@ mod tests {
         assert_eq!(g.deployed, None);
         assert_eq!(g.limit, Some(150.0), "what IS readable is still read");
         assert_eq!(break_point(&g, None).0, None, "and no headroom is fabricated");
+    }
+
+    /// The trap a cap change sets: `exec.yaml` is read once at startup, so
+    /// editing it changes what this dashboard reads and NOT what the engine
+    /// enforces, until a restart. The comparison that catches it is the file's
+    /// age against the engine's uptime — a file younger than the process is
+    /// one the process never read.
+    #[test]
+    fn a_config_touched_after_the_engine_started_is_one_it_has_never_read() {
+        let stale = |changed: u64, up: u64| changed < up;
+        assert!(stale(60, 3600), "edited a minute ago, engine up an hour");
+        assert!(!stale(7200, 3600), "edited before the engine started: it read this");
+        assert!(!stale(3600, 3600), "same instant is not evidence of a later edit");
     }
 
     /// `topic_of` is arb-core's, so a position is bucketed exactly the way the
