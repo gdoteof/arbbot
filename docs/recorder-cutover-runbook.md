@@ -279,15 +279,20 @@ left to isolate it from.
 
 ## 3. What the banner must say
 
-Every line below is from the 2026-07-29 14:49:57 start, on the Python feed.
+Every line below is from the 2026-07-31 15:52 start, the first on the Rust
+feed, and every census figure in it was byte-identical to the 13:55 start on
+the Python feed — which is the actual check. (The numbers here were `16
+quoters, 32 markets` / `seeded 346` until 2026-07-31: stale since the armed
+drop-in widened `--rel-prefix` to `xvus-`, and quietly wrong for anyone
+comparing against them.)
 After the flip, **only the `[feed]` line may differ.**
 
 ```
-[gate] 143 relationships -> 16 quoting; 93 blocked (4 vetoed by registry verdict, ...)
+[gate] 143 relationships -> 32 quoting; 93 not quoted (4 vetoed by registry verdict, ...)
 [risk] bankroll ... balances [kalshi=... polymarket_us=...]
-[risk] seeded 346 open contracts across 10 relationships from data/exec/trades.jsonl
+[risk] seeded 289 open contracts across 10 relationships from data/exec/trades.jsonl
 [apr] maker hurdle 16.00%/yr = 4 + 12*util at util 1.000, holds measured from ...
-arb-trader up: 16 quoters, 32 markets, mode=shadow
+arb-trader up: 32 quoters, 64 markets, mode=shadow
 [feed] connected data/arbbot.sock             <-- UNCHANGED. That is the point.
 [exec] ORDERS ARMED — this process can place real orders
 [exec] PolymarketUs: book is clean
@@ -391,7 +396,63 @@ afterwards.
 
 ---
 
-## 5. Known-open at the time of writing (2026-07-29)
+## 5. The swap ran on a RED gate. Here is exactly why, and what it cost
+
+2026-07-31 15:46 EDT, `data/reports/shadow-gate-2026-07-31.txt`, one red
+reason and one only:
+
+```
+FAIL: coverage polymarket: 216 market(s) python published in the window are
+      NOT in the rust recorder's welcome burst
+```
+
+**It is an artifact of turning INTL off, and it is not interpretable as
+anything else.** The check asks whether Rust's LIVE welcome burst carries every
+market Python published in the tape window. For `polymarket` (INTL — not
+`polymarket_us`) it was comparing a live burst against a dead tape:
+
+* `data/raw-rs/polymarket-2026-07-31.jsonl` mtime is **15:39:41**, which is
+  `arb-recorder`'s restart timestamp to the second — not one byte written since
+  `record_polymarket_intl: false` took effect.
+* `data/raw/polymarket-2026-07-31.jsonl` mtime is **14:06:25**, so Python's INTL
+  feed had already been silent for 49 minutes before its own 14:55 restart.
+* `data/health-rs.jsonl` carries `kalshi-ws` and `polymarket_us-ws` and no
+  third feed — INTL is absent, which is the designed result.
+
+So the window the gate scored is 14:06-and-earlier on one side and 15:46 live on
+the other. Zero INTL coverage is the CORRECT answer for a venue neither recorder
+records.
+
+**What was actually proven, on the two venues that have an order path:**
+
+| | verdict |
+|---|---|
+| coverage kalshi | welcome has all 141 python markets |
+| coverage polymarket_us | welcome has all 750 python markets |
+| live subscriber, 120s under 6 burners | `live: ok`, 14,692 lines, gaps=0 unsynced=0 undecodable=0 bad_field=0 |
+| load | 1.14 → peak 5.74, ceiling 40 |
+| running image | `current` — §1 step zero, now checked by the binary |
+| tape parse-compat | undecodable=0 bad_field=0 on all three venues |
+| TOB agreement | polymarket_us 100.0%, polymarket 99.9% |
+
+The 2026-07-23 FAIL (2,754 unparseable lines) is gone.
+
+**This is the reflex the runbook warns about two sections up, and it is being
+taken knowingly rather than accidentally.** The mitigating facts: the red venue
+has no order path, is deliberately dark on both sides, and is excluded from the
+engine's quote-pull decision by `DATA_ONLY_VENUES` (`feed_health.rs:40`)
+regardless. The aggravating fact: a gate that says FAIL was overridden by
+judgement, which is worth exactly as much as the judgement.
+
+**Left open deliberately:** the gate cannot tell a venue that is OFF from a
+venue that is BROKEN — both look like an empty welcome burst — and the fix is
+for it to read `record_polymarket_intl` from the same config the recorder does,
+and decline to score a venue the recorder was told not to record. Not built
+here, because this gate compares a Python tape against a Rust one and the Python
+tape stops existing at the end of this runbook. If a future shadow is ever cut,
+build that first.
+
+## 6. Known-open at the time of writing (2026-07-29)
 
 * **DAY 1 CANNOT START UNTIL THE TRAILING SLICE IS CLEAR OF PRE-FIX TRADES,
   which is about 77 minutes after the recorder restart.** `bad_field > 0` is a
