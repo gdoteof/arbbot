@@ -61,13 +61,18 @@ fn handle(s: TcpStream, a: &Args, sh: &Shared) {
         // endpoints, which is the point — a single page would fan out to
         // every endpoint on every load as views are added.
         "/" | "/recording" | "/opportunities" | "/pairs" | "/current" | "/intents"
-        | "/trades" | "/live" => {
+        | "/trades" | "/live" | "/architecture" => {
             respond(s, "200 OK", "text/html; charset=utf-8", PAGE)
         }
         // Long-lived: these return only when the client goes away.
         "/api/stream" => stream::state(s, a, sh),
         "/api/tape" => stream::tape(s, a),
         "/api/books" => respond(s, "200 OK", "application/json", &books::json(a)),
+        // Built from /proc, the unit files and the artifacts on disk on every
+        // request — it holds no picture of its own to go stale.
+        "/api/architecture" => {
+            respond(s, "200 OK", "application/json", &crate::architecture::json())
+        }
         "/api/integrity" => {
             let i = integrity::build(&a.data_dir);
             let body = serde_json::to_string(&i).unwrap_or_else(|_| "{}".into());

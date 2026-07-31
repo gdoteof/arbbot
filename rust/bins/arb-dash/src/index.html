@@ -53,6 +53,53 @@
   nav a.on{color:var(--accent);border-bottom-color:var(--accent)}
   th.sortable{cursor:pointer;user-select:none}
   th.sortable:hover{color:var(--ink)}
+
+  /* --- architecture diagram -------------------------------------------- */
+  .arch{width:100%;height:auto;display:block;overflow:visible}
+  .arch text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .arch .laneband{fill:var(--line);opacity:.16}
+  .arch .lane{fill:var(--dim);font-size:10px;letter-spacing:.16em;text-transform:uppercase}
+  .arch .nbox{fill:var(--panel);stroke:var(--line);stroke-width:1}
+  .arch .k-artifact .nbox{stroke-dasharray:4 3}
+  .arch .k-part .nbox{stroke-dasharray:1 3}
+  .arch .k-venue .nbox{fill:var(--bg)}
+  .arch .st-down .nbox{stroke:var(--bad)}
+  .arch .st-stale .nbox,.arch .st-alive .nbox{stroke:var(--warn)}
+  .arch .nlabel{fill:var(--ink);font-size:12px;font-weight:600}
+  .arch .nsub{fill:var(--dim);font-size:10px}
+  .arch .nchip{font-size:10.5px;fill:var(--dim)}
+  .arch .ntag{font-size:10px;font-weight:700;letter-spacing:.06em;fill:var(--warn)}
+  .arch .c-down{fill:var(--bad)} .arch .c-stale,.arch .c-alive{fill:var(--warn)}
+  .arch .b-live{fill:var(--ok)} .arch .b-stale,.arch .b-alive{fill:var(--warn)}
+  .arch .b-down{fill:var(--bad)} .arch .b-off{fill:var(--dim)}
+  .arch .d-live{fill:var(--ok)} .arch .d-stale,.arch .d-alive{fill:var(--warn)}
+  .arch .d-down{fill:var(--bad)} .arch .d-off{fill:var(--dim)}
+  .arch .e{fill:none;stroke-width:1.4}
+  .arch .e.feed{stroke:var(--accent)}
+  .arch .e.write{stroke:var(--ok)}
+  .arch .e.read{stroke:var(--dim);stroke-dasharray:5 4}
+  .arch .e.order{stroke:var(--warn);stroke-width:2.2}
+  .arch .e.dead{stroke:var(--line);stroke-width:1;stroke-dasharray:2 5}
+  /* Arrowheads are styled through a CLASS, never a fill="var(--x)" attribute:
+     a presentation attribute is not a CSS declaration and browsers do not
+     resolve a custom property inside one. Every head rendered black. */
+  .arch .m-feed{fill:var(--accent)} .arch .m-write{fill:var(--ok)}
+  .arch .m-read{fill:var(--dim)}    .arch .m-order{fill:var(--warn)}
+  .arch .m-dead{fill:var(--line)}
+  /* The halo is what keeps a label readable where it sits on top of a line. */
+  .arch .elabel{fill:var(--dim);font-size:9.5px;paint-order:stroke;
+    stroke:var(--panel);stroke-width:3px;stroke-linejoin:round}
+  .arch .flow{stroke-dasharray:6 8;animation:archflow 1.2s linear infinite}
+  .arch .pulse{animation:archpulse 2.4s ease-in-out infinite}
+  @keyframes archflow{to{stroke-dashoffset:-28}}
+  @keyframes archpulse{0%,100%{opacity:1}50%{opacity:.3}}
+  @media (prefers-reduced-motion:reduce){
+    .arch .flow,.arch .pulse{animation:none}
+    .arch .flow{stroke-dasharray:none}
+  }
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;font-size:11px;color:var(--dim)}
+  .legend i{display:inline-block;width:18px;height:0;border-top-width:2px;
+    border-top-style:solid;vertical-align:middle;margin-right:5px}
 </style>
 </head>
 <body>
@@ -1041,6 +1088,294 @@ function oppsPanel(o){
   </section>`);
 }
 
+/* ===========================================================================
+   ARCHITECTURE
+
+   The diagram is a pure function of /api/architecture, and the LAYOUT is a
+   pure function of each node's (lane, row) — no measurement, no post-render
+   effect, no library. That is deliberate: every other attempt at a live
+   diagram in a page like this ends up measuring the DOM after paint and
+   writing back into it, which is exactly the class of bug the state rule at
+   the top of this file exists to prevent.
+
+   Nothing here decides anything. Which components exist, whether each is
+   alive, and which edges are carrying traffic all arrive from the server,
+   which measures them. This code only draws.
+   =========================================================================== */
+/* A_TOP is the whole vertical budget above the first row of cards, and it is
+   spent deliberately: 0-40 for the order arcs, 44-76 for long-haul edges,
+   88 for the lane headings, 96 where the lane bands start. */
+const A_LANEW = 196, A_GAP = 54, A_ROWH = 92, A_BOXH = 62, A_TOP = 130, A_PAD = 26;
+const archX = (lane) => A_PAD + lane * (A_LANEW + A_GAP);
+const archY = (row)  => A_TOP + row * A_ROWH;
+const archBox = (n) => ({ x: archX(n.lane), y: archY(n.row), w: A_LANEW, h: A_BOXH,
+                          cx: archX(n.lane) + A_LANEW/2, cy: archY(n.row) + A_BOXH/2 });
+const archTrunc = (s, n) => String(s).length > n ? String(s).slice(0, n-1) + '…' : String(s);
+const archBytes = (b) => b == null ? '' :
+  b >= 1e9 ? (b/1e9).toFixed(1)+' GB' : b >= 1e6 ? (b/1e6).toFixed(0)+' MB' :
+  b >= 1e3 ? (b/1e3).toFixed(0)+' KB' : b+' B';
+
+/* Edges are routed by where their ends sit, not by hand. Four cases, because
+   this graph genuinely has four: forward through the lanes, a hop back one
+   lane (a file the engine reads at startup), a loop inside one lane (the
+   engine writes the marks file it then decides from), and the order path —
+   drawn over the top of everything, because it is the only edge here that
+   moves money and it should not be mistaken for another data line.
+
+   Each case returns the four control points of one cubic, not a path string,
+   so a label can be put ON the curve rather than near it. */
+const A_GUT = A_GAP / 2;          /* the middle of the gap between two lanes */
+
+/* The point at t on a cubic. Three edges arrive at the engine and three leave
+   it, and labelled at one shared midpoint they landed on top of each other —
+   so each label is placed at a different t along its OWN curve instead. */
+const archAt = (p, t) => {
+  const u = 1 - t;
+  const at = (k) => u*u*u*p[0][k] + 3*u*u*t*p[1][k] + 3*u*t*t*p[2][k] + t*t*t*p[3][k];
+  return { x: at('x'), y: at('y') };
+};
+const archD = (p) =>
+  `M${p[0].x} ${p[0].y} C${p[1].x} ${p[1].y}, ${p[2].x} ${p[2].y}, ${p[3].x} ${p[3].y}`;
+
+/* `t` is where along its own curve this edge's label sits; see the caller.
+   `w` is the canvas width, which only the last case needs. */
+function archRoute(a, b, kind, t, alt, w){
+  const A = archBox(a), B = archBox(b), P = (x,y) => ({x, y});
+  const cubic = (p) => { const at = archAt(p, t); return { d: archD(p), lx: at.x, ly: at.y - 4 }; };
+
+  // The order path, arcing over everything. It is the only edge here that
+  // moves money and it should not read as one more data line.
+  //
+  // The control points are solved for the apex rather than guessed: a cubic
+  // does not pass through its own controls, so a control at y=25 put the
+  // actual arc at y≈57, straight through the lane headings.
+  if(kind === 'order' && b.lane < a.lane){
+    const c = (4/3) * ((16 + (b.row % 3) * 10) - (A.y + B.y)/8);
+    return cubic([P(A.cx, A.y), P(A.cx, c), P(B.cx, c), P(B.cx, B.y)]);
+  }
+
+  // Two lanes or more apart. A curve drawn straight across would cross the
+  // faces of every card in between, so this goes UP the gutter beside the
+  // source, across ABOVE the cards, and down the gutter beside the target —
+  // through the only space on the canvas guaranteed to be empty.
+  if(b.lane - a.lane >= 2){
+    const g1 = A.x + A.w + A_GUT, g2 = B.x - A_GUT, r = 16;
+    return {
+      d: `M${A.x + A.w} ${A.cy} L${g1 - r} ${A.cy} Q${g1} ${A.cy} ${g1} ${A.cy - r}` +
+         ` L${g1} ${alt + r} Q${g1} ${alt} ${g1 + r} ${alt}` +
+         ` L${g2 - r} ${alt} Q${g2} ${alt} ${g2} ${alt + r}` +
+         ` L${g2} ${B.cy - r} Q${g2} ${B.cy} ${g2 + r} ${B.cy} L${B.x} ${B.cy}`,
+      lx: (g1 + g2) / 2, ly: alt - 5,
+    };
+  }
+  if(a.lane < b.lane){
+    const x1 = A.x + A.w, x2 = B.x, dx = Math.max(30, (x2 - x1) * 0.55);
+    return cubic([P(x1, A.cy), P(x1+dx, A.cy), P(x2-dx, B.cy), P(x2, B.cy)]);
+  }
+  // One lane back: an S that stays INSIDE the gutter. The earlier version
+  // dipped below its own endpoints and swept across three cards to do it.
+  if(a.lane > b.lane){
+    const x1 = A.x, x2 = B.x + B.w;
+    return cubic([P(x1, A.cy), P(x1-A_GUT, A.cy), P(x2+A_GUT, B.cy), P(x2, B.cy)]);
+  }
+  // Same lane: bulge out into a gutter. Down goes right and up goes left, so
+  // a write and the read that answers it read as the two sides of a loop —
+  // except in the last lane, where bulging right runs off the canvas and the
+  // archive edge was drawn half outside the picture.
+  const down = b.row > a.row;
+  let off = (down ? 1 : -1) * (A.w/2 + 34);
+  if(A.cx + off > w - 12 || A.cx + off < 12) off = -off;
+  const y1 = down ? A.y + A.h : A.y, y2 = down ? B.y : B.y + B.h;
+  return cubic([P(A.cx, y1), P(A.cx+off, y1), P(B.cx+off, y2), P(B.cx, y2)]);
+}
+
+/* One line of evidence per node — and it is EVIDENCE, never a restatement of
+   the state chip. "up 41m · pid 2466552" and "14s ago · 15 KB" are both facts
+   a reader can go and check; "healthy" is not. */
+function archChip(n, now){
+  if(n.kind === 'timer')
+    return n.state === 'live' ? 'next in ' + dur(n.next_s - now) : 'not scheduled';
+  // The pid gives way to the tag when there is one: ARMED is the more
+  // important fact, and side by side the two ran into each other.
+  if(n.up_s != null)
+    return 'up ' + dur(n.up_s) +
+      (n.pid && !(n.tags||[]).length ? ' · pid ' + n.pid : '');
+  if(n.age_s == null) return n.state === 'off' ? 'not writing' : 'missing';
+  return dur(n.age_s) + ' ago' + (n.bytes != null ? ' · ' + archBytes(n.bytes) : '');
+}
+
+function archNode(n, now){
+  const B = archBox(n);
+  const tag = (n.tags && n.tags.length) ? n.tags[0] : '';
+  const dot = 'd-' + n.state + (n.state === 'live' ? ' pulse' : '');
+  return `<g class="an k-${n.kind} st-${n.state}" data-k="n-${esc(n.id)}">
+    <title>${esc(n.label)} — ${esc(n.what)}</title>
+    <rect class="nbox" x="${B.x}" y="${B.y}" width="${B.w}" height="${B.h}" rx="7"/>
+    <rect class="nbar b-${n.state}" x="${B.x}" y="${B.y}" width="3" height="${B.h}"/>
+    <circle class="ndot ${dot}" cx="${B.x+B.w-11}" cy="${B.y+15}" r="3.5"/>
+    <text class="nlabel" x="${B.x+12}" y="${B.y+19}">${esc(archTrunc(n.label,21))}</text>
+    <text class="nsub" x="${B.x+12}" y="${B.y+34}">${esc(archTrunc(n.sub,28))}</text>
+    <text class="nchip c-${n.state}" x="${B.x+12}" y="${B.y+51}">${esc(archChip(n,now))}</text>
+    ${tag ? `<text class="ntag" x="${B.x+B.w-11}" y="${B.y+51}"
+      text-anchor="end">${esc(tag)}</text>` : ''}
+  </g>`;
+}
+
+function archSvg(d){
+  const N = {};
+  d.nodes.forEach(n => { N[n.id] = n; });
+  const rows  = Math.max(...d.nodes.map(n => n.row)) + 1;
+  const lanes = d.lanes.length;
+  const W = A_PAD*2 + lanes*A_LANEW + (lanes-1)*A_GAP;
+  const H = archY(rows-1) + A_BOXH + 26;
+  const now = d.generated_at;
+
+  const marker = (kind) =>
+    `<marker id="ah-${kind}" markerWidth="7" markerHeight="7" refX="6.5" refY="3"
+       orient="auto" markerUnits="userSpaceOnUse">
+       <path class="m-${kind}" d="M0,0 L7,3 L0,6 z"/></marker>`;
+
+  const bands = d.lanes.map((l,i) => `
+    <rect class="laneband" x="${archX(i)-10}" y="${A_TOP-34}"
+      width="${A_LANEW+20}" height="${rows*A_ROWH+8}" rx="10"/>
+    <text class="lane" x="${archX(i)}" y="${A_TOP-42}">${esc(l)}</text>`).join('');
+
+  /* Labels are spread along their own curves exactly where they would
+     otherwise converge: five edges arrive at the dashboard and three leave
+     the socket, and every one of those labels wants the same few pixels.
+     Spread by the TARGET where edges fan in, by the source where they fan
+     out, and leave a lone edge at its midpoint. Deterministic, so the picture
+     does not reshuffle on every repaint. */
+  const into = {}, from = {}, seenTo = {}, seenFrom = {}, alt = {};
+  d.edges.forEach(e => {
+    into[e.to]   = (into[e.to]   || 0) + 1;
+    from[e.from] = (from[e.from] || 0) + 1;
+  });
+  const edges = d.edges.map(e => {
+    const a = N[e.from], b = N[e.to];
+    if(!a || !b) return '';
+    const ti = seenTo[e.to]     = (seenTo[e.to]     || 0), fi = seenFrom[e.from] = (seenFrom[e.from] || 0);
+    seenTo[e.to] = ti + 1; seenFrom[e.from] = fi + 1;
+    const t = into[e.to] > 1      ? 0.22 + ti * (0.56 / (into[e.to] - 1))
+            : from[e.from] > 1    ? 0.30 + fi * (0.48 / (from[e.from] - 1))
+            : 0.5;
+    // Long-haul edges each get their own altitude so two of them never share
+    // a line. Only they consume one — the counter is what spaces them.
+    const key = e.from + '>' + e.to;
+    if(b.lane - a.lane >= 2 && alt[key] === undefined)
+      alt[key] = 52 + Object.keys(alt).length * 14;
+    const cls  = e.live ? e.kind : 'dead';
+    const flow = e.live && (e.kind === 'feed' || e.kind === 'order') ? ' flow' : '';
+    const r = archRoute(a, b, e.kind, t, alt[key], W);
+    return `<g data-k="e-${esc(e.from)}-${esc(e.to)}">
+      <path class="e ${cls}${flow}" d="${r.d}" marker-end="url(#ah-${cls})"/>
+      <text class="elabel" x="${r.lx.toFixed(1)}" y="${r.ly.toFixed(1)}"
+        text-anchor="middle">${esc(e.label)}</text>
+    </g>`;
+  }).join('');
+
+  return `<svg class="arch" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet"
+    role="img" aria-label="arbbot component architecture">
+    <defs>${['feed','write','read','order','dead'].map(marker).join('')}</defs>
+    ${bands}${edges}
+    ${d.nodes.map(n => archNode(n, now)).join('')}
+  </svg>`;
+}
+
+function archPanel(d){
+  const live = d.nodes.filter(n => n.state === 'live').length;
+  return $(`<section class="wide">
+    <h2>Architecture &middot; ${live}/${d.nodes.length} components live</h2>
+    <div class="scroll">${archSvg(d)}</div>
+    <div class="legend">
+      <span><i style="border-color:var(--accent)"></i>market data</span>
+      <span><i style="border-color:var(--ok)"></i>writes</span>
+      <span><i style="border-color:var(--dim);border-top-style:dashed"></i>reads</span>
+      <span><i style="border-color:var(--warn);border-top-width:3px"></i>orders (money)</span>
+      <span><i style="border-color:var(--line);border-top-style:dashed"></i>not flowing</span>
+      <span class="dim">dashed box = a file &middot; hover any component for what it is</span>
+    </div>
+    <div class="sub" style="margin-top:10px">
+      Nothing here is drawn from memory. The components and the edges between
+      them are declared in one table in <code>architecture.rs</code>; everything
+      else on this page is <b>measured on each request</b> — which processes are
+      running and for how long from <code>/proc</code>, what each is actually
+      running from its command line, when each artifact was last written from
+      its mtime, and when each timer next fires from systemd. A component that
+      dies goes red here without anyone editing anything, and anything running
+      that this diagram does not know about is listed below rather than
+      silently omitted.
+    </div>
+  </section>`);
+}
+
+function archDriftPanel(d){
+  const und = d.undeclared || [], warn = d.warnings || [];
+  if(!und.length && !warn.length) return $(`<section>
+    <h2>Drift</h2>
+    <div class="kv"><span>declared components missing or stale</span><b class="ok">none</b></div>
+    <div class="kv"><span>running but not on the diagram</span><b class="ok">none</b></div>
+    <div class="sub" style="margin-top:8px">The picture and the machine agree.</div>
+  </section>`);
+  return $(`<section>
+    <h2>Drift &middot; <span class="bad">${warn.length + und.length}</span></h2>
+    ${warn.map(w => `<div class="kv"><span class="warn">${esc(w)}</span></div>`).join('')}
+    ${und.map(u => `<div class="kv" data-k="u-${esc(u.unit)}">
+      <span><b>${esc(u.unit)}</b> is running (${dur(u.up_s)}) and is not on this
+      diagram.<div class="sub">${esc(archTrunc(u.cmd, 120))}</div></span></div>`).join('')}
+    <div class="sub" style="margin-top:8px">
+      Either the machine changed or the topology table did not. Both are worth
+      knowing; neither is visible on a diagram drawn by hand.</div>
+  </section>`);
+}
+
+const ARCH_STATE = {
+  live:'ok', alive:'warn', stale:'warn', down:'bad', off:'dim',
+};
+
+function archTable(d){
+  return $(`<section class="wide">
+    <h2>What each component is</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>component</th><th>unit</th><th>boot</th><th>state</th>
+        <th>evidence</th><th>what it is</th></tr></thead>
+      <tbody>${d.nodes.map(n => `<tr data-k="r-${esc(n.id)}">
+        <td><b>${esc(n.label)}</b><div class="sub">${esc(d.lanes[n.lane])}</div></td>
+        <td class="sub">${esc(n.unit || '—')}</td>
+        <td class="sub">${n.enabled ? esc(n.enabled) : '—'}</td>
+        <td><span class="badge ${ARCH_STATE[n.state]||'dim'}">${esc(n.state)}</span></td>
+        <td class="sub">${esc(archChip(n, d.generated_at))}</td>
+        <td>${esc(n.what)}${n.cmd ? `<div class="sub" style="margin-top:3px">
+          <code>${esc(archTrunc(n.cmd, 150))}</code></div>` : ''}</td>
+      </tr>`).join('')}</tbody>
+    </table></div>
+    <div class="sub" style="margin-top:8px">
+      <b>boot</b> is the unit's install state, and it is not the same question
+      as whether it is up now: a <b>disabled</b> unit that is running will not
+      come back on its own after a reboot.
+    </div>
+  </section>`);
+}
+
+function archInstalled(d){
+  const rows = (d.installed || []).filter(u => !u.declared);
+  if(!rows.length) return $(`<section><h2>Other installed units</h2>
+    <div class="sub">Every arbbot unit installed on this machine is on the diagram.</div>
+  </section>`);
+  return $(`<section>
+    <h2>Other installed units &middot; ${rows.length}</h2>
+    <table><tbody>${rows.map(u => `<tr data-k="i-${esc(u.unit)}">
+      <td>${esc(u.unit)}</td><td class="sub">${esc(u.enabled)}</td>
+      <td class="num ${u.running?'ok':'dim'}">${u.running?'running':'stopped'}</td>
+    </tr>`).join('')}</tbody></table>
+    <div class="sub" style="margin-top:8px">
+      Installed and not part of the running architecture — retired experiments
+      and one-shot services. They are listed so that "not on the diagram" never
+      has to mean "forgotten".
+    </div>
+  </section>`);
+}
+
 const VIEWS = [
   {path:'/',              label:'Books'},
   {path:'/recording',     label:'Recording'},
@@ -1050,6 +1385,7 @@ const VIEWS = [
   {path:'/intents',       label:'Intents'},
   {path:'/trades',        label:'Trades'},
   {path:'/live',          label:'Live'},
+  {path:'/architecture',  label:'Architecture'},
 ];
 
 const json = (u) => fetch(u).then(r=>r.json());
@@ -1112,6 +1448,7 @@ const NEEDS = {
   '/intents':       () => ({intents:  '/api/intents', top:'/api/top-series?n=4'}),
   '/trades':        () => ({trades:   '/api/trades'}),
   '/live':          () => ({}),
+  '/architecture':  () => ({arch:     '/api/architecture'}),
   '/pair':          () => {
     const q = new URLSearchParams(location.search);
     q.set('rel', relOf());
@@ -1125,6 +1462,9 @@ const TOPIC = {
   '/':'books', '/recording':'recording', '/opportunities':'opportunities',
   '/pairs':'pairs', '/current':'rollup', '/intents':'intents', '/pair':'rollup',
   '/trades':'intents', '/live':'intents',
+  // The tape moving is the cheapest proof the ingest half is alive, so it is
+  // also the right thing to re-measure the whole picture on.
+  '/architecture':'recording',
 };
 
 /* Each draw is PURE: reads S, appends to a fragment, returns the header text.
@@ -1190,6 +1530,20 @@ const DRAW = {
     f.append(intentsPanel(d));
     return d.error ? 'engine not running'
       : `${d.resting_orders} resting &middot; ${d.pairs} pairs &middot; last ${dur(d.last_intent_age_s)} ago`;
+  },
+  '/architecture': (f) => {
+    const d = S.data.arch;
+    if(!d) return loading(f, 'the running system');
+    if(d.error) return fail(f, d.error);
+    f.append(archPanel(d));
+    f.append(archDriftPanel(d));
+    f.append(archInstalled(d));
+    f.append(archTable(d));
+    const bad = d.nodes.filter(n => n.state === 'down' || n.state === 'stale').length;
+    const drift = (d.warnings||[]).length + (d.undeclared||[]).length;
+    return `${d.nodes.length} components &middot; ` +
+      (bad ? `<b class="bad">${bad} not healthy</b>` : '<span class="ok">all healthy</span>') +
+      ` &middot; ` + (drift ? `<b class="warn">${drift} drift</b>` : 'no drift');
   },
   '/pairs': (f) => {
     const d = S.data.pairs;

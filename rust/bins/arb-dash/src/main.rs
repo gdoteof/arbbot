@@ -30,6 +30,7 @@
 //! `series` its charts. `integrity` and `trades` are views that were already
 //! big enough to own a file before the rest of this was split up.
 
+mod architecture;
 mod endpoints;
 mod http;
 mod integrity;
