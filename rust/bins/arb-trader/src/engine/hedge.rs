@@ -1561,8 +1561,8 @@ mod hedge_accounting_tests {
         };
         let f1 = hedge_credit(4, 10, 0, Some((10, 0)));
         let f2 = hedge_credit(10, 10, 4, Some((10, 4)));
-        book_basket(p, &maker, &hedge, f1.book, 1_700_000_000.0);
-        book_basket(p, &maker, &hedge, f2.book, 1_700_000_001.0);
+        book_basket(p, &maker, &hedge, "h1", f1.book, 1_700_000_000.0);
+        book_basket(p, &maker, &hedge, "h1", f2.book, 1_700_000_001.0);
 
         let open = crate::ledger::open_exposure(crate::ledger::read(p).unwrap());
         assert_eq!(
