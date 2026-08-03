@@ -23,13 +23,32 @@
 # Arming means adding --yes-trade-live by hand, which is the whole point of the
 # two-flag design (see main.rs:62 — the 2026-07-28 incident).
 #
-# Restart=no on purpose: this is the supervised session. If it dies, a human
-# should read why before it starts cancelling and re-quoting again.
+# Restart=on-failure, BOUNDED: 3 tries in 10 minutes, 30s apart, then it stays
+# down. This replaced Restart=no on 2026-08-01. The old rule was the supervised
+# session — "if it dies, a human should read why before it starts cancelling and
+# re-quoting again" — and the 2026-08-01 reboot is the argument against it. The
+# shutdown sweep could reach neither venue as the network went away, the process
+# exited 17 with the book unproven, and one Kalshi order (m1785541220013,
+# KXNOBELPEACE-27-UNRWA ask 0.08) rested live for ~3h because nothing came back
+# to sweep it. Coming back UP is what clears a leaked book: startup_sweep runs
+# before this process may quote, and exits 10 rather than arming over a book it
+# cannot prove empty.
+#
+# The bound is what stops that from becoming a loop. exit 10 (venue unreadable)
+# and exit 17 (book unproven) are both failures and both retry, which is the
+# point — a transient venue outage at boot clears on the second try, and a
+# persistent one gives up after three instead of re-sweeping forever.
+#
+# A deliberate `systemctl --user stop` is NOT a failure and does not restart.
+# Neither is system shutdown, so exit 17 on the way down cannot restart-loop a
+# box that is trying to power off.
 
 [Unit]
 Description=arbbot Rust M3 slice (ONE relationship, order path behind two flags)
 After=arbbot-recorder.service
 Wants=arbbot-recorder.service
+StartLimitIntervalSec=600
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -48,7 +67,8 @@ ExecStart=%h/claude/arbbot/rust/target/release/arb-trader \
     --balance polymarket_us=349.42 \
     --stats-every 60 \
     --enable-orders
-Restart=no
+Restart=on-failure
+RestartSec=30
 Nice=10
 MemoryMax=1G
 
