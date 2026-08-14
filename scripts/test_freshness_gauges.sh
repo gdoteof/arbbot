@@ -106,7 +106,8 @@ d = {"mode": "live", "elapsed_s": float(sys.argv[1]), "events": 1, "killed": Fal
      "hedges_naked": 0, "exec_dropped": 0, "exec_recovered": 0,
      "kalshi_fills_unreadable": 0, "exec_failed": 0,
      "kalshi_reconcile_failures": 0, "cancels_unresolved": 0,
-     "sweeps_owed": 0}
+     "sweeps_owed": 0, "maker_exit_unresolved": 0,
+     "positions_recon_act_unresolved": 0, "positions_recon_acted": 0}
 for a in sys.argv[2:]:
     k, v = a.split("=", 1)
     if v == "DROP":
@@ -204,11 +205,16 @@ check "a standing fills_unattributed=1 does not re-page" silent
 stats 540 fills_unattributed=3 > "$TMP/journal"; run
 check "fills_unattributed 1->3 pages the DELTA" "fills_unattributed +2 (now 3)"
 
-# 6. Restart: elapsed_s falls, counters reset. The two standing values come back
-#    from 0, which is exactly the shape that pages falsely if unhandled.
+# 6. Restart: elapsed_s falls, counters reset. Asserted SILENT until
+#    2026-08-14, which is exactly how the 2026-08-09 armed SIGABRT went
+#    unreported — the RESTARTED page is the fix. The standing values coming
+#    back from 0 still must not read as rises.
 fresh; stats 3600 > "$TMP/journal"; run
 stats 120 > "$TMP/journal"; run
-check "process restart is silent" silent
+check "a process restart pages, once, as itself" "RESTARTED"
+check_absent "...not as a rise in the standing values" "fill_gaps +"
+cooldown_clear; stats 180 > "$TMP/journal"; run
+check "...and not again while the process lives" silent
 
 # 6b. ...and a DISCRIMINATING version of it. The scenario above has every
 #     watched gauge at 0 in both lines, so it passes whether or not the restart
@@ -242,7 +248,7 @@ stats 1000 cancels_unresolved=2 > "$TMP/journal"; run
 stats 1300 cancels_unresolved=2 > "$TMP/journal"; run
 export STUB_INVOCATION=2222222222222222222222222222222b   # a different process
 stats 1600 cancels_unresolved=2 > "$TMP/journal"; run
-check "a new InvocationID resets the streak a dead process built" silent
+check_absent "a new InvocationID resets the streak a dead process built" "cancels_unresolved"
 
 # 6d. The same discriminator on the RISE side, where the failure is a MISSED
 #     alarm rather than a false one: a replacement process that already cannot
@@ -410,6 +416,24 @@ stats 360 sweeps_owed=2 > "$TMP/journal"; run
 check "sweeps_owed 0->2 pages the unproven book" "sweeps_owed +2"
 cooldown_clear; stats 420 sweeps_owed=2 > "$TMP/journal"; run
 check "...and the standing ratchet never pages again" silent
+
+# The maker-exit / recon-act rows (2026-08-14), added BEFORE the exit loop is
+# ever armed so its first unresolved leg is read by something. Same shape as
+# fills_unattributed: RISE from 0.
+fresh; stats 300 > "$TMP/journal"; run
+stats 360 maker_exit_unresolved=1 > "$TMP/journal"; run
+check "maker_exit_unresolved 0->1 pages the naked leg" "maker_exit_unresolved +1"
+check "...at high priority" "PRIORITY=high"
+fresh; stats 300 > "$TMP/journal"; run
+stats 360 positions_recon_act_unresolved=1 > "$TMP/journal"; run
+check "positions_recon_act_unresolved 0->1 pages" "positions_recon_act_unresolved +1"
+# ...and the completer ACTING is the feature working: one low-priority line,
+# not a page, so the operator reads it beside maker_exit_unresolved rather
+# than learning to swipe it away.
+fresh; stats 300 > "$TMP/journal"; run
+stats 360 positions_recon_acted=2 > "$TMP/journal"; run
+check "positions_recon_acted first move is a NOTE" "positions_recon_acted +2"
+check "...at low priority" "PRIORITY=low"
 
 echo "=== the gauge check reporting its own absence ==="
 
