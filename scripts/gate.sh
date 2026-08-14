@@ -30,7 +30,21 @@
 set -uo pipefail
 PRIMARY=/home/geoff/claude/arbbot
 ROOT="$(git rev-parse --show-toplevel)"
-BASELINE_SHA=f4141b53831220c962f552955c079203ca0c7e2a7a7bb75bced5efe5e5e4bdc8
+# Re-pinned 2026-08-14 by the queue-aware `touch_excl_self` fix: a resting quote
+# no longer treats size that JOINED its own level behind it as competition to
+# step over. One decision on this tape moves, and it is the defect itself —
+# KXFRENCHPRES-27-FHOL:bid, resting 0.06, where a 99-lot joiner lands on our
+# level at ts 1785243864.950475. The old rule netted our 5 out, read the
+# remaining 94 as competition and repriced to 0.07, forfeiting the priority it
+# already had; the new one holds. (37ms later a genuinely foreign 1.05 appears
+# at 0.07 — a level we do NOT hold — and it steps over that to 0.08, which is
+# the unchanged rule doing its job.) 31692/182/131 -> 31691/181/130: one place
+# and one cancel fewer, no other line of the intent stream altered.
+#
+# Stage 6 does NOT move (still 38978b34, 31485/15/6): the APR hurdle refuses
+# this quote long before the queue question arises, so its pin below is
+# untouched.
+BASELINE_SHA=b84e60792b258266c3b7546563f3ae6cbd96c088a719934b4f892ccee080081b
 # Re-pinned 2026-08-14 (authorized by Geoff). #65 dated the DECEMBER btc150k
 # rung — a deliberate resolve-dating change, and resolve dates are the APR
 # hold-length input stage 6 exists to exercise — and did not re-pin this.
@@ -429,7 +443,7 @@ elif [ "$skip_digest" = 1 ]; then
   suffix=" (DIGESTS SKIPPED)"
 else
 echo "--- 5/6 real-tape digest ---"
-  digest_stage DIGEST "$BASELINE_SHA" "31692 / 182 / 131"
+  digest_stage DIGEST "$BASELINE_SHA" "31691 / 181 / 130"
 
 # --- 6/6 The SAME tape with the maker APR hurdle turned on.
 #
@@ -443,10 +457,12 @@ echo "--- 5/6 real-tape digest ---"
 # This run pins the hurdle explicitly (an explicit --min-apr wins over the risk
 # view, which is how bench pins it at all) with a fixed as-of date, because the
 # hold length is measured from TODAY and an unpinned asof re-digests daily. It
-# cuts 31692 intents to 31485 and 182 places to 15 — i.e. 167 of the 182 maker
+# cuts 31691 intents to 31485 and 181 places to 15 — i.e. 166 of the 181 maker
 # quotes stage 5 blesses are locking capital under 12%/yr, and only this stage
 # can see that. (152 of 182 before #65 dated the btc150k rung: dating a rung
-# changes its hold length, its APR, and therefore which quotes clear the bar.)
+# changes its hold length, its APR, and therefore which quotes clear the bar.
+# 167 of 182 until the queue-aware `touch_excl_self` fix held one of stage 5's
+# places instead of repricing it; the 15 that clear the bar are unaffected.)
 echo "--- 6/6 real-tape digest, APR hurdle on ---"
   digest_stage "APR-DIGEST" "$APR_SHA" "31485 / 15 / 6" --min-apr 12 --apr-asof 2026-07-28
 fi

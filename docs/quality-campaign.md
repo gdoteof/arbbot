@@ -57,12 +57,21 @@ The `sha256` field of that summary line MUST equal the baseline:
 
 | field | baseline | where it came from |
 |---|---|---|
-| `sha256` | `f4141b53831220c962f552955c079203ca0c7e2a7a7bb75bced5efe5e5e4bdc8` | main @ b900470; re-measured 2026-07-29 @ 70952c0 |
-| `intents` | 31692 | same |
-| `would_place` | 182 | same |
-| `would_cancel` | 131 | same |
+| `sha256` | `b84e60792b258266c3b7546563f3ae6cbd96c088a719934b4f892ccee080081b` | re-pinned 2026-08-14 by the queue-aware `touch_excl_self` fix (was `f4141b53…`: main @ b900470, re-measured 2026-07-29 @ 70952c0) |
+| `intents` | 31691 | same |
+| `would_place` | 181 | same |
+| `would_cancel` | 130 | same |
 | `book_events` | 675950 | property of the tape; identical in both gates |
 | wall time | ~4 s | 2026-07-29, production box, `nice -n 19` |
+
+The one decision that moved: `KXFRENCHPRES-27-FHOL:bid`, resting at 0.06, when
+99 lots join that level at ts 1785243864.950475. Netting our own 5 out left 94
+and read it as competition, so the quote repriced to 0.07 and gave up the FIFO
+priority it already held; a quote that opened its level now holds through a
+joiner behind it. Nothing else in the intent stream differs — and the direction
+matters, because the first cut of this fix skipped our price unconditionally and
+took the same tape to 1,212 places by walking `cpc-btc-*-140k:ask` off a
+1,500,238-lot wall it had merely joined. `touch_excl_self` carries that story.
 
 `sha256` is a rolling hash of every intent line the engine emits, in order. It
 is not a checksum of the summary: two runs that place the same orders at the
