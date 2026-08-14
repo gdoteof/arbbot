@@ -89,19 +89,37 @@
 //!    identity `n_open - positions.len() - unpriced_positions == single-leg
 //!    records` true in both implementations, which is the only thing a monitor
 //!    can check.
+//! 5. **A record carrying no `cost_usd`/`profit_usd` has one DERIVED from its
+//!    own legs.** The Python skips those (`mark_positions.py:280-282`), and so
+//!    did this file until 2026-08-14 — which meant every basket
+//!    `engine::fill::book_basket` has ever written was absent from `positions`
+//!    and therefore invisible to [`crate::unwind::select`], which iterates that
+//!    array and nothing else. See [`derived_basis`]: the basis is not a guess,
+//!    it is the all-in per-contract cost [`crate::naked_act::worst_lot`] already
+//!    prices real hedges and real exits off, read from the prices and roles the
+//!    engine does write. A record whose legs cannot carry one is still skipped
+//!    and still COUNTED.
 //!
-//! # The one hazard NOT diverged from
+//! # The hazard that WAS latent, and goes live with divergence 5
 //!
-//! `inverted` is `kleg["side"] == "no"`, verbatim. Two writers spell leg sides
+//! `inverted` was `kleg["side"] == "no"`, verbatim. Two writers spell leg sides
 //! differently — the Python hedger records the POSITION (`kalshi side=yes`),
-//! this engine records the ORDER (`kalshi side=bid`) — so a Kalshi maker ASK
-//! fill booked by the engine reads as `side="ask"`, which is not `"no"`, and is
-//! therefore marked as a standard basket when it is really an inverted one.
-//! That is latent rather than live: all six engine-written records in today's
-//! ledger carry no `cost_usd` and are skipped as unpriced before they get here.
-//! It is left alone because changing it would change live unwind signals, and
-//! this change is a port.
+//! this engine records the ORDER (`kalshi side=ask`, because `BookSide` renames
+//! to the wire spelling) — so a Kalshi maker ASK fill booked by the engine reads
+//! as `side="ask"`, which is not `"no"`, and was therefore marked as a standard
+//! basket when it is really an inverted one. It was latent only because those
+//! records were skipped as unpriced before they got here; divergence 5 makes
+//! them rows, so it would have gone live in the same commit that fixed it.
+//!
+//! The test is now `naked_act::Held::ShortYes.matches(side)` — the ONE
+//! side-vocabulary table, shared with the placer rather than copied. It reads
+//! all three spellings and changes nothing the Python wrote, which only ever
+//! writes `yes`/`no`. Exactly one live record moves: the
+//! `xvus-nobel-peace-26-sudansemergencyresponser` lot at ts 1785754029.3976908
+//! (Kalshi `side:"ask"`@0.34 against PM `side:"bid"`@0.30), which is now marked
+//! the way round it was actually entered.
 
+use crate::naked_act::Held;
 use arb_core::book::BookBuilder;
 use arb_core::fees::{leg_fee, FeeSchedule, Role};
 use arb_core::model::Venue;
@@ -196,22 +214,31 @@ pub struct Totals {
     /// EVERY open ledger record, including the ones no row was emitted for.
     ///
     /// **This is not `positions.len()`, and must never be "fixed" to be.** On
-    /// the 2026-07-31 live file it is 32 against 25 rows: one single-leg record
+    /// the 2026-07-31 live file it was 32 against 25 rows: one single-leg record
     /// (a directional pm-lean rider, which has no basket to mark) and six with
-    /// no cost basis. The gap is the point — it is how an operator sees that the
-    /// book is bigger than the marked book.
+    /// no cost basis. Since divergence 5 those six would be rows, and the gap on
+    /// that file would be the single-leg record alone. The gap is the point — it
+    /// is how an operator sees that the book is bigger than the marked book.
     pub n_open: u64,
-    /// Open baskets that could not be marked because the record carries no
-    /// `cost_usd` / `profit_usd`.
+    /// Open baskets that could not be marked: no `cost_usd` / `profit_usd` on
+    /// the record, AND none derivable from its legs.
     ///
-    /// COUNTED, NOT SILENTLY DROPPED, and that is load-bearing. This engine
-    /// books a basket at place time and never reads fill reports, so its records
-    /// carry no cost basis; marking one would be a guess. On 2026-07-28 the
-    /// engine's first four live records hit `mark_positions.py`'s hard subscript
-    /// and killed the timer 8 seconds after the last good run — and because this
-    /// file is where the engine re-derives its own take-take bar, that froze the
-    /// bar at a stale value the armed engine went on trading against for four
-    /// hours.
+    /// RETRACTION (2026-08-14). This doc used to say "this engine books a basket
+    /// at place time and never reads fill reports, so its records carry no cost
+    /// basis; marking one would be a guess". The first clause is still true — see
+    /// `fill::book_basket`'s `fees_pending: true` — and the conclusion was wrong.
+    /// A basis DERIVED from the record's own legs is not a guess: it is the same
+    /// per-contract number [`crate::naked_act::worst_lot`] hands the maker-exit
+    /// placer, off the same fields. [`derived_basis`] does that, so this counter
+    /// now holds only records whose legs cannot carry one — no readable price,
+    /// only one venue, or both legs pointing the same way.
+    ///
+    /// COUNTED, NOT SILENTLY DROPPED, and that is still load-bearing. On
+    /// 2026-07-28 the engine's first four live records hit
+    /// `mark_positions.py`'s hard subscript and killed the timer 8 seconds after
+    /// the last good run — and because this file is where the engine re-derives
+    /// its own take-take bar, that froze the bar at a stale value the armed
+    /// engine went on trading against for four hours.
     pub unpriced_positions: u64,
     pub unwind_signals: u64,
     pub unwind_hard: u64,
@@ -400,6 +427,111 @@ fn resolves_for(t: &Value, now: f64) -> (Option<String>, bool) {
     (resolves, estimated)
 }
 
+/// A leg field as a decimal, string OR number.
+///
+/// The live ledger writes every price and every fee as a string, but
+/// `naked_act::worst_lot` reads them through a helper that accepts both, and the
+/// point of [`leg_cost`] is that the two agree on every input, not on most of
+/// them.
+fn leg_dec(cx: &mut Cx, leg: &Value, k: &str) -> Option<D> {
+    let s = match leg.get(k)? {
+        Value::String(s) => s.clone(),
+        n @ Value::Number(_) => n.to_string(),
+        _ => return None,
+    };
+    cx.parse(&s)
+}
+
+/// One leg's ALL-IN cost per contract, and which way the leg points.
+///
+/// **THIS IS `naked_act::worst_lot`'s ARITHMETIC, deliberately.** That function
+/// prices the lot a maker exit has to beat; this one prices the lot a mark is
+/// taken against. If they disagree about what a contract cost, the selector
+/// offers the placer a basket the placer then refuses to price — which is the
+/// drift this shared derivation exists to prevent, so every rule below is lifted
+/// from `worst_lot` rather than re-derived:
+///
+///   * direction comes from [`Held::matches`], the one side-vocabulary table;
+///   * the price is `yes_price`, else `avg_price`, and an unreadable one is a
+///     refusal rather than a default;
+///   * a long-YES contract costs its YES price, a short-YES one costs the rest
+///     of the dollar;
+///   * fees are the leg's own `fees` field when it has one, and otherwise the
+///     schedule at the leg's `role` — with a MISSING role read as `Taker`, the
+///     dearer of the two, because a fee guessed low is a basis we beat by less
+///     than we thought.
+///
+/// The one divergence: `worst_lot` falls back to the RECORD's remaining qty when
+/// a leg carries none, and here that would be wrong — [`open_baskets`] scales a
+/// partially-unwound record's `qty` and never its legs' — so a leg with no
+/// usable qty of its own is refused instead.
+fn leg_cost(cx: &mut Cx, fees: &FeeSchedule, venue: Venue, leg: &Value) -> Option<(D, Held)> {
+    let side = str_of(leg, "side")?;
+    let held = [Held::LongYes, Held::ShortYes].into_iter().find(|h| h.matches(side))?;
+    let px = leg_dec(cx, leg, "yes_price").or_else(|| leg_dec(cx, leg, "avg_price"))?;
+    let paid = match held {
+        Held::LongYes => px,
+        Held::ShortYes => cx.one_minus(px),
+    };
+    let qty = leg.get("qty").and_then(Value::as_f64).filter(|q| *q > 0.0)?;
+    let size = cx.parse(&qty.to_string())?;
+    let fee_total = match leg_dec(cx, leg, "fees") {
+        Some(f) => f,
+        None => {
+            let role = match str_of(leg, "role") {
+                Some("maker") => Role::Maker,
+                _ => Role::Taker,
+            };
+            leg_fee(cx, fees, venue, role, px, size, "default", None)
+        }
+    };
+    let fee_ct = cx.div(fee_total, size);
+    Some((cx.add(paid, fee_ct), held))
+}
+
+/// `(cost_usd, profit_usd)` for a record that carries neither, from its legs.
+///
+/// `engine::fill::book_basket` writes `qty` and, per leg, `yes_price` / `role` /
+/// `side` / `qty` — everything [`leg_cost`] needs and no cost fields, because
+/// venue fees arrive on fill reports this process does not read (`fees_pending`).
+/// Both legs are therefore priced at the SCHEDULE, which is an upper bound on
+/// what we were actually charged, so the derived basis is dear and the derived
+/// locked profit is conservative. That is the right direction for a number the
+/// exit selector screens against.
+///
+/// The refusals, and each is a case where inventing a basis would be worse than
+/// having none:
+///
+///   * no positive record `qty`, or no Kalshi leg, or no PM-US leg — the first
+///     of each, exactly as [`build`] finds them, and the same shape divergence 4
+///     already counts unpriced;
+///   * BOTH LEGS POINTING THE SAME WAY. That is not a basket, it is two bets in
+///     the same direction, and `qty * 1.00` is not what it pays. The old
+///     no-cost-basis guard refused it by accident; this refuses it on purpose.
+///
+/// The payoff is `qty * $1.00` in BOTH orientations — exactly one leg of a
+/// two-sided basket pays the dollar, whichever leg that is — which is why the
+/// inverted lot needs no second formula, only [`leg_cost`]'s direction.
+fn derived_basis(cx: &mut Cx, fees: &FeeSchedule, t: &Value) -> Option<(f64, f64)> {
+    let zero = cx.zero();
+    let qty = dec_of(cx, t, "qty")?;
+    if cx.cmp(qty, zero) != Ordering::Greater {
+        return None;
+    }
+    let legs = t.get("legs").and_then(|v| v.as_array())?;
+    let kleg = legs.iter().find(|l| str_of(l, "venue") == Some("kalshi"))?;
+    let pleg = legs.iter().find(|l| str_of(l, "venue") == Some("polymarket_us"))?;
+    let (k_ct, k_held) = leg_cost(cx, fees, Venue::Kalshi, kleg)?;
+    let (p_ct, p_held) = leg_cost(cx, fees, Venue::PolymarketUs, pleg)?;
+    if k_held == p_held {
+        return None;
+    }
+    let per_ct = cx.add(k_ct, p_ct);
+    let cost = cx.mul(per_ct, qty);
+    let profit = cx.sub(qty, cost);
+    Some((f(cost), f(profit)))
+}
+
 /// Pure per-position marking: one trade record plus four top-of-book quotes ->
 /// one row.
 ///
@@ -455,7 +587,9 @@ pub fn compute_row(
     // Basket direction. Standard = long Kalshi YES + long PM NO; a Kalshi-maker
     // ask-side fill produces the INVERSE (Kalshi NO + PM YES), and marking one
     // of those as standard flags our own entry as a phantom "reverse" arb.
-    let inverted = kleg.and_then(|l| str_of(l, "side")) == Some("no");
+    // `Held::matches` and not `== "no"`, because the engine spells that side
+    // `"ask"` — see the header section on the latent hazard.
+    let inverted = kleg.and_then(|l| str_of(l, "side")).is_some_and(|s| Held::ShortYes.matches(s));
     let priced = match (inverted, k_bid, k_ask, p_bid, p_ask) {
         // Liquidate: sell the Kalshi NO at the NO bid (= 1 - YES ask); sell the
         // PM YES at its bid.
@@ -706,19 +840,40 @@ pub fn build(
     let mut unpriced = 0u64;
     let mut no_book = std::collections::BTreeSet::new();
     for t in &open {
-        let legs = t.get("legs").and_then(|v| v.as_array()).map_or(&[][..], Vec::as_slice);
-        if legs.len() < 2 {
+        if t.get("legs").and_then(|v| v.as_array()).map_or(0, Vec::len) < 2 {
             // Single-leg records (pm-lean riders) are directional — there is no
             // basket to mark. Skipped BEFORE the unpriced counter, as in Python.
             continue;
         }
-        // Marking needs a cost basis; without one the row would be a guess. Skip
-        // and COUNT — see `Totals::unpriced_positions` for what a silent
-        // omission here costs.
-        let (Some(cost), Some(locked)) = (f64_of(t, "cost_usd"), f64_of(t, "profit_usd")) else {
-            unpriced += 1;
-            continue;
+        // Marking needs a cost basis. The Python writer's records carry one and
+        // pass through here untouched — `Cow::Borrowed`, so nothing is copied
+        // for them. This engine's records carry none (`fill::book_basket`), so
+        // it is derived from their legs; a record that cannot carry one is still
+        // skipped and still COUNTED, and `Totals::unpriced_positions` says what
+        // a silent omission here costs.
+        let mut t = std::borrow::Cow::Borrowed(t);
+        let (cost, locked) = match (f64_of(&t, "cost_usd"), f64_of(&t, "profit_usd")) {
+            (Some(cost), Some(locked)) => (cost, locked),
+            _ => {
+                let Some((cost, locked)) = derived_basis(cx, fees, &t) else {
+                    unpriced += 1;
+                    continue;
+                };
+                // INTO the record, before `compute_row` reads a basis off it.
+                // The emitted `cost_usd` has to BE the number the row was priced
+                // from — a row priced off one cost and published against another
+                // is a maker exit sized against a basis nobody holds, and the
+                // absent-field default is 0, which reads as ~$1/ct of free money.
+                let obj = t
+                    .to_mut()
+                    .as_object_mut()
+                    .expect("derived_basis read qty and legs off it, so it is an object");
+                obj.insert("cost_usd".into(), serde_json::json!(cost));
+                obj.insert("profit_usd".into(), serde_json::json!(locked));
+                (cost, locked)
+            }
         };
+        let legs = t.get("legs").and_then(|v| v.as_array()).map_or(&[][..], Vec::as_slice);
         let kleg = legs.iter().find(|l| str_of(l, "venue") == Some("kalshi"));
         let pleg = legs.iter().find(|l| str_of(l, "venue") == Some("polymarket_us"));
         // Divergence 4: Python's bare `next(...)` raises here and kills the run.
@@ -736,7 +891,7 @@ pub fn build(
         }
         let (k_bid, k_ask) = top(cx, books, Venue::Kalshi, km);
         let (p_bid, p_ask) = top(cx, books, Venue::PolymarketUs, pm);
-        let row = compute_row(cx, fees, t, k_bid, k_ask, p_bid, p_ask, now);
+        let row = compute_row(cx, fees, &t, k_bid, k_ask, p_bid, p_ask, now);
         if let Some(m) = row.mark_pnl_usd {
             tot_mark += m;
         }
@@ -1023,6 +1178,10 @@ mod tests {
     /// 2026-07-28 the four records this engine had just written hit
     /// `mark_positions.py`'s hard subscript instead, and the resulting frozen
     /// take-take bar was traded against for four hours.
+    ///
+    /// Since divergence 5 this ALSO pins the other half of the guard: the legs
+    /// here carry no price, so nothing can be derived from them either, and a
+    /// leg with no price is still not a basis.
     #[test]
     fn a_basket_with_no_cost_basis_is_skipped_and_counted() {
         let mut cx = Cx::default();
@@ -1046,9 +1205,185 @@ mod tests {
         assert_eq!(m.doc.positions[0].liq_value_usd, Some(0.945_086), "unchanged by its neighbour");
     }
 
+    /// A basket THIS ENGINE WROTE, off `data/exec/trades.jsonl` — the
+    /// `xvus-nobel-peace-26-donaldtrump` lot at ts 1785257180.2107046, with the
+    /// two market ids renamed to the ones `books()` carries.
+    ///
+    /// `fill::book_basket`'s shape exactly: order-side spellings, per-leg
+    /// price / role / qty, `fees_pending`, and NO cost fields.
+    fn engine_written() -> Value {
+        v(r#"{"ts":1785257180.2107046,"relationship_id":"xvus-nobel-peace-26-donaldtrump",
+            "title":"xvus-nobel-peace-26-donaldtrump (rust maker-hedge)","qty":5,
+            "strategy":"maker-hedge","status":"open","source":"arb-trader","fees_pending":true,
+            "legs":[{"venue":"polymarket_us","market_id":"P","side":"ask","role":"maker",
+                     "qty":5,"yes_price":"0.0800","order_id":"t1"},
+                    {"venue":"kalshi","market_id":"K","side":"bid","role":"taker",
+                     "qty":5,"yes_price":"0.0400","order_id":"h1"}]}"#)
+    }
+
+    /// **DIVERGENCE 5, AND THE POINT OF IT.** The basket this engine booked is a
+    /// ROW now, with a basis derived from its own legs.
+    ///
+    /// Kalshi long YES at 0.0400 costs 0.04 plus its taker fee —
+    /// `ceil_cents(0.07*5*0.04*0.96)` = $0.02 over 5 contracts, so 0.004/ct. The
+    /// PM-US leg is SHORT yes at 0.0800, which costs the rest of the dollar,
+    /// 0.92, and a PM maker pays nothing. 0.964/ct over 5 contracts is $4.82,
+    /// against a $5.00 payoff: $0.18 locked.
+    ///
+    /// The fields asserted at the end are what `unwind::consider` requires
+    /// before it will consider a position at all — the five it destructures in
+    /// one `let-else`, plus the `resolves_by` it reads first. Without a row
+    /// carrying every one of them the exit selector cannot see this basket,
+    /// however profitable its exit is.
+    #[test]
+    fn an_engine_written_basket_is_priced_from_its_own_legs() {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let bk = books((&[lv("0.05", "9")], &[lv("0.08", "9")]), (&[], &[lv("0.09", "9")]));
+        let m = build(&mut cx, &fees, vec![engine_written()], &bk, at("2026-07-31", 18, 24, 49));
+
+        assert_eq!(m.doc.positions.len(), 1, "the engine's own basket is marked");
+        assert_eq!(m.doc.totals.unpriced_positions, 0, "and nothing is left uncounted");
+        let row = &m.doc.positions[0];
+        assert_eq!(row.cost_usd, 4.82, "0.04 + 0.004 fee + 0.92, five contracts");
+        assert_eq!(row.locked_profit_usd, 0.18, "$5.00 payoff less the basis");
+        assert_eq!(m.doc.totals.cost_usd, 4.82, "the totals are the derived dollars");
+        assert_eq!(m.doc.totals.locked_profit_usd, 0.18);
+
+        // The tuple `unwind::consider` destructures. Every one present, or the
+        // basket is invisible to the exit selector.
+        assert_eq!(row.kalshi_ticker.as_deref(), Some("K"));
+        assert_eq!(row.ts, Some(1_785_257_180.210_704_6));
+        assert_eq!(row.qty, 5);
+        assert_eq!(row.resolves_by.as_deref(), Some("2026-10-09"));
+        assert!(row.forward_hold_apr.is_some());
+        assert!(
+            matches!(row.maker_exit_ct, Some(Some(_))),
+            "a standard basket prices a maker exit: {:?}",
+            row.maker_exit_ct
+        );
+    }
+
+    /// **THE PARITY THAT MATTERS.** The basis this file derives is the basis
+    /// `naked_act::worst_lot` prices a real order off — the same lot, to the
+    /// last of its six decimal places.
+    ///
+    /// `worst_lot` is what `maker_exit` sizes a resting ask against. If the two
+    /// disagreed, this file would offer the placer a basket the placer then
+    /// prices differently — selecting an exit that does not clear its own lot,
+    /// or refusing one that does. `leg_cost` exists to be the same arithmetic,
+    /// and this is the test that says so.
+    #[test]
+    fn the_derived_basis_is_the_placers_own_lot_arithmetic() {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let recs = vec![engine_written()];
+        let rel = "xvus-nobel-peace-26-donaldtrump";
+        let k = crate::naked_act::worst_lot(
+            &mut cx,
+            &fees,
+            &recs,
+            rel,
+            Venue::Kalshi,
+            "K",
+            Held::LongYes,
+        )
+        .expect("the placer prices the Kalshi lot");
+        let p = crate::naked_act::worst_lot(
+            &mut cx,
+            &fees,
+            &recs,
+            rel,
+            Venue::PolymarketUs,
+            "P",
+            Held::ShortYes,
+        )
+        .expect("...and the PM-US lot");
+        assert_eq!((k.cost_per_ct.as_str(), p.cost_per_ct.as_str()), ("0.044000", "0.920000"));
+
+        let (cost, profit) = derived_basis(&mut cx, &fees, &recs[0]).expect("a basis");
+        let kc = q(&mut cx, &k.cost_per_ct).expect("k");
+        let pc = q(&mut cx, &p.cost_per_ct).expect("p");
+        let per_ct = cx.add(kc, pc);
+        let five = cx.from_i64(5);
+        assert_eq!(f(cx.mul(per_ct, five)), cost, "the marker's basis IS the placer's lot");
+        assert_eq!(cost + profit, 5.0, "and the pair still sums to the $1/ct payoff");
+    }
+
+    /// The ONE live record the side-vocabulary fix moves:
+    /// `xvus-nobel-peace-26-sudansemergencyresponser` at ts 1785754029.3976908,
+    /// a Kalshi maker ASK at 0.34 against a PM-US taker BID at 0.30. The engine
+    /// spells that Kalshi side `"ask"`, so the old `== "no"` test read an
+    /// INVERTED basket as a standard one — latent while it was unpriced, live
+    /// the moment divergence 5 gives it a basis.
+    ///
+    /// It is also belt and braces on the exit path, in two independent places:
+    /// `compute_row`'s inverted arm returns before pricing `maker_exit_ct`, so
+    /// the row publishes `null` and `unwind::consider` answers a null with
+    /// `NotPriceable` — the basket is structurally unselectable. And if one ever
+    /// did reach `maker_exit`, `worst_lot` refuses a lot pointing the wrong way.
+    #[test]
+    fn an_engine_written_inverted_basket_is_marked_the_other_way_round_and_never_maker_exits() {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let sudan = v(r#"{"ts":1785754029.3976908,"qty":5,"status":"open","source":"arb-trader",
+            "relationship_id":"xvus-nobel-peace-26-sudansemergencyresponser","fees_pending":true,
+            "legs":[{"venue":"kalshi","market_id":"K","side":"ask","role":"maker",
+                     "qty":5,"yes_price":"0.34"},
+                    {"venue":"polymarket_us","market_id":"P","side":"bid","role":"taker",
+                     "qty":5,"yes_price":"0.3000"}]}"#);
+        let bk = books(
+            (&[lv("0.32", "9")], &[lv("0.36", "9")]),
+            (&[lv("0.30", "9")], &[lv("0.34", "9")]),
+        );
+        let m = build(&mut cx, &fees, vec![sudan], &bk, at("2026-07-31", 18, 24, 49));
+        let row = &m.doc.positions[0];
+
+        // Short YES at 0.34 costs 0.66 plus ceil_cents(0.0175*5*0.34*0.66) =
+        // $0.02 maker fee; long YES at 0.30 costs 0.30 plus 0.06*0.30*0.70*5 =
+        // $0.063 taker. 0.9766/ct over five contracts. The SAME formula as the
+        // standard basket: exactly one leg of a two-sided basket pays the dollar
+        // either way round.
+        assert_eq!(row.cost_usd, 4.883);
+        assert_eq!(row.locked_profit_usd, 0.117);
+        // Liquidated the inverted way: sell the Kalshi NO at 1 - 0.36, sell the
+        // PM YES at its bid. Read as standard it would have been 0.32 + (1 -
+        // 0.34) = 0.98/ct instead.
+        assert_eq!(row.liq_value_usd, Some(4.547), "(1 - k_ask) + p_bid, less both taker fees");
+        assert_eq!(row.reverse_edge_c, Some(-6.0), "p_bid - k_ask, not k_bid - p_ask");
+        assert_eq!(
+            row.maker_exit_ct,
+            Some(None),
+            "the maker exit rests a Kalshi ask against a long YES; this basket has none"
+        );
+    }
+
+    /// Two legs pointing the SAME way is not a basket, and no basis is invented
+    /// for one.
+    ///
+    /// `qty * $1.00` is the payoff of a basket holding both sides of one
+    /// question; two same-direction bets pay 0 or 2 and the derivation would be
+    /// a fiction. The no-cost-basis guard used to refuse this shape by accident
+    /// — it refused everything — so the refusal is now explicit and pinned.
+    #[test]
+    fn a_record_whose_legs_point_the_same_way_is_not_a_basket() {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let mut same_way = engine_written();
+        same_way["legs"][0]["side"] = v("\"bid\"");
+        let bk = books((&[lv("0.05", "9")], &[lv("0.08", "9")]), (&[], &[lv("0.09", "9")]));
+        let m = build(&mut cx, &fees, vec![same_way], &bk, at("2026-07-31", 18, 24, 49));
+        assert!(m.doc.positions.is_empty(), "no row, and no invented dollar of payoff");
+        assert_eq!(m.doc.totals.unpriced_positions, 1, "counted, like every other refusal");
+        assert_eq!(m.doc.totals.n_open, 1);
+    }
+
     /// `n_open` is not `positions.len()`, and the difference is exactly the
-    /// records no row was emitted for. The live file reads 32 against 25; this
+    /// records no row was emitted for. The live file read 32 against 25; this
     /// pins the identity that makes those two numbers legible.
+    ///
+    /// The `no_basis` record's legs carry no price, so divergence 5 cannot
+    /// derive one either — a leg with no price is still not a basis.
     #[test]
     fn n_open_counts_every_open_record_and_the_gap_is_accounted_for() {
         let mut cx = Cx::default();

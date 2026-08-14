@@ -8,49 +8,62 @@
 //!
 //! # 1. What this selects and what this engine can act on are disjoint sets
 //!
-//! THE BLOCKER TO ARMING, and it is not a rounding error — it is total. Two
-//! halves that point in opposite directions:
+//! **RETRACTED IN BOTH HALVES, on two different dates.** This was THE BLOCKER
+//! TO ARMING and it is no longer a blocker at all. The claim is kept, because
+//! the placer in `crate::maker_exit` was written against it and a reader of
+//! that file needs to know which sentence stopped being true when:
 //!
-//!   * `mark_positions.py` skips any open basket with no `cost_usd`/`profit_usd`
-//!     (`mark_positions.py:280-282`), and `engine::fill::book_basket` writes
-//!     exactly that shape — `status: "open"`, `fees_pending: true`, no cost
-//!     basis, because venue fees arrive on fill reports the engine does not
-//!     read. So EVERY basket the Rust engine has ever booked is invisible to
-//!     the file this module decides from; `marks.json`'s own
-//!     `totals.unpriced_positions` counts them. On 2026-07-29 that was about
-//!     one in six open baskets.
-//!   * Those baskets sit in the `xvus-nobel-peace-26` and `xvus-brazil-pres-26`
+//!   * "`mark_positions.py` skips any open basket with no `cost_usd`/
+//!     `profit_usd` (`mark_positions.py:280-282`), and `engine::fill::
+//!     book_basket` writes exactly that shape — `status: "open"`,
+//!     `fees_pending: true`, no cost basis, because venue fees arrive on fill
+//!     reports the engine does not read. So EVERY basket the Rust engine has
+//!     ever booked is invisible to the file this module decides from." True of
+//!     the Python, and of the Rust port that replaced it, until **2026-08-14**:
+//!     [`crate::marks::build`] now DERIVES the missing basis from the record's
+//!     own legs (`marks::derived_basis` — `naked_act::worst_lot`'s arithmetic,
+//!     which is a measurement and not a guess), so every two-leg basket this
+//!     engine has booked is an ordinary row and [`select`] reads it like any
+//!     other. On the ledger the day it landed that was 31 records and about
+//!     $133 of book. `totals.unpriced_positions` now counts only records whose
+//!     LEGS cannot carry a basis.
+//!   * "Those baskets sit in the `xvus-nobel-peace-26` and `xvus-brazil-pres-26`
 //!     families — which are, precisely, two of the three `--rel-prefix` scopes
 //!     the armed process runs under. Meanwhile every candidate this module
 //!     selects from the live marks is `xvus-france-pres-27` or
 //!     `xvus-time-poty-26`, for which that process holds no quoter
-//!     (`main.rs:387` filters the registry by prefix) and no book subscription.
+//!     (`main.rs:387` filters the registry by prefix) and no book
+//!     subscription." Retracted **2026-07-31** in `maker_exit`'s own §1: the
+//!     armed process runs `--rel-prefix xvus-` and every priced position in
+//!     `data/exec/marks.json` is `xvus-`, so the candidate set and the owned set
+//!     are the same set.
 //!
-//! Everything the production engine locks up is invisible to the recycler, and
-//! everything the recycler selects is on markets the production engine cannot
-//! quote. A detector that reports what it could never execute is a misleading
-//! detector, so [`Exit::actionable`] carries the prefix test and the report
-//! says which side of it a candidate falls on. `scripts/unwind_positions.py:282`
-//! refuses by the same kind of ownership contract and has since it was written.
+//! A detector that reports what it could never execute is a misleading
+//! detector, so [`Exit::actionable`] still carries the prefix test and the
+//! report still says which side of it a candidate falls on — enforced rather
+//! than assumed, which is what makes the retraction above safe to act on.
+//! `scripts/unwind_positions.py:282` refuses by the same kind of ownership
+//! contract and has since it was written.
 //!
-//! THE MISSING COST BASIS HAS A THIRD OPTION, and an arming author should not
-//! be left believing the only two are "guess one" and "build a Rust-side mark".
-//! `ledger::apply_corrections` (`ledger.py:26-52`) shallow-merges
+//! THE MISSING COST BASIS HAD A THIRD OPTION, and the route taken was a fourth.
+//! This paragraph offered corrections — `ledger::apply_corrections`
+//! (`ledger.py:26-52`) shallow-merges
 //! `{"status":"correction","corrects_ts":<the open record's ts>,"fields":{…}}`
-//! onto its target, and `open_baskets` folds corrections BEFORE
-//! `mark_positions.py:280-282` ever sees the record. The mechanism is in
-//! production for this class of defect — corrections carrying
-//! `cost_usd`/`profit_usd`/`legs` already sit in the ledger, though none has
-//! yet targeted an engine record — and the raw material is already written:
-//! `fill::book_basket` emits `qty` and `legs[].yes_price` for both legs, and
-//! `mark_positions.py` already imports `FeeSchedule`/`leg_fee`.
+//! onto its target, and `open_baskets` folds them BEFORE the basis test ever
+//! sees the record — against "guess one" and "build a Rust-side mark". What
+//! landed instead derives the basis INSIDE the mark, at read time, from `qty`
+//! and each leg's `yes_price` / `role` / `qty`: no ledger line is written, the
+//! records already in the file need no backfill, and a record this engine
+//! writes tomorrow is marked the second it lands. The correction route stays
+//! available, and is still the right one for a basis somebody has to CORRECT
+//! rather than derive.
 //!
-//! It is still not free, and the DEPENDENCY is the real obstacle: a basis that
-//! is not merely an upper bound needs the venue FILL reports the engine does
-//! not read — which is what `fees_pending: true` is naming — and both cheap
-//! variants of this are Python edits, which the freeze forbids. So this is a
-//! route rather than a plan. But it is a cheaper route than a Rust-side mark,
-//! and the arming PR should cost it out before assuming otherwise.
+//! THE DEPENDENCY THAT PARAGRAPH NAMED IS REAL AND IS UNPAID. A basis that is
+//! not merely an upper bound needs the venue FILL reports this engine does not
+//! read — which is what `fees_pending: true` is naming. The derived basis
+//! charges both legs at the SCHEDULE, so it is dear and the locked profit it
+//! implies is conservative: the safe direction for a number an exit is screened
+//! against, and still not the number the venue charged.
 //!
 //! # 2. The signal FLAPS. A placer needs hysteresis
 //!
@@ -193,9 +206,11 @@
 //! a fill on a tagged place mints a hedge that OPENS the other leg, and
 //! `engine::fill::book_basket` appends `status: "open"`. An exit fill has to
 //! CLOSE the other leg and append a `status: "unwound"` record netting against
-//! one specific open record's `ts` (`ledger::open_exposure`). None of that
-//! exists, and §1 says it should not be built until the recycler and the engine
-//! can see the same book.
+//! one specific open record's `ts` (`ledger::open_exposure`). None of that is
+//! expressible here, so it was built somewhere else: [`crate::maker_exit`] is
+//! the placer, off its own order path and its own ledger write. §1's condition
+//! on building one — "not until the recycler and the engine can see the same
+//! book" — is met as of 2026-08-14, in both directions.
 //!
 //! THE DIRECTION IS FIXED BY THE INPUT. `maker_exit_ct` is priced by
 //! `mark_positions.py` for the STANDARD basket only (long Kalshi YES + long PM
@@ -203,6 +218,16 @@
 //! NO one tick through its ask when it fills. Inverted baskets (Kalshi NO + PM
 //! YES) get `maker_exit_ct: null` there, so they are unpriceable here and are
 //! never selected. That is the scope, not an oversight.
+//!
+//! AND IT NOW CARRIES WEIGHT IT DID NOT CARRY BEFORE. `marks::compute_row`
+//! reads that direction through the ONE side-vocabulary table
+//! (`naked_act::Held`), which knows this engine spells a Kalshi short
+//! `side:"ask"` — so the engine-written baskets that became visible on
+//! 2026-08-14 are classified honestly, and the inverted ones among them
+//! publish `maker_exit_ct: null` and are refused here as [`Skip::NotPriceable`]
+//! before anything prices them. That refusal is the SELECTION-level half of a
+//! belt-and-braces pair; the other half is `naked_act::worst_lot`, which
+//! refuses a lot pointing the wrong way when the placer asks for its basis.
 //!
 //! THE MARKS ARE READ TWICE PER STATS TICK — once by `stats_tick` for the
 //! take-take bar and once by `Engine::unwind_tick` — and the file is rewritten
@@ -311,9 +336,11 @@ pub struct Exit {
     /// Per-contract profit the maker exit locks, net of both legs' fees.
     pub exit_ct: f64,
     /// Whether THIS process could act on it: the relationship is inside the
-    /// `--rel-prefix` scope this engine loaded quoters for. See §1 — today the
-    /// live answer is `false` for every candidate, and that is the finding, not
-    /// a bug in the filter.
+    /// `--rel-prefix` scope this engine loaded quoters for. See §1 — this read
+    /// `false` for every candidate when the armed process ran three families,
+    /// and `maker_exit`'s §1 re-derived it on 2026-07-31 under
+    /// `--rel-prefix xvus-`, where the candidate set and the owned set are the
+    /// same set. The test is enforced either way rather than assumed.
     pub actionable: bool,
     /// Clears [`MIN_EXIT_CT`] by less than one [`TICK_CT`]. Reported so the
     /// operator can tell a decision from a coin flip: one tick of book movement
