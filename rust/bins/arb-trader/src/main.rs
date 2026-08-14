@@ -1547,6 +1547,11 @@ fn spawn_maker_exit(
             if args.maker_exit { " --maker-exit was ALSO passed and is overridden: shadow wins." } else { "" }
         );
     } else {
+        // ONLY THE ARMED PASS STANDS ANYBODY OFF. A shadow exit rests no ask, so
+        // there is nothing for a naked-leg IOC to cross, and standing that
+        // backstop off a market would cost a real leg its completion for a trade
+        // that is not going to happen.
+        maker_exit::arm_standoff();
         eprintln!(
             "[maker-exit] *** ARMED *** — it will REST a post-only Kalshi ask that flattens \
              ONE lot of ONE basket at a time, at a price that locks >= {}/ct against a cost \
@@ -1566,7 +1571,10 @@ fn spawn_maker_exit(
              one-legged with the ledger still calling the basket open. ALARM ON \
              `maker_exit_unresolved`; it must stay 0. If --positions-recon-act is also armed \
              the two WILL fight over that leg — it completes a PmShort by buying Kalshi back, \
-             which re-opens what this just exited."
+             which re-opens what this just exited. ONE naked leg LATCHES THIS OFF: while \
+             `maker_exit_unresolved` is non-zero no new exit rests until the process is \
+             RESTARTED, and the 60s cycle repeats that refusal on every tick, which is the \
+             alarm rather than a stuck loop."
         );
     }
     tokio::spawn(maker_exit::exit_loop(
@@ -2432,8 +2440,11 @@ mod precondition_tests {
     /// until the PM-US close returns, so a default that armed it would change
     /// what today's running unit does on its next restart — which is the one
     /// thing a new strategy must never do.
-    #[test]
-    fn the_maker_exit_is_off_by_default() {
+    #[tokio::test]
+    async fn the_maker_exit_is_off_by_default() {
+        // Under the guard every test that ARMS the stand-off takes and clears:
+        // a failure of the last assertion here is one of those having leaked.
+        let _g = naked_act::TEST_SERIAL.lock().await;
         assert!(!default_args().maker_exit);
         assert!(!default_args().maker_exit_shadow);
         assert_eq!(maker_exit_shadow(false, false), None, "neither flag places anything");
@@ -2450,6 +2461,76 @@ mod precondition_tests {
             Policy { toxgate_file: None, apr: None, apr_installed: (0.0, "d".into()) },
         );
         assert!(!cfg.maker_exit_view, "an unflagged run must publish no view");
+        // ...and it stands nothing off either. The naked-leg backstop asks this
+        // question before every order it sends, and on a unit with no maker exit
+        // the answer must be yes — a refusal there would leave a real naked leg
+        // uncompleted for an exit that does not exist.
+        assert!(
+            maker_exit::working_check("anything").is_ok(),
+            "an unflagged run must stand nobody off"
+        );
+    }
+
+    /// A SHADOW MAKER EXIT STANDS NOBODY OFF EITHER.
+    ///
+    /// It decides, prices and prints, and rests no ask — so there is no order of
+    /// ours for a backstop IOC to cross, and holding the backstop off a market
+    /// anyway would cost a real naked leg its completion for a trade that will
+    /// not happen. The arming lives in the ARMED branch alone; this is what says
+    /// so.
+    #[tokio::test]
+    async fn a_shadow_maker_exit_stands_nobody_off() {
+        let _g = naked_act::TEST_SERIAL.lock().await;
+        maker_exit::reset_standoff();
+
+        /// The shadow path stops before the wire, so every method here is a
+        /// claim about that: reaching one is the failure.
+        struct NeverUsed;
+        impl sink::OrderSink for NeverUsed {
+            fn place(
+                &self,
+                _r: &arb_venue::gateway::PlaceRequest,
+            ) -> Result<String, arb_venue::VenueError> {
+                unreachable!("a shadow exit never places")
+            }
+            fn cancel(
+                &self,
+                _r: &arb_venue::gateway::CancelRequest,
+            ) -> Result<(), arb_venue::VenueError> {
+                unreachable!("a shadow exit never cancels")
+            }
+            fn cancel_all_open(&self) -> Result<(), arb_venue::VenueError> {
+                unreachable!("the exit loop never sweeps")
+            }
+            fn resting_order_ids(&self) -> Result<Vec<String>, arb_venue::VenueError> {
+                unreachable!("the exit loop never lists")
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("arb-shadow-standoff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let reg = dir.join("registry.yaml");
+        std::fs::write(
+            &reg,
+            "relationships:\n  - id: xvus-r1\n    legs:\n      - venue: kalshi\n        \
+             market_id: K-a\n      - venue: polymarket_us\n        market_id: p-a\n",
+        )
+        .expect("registry");
+
+        let mut a = default_args();
+        a.maker_exit_shadow = true;
+        a.registry = reg.to_string_lossy().into_owned();
+        let s: std::sync::Arc<dyn sink::OrderSink> = std::sync::Arc::new(NeverUsed);
+        let mut h: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> = HashMap::new();
+        h.insert(Venue::Kalshi, s.clone());
+        h.insert(Venue::PolymarketUs, s);
+        spawn_maker_exit(&a, &h);
+
+        assert!(
+            maker_exit::working_check("K-a").is_ok(),
+            "a shadow exit rests nothing, so it may stand nobody off"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SHADOW WINS FOR THE MAKER EXIT TOO. Same rule as the naked-leg completer

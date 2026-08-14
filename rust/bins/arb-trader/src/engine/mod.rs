@@ -22,7 +22,11 @@
 
 mod cancel;
 mod feed_health;
-mod fill;
+/// `pub(crate)` for ONE item: `note_sidecar_order`. The two modules that place
+/// orders without going through `Engine::dispatch` — `maker_exit` and
+/// `positions` — have to name the venue ids they got back, or their fills land
+/// on this engine's must-stay-0 unexplained-money gauge.
+pub(crate) mod fill;
 /// `pub(crate)` for ONE item: `venue_reopen_park`, the halt backoff. The
 /// venue-truth naked-leg completer (`positions::Act`) parks on the same policy,
 /// and a second copy of a backoff curve is a second thing to keep in step.

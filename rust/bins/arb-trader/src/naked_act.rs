@@ -736,6 +736,12 @@ pub fn decide(
         ));
     }
     inflight_check(&f.kalshi)?;
+    // ...and the same question asked of the OTHER order-owner in this process.
+    // Both directions of a finding place a Kalshi taker order, and both would
+    // cross a post-only exit ask resting on the same ticker — which
+    // `self_trade_prevention_type: taker_at_cross` answers by cancelling THIS
+    // order, silently, as "the book moved". See `maker_exit::working_check`.
+    crate::maker_exit::working_check(&f.kalshi)?;
 
     match f.leg {
         crate::positions::Leg::PmShort => {
@@ -972,10 +978,14 @@ mod tests {
 
     /// Nothing may place unless the engine has said what it is working. This is
     /// the fail-closed default, and every decide test below has to clear it —
-    /// under [`TEST_SERIAL`], which is shared with `positions`' act tests.
+    /// under [`TEST_SERIAL`], which is shared with `positions`' act tests and
+    /// with every test in either module that touches the maker exit's stand-off.
+    /// That second registry is cleared here for the same reason as the first: a
+    /// test that armed it must not decide what the next test is allowed to do.
     async fn allow_all() -> tokio::sync::MutexGuard<'static, ()> {
         let g = TEST_SERIAL.lock().await;
         publish_inflight(BTreeSet::new());
+        crate::maker_exit::reset_standoff();
         g
     }
 
@@ -1423,6 +1433,36 @@ mod tests {
         assert!(inflight_check("K-a").is_err());
         publish_inflight(BTreeSet::new());
         assert!(inflight_check("K-a").is_ok());
+    }
+
+    /// A MARKET A MAKER EXIT IS WORKING IS NOT COMPLETED FROM UNDER IT.
+    ///
+    /// Both directions of a finding send a Kalshi TAKER order, and a taker that
+    /// crosses our own post-only exit ask is cancelled by
+    /// `self_trade_prevention_type: taker_at_cross`: it comes back unfilled,
+    /// this module reports that the book moved, and the leg it was sent to
+    /// complete stays naked with nothing anywhere naming the reason.
+    #[tokio::test]
+    async fn a_market_a_maker_exit_is_working_is_not_completed_by_recon_act() {
+        let _g = allow_all().await;
+        crate::maker_exit::arm_standoff();
+        crate::maker_exit::publish_working(BTreeSet::from(["K-a".to_string()]));
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 5, "0.22", "0.19")];
+        let q = quote(penny(), Some("0.18"), Some("0.19"));
+        let e = decide(&mut cx, &fees, &recs, &finding(Leg::PmShort, 3), &q, 1e9)
+            .expect_err("an exit of ours is working that ticker");
+        assert!(e.contains("maker exit is working"), "{e}");
+        assert!(e.contains("taker_at_cross"), "and it names the rule that decides it: {e}");
+
+        // ...and the market comes back the moment the exit stops working it,
+        // which is what makes this a stand-off and not a disarm.
+        crate::maker_exit::publish_working(BTreeSet::new());
+        assert!(
+            decide(&mut cx, &fees, &recs, &finding(Leg::PmShort, 3), &q, 1e9).is_ok(),
+            "a released market must be actionable again"
+        );
+        crate::maker_exit::reset_standoff();
     }
 
     /// The frozen Python hedger having booked this relationship minutes ago is
