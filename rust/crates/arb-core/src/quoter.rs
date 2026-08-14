@@ -214,6 +214,15 @@ struct RestingQuote {
     order_id: String,
     price: D,
     count: i64,
+    /// Whether NOTHING was resting at `price` in the book this quote was priced
+    /// off — i.e. whether we opened the level or joined one. It is the only
+    /// record of our queue position, and it has to be taken at placement:
+    /// afterwards the book aggregates us with everyone else at that price and
+    /// no update distinguishes an order ahead of ours from one behind it.
+    ///
+    /// Read by `touch_excl_self`, which is where what it costs to get this
+    /// wrong in either direction is written down.
+    first_at_price: bool,
 }
 
 pub struct Quoter {
@@ -307,7 +316,44 @@ impl Quoter {
         self.toxgate = tox;
     }
 
-    /// Best price on `side` from OTHER participants (our resting subtracted).
+    /// Best price on `side` from OTHER participants — the level `target` has to
+    /// beat. Our own resting size is netted out of its level, and a level we
+    /// were FIRST at is skipped whole.
+    ///
+    /// The netting alone reads an aggregated L2 book as if it carried queue
+    /// position, and it does not: at one price the only thing separating two
+    /// orders is time. Whether the residual at our price is competition depends
+    /// entirely on whether it arrived before or after us, and no book update
+    /// says so — which is why `RestingQuote::first_at_price` answers it from the
+    /// book we placed off instead.
+    ///
+    /// JOIN-BEHIND, measured on the 2026-08-14 tape. On
+    /// KXNOBELPEACE-26-SUD:bid the netting ran 2,836 places for 7 fills
+    /// (405:1). The cycle is deterministic and it flipped 100% of the time: a
+    /// counterparty adds size at our resting 0.25 (15-23s AFTER our place, so
+    /// our priority there is real), the residual makes 0.25 look contested, we
+    /// step to 0.26 and go to the back of a new queue — and when they pull, the
+    /// residual goes with them and we step back to 0.25, behind whoever joined
+    /// meanwhile. Each round trip pays a tick to forfeit the priority we
+    /// already had. A 16-minute window with our order alone at the level
+    /// produced zero requotes, so nothing but the joiner drives it, and the
+    /// 47-112ms cancel-to-feed latency is not in it.
+    ///
+    /// WHY THE SKIP IS NOT UNCONDITIONAL. Because `target` posts AT the touch
+    /// whenever the profitable limit lands exactly on it, resting at a price is
+    /// NOT evidence of owning it. On the golden tape, `cpc-btc-*-140k:ask`
+    /// rests at 0.07 against a level holding 1,500,238 lots — a wall we joined,
+    /// every lot of it ahead of ours, with the next offer 83 ticks away at
+    /// 0.90. Skipping that on price equality alone hands `target` a 0.90
+    /// competitor, so the quote abandons the touch for 0.89, and once it leaves
+    /// the wall it is foreign again and the quote comes straight back: 1 place
+    /// became 218 on that market alone, four of the btc rungs did the same, and
+    /// 182 became 1,212 across the tape. Trading a 1-tick oscillation for an
+    /// 82-cent one is not a fix.
+    ///
+    /// So the skip asks who was here first, and only the case the tape actually
+    /// shows — a level we opened, joined later by someone behind us — is exempt
+    /// from the netting.
     fn touch_excl_self(
         &self,
         cx: &mut Cx,
@@ -325,8 +371,18 @@ impl Quoter {
         for lvl in levels {
             let p = cx.parse(&lvl.price)?;
             let mut size = cx.parse(&lvl.size)?;
+            // Only ever for a price we HOLD. With nothing resting there is no
+            // `rq`, every level is foreign, and a fresh quote still improves
+            // over the touch exactly as before.
             if let Some(rq) = rq {
                 if cx.cmp(p, rq.price) == Ordering::Equal {
+                    if rq.first_at_price {
+                        continue; // ours; everything else here queued behind it
+                    }
+                    // We joined this level. What is ahead of us stays
+                    // competition — but netting still matters, because the size
+                    // ahead can cancel and leave the level holding nothing but
+                    // our own order, which is not something to outbid.
                     let c = cx.from_i64(rq.count);
                     size = cx.sub(size, c);
                 }
@@ -634,6 +690,14 @@ impl Quoter {
                     continue;
                 };
                 // hysteresis: exact-match hold (deadband 0)
+                //
+                // Still 0, and `min_requote_s` still 15s, on purpose: both were
+                // candidates for the join-behind flip `touch_excl_self`
+                // documents and both are the wrong instrument for it. A band
+                // wide enough to swallow a 1-tick oscillation swallows every
+                // legitimate 1-tick improvement with it, and a longer throttle
+                // makes the flip slower rather than rarer. Removing the reason
+                // to move beats damping the move; these stay as they are.
                 if let Some(curq) = self.resting.get(&key) {
                     if cx.cmp(curq.price, target) == Ordering::Equal {
                         // The book agrees with what we rest, so this quote is
@@ -757,6 +821,18 @@ impl Quoter {
                     }
                     self.refused_since.remove(&key);
                 }
+                // Did this price IMPROVE on the competition, or JOIN it? Asked
+                // here, against the same book and the same `resting` state
+                // `target` was computed from, because it is only answerable
+                // before the order exists: `target` sits strictly inside `comp`
+                // when it opens a level and exactly ON it when the profitable
+                // limit could not afford the tick. Equality is therefore the
+                // whole test, and no second reading of the book can recover it
+                // once we are one of the orders at that price.
+                let first_at_price = match self.touch_excl_self(cx, books, i, side) {
+                    Some(c) => cx.cmp(c, target) != Ordering::Equal,
+                    None => true, // nobody else on this side at all
+                };
                 let mut replaced: Option<(String, String)> = None;
                 if let Some(curq) = self.resting.remove(&key) {
                     replaced = Some((curq.order_id, Self::px(cx, curq.price)));
@@ -786,7 +862,7 @@ impl Quoter {
                 }));
                 self.resting.insert(
                     key,
-                    RestingQuote { order_id: oid, price: target, count: self.clip },
+                    RestingQuote { order_id: oid, price: target, count: self.clip, first_at_price },
                 );
                 self.last_quote_ts.insert(key, now);
             }
@@ -1767,7 +1843,12 @@ mod crossed_book_tests {
         for side in [BookSide::Bid, BookSide::Ask] {
             q.resting.insert(
                 (0, side),
-                RestingQuote { order_id: format!("m-{}", side.as_str()), price: px, count: 1 },
+                RestingQuote {
+                    order_id: format!("m-{}", side.as_str()),
+                    price: px,
+                    count: 1,
+                    first_at_price: true,
+                },
             );
         }
         let mut intents = Vec::new();
@@ -1780,5 +1861,257 @@ mod crossed_book_tests {
             })
             .collect();
         assert_eq!(sides, vec!["ask", "bid"], "cancel_all must emit ask before bid");
+    }
+}
+
+/// Who is ahead of us at our own price, both sides. The books are the two
+/// shapes `touch_excl_self` documents: the KXNOBELPEACE-26-SUD:bid join-behind
+/// cycle, and the `cpc-btc-*-140k:ask` wall that makes the skip conditional.
+#[cfg(test)]
+mod queue_priority_tests {
+    use super::tests_support::{cancel_on, fixture, lvl, place_on};
+    use super::*;
+    use crate::model::Level;
+    use crate::scan::RelLeg;
+
+    /// The PM-US book with `bids` as given. The 1-lot ask is the `fixture()`
+    /// shape and it is load-bearing: `hedge_has_depth` refuses the P ask and
+    /// the K ask against it, and K's own bid never beats its 0.60 touch, so the
+    /// P BID is the only side that can emit anything. An unexpected intent in
+    /// these tests is therefore the defect, not the fixture.
+    fn pm(bb: &mut BookBuilder, bids: Vec<Level>, seq: u64, ts_ns: i64) {
+        bb.apply_snapshot(
+            Venue::PolymarketUs, "P", bids, vec![lvl("0.99", "1")], seq, ts_ns, None,
+        );
+    }
+
+    /// Zero order traffic on the maker leg — the thing the flip cycle spent
+    /// 2,836 places on.
+    fn quiet(intents: &[Intent]) -> bool {
+        place_on(intents, "P").is_none() && cancel_on(intents, "P").is_none()
+    }
+
+    fn bid_target(q: &Quoter, cx: &mut Cx, fees: &FeeSchedule, bb: &BookBuilder) -> String {
+        let t = q.target(cx, fees, bb, 1, BookSide::Bid).expect("a bid target");
+        Quoter::px(cx, t)
+    }
+
+    /// Entry against a 0.24 touch: one tick inside, 5 lots, ours alone at 0.25.
+    fn resting_at_25() -> (Cx, FeeSchedule, BookBuilder, Quoter, u64) {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0u64;
+        let mut intents = Vec::new();
+        pm(&mut bb, vec![lvl("0.24", "3")], 1, 1_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(
+            place_on(&intents, "P").map(|p| p.price.as_str()),
+            Some("0.25"),
+            "the entry itself moved: {intents:?}"
+        );
+        (cx, fees, bb, q, oid)
+    }
+
+    /// A counterparty adds 5 lots at the price we already rest at. They are
+    /// BEHIND us in the FIFO — our place preceded theirs — so the level is
+    /// still ours to be filled on first, and stepping a tick over it buys
+    /// nothing but a new order at the back of a worse queue.
+    ///
+    /// `now` is 30s past the entry, so the requote throttle is NOT what holds
+    /// this quote: a test that leaned on `min_requote_s` would pass with the
+    /// defect intact.
+    #[test]
+    fn a_joiner_behind_us_at_our_level_is_not_competition() {
+        let (mut cx, fees, mut bb, mut q, mut oid) = resting_at_25();
+        let mut intents = Vec::new();
+        pm(&mut bb, vec![lvl("0.25", "10"), lvl("0.24", "3")], 2, 130_000_000_000);
+        assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.25", "stepped off our own level");
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        assert!(quiet(&intents), "requoted over a joiner behind us: {intents:?}");
+    }
+
+    /// The other half of the cycle, and the half that makes it a CYCLE: the
+    /// joiner pulls, the level goes back to our 5 lots alone, and the old rule
+    /// stepped straight back down to the price it had just left.
+    #[test]
+    fn the_joiner_leaving_causes_no_retreat_either() {
+        let (mut cx, fees, mut bb, mut q, mut oid) = resting_at_25();
+        let mut intents = Vec::new();
+        pm(&mut bb, vec![lvl("0.25", "10"), lvl("0.24", "3")], 2, 130_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        assert!(quiet(&intents), "requoted on the join: {intents:?}");
+
+        intents.clear();
+        pm(&mut bb, vec![lvl("0.25", "5"), lvl("0.24", "3")], 3, 160_000_000_000);
+        assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.25", "retreated when they left");
+        q.on_book(&mut cx, &fees, &bb, 160.0, &mut oid, &mut intents);
+        assert!(quiet(&intents), "requoted on the pull: {intents:?}");
+    }
+
+    /// The untouched path. Nothing of ours rests, so 0.25 is somebody else's
+    /// level with somebody else's priority, and the only way to be filled ahead
+    /// of them is to outbid them. This is the rule the fix must not weaken into
+    /// a hysteresis band.
+    #[test]
+    fn a_foreign_level_is_still_stepped_over_when_we_are_not_on_it() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0u64;
+        let mut intents = Vec::new();
+        pm(&mut bb, vec![lvl("0.25", "5"), lvl("0.24", "3")], 1, 1_000_000_000);
+        assert_eq!(
+            bid_target(&q, &mut cx, &fees, &bb),
+            "0.26",
+            "failed to improve on a foreign touch"
+        );
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(place_on(&intents, "P").map(|p| p.price.as_str()), Some("0.26"), "{intents:?}");
+    }
+
+    /// The skip is keyed on OUR price, not on "a level we were once at". We
+    /// rest at 0.26; the 0.25 under it is foreign the moment we leave it, and
+    /// it is still what the next quote has to beat.
+    #[test]
+    fn a_level_we_left_is_foreign_again() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0u64;
+        let mut intents = Vec::new();
+        pm(&mut bb, vec![lvl("0.25", "5"), lvl("0.24", "3")], 1, 1_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(place_on(&intents, "P").map(|p| p.price.as_str()), Some("0.26"), "{intents:?}");
+
+        intents.clear();
+        pm(&mut bb, vec![lvl("0.26", "5"), lvl("0.25", "5"), lvl("0.24", "3")], 2, 130_000_000_000);
+        let comp = q.touch_excl_self(&mut cx, &bb, 1, BookSide::Bid).expect("competition");
+        assert_eq!(Quoter::px(&mut cx, comp), "0.25", "skipped a level we do not hold");
+        assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.26");
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        assert!(quiet(&intents), "{intents:?}");
+    }
+
+    /// The ask side is a separate branch of `target`, so it gets its own pair.
+    /// K is deep on BOTH sides here (the P ask is hedged by taking K's ask, and
+    /// `hedge_has_depth` wants 5 lots there), and the P bid is 1 lot, which
+    /// keeps K's own bid quiet the way the 1-lot ask does above.
+    fn ask_fixture(asks: Vec<Level>) -> (Cx, FeeSchedule, BookBuilder, Quoter) {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let mut bb = BookBuilder::new();
+        bb.apply_snapshot(
+            Venue::Kalshi, "K", vec![lvl("0.20", "500")], vec![lvl("0.30", "500")],
+            1, 1_000_000_000, None,
+        );
+        bb.apply_snapshot(
+            Venue::PolymarketUs, "P", vec![lvl("0.50", "1")], asks, 1, 1_000_000_000, None,
+        );
+        let rel = Rel {
+            id: "xv-test".into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: "K".into() },
+                RelLeg { venue: Venue::PolymarketUs, market_id: "P".into() },
+            ],
+        };
+        (cx, fees, bb, Quoter::new(rel))
+    }
+
+    fn pm_asks(bb: &mut BookBuilder, asks: Vec<Level>, seq: u64, ts_ns: i64) {
+        bb.apply_snapshot(
+            Venue::PolymarketUs, "P", vec![lvl("0.50", "1")], asks, seq, ts_ns, None,
+        );
+    }
+
+    fn ask_target(q: &Quoter, cx: &mut Cx, fees: &FeeSchedule, bb: &BookBuilder) -> String {
+        let t = q.target(cx, fees, bb, 1, BookSide::Ask).expect("an ask target");
+        Quoter::px(cx, t)
+    }
+
+    /// Mirror of the bid case: we rest 5 at 0.75, a joiner adds 5 at 0.75, and
+    /// the old rule undercut its own offer to 0.74.
+    #[test]
+    fn a_joiner_behind_our_ask_is_not_competition_either() {
+        let (mut cx, fees, mut bb, mut q) = ask_fixture(vec![lvl("0.76", "3")]);
+        let mut oid = 0u64;
+        let mut intents = Vec::new();
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(
+            place_on(&intents, "P").map(|p| p.price.as_str()),
+            Some("0.75"),
+            "the entry itself moved: {intents:?}"
+        );
+
+        intents.clear();
+        pm_asks(&mut bb, vec![lvl("0.75", "10"), lvl("0.76", "3")], 2, 130_000_000_000);
+        assert_eq!(ask_target(&q, &mut cx, &fees, &bb), "0.75", "undercut our own offer");
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        assert!(quiet(&intents), "requoted over a joiner behind us: {intents:?}");
+    }
+
+    /// THE case that makes the skip conditional, lifted off the golden tape:
+    /// `cpc-btc-hitprice-high-yr-12-31-2026-140k:ask`, 1,500,238 lots at 0.07
+    /// and the next offer 83 ticks away at 0.90. Our 0.07 is the cheapest offer
+    /// the hedge pays for, so we JOIN that wall rather than open a level — and
+    /// every lot of it is ahead of ours.
+    ///
+    /// Skipping it on price equality alone reads the 0.90 as the competition,
+    /// walks the quote out to 0.89, and brings it straight back once the wall
+    /// is foreign again. That flip ran 218 places on this one market and 1,212
+    /// across the tape against a baseline of 182.
+    #[test]
+    fn a_wall_we_joined_is_still_competition() {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let mut bb = BookBuilder::new();
+        // K's ask is the hedge, and it is what puts our cheapest offer at 0.07.
+        bb.apply_snapshot(
+            Venue::Kalshi, "K", vec![lvl("0.02", "500")], vec![lvl("0.06", "500")],
+            1, 1_000_000_000, None,
+        );
+        let wall = vec![lvl("0.07", "1500238"), lvl("0.90", "25")];
+        bb.apply_snapshot(
+            Venue::PolymarketUs, "P", vec![lvl("0.05", "1")], wall.clone(), 1, 1_000_000_000, None,
+        );
+        let rel = Rel {
+            id: "xv-test".into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: "K".into() },
+                RelLeg { venue: Venue::PolymarketUs, market_id: "P".into() },
+            ],
+        };
+        let mut q = Quoter::new(rel);
+        let mut oid = 0u64;
+        let mut intents = Vec::new();
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(
+            place_on(&intents, "P").map(|p| p.price.as_str()),
+            Some("0.07"),
+            "we should join the wall, not price through it: {intents:?}"
+        );
+
+        // Same book, 30s later. The wall is not ours to skip.
+        intents.clear();
+        bb.apply_snapshot(
+            Venue::PolymarketUs, "P", vec![lvl("0.05", "1")], wall, 2, 130_000_000_000, None,
+        );
+        assert_eq!(ask_target(&q, &mut cx, &fees, &bb), "0.07", "jumped the gap to 0.89");
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        assert!(quiet(&intents), "abandoned the touch: {intents:?}");
+    }
+
+    /// Mirror of the untouched path: no offer of ours rests, so 0.75 is a
+    /// foreign one and we still undercut it.
+    #[test]
+    fn a_foreign_ask_is_still_undercut_when_we_are_not_on_it() {
+        let (mut cx, fees, bb, mut q) = ask_fixture(vec![lvl("0.75", "5"), lvl("0.76", "3")]);
+        let mut oid = 0u64;
+        let mut intents = Vec::new();
+        assert_eq!(
+            ask_target(&q, &mut cx, &fees, &bb),
+            "0.74",
+            "failed to improve on a foreign offer"
+        );
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(place_on(&intents, "P").map(|p| p.price.as_str()), Some("0.74"), "{intents:?}");
     }
 }
