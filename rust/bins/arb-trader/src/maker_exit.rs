@@ -2601,8 +2601,15 @@ mod tests {
     /// whose PM-US close did not complete leaves a real short with the ledger
     /// still saying the basket is hedged, and it must never share a counter
     /// with "the book did not pay".
-    #[test]
-    fn a_filled_exit_whose_close_failed_alarms_on_its_own_gauge() {
+    #[tokio::test]
+    async fn a_filled_exit_whose_close_failed_alarms_on_its_own_gauge() {
+        // Under the guard every other test that moves [`UNRESOLVED`] already
+        // holds: the counter is process-global and never decrements, so an
+        // unguarded `before + 1` here races the serialized bumpers and fails on
+        // whichever side loses the interleaving. Caught live 2026-08-14: the
+        // merge gate flaked on this test and on its guarded sibling on
+        // consecutive runs, one each.
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
         let o = Order {
             rel_id: "r1".into(),
             market: "K-a".into(),
