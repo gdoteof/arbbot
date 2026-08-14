@@ -1498,6 +1498,26 @@ fn maker_exit_shadow(act: bool, shadow: bool) -> Option<bool> {
     (act || shadow).then_some(shadow)
 }
 
+/// The one word in the startup banner an operator reads to answer "is this
+/// thing live?".
+///
+/// Until 2026-08-14 it printed `bench` or `shadow` — nothing else — so the
+/// fully ARMED process announced itself as `shadow` on the line directly above
+/// `[exec] ORDERS ARMED`, and a placement audit had to correct its own premise
+/// after reading it. The order path has three states and the banner now names
+/// them: `--enable-orders` without `--yes-trade-live` only reports
+/// preconditions and exits, so it is `dry-run` here too — nothing it prints
+/// after this line can place.
+fn up_mode(bench: bool, enable_orders: bool, confirm_live: bool) -> &'static str {
+    if bench {
+        "bench"
+    } else if enable_orders && confirm_live {
+        "ARMED"
+    } else {
+        "dry-run"
+    }
+}
+
 /// Spawn the maker-exit loop, if either flag asked for it.
 ///
 /// It needs BOTH sinks — the Kalshi one rests and cancels the ask, the PM-US one
@@ -1836,7 +1856,7 @@ async fn main() {
         "arb-trader up: {} quoters, {} markets, mode={}",
         quoters.len(),
         by_market.len(),
-        if bench { "bench" } else { "shadow" }
+        up_mode(bench, args.enable_orders, args.confirm_live)
     );
 
     let (tx, rx) = tokio::sync::mpsc::channel::<feed::FeedMsg>(65536);
@@ -2531,6 +2551,20 @@ mod precondition_tests {
             "a shadow exit rests nothing, so it may stand nobody off"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE BANNER'S MODE WORD MUST TELL THE TRUTH ABOUT THE ORDER PATH.
+    ///
+    /// On 2026-08-14 the armed unit printed `mode=shadow` one line above
+    /// `[exec] ORDERS ARMED`, and an audit of live placements had to correct
+    /// its own premise after trusting it. The word is the first thing an
+    /// operator reads; it may never understate an armed process.
+    #[test]
+    fn the_banner_names_the_order_path_state() {
+        assert_eq!(up_mode(true, true, true), "bench", "bench outranks everything");
+        assert_eq!(up_mode(false, true, true), "ARMED");
+        assert_eq!(up_mode(false, true, false), "dry-run", "one flag only reports and exits");
+        assert_eq!(up_mode(false, false, false), "dry-run");
     }
 
     /// SHADOW WINS FOR THE MAKER EXIT TOO. Same rule as the naked-leg completer
