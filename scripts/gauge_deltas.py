@@ -77,6 +77,13 @@ it.
 Both are now reset on a new `InvocationID`: baselines to 0, sustain streaks to
 nothing.
 
+A detected restart is also REPORTED, once, as its own page. Every counter here
+is per-process, so a restart is the one event that resets them all — and
+measured 2026-08-09, an armed SIGABRT (malloc_consolidate, orders left resting,
+swept 30s later by the auto-restart) paged nothing: freshness_check.sh pages on
+is-failed, which an auto-restart satisfies for ~30 seconds between five-minute
+polls, so the crash of the one real-money process was invisible by timing.
+
 VERDICTS SURVIVE BOTH THE COOLDOWN AND A RESTART
 ------------------------------------------------
 freshness_check.sh shares one 30-minute cooldown across every check in the file,
@@ -287,6 +294,43 @@ WATCH = [
     # session that fully recovered from a morning outage reads non-zero for the
     # rest of its life. A level rule would page about that for ever; a rise rule
     # says "a book just went unproven", which is the event, and then goes quiet.
+    (
+        "maker_exit_unresolved",
+        "RISE",
+        "PAGE",
+        0,
+        "a Kalshi exit ask FILLED and its PM-US close did not complete — the "
+        "account is one-legged and the ledger still calls the basket OPEN; "
+        "new exits are latched off until restart",
+    ),  # doc (maker_exit.rs): the module's own alarm gauge — every arm that
+    # bumps it prints CHECK/RECONCILE BY HAND. NO OBSERVED HISTORY: the
+    # maker-exit loop has never been armed; this row lands BEFORE the flag so
+    # the first unresolved leg is read by something. Structurally bounded like
+    # sweeps_owed: the unresolved latch halts new rests, so it cannot spam.
+    (
+        "positions_recon_act_unresolved",
+        "RISE",
+        "PAGE",
+        0,
+        "a recon-act order the venue ACCEPTED whose fate this process could "
+        "not read — contracts that may be in the account and are not in the "
+        "ledger",
+    ),  # doc (engine/mod.rs): "MUST STAY 0 ... Alarm on any change" — and,
+    # measured 2026-08-14, nothing read it: the exact defect this file exists
+    # to close, recurring in the same tree. Present in the live stats line,
+    # max 0 across ~5.9k recon cycles (which have placed 0 orders).
+    (
+        "positions_recon_acted",
+        "RISE",
+        "NOTE",
+        0,
+        "the naked-leg completer ACTED for the first time in this process — "
+        "read it against maker_exit_unresolved, because the two climbing "
+        "together is the documented maker-exit/recon-act fight",
+    ),  # NOTE, not PAGE: acting is the feature working (profitable-only, 5
+    # ct/order, 2/cycle). It has been 0 for the life of the deployment against
+    # thousands of refusals, so the first move is worth one low-priority line;
+    # every money condition it can CREATE pages via the rows above.
     # ---- SUSTAINED. See the two-rules note above.
     (
         "cancels_unresolved",
@@ -495,6 +539,17 @@ def main() -> int:
         (bool(invocation) and bool(prev_inv) and invocation != prev_inv)
         or cur.get("elapsed_s", 0) < prev.get("elapsed_s", 0)
     )
+    # Say the restart itself, once. Until 2026-08-14 a restart only reset
+    # baselines, silently — see the module docstring for the 2026-08-09 armed
+    # SIGABRT that missed. A deliberate restart costs one page, which for a
+    # unit restarted about fortnightly is the right price for never missing a
+    # crash of the one process that can hold real orders.
+    if restarted:
+        out.append(
+            "PAGE|ARMED trader-m3 RESTARTED (new process; every gauge baseline "
+            "reset) — check journalctl for the previous exit code and whether "
+            "startup_sweep found orders resting"
+        )
 
     prev_streak = prev.get("_streak", {})
     if not isinstance(prev_streak, dict):

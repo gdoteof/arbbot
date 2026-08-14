@@ -35,7 +35,7 @@ STAMP_ROUTINE=$STATE_DIR/arbbot-freshness-routine    # low-priority channel, own
 # would otherwise compete for the stamp above. This file's own comment reserves
 # that window: "routine noise can never consume the 30-minute window that ARMED
 # trader-m3 FAILED needs" — and a gauge page at 12:00 deferring an is-failed
-# page to 12:30, on a Restart=no trader that may have left orders resting, is
+# page to 12:30, on an armed trader that may have left orders resting, is
 # exactly that. Same severity, different stamp: they can no longer starve
 # each other.
 STAMP_ARMED=$STATE_DIR/arbbot-freshness-armed
@@ -78,7 +78,17 @@ age() { echo $(( now - $(stat -c %Y "$1" 2>/dev/null || echo 0) )); }
 # arbbot-recorder is load-bearing — the armed engine reads its socket — so a
 # stopped one pages even though stopping it is deliberate.
 if systemctl --user is-active --quiet arbbot-recorder; then
-  raw_age=$(age "data/raw/polymarket-$DAY.jsonl")
+  # Newest of ANY feed, not one feed by name. This aged
+  # data/raw/polymarket-$DAY.jsonl — the INTL feed, which record_polymarket_intl
+  # turned off on 2026-07-31. From that day the file did not exist, age() read
+  # its absence as the epoch, and this line paged "recorder writing NOTHING for
+  # <two weeks>s" on every poll while the recorder wrote ~800 MB/day two entries
+  # down the same directory — burning the shared cooldown stamp the whole time.
+  # "Writing NOTHING" means no feed at all, which is what the newest file
+  # measures, and it survives the next feed-config change too (the scanner
+  # check below has always used this idiom).
+  newest_raw=$(ls -t data/raw/*-"$DAY".jsonl 2>/dev/null | head -1)
+  raw_age=$(age "$newest_raw")
   [ "$raw_age" -gt 900 ] && page "recorder writing NOTHING for ${raw_age}s"
   # health_task appends one line per second unconditionally — it records a stale
   # feed, it does not stop writing for one. So the FILE going quiet is the only
@@ -112,7 +122,10 @@ fi
 # Paging high on that trains the operator to swipe away the notification that
 # one day reads ARMED trader-m3 FAILED. Reported, quietly, on its own cooldown.
 if systemctl --user is-active --quiet arbbot-recorder-rs; then
-  raw_rs_age=$(age "data/raw-rs/polymarket-$DAY.jsonl")
+  # Same defect as the data/raw check above, fixed in the same breath:
+  # dormant today (the unit is stopped), wrong the day someone starts it.
+  newest_raw_rs=$(ls -t data/raw-rs/*-"$DAY".jsonl 2>/dev/null | head -1)
+  raw_rs_age=$(age "$newest_raw_rs")
   [ "$raw_rs_age" -gt 900 ] && note "recorder-rs writing NOTHING for ${raw_rs_age}s"
   health_rs_age=$(age data/health-rs.jsonl)
   [ "$health_rs_age" -gt 120 ] && note "health-rs.jsonl not appended for ${health_rs_age}s (recorder-rs health task dead)"
@@ -120,15 +133,18 @@ else
   note "recorder-rs service DOWN"
 fi
 systemctl --user is-active --quiet arbbot-trader-rs || note "trader-rs service DOWN"
-# arbbot-trader-m3 is the ARMED, real-money session. It is Restart=no on purpose
-# — it is the one unit that will NOT come back by itself — but it is also
-# deliberately STOPPED between supervised sessions, so is-active would page on
-# every clean disarm and an alarm that cries wolf on an operator's own action is
-# worse than no alarm. A clean stop leaves it inactive/Result=success; a crash
-# leaves it failed. is-failed is therefore the only RUNTIME condition that means
-# something is wrong.
+# arbbot-trader-m3 is the ARMED, real-money session. Since 2026-08-01 it is
+# Restart=on-failure bounded at 3 tries in 600s (systemd/arbbot-trader-m3
+# .service:26) — the Restart=no this comment used to reason from is gone, and a
+# single crash now self-heals and is reported by the gauge block's RESTARTED
+# page, not here. The unit is still deliberately STOPPED between supervised
+# sessions, so is-active would page on every clean disarm, and an alarm that
+# cries wolf on an operator's own action is worse than no alarm. A clean stop
+# leaves it inactive/Result=success. What is-failed means now is that the
+# restart budget is SPENT: it crashed three times in ten minutes and systemd
+# has stopped trying — strictly more urgent than the reading it replaced.
 if systemctl --user is-failed --quiet arbbot-trader-m3; then
-  armed_page "ARMED trader-m3 FAILED (Result=$(systemctl --user show arbbot-trader-m3 -p Result --value)) — Restart=no, it will NOT come back on its own"
+  armed_page "ARMED trader-m3 FAILED (Result=$(systemctl --user show arbbot-trader-m3 -p Result --value)) — the 3-in-600s restart budget is spent, it will NOT come back on its own"
 fi
 # But is-failed returns 4, not 0, for a unit that is gone or unloadable, so on
 # its own it makes the ARMED unit the only one whose DISAPPEARANCE is silent —
