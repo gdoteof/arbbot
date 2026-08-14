@@ -31,7 +31,14 @@ set -uo pipefail
 PRIMARY=/home/geoff/claude/arbbot
 ROOT="$(git rev-parse --show-toplevel)"
 BASELINE_SHA=f4141b53831220c962f552955c079203ca0c7e2a7a7bb75bced5efe5e5e4bdc8
-APR_SHA=2d330021a685bdeb1c385cccd93d6f2fec201eb0bbcdc973d45e607126a8a214
+# Re-pinned 2026-08-14 (authorized by Geoff). #65 dated the DECEMBER btc150k
+# rung — a deliberate resolve-dating change, and resolve dates are the APR
+# hold-length input stage 6 exists to exercise — and did not re-pin this.
+# Verified stale rather than flaky before touching it: three binaries (the
+# Jul-31 build the armed unit is running, an unmodified ac4df9b, and PR #69's)
+# replay this tape to the SAME 38978b34 digest and the same 31485/15/6 counts,
+# while stage 5 still matches its baseline byte-for-byte on all three.
+APR_SHA=38978b34171e4ec8b52102d71282014f1c96d5640ad77739e0e5926a614d37c9
 fail=0
 skip_digest=0
 allow_change=0
@@ -436,11 +443,12 @@ echo "--- 5/6 real-tape digest ---"
 # This run pins the hurdle explicitly (an explicit --min-apr wins over the risk
 # view, which is how bench pins it at all) with a fixed as-of date, because the
 # hold length is measured from TODAY and an unpinned asof re-digests daily. It
-# cuts 31692 intents to 31500 and 182 places to 30 — i.e. 152 of the 182 maker
+# cuts 31692 intents to 31485 and 182 places to 15 — i.e. 167 of the 182 maker
 # quotes stage 5 blesses are locking capital under 12%/yr, and only this stage
-# can see that.
+# can see that. (152 of 182 before #65 dated the btc150k rung: dating a rung
+# changes its hold length, its APR, and therefore which quotes clear the bar.)
 echo "--- 6/6 real-tape digest, APR hurdle on ---"
-  digest_stage "APR-DIGEST" "$APR_SHA" "31500 / 30 / 19" --min-apr 12 --apr-asof 2026-07-28
+  digest_stage "APR-DIGEST" "$APR_SHA" "31485 / 15 / 6" --min-apr 12 --apr-asof 2026-07-28
 fi
 
 # A hatched run says HATCHED, not PASS, and exits 3. Both halves matter, and the
