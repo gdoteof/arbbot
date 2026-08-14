@@ -19,6 +19,7 @@ use arb_core::model::{BookSide, Venue};
 use arb_core::scan::Rel;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 /// The maker order behind a basket: everything the ledger record needs about
 /// the leg we rested.
@@ -167,6 +168,11 @@ enum FillArm {
     Maker,
     /// Belongs to no order we know; held for its `order_ack`.
     Unattributed,
+    /// Belongs to an order this process placed OUTSIDE the engine — the maker
+    /// exit's resting ask, its PM-US close, or the recon pass's IOC. Neither
+    /// this engine's to book nor money it cannot explain, so it is held for no
+    /// ack and counted on no gauge. See [`SIDECAR_ORDERS`].
+    Sidecar,
 }
 
 /// A fill the engine cannot attribute YET.
@@ -208,6 +214,52 @@ pub(super) struct UnclaimedFill {
 /// holds while a fill on its market is unclaimed, so the grace is exactly how
 /// long the engine will wait for proof before it risks hedging twice.
 pub(super) const FILL_ACK_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Venue order ids placed by the SIDECARS in this process: `maker_exit`'s
+/// post-only `x` ask and the PM-US IOC that closes it, and `positions`' `n`
+/// recon order.
+///
+/// Those modules call the sink directly instead of going through
+/// `Engine::dispatch`, so no `order_ack` ever reaches the engine, `venue_oid`
+/// never learns their ids, and their fills arrive on the account-wide feeds
+/// matching no order the engine knows. Without this they are held for an ack
+/// that cannot come and then land on [`Engine::unclaimed_tick`]'s
+/// `[fill] UNEXPLAINED` line, moving `fills_unattributed` — a must-stay-0
+/// gauge — for money that IS explained, only not here: the module that placed
+/// the order polls its own fill and writes its own ledger record.
+///
+/// IT IS THE VENUE'S OWN ID AND NOTHING ELSE, which is what keeps the gauge
+/// worth reading. The cheaper-looking test — the `x`/`n` prefix
+/// `gateway::is_ours` reads — is not available at attribution time: neither
+/// venue's fill frame carries a `client_order_id` (`fills.rs` says so of Kalshi
+/// in as many words, and PM-US's frame carries `order.id`), so the only thing
+/// there is to match on is the id a `place` actually returned. A fill from a
+/// hand trade or another tool on this account has no entry here and alarms
+/// exactly as it did before.
+static SIDECAR_ORDERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// How many sidecar ids are remembered, oldest evicted first.
+///
+/// A maker exit rests at most one ask per 60 s and the recon pass sends at most
+/// two orders per 300 s, so 256 is hours of them. A fill arriving after its id
+/// has aged out alarms as it always did, which is the direction to fail in: the
+/// bound is on memory, never on the gauge.
+const SIDECAR_REMEMBERED: usize = 256;
+
+/// Remember a venue order id this process placed OUTSIDE the engine.
+pub(crate) fn note_sidecar_order(venue_order_id: &str) {
+    if let Ok(mut g) = SIDECAR_ORDERS.lock() {
+        if g.len() >= SIDECAR_REMEMBERED {
+            g.remove(0);
+        }
+        g.push(venue_order_id.to_string());
+    }
+}
+
+/// Did a sidecar of ours place this venue order id?
+fn is_sidecar_order(venue_order_id: &str) -> bool {
+    SIDECAR_ORDERS.lock().is_ok_and(|g| g.iter().any(|id| id == venue_order_id))
+}
 
 /// Held fills that have waited past the grace, in a deterministic order.
 pub(super) fn unclaimed_expired(
@@ -498,6 +550,23 @@ impl Engine {
                 // idempotent by construction, nothing to do.
                 arb_core::fill::FillOutcome::Seen => FillArm::Maker,
                 arb_core::fill::FillOutcome::Unknown => {
+                    // OURS, BUT NOT THIS ENGINE'S. `maker_exit` and `positions`
+                    // place straight on the sink, so nothing here will ever be
+                    // able to name this id — see `SIDECAR_ORDERS`. Holding it
+                    // for an ack that cannot come only defers alarming as
+                    // unexplained money about a fill whose owner is polling it
+                    // and booking it right now.
+                    if is_sidecar_order(oid) {
+                        eprintln!(
+                            "[fill] {cum}x on {} {} is order {oid} — placed by THIS PROCESS \
+                             outside the engine (the maker exit, or --positions-recon-act). \
+                             That module polls its own fill and books its own record, so this \
+                             frame is neither credited here nor counted as unexplained.",
+                            venue.as_str(),
+                            market
+                        );
+                        return FillArm::Sidecar;
+                    }
                     // HELD, not dropped. See `UnclaimedFill` — this is the
                     // fill the engine used to count in `fills` and then
                     // throw away with no alarm at all.
@@ -1009,6 +1078,50 @@ mod attribute_fill_tests {
             e.summary()["hedges_overfilled"],
             serde_json::json!(1),
             "and it must reach the gauge a human watches"
+        );
+    }
+
+    /// A FILL ON AN ORDER THIS PROCESS PLACED OUTSIDE THE ENGINE IS EXPLAINED,
+    /// AND MUST NOT MOVE THE GAUGE THAT SAYS OTHERWISE.
+    ///
+    /// `maker_exit` and `positions` call the sink directly, so no `order_ack`
+    /// ever reaches this engine and their fills arrive naming an order it has
+    /// never heard of. Held for an ack that cannot come, every one of them ages
+    /// out into `[fill] UNEXPLAINED` and increments `fills_unattributed` — a
+    /// must-stay-0 gauge — so an armed maker exit would page whoever watches it
+    /// every single time it worked, about money its own module had already
+    /// booked.
+    #[test]
+    fn a_fill_on_a_sidecar_order_is_neither_credited_nor_called_unexplained() {
+        let mut e = test_engine(test_cfg());
+        note_sidecar_order("KALSHI-SIDECAR-ID-1");
+        let arm =
+            e.attribute_fill("KALSHI-SIDECAR-ID-1", 5, Venue::Kalshi, "K", 1.0, Instant::now());
+        assert!(
+            matches!(arm, FillArm::Sidecar),
+            "neither a maker frame of this engine's nor money it cannot explain"
+        );
+        assert!(e.unclaimed_fills.is_empty(), "not held: no ack can ever claim it");
+        assert!(e.pending_hedges.is_empty(), "and nothing may be hedged off it");
+        e.unclaimed_tick();
+        assert_eq!(e.n_unattributed, 0, "the must-stay-0 gauge did not move");
+    }
+
+    /// ...AND THE GAUGE STILL WORKS FOR EVERYTHING ELSE, which is the whole
+    /// reason the test above matches the venue's own id rather than the `x`/`n`
+    /// client-id space: a fill from a hand trade or another tool on this
+    /// account-wide feed has no entry in the registry and is held and alarmed
+    /// exactly as it always was.
+    #[test]
+    fn a_fill_on_an_order_nothing_here_placed_is_still_unexplained_money() {
+        let mut e = test_engine(test_cfg());
+        let arm = e.attribute_fill("SOMEBODY-ELSES-ORDER", 2, Venue::Kalshi, "K", 1.0, Instant::now());
+        assert!(matches!(arm, FillArm::Unattributed), "still held for an ack that might name it");
+        assert_eq!(e.unclaimed_fills.len(), 1);
+        assert_eq!(
+            unclaimed_expired(&e.unclaimed_fills, Instant::now() + FILL_ACK_GRACE),
+            vec!["SOMEBODY-ELSES-ORDER".to_string()],
+            "and past the grace it is what the alarm is for"
         );
     }
 

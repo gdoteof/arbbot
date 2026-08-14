@@ -745,6 +745,11 @@ async fn place_and_book(
             return;
         }
     };
+    // This order never went through `Engine::dispatch`, so no ack names it to
+    // the engine and its fill would arrive on the account-wide feed as money
+    // nothing there can explain. Tell it the venue's own id, which is the only
+    // thing the fill frame will carry.
+    crate::engine::fill::note_sidecar_order(&oid);
     // A place that ACCEPTED and a place that FILLED are different facts, and
     // only the second may be booked. `filled_qty` refuses rather than answering
     // 0 when it cannot ask (`OrderSink::filled_qty`), which is what keeps an

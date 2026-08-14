@@ -94,6 +94,45 @@
 //! `data/exec/marks_history.jsonl` spanning 172.7 h, 60% of every excursion
 //! above the two-tick floor is ONE SAMPLE LONG.
 //!
+//! # THREE ORDER-OWNERS, ONE ACCOUNT, AND THE RULE THAT DECIDES COLLISIONS
+//!
+//! This is not the only thing sending Kalshi orders on these markets. The engine
+//! hedges, `--positions-recon-act` completes naked legs from venue truth, and
+//! this rests exits — and every Kalshi order this binary sends carries
+//! `self_trade_prevention_type: taker_at_cross` (`arb_venue::wire`), which
+//! answers a collision by CANCELLING THE TAKER. This module is the maker in
+//! every one of those collisions, so its ask is never the order that dies. The
+//! other one is, and it dies quietly: an IOC that crossed our own resting ask
+//! comes back unfilled, and its owner reports that the book moved.
+//!
+//!   * **THE BACKSTOP COMPLETING A LEG WE ARE ALREADY WORKING.**
+//!     [`working_check`] stands `naked_act` off every market in
+//!     [`Live::working_set`] while an ARMED exit is working it. Armed only: a
+//!     shadow exit rests nothing, so standing the backstop off would cost a real
+//!     naked leg its completion for a trade that is not going to happen.
+//!   * **OUR ASK ON A MARKET THE ENGINE OWES A HEDGE ON.** There the engine's
+//!     hedge is the IOC, so the hedge is what `taker_at_cross` cancels and the
+//!     leg it was covering stays naked. [`decide`] refuses through
+//!     `naked_act::inflight_check` — the same registry the backstop reads, for
+//!     the same reason.
+//!   * **A NAKED LEG WE MADE OURSELVES.** [`Live::target`] refuses every new
+//!     exit once [`UNRESOLVED`] is non-zero, and that counter never decrements,
+//!     so the refusal is a LATCH cleared by a restart and by nothing else. What
+//!     it prevents is the compounding shape: a close that failed leaves the
+//!     ledger still calling the lot open, `unwind` re-selects it on the next
+//!     scan, and a second ask rests against contracts the venue sold an hour
+//!     ago. The refusal prints on every 60 s cycle while it holds, the same
+//!     cadence as every other "nothing to rest:" line — that is the alarm
+//!     working, not a loop to fix.
+//!
+//! THE STAND-OFF RELEASES ITSELF and nothing hands it over: an exit that fails
+//! its close clears [`Live::resting`] and latches `target` off, so the very next
+//! cycle publishes a working set without that market and the backstop is free to
+//! complete the leg this module just left naked. The one exception is an order
+//! this process could not address — a place or a cancel that never completed —
+//! which joins [`Live::unaddressable`] and is never released, because nothing
+//! here can learn that it is gone.
+//!
 //! # WHAT THIS STILL CANNOT DO
 //!
 //! It cannot make the fill-time PM close safe, only bounded. Between the Kalshi
@@ -107,7 +146,24 @@
 //! profitably, against its own ledger basis, so the money is safe; what is not
 //! safe is an operator's model of what the process is doing. If both are armed,
 //! `positions_recon_acted` climbing in step with `maker_exit_unresolved` is that
-//! fight, and it is a reason to disarm one of them, not a curiosity.
+//! fight, and it is a reason to disarm one of them, not a curiosity. The
+//! stand-off above narrows that fight to its one legitimate case — the backstop
+//! completing a leg this module has ALREADY abandoned — and does not remove it.
+//!
+//! It also works ONE candidate per cycle and gives that cycle up when the
+//! candidate refuses. [`Live::target`] returns the first admitted candidate of
+//! `unwind::select`'s display order (`qty` descending, then forward APR) and
+//! [`cycle`] pushes the refusal and returns rather than trying the next one, so
+//! one candidate that refuses PERSISTENTLY — a floor above the bid, a PM-US book
+//! gone dark, no `polymarket_us` leg in the registry — blocks every candidate
+//! behind it for as long as it is selected. The debounce keeps folding for all
+//! of them, so nothing is lost but time; what is lost is a paying exit waiting
+//! behind an unexitable lot. It is left that way deliberately: trying the next
+//! candidate means publishing the UNION of their suppression requests, because
+//! `Engine::maker_exit_tick` drops the install stamp of any market absent from
+//! the current request and a rotating request would therefore never accumulate
+//! [`SUPPRESS_SETTLE_S`] — so the cheap-looking fix yields the entry quoter's
+//! ask on three markets in order to rest at most one exit.
 //!
 //! It also prices the PM close off a book that INCLUDES OUR OWN RESTING SIZE.
 //! `unwind::MIN_EXIT_CT` names this bias exactly — always adverse, a tick is a
@@ -127,7 +183,7 @@ use arb_venue::gateway::Quote;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrd};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrd};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -358,6 +414,119 @@ pub(crate) fn reset_view() {
         *g = None;
     }
     if let Ok(mut g) = SUPPRESS_REQ.lock() {
+        *g = None;
+    }
+}
+
+// -------------------------------------------------------------- the stand-off ---
+
+/// The Kalshi markets this module is WORKING: an ask resting on one, an ask
+/// about to be rested on one, or an order it can no longer address.
+///
+/// PUBLISHED WHOLESALE at the top of every cycle, for [`EngineView`]'s reason —
+/// a missed incremental update here would be a backstop IOC crossing our own
+/// resting ask and being cancelled for it — and for one more. The RELEASE of a
+/// market is derived rather than coded: the set is rebuilt from [`Live`] on
+/// every cycle, so an exit that fills, is pulled or halts stops appearing in it
+/// without anything having to remember to hand the market back.
+struct Working {
+    markets: BTreeSet<String>,
+    at: Instant,
+}
+
+static WORKING: Mutex<Option<Working>> = Mutex::new(None);
+
+/// Whether anybody is stood off at all. Set by [`arm_standoff`], never cleared.
+static STANDOFF: AtomicBool = AtomicBool::new(false);
+
+/// How stale a publication may be and still stand a backstop off. Three cycles
+/// of the publisher, [`VIEW_MAX_AGE`]'s reasoning and its arithmetic: a loop
+/// that has stopped publishing is one nothing can ask about, and the honest
+/// answer to "is a post-only ask of ours resting there" from a silent loop is
+/// not "no".
+const WORKING_MAX_AGE: Duration = Duration::from_secs(CYCLE_S * 3);
+
+/// Stand the naked-leg backstop off the markets this module is working. Called
+/// from `main::spawn_maker_exit`'s ARMED branch and nowhere else.
+///
+/// NEVER from the shadow branch, and that asymmetry is the whole of it: a shadow
+/// exit rests nothing, so there is no ask of ours for anything to collide with,
+/// and standing the backstop off would cost a real naked leg its completion for
+/// the sake of a trade that is not going to happen.
+pub fn arm_standoff() {
+    STANDOFF.store(true, AtomicOrd::Relaxed);
+}
+
+/// Publish what this module is working. Called from [`cycle`] and nowhere else.
+pub fn publish_working(markets: BTreeSet<String>) {
+    if let Ok(mut g) = WORKING.lock() {
+        *g = Some(Working { markets, at: Instant::now() });
+    }
+}
+
+/// May another order-owner in this process send a TAKER order on `market`?
+///
+/// `taker_at_cross` cancels the TAKER (`arb_venue::wire`), so an IOC that lifts
+/// our own resting exit ask does not trade and does not error: it returns
+/// unfilled and `positions.rs` reports that the book moved. The naked leg it was
+/// sent to complete stays naked and nothing anywhere names the reason.
+///
+/// FAIL-OPEN on "no armed maker exit" and FAIL-CLOSED on everything else. That
+/// is not `naked_act::inflight_check`'s asymmetry and the difference is
+/// deliberate: with nothing armed there is no ask of ours to cross, so a refusal
+/// would cost a naked leg its completion for nothing, while an armed exit whose
+/// registry cannot answer is a registry saying "I cannot tell whether an `x` ask
+/// of ours is resting there".
+pub fn working_check(market: &str) -> Result<(), String> {
+    if !STANDOFF.load(AtomicOrd::Relaxed) {
+        return Ok(());
+    }
+    let g = WORKING.lock().map_err(|_| {
+        "the maker-exit working registry is poisoned — it cannot say whether a post-only exit \
+         ask of ours is resting on this market, and a taker that crosses one is CANCELLED by \
+         taker_at_cross rather than filled"
+            .to_string()
+    })?;
+    let Some(w) = g.as_ref() else {
+        return Err(
+            "the maker exit is ARMED and has not yet published what it is working — until it \
+             does, a taker order here may cross an `x` ask of ours and be cancelled by \
+             taker_at_cross while reporting only that the book moved. It publishes on its own \
+             cycle, so this clears itself; if it does not, the exit loop is not running."
+                .into(),
+        );
+    };
+    let age = w.at.elapsed();
+    if age > WORKING_MAX_AGE {
+        return Err(format!(
+            "the maker exit's working set is {:.0}s old (it publishes every {CYCLE_S}s) — the \
+             exit loop is not running, so nothing here can tell whether an `x` ask of ours is \
+             resting on {market}, and taker_at_cross would answer this order by cancelling it \
+             rather than filling it",
+            age.as_secs_f64()
+        ));
+    }
+    if w.markets.contains(market) {
+        return Err(format!(
+            "a maker exit is working {market} — a post-only ask of ours is resting there or is \
+             about to be, and `self_trade_prevention_type: taker_at_cross` answers a taker that \
+             crosses it by CANCELLING THE TAKER, which is this order. It would come back \
+             unfilled and be reported as the book having moved. The market is released on the \
+             first cycle after the exit fills, is pulled, or halts on an unresolved leg"
+        ));
+    }
+    Ok(())
+}
+
+/// [`WORKING`] and [`STANDOFF`] are process-wide, and the tests that touch them
+/// span two modules: this one publishes and `naked_act::decide` reads. They all
+/// serialise on `naked_act::TEST_SERIAL` — the guard the reader's own tests
+/// already take — rather than on [`VIEW_TEST_SERIAL`], which would leave the two
+/// halves free to interleave with each other.
+#[cfg(test)]
+pub(crate) fn reset_standoff() {
+    STANDOFF.store(false, AtomicOrd::Relaxed);
+    if let Ok(mut g) = WORKING.lock() {
         *g = None;
     }
 }
@@ -678,6 +847,19 @@ pub fn decide(
             cand.market_id, quote.status
         )));
     }
+    // THE OTHER HALF OF THE STAND-OFF, pointing back at us. A post-only ask of
+    // ours on a market this engine owes a hedge on makes the ENGINE'S hedge the
+    // taker in the collision, and `taker_at_cross` cancels the taker — so the
+    // hedge silently does not happen and the leg it was covering stays naked.
+    // An ordinary refusal, on the ordinary gauge: this is "not now", not
+    // "halted", and the obligation is discharged within seconds.
+    crate::naked_act::inflight_check(&cand.market_id).map_err(|why| {
+        refuse(format!(
+            "not resting an exit on {}: {why}. Our ask would be the maker in that collision \
+             and the engine's hedge IOC the taker, which is the order taker_at_cross cancels",
+            cand.market_id
+        ))
+    })?;
     match view.suppressed_at.get(&cand.market_id) {
         None => {
             return Err(refuse(format!(
@@ -838,6 +1020,15 @@ pub struct Live {
     pub ledger_path: String,
     pub debounce: Debounce,
     pub resting: Option<Resting>,
+    /// Markets where a place or a cancel DID NOT COMPLETE, so an ask of ours may
+    /// be resting under an id nothing in this process can address.
+    ///
+    /// NEVER REMOVED IN-PROCESS, for [`UNRESOLVED`]'s reason: nothing here can
+    /// learn that the order is gone. It holds the stand-off on that market until
+    /// a restart, which costs the naked-leg backstop a market it might have
+    /// completed — the safe direction, because the alternative is a taker of
+    /// ours crossing an ask of ours and being cancelled for it.
+    unaddressable: BTreeSet<String>,
     cx: Cx,
     fees: FeeSchedule,
     /// Markets the venue has refused as halted, and until when. Same policy as
@@ -855,6 +1046,7 @@ impl Live {
             ledger_path,
             debounce: Debounce::default(),
             resting: None,
+            unaddressable: BTreeSet::new(),
             cx,
             fees,
             parked: BTreeMap::new(),
@@ -872,20 +1064,60 @@ impl Live {
         d
     }
 
+    /// The markets this module is working, for [`publish_working`]: what it can
+    /// no longer address, plus what it has resting, plus the one it is about to
+    /// rest on.
+    fn working_set(&self, extra: Option<&str>) -> BTreeSet<String> {
+        let mut s = self.unaddressable.clone();
+        if let Some(r) = &self.resting {
+            s.insert(r.order.market.clone());
+        }
+        if let Some(m) = extra {
+            s.insert(m.to_string());
+        }
+        s
+    }
+
     /// Which candidate, if any, this cycle may work — the gate that makes
     /// "rest a second ask" unexpressible.
     ///
     /// `Err` carries the reason so the operator can tell a quiet book from a
     /// held one; `Ok(None)` never happens, which is why there is no third arm.
+    ///
+    /// `unresolved` is [`unresolved()`] PASSED IN rather than read here, and
+    /// that is not style: the counter is process-wide and never decrements, so a
+    /// gate reading it directly would make every test of this function depend on
+    /// which other test alarmed first.
     pub fn target<'a>(
         &mut self,
         exits: &'a [crate::unwind::Exit],
         now: f64,
+        unresolved: u64,
     ) -> Result<&'a crate::unwind::Exit, String> {
         // The debounce is folded on EVERY cycle, including one that will not
         // place: forgetting a scan because an exit was already resting would
         // restart the clock for every other candidate.
         let admitted = self.debounce.admit(exits, now);
+        if unresolved > 0 {
+            // NOT `refuse()`. The REFUSED gauge is the resting state of a module
+            // that mostly declines — "the book did not pay" — and this is a
+            // halt: an exit of ours filled and its close did not, so the ledger
+            // quantity anything here would price against has ALREADY been sold
+            // at the venue. See the gauge's own doc for why the two must never
+            // share a number.
+            return Err(format!(
+                "maker_exit_unresolved is {unresolved} — a Kalshi exit SOLD contracts whose \
+                 PM-US leg this process could not close or could not read, so the lot the \
+                 ledger still calls open is one the venue has already sold. Resting another \
+                 ask against it compounds the naked short by a clip a cycle, which is the \
+                 failure this halt exists to make unexpressible. It is a LATCH: the counter \
+                 never decrements, so nothing new rests until the leg has been reconciled by \
+                 hand and this process has been RESTARTED. ({} of {} candidate(s) are still \
+                 held, and the debounce is still being folded for all of them.)",
+                admitted.len(),
+                exits.len()
+            ));
+        }
         if self.resting.is_some() {
             return Err(format!(
                 "an exit is already resting ({} of {} in-scope candidate(s) held) — \
@@ -1069,6 +1301,12 @@ async fn cycle(
     pmus: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> Vec<String> {
     let mut out = Vec::new();
+    // WHAT WE ARE WORKING, BEFORE ANYTHING CAN RETURN. Published first so that
+    // every early return below — an unusable view, a failed scan, a held
+    // target — leaves the backstop reading a set this cycle actually built,
+    // and so that a market this module has just given up on is given up on
+    // within one cycle rather than at the next successful place.
+    publish_working(live.working_set(None));
     let view = match engine_view() {
         Ok(v) => v,
         Err(why) => {
@@ -1108,7 +1346,7 @@ async fn cycle(
         }
     };
     let now = wall_now();
-    let target = match live.target(&exits, now) {
+    let target = match live.target(&exits, now, unresolved()) {
         Ok(e) => e.clone(),
         Err(why) => {
             request_suppress(live.resting.iter().map(|r| r.order.market.clone()).collect());
@@ -1122,6 +1360,12 @@ async fn cycle(
     let mut want: BTreeSet<String> = live.resting.iter().map(|r| r.order.market.clone()).collect();
     want.insert(target.market_id.clone());
     request_suppress(want);
+    // ...and the backstop is stood off the same market in the same breath,
+    // BEFORE any wire call. The window this closes is one cycle wide: the
+    // publication at the top of this cycle did not know which candidate would be
+    // picked, and the recon pass runs on its own 5-minute timer inside this
+    // process.
+    publish_working(live.working_set(Some(&target.market_id)));
 
     let Some(pm) = cfg.pm_market.get(&target.rel_id).cloned() else {
         out.push(refuse(format!(
@@ -1202,6 +1446,11 @@ async fn place(
     match tokio::task::spawn_blocking(move || k.place(&r)).await {
         Ok(Ok(id)) => {
             PLACED.fetch_add(1, AtomicOrd::Relaxed);
+            // This order never went through `Engine::dispatch`, so no ack ever
+            // names it to the engine and its fill would arrive on the
+            // account-wide feed as money nothing can explain. Tell the engine
+            // the one thing that makes it explicable: the venue's own id.
+            crate::engine::fill::note_sidecar_order(&id);
             let line = format!(
                 "[maker-exit] RESTED {}x {} @ {} — venue id {id}, client {coid}",
                 order.qty, order.market, order.limit
@@ -1236,10 +1485,12 @@ async fn place(
         // by any cancel, and a fill on it would arrive against nothing.
         Ok(Err(e)) => {
             UNRESOLVED.fetch_add(1, AtomicOrd::Relaxed);
+            live.unaddressable.insert(order.market.clone());
             vec![format!(
                 "[maker-exit] PLACE DID NOT COMPLETE on {} ({e}) — an ASK may be RESTING at \
                  the venue under an id this process never learned, so nothing here can cancel \
-                 it and a fill on it would leave a naked PM-US short. CHECK BY HAND: \
+                 it and a fill on it would leave a naked PM-US short. Nothing else in this \
+                 process will take on that market again either. CHECK BY HAND: \
                  client_order_id {coid}. maker_exit_unresolved is now {}.",
                 order.market,
                 unresolved()
@@ -1247,6 +1498,7 @@ async fn place(
         }
         Err(e) => {
             UNRESOLVED.fetch_add(1, AtomicOrd::Relaxed);
+            live.unaddressable.insert(order.market.clone());
             vec![format!(
                 "[maker-exit] PLACE TASK FAILED on {} ({e}) — same as above: the ask may or \
                  may not be resting. CHECK BY HAND: client_order_id {coid}",
@@ -1292,7 +1544,11 @@ async fn manage(
              so nothing else can trade while the PM-US leg is open",
             r.order.market, r.order.qty
         )];
-        out.extend(cancel_at_venue(kalshi, &r).await);
+        let (lines, unaddressable) = cancel_at_venue(kalshi, &r).await;
+        out.extend(lines);
+        if let Some(m) = unaddressable {
+            live.unaddressable.insert(m);
+        }
         // ...and the count is RE-READ after the cancel. Anything that traded
         // between the poll and the cancel is ours too, and closing less than we
         // sold is precisely the naked leg this path exists to avoid.
@@ -1390,23 +1646,34 @@ fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> 
 /// retried for ever. What is NOT covered is a cancel that failed and left the
 /// order resting: the account-wide sweep at kill and at exit reaches it (it
 /// carries an `x` id, which `gateway::is_ours` recognises), and nothing else
-/// does.
+/// does — but the market joins [`Live::unaddressable`], so nothing else in this
+/// process will cross it in the meantime either.
 async fn pull(
     live: &mut Live,
     kalshi: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> Vec<String> {
     let Some(r) = live.resting.take() else { return Vec::new() };
-    cancel_at_venue(kalshi, &r).await
+    let (out, unaddressable) = cancel_at_venue(kalshi, &r).await;
+    if let Some(m) = unaddressable {
+        live.unaddressable.insert(m);
+    }
+    out
 }
 
 /// Send the cancel, WITHOUT touching [`Live::resting`].
 ///
 /// Split from [`pull`] because the partial-fill path needs the cancel and must
 /// NOT drop the record until it has re-read the fill count off the same id.
+///
+/// The second half of the answer is the market to stand everything else off,
+/// when the cancel DID NOT COMPLETE and the ask may therefore still be resting.
+/// It comes back as a value rather than being written here because both callers
+/// already hold the `&mut Live`, and threading one in would give this function a
+/// reason to touch the state it exists to leave alone.
 async fn cancel_at_venue(
     kalshi: &std::sync::Arc<dyn crate::sink::OrderSink>,
     r: &Resting,
-) -> Vec<String> {
+) -> (Vec<String>, Option<String>) {
     use arb_venue::gateway::{CancelBy, CancelRequest};
     let k = kalshi.clone();
     let req = CancelRequest {
@@ -1414,19 +1681,30 @@ async fn cancel_at_venue(
         market_slug: Some(r.order.market.clone()),
     };
     match tokio::task::spawn_blocking(move || k.cancel(&req)).await {
-        Ok(Ok(())) => vec![format!(
-            "[maker-exit] pulled {} ({}) after {:.0}s resting",
-            r.order.market,
-            r.venue_order_id,
-            r.since.elapsed().as_secs_f64()
-        )],
-        Ok(Err(e)) => vec![format!(
-            "[maker-exit] CANCEL FAILED on {} ({e}) — order {} may still be RESTING. It \
-             carries client id {} and the account-wide sweep will reach it at kill or exit; \
-             nothing else will.",
-            r.order.market, r.venue_order_id, r.client_order_id
-        )],
-        Err(e) => vec![format!("[maker-exit] cancel task failed ({e})")],
+        Ok(Ok(())) => (
+            vec![format!(
+                "[maker-exit] pulled {} ({}) after {:.0}s resting",
+                r.order.market,
+                r.venue_order_id,
+                r.since.elapsed().as_secs_f64()
+            )],
+            None,
+        ),
+        Ok(Err(e)) => (
+            vec![format!(
+                "[maker-exit] CANCEL FAILED on {} ({e}) — order {} may still be RESTING. It \
+                 carries client id {} and the account-wide sweep will reach it at kill or exit; \
+                 nothing else will.",
+                r.order.market, r.venue_order_id, r.client_order_id
+            )],
+            Some(r.order.market.clone()),
+        ),
+        // The cancel may never have been SENT, which is the same hazard as the
+        // arm above wearing a different error: an ask that may still be resting.
+        Err(e) => (
+            vec![format!("[maker-exit] cancel task failed ({e})")],
+            Some(r.order.market.clone()),
+        ),
     }
 }
 
@@ -1530,6 +1808,9 @@ async fn close_leg(
             return out;
         }
     };
+    // The PM-US half of the same problem the Kalshi place has: this IOC is not
+    // the engine's, so its fill on the account-wide feed matches nothing there.
+    crate::engine::fill::note_sidecar_order(&oid);
     let mut got = 0i64;
     let mut unreadable: Option<String> = None;
     for i in 0..crate::naked_act::FILL_POLLS {
@@ -1636,6 +1917,19 @@ mod tests {
         }
     }
 
+    /// [`decide`] asks `naked_act::inflight_check`, which is FAIL-CLOSED on a
+    /// registry nobody has published — so every decide test has to clear it, the
+    /// way that module's own tests do, under the guard that owns it.
+    ///
+    /// It clears the stand-off too: `naked_act::tests::allow_all` does the same,
+    /// and the two registries are shared across the same set of tests.
+    async fn allow_all() -> tokio::sync::MutexGuard<'static, ()> {
+        let g = crate::naked_act::TEST_SERIAL.lock().await;
+        crate::naked_act::publish_inflight(BTreeSet::new());
+        reset_standoff();
+        g
+    }
+
     /// A view with the market already yielded long enough to place.
     fn view(pm_ask: &str) -> EngineView {
         EngineView {
@@ -1737,9 +2031,9 @@ mod tests {
         let c = [cand(10, 1.0), cand(10, 2.0)];
         let t0 = 1_000_000.0;
         for i in 0..3 {
-            let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S);
+            let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 0);
         }
-        let e = l.target(&c, t0 + 3.0 * DEBOUNCE_S).expect("held long enough");
+        let e = l.target(&c, t0 + 3.0 * DEBOUNCE_S, 0).expect("held long enough");
         assert_eq!(e.opened_ts, 1.0, "the first admitted candidate");
 
         l.resting = Some(Resting {
@@ -1758,7 +2052,7 @@ mod tests {
             client_order_id: "x1".into(),
             since: Instant::now(),
         });
-        let why = l.target(&c, t0 + 4.0 * DEBOUNCE_S).expect_err("one at a time");
+        let why = l.target(&c, t0 + 4.0 * DEBOUNCE_S, 0).expect_err("one at a time");
         assert!(why.contains("already resting"), "{why}");
         assert!(why.contains("MAX_RESTING"), "and it names the cap: {why}");
     }
@@ -1787,10 +2081,61 @@ mod tests {
             since: Instant::now(),
         });
         for i in 0..4 {
-            let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S);
+            let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 0);
         }
         l.resting = None;
-        let e = l.target(&c, t0 + 4.0 * DEBOUNCE_S).expect("the clock kept running");
+        let e = l.target(&c, t0 + 4.0 * DEBOUNCE_S, 0).expect("the clock kept running");
+        assert_eq!(e.rel_id, "r1");
+    }
+
+    // ---- the latch --------------------------------------------------------
+
+    /// A NAKED LEG WE MADE OURSELVES STOPS THE MODULE UNTIL A RESTART.
+    ///
+    /// `close_leg` books ONLY on full success and six of its arms alarm and
+    /// return without a record, so the ledger goes on calling the lot open and
+    /// `unwind` goes on selecting it. Without this, the next cycle rests ANOTHER
+    /// ask against a quantity the venue has already sold — a clip of naked short
+    /// per cycle, compounding, none of it visible to any exposure fold.
+    #[test]
+    fn nothing_new_rests_while_a_naked_leg_is_unresolved() {
+        let mut l = Live::new(true, "/dev/null".into());
+        let c = [cand(10, 1.0)];
+        let t0 = 1_000_000.0;
+        for i in 0..3 {
+            let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 0);
+        }
+        let before = refused();
+        let why = l.target(&c, t0 + 3.0 * DEBOUNCE_S, 1).expect_err("one naked leg is enough");
+        assert!(why.contains("maker_exit_unresolved is 1"), "it names the gauge: {why}");
+        assert!(why.contains("RESTARTED"), "and says only a restart clears it: {why}");
+        assert_eq!(
+            refused(),
+            before,
+            "a halt must not move the REFUSED gauge — 'the book did not pay' and 'we are naked' \
+             are different facts and the module's own doc says they may never share a number"
+        );
+        // ...and the same candidate at the same instant, with nothing unresolved.
+        let e = l.target(&c, t0 + 3.0 * DEBOUNCE_S, 0).expect("held long enough");
+        assert_eq!(e.rel_id, "r1");
+    }
+
+    /// The debounce is folded on a HALTED cycle exactly as it is on a blocked
+    /// one. The latch is about what may REST, not about what may be counted, and
+    /// a halt that stopped the folding would restart every other candidate's
+    /// clock on every pass.
+    #[test]
+    fn the_debounce_is_still_folded_while_halted() {
+        let mut l = Live::new(true, "/dev/null".into());
+        let c = [cand(10, 1.0)];
+        let t0 = 1_000_000.0;
+        for i in 0..3 {
+            assert!(
+                l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 1).is_err(),
+                "halted, and still scanning"
+            );
+        }
+        let e = l.target(&c, t0 + 3.0 * DEBOUNCE_S, 0).expect("the clock kept running");
         assert_eq!(e.rel_id, "r1");
     }
 
@@ -2017,8 +2362,9 @@ mod tests {
     // ---- the decision -----------------------------------------------------
 
     /// THE WHOLE DECISION, on the live ledger's shape.
-    #[test]
-    fn a_held_candidate_with_a_ledger_basis_and_a_yielded_ask_prices_an_exit() {
+    #[tokio::test]
+    async fn a_held_candidate_with_a_ledger_basis_and_a_yielded_ask_prices_an_exit() {
+        let _g = allow_all().await;
         let (mut cx, fees) = ready();
         let recs = vec![open_basket(1.0, 34, "0.22", "0.19")];
         let o = decide(
@@ -2047,8 +2393,9 @@ mod tests {
     /// NO BASIS IS A NAMED REFUSAL, NEVER A DEFAULT — on EITHER leg. The
     /// `xvus-fedcut-26` incident is the PM leg's version of this; a Kalshi leg
     /// with no open record is the same fact about the other side.
-    #[test]
-    fn a_lot_our_own_ledger_cannot_vouch_for_is_never_exited() {
+    #[tokio::test]
+    async fn a_lot_our_own_ledger_cannot_vouch_for_is_never_exited() {
+        let _g = allow_all().await;
         let (mut cx, fees) = ready();
         // fully unwound: the relationship vouches for nothing
         let recs = vec![
@@ -2095,8 +2442,9 @@ mod tests {
     /// THE ENTRY QUOTE COMES OFF FIRST, AND A BOUNDED WAIT FOLLOWS IT.
     /// `scripts/unwind_positions.py:45-49` — card ed6a5910, 14 soft unwinds
     /// deadlocked by self-trade prevention.
-    #[test]
-    fn nothing_rests_until_the_entry_quoter_has_had_time_to_yield_the_ask() {
+    #[tokio::test]
+    async fn nothing_rests_until_the_entry_quoter_has_had_time_to_yield_the_ask() {
+        let _g = allow_all().await;
         let (mut cx, fees) = ready();
         let recs = vec![open_basket(1.0, 34, "0.22", "0.19")];
         let never = EngineView { suppressed_at: BTreeMap::new(), ..view("0.20") };
@@ -2122,8 +2470,9 @@ mod tests {
     /// AN ASK AT OR UNDER THE BID IS THE TAKE, AND THE TAKE IS THE TRADE THIS
     /// MODULE EXISTS NOT TO MAKE. Post-only would reject it; if it did not it
     /// would cross into a book at a price nothing here decided to take.
-    #[test]
-    fn an_exit_that_would_cross_the_book_is_refused_rather_than_crossed() {
+    #[tokio::test]
+    async fn an_exit_that_would_cross_the_book_is_refused_rather_than_crossed() {
+        let _g = allow_all().await;
         let (mut cx, fees) = ready();
         let recs = vec![open_basket(1.0, 34, "0.22", "0.19")];
         // Bid at 0.90 is far above any floor this basket produces.
@@ -2174,8 +2523,9 @@ mod tests {
     /// A DARK PM-US BOOK MAKES THE CLOSE UNPRICEABLE, SO THE EXIT IS
     /// UNPRICEABLE. Resting the Kalshi ask anyway would be committing to a
     /// two-leg trade having valued one leg.
-    #[test]
-    fn an_exit_whose_close_leg_has_no_book_is_refused() {
+    #[tokio::test]
+    async fn an_exit_whose_close_leg_has_no_book_is_refused() {
+        let _g = allow_all().await;
         let (mut cx, fees) = ready();
         let recs = vec![open_basket(1.0, 34, "0.22", "0.19")];
         let dark = EngineView { pm_ask: BTreeMap::new(), ..view("0.20") };
@@ -2280,6 +2630,10 @@ mod tests {
     struct FakeVenue {
         /// `filled_qty` answers, consumed in order; the last one repeats.
         fills: Mutex<Vec<i64>>,
+        /// What `place` answers instead of an id. A `Transport` error here is
+        /// the request that never completed — the arm that cannot say whether
+        /// an ask is resting.
+        place_err: Mutex<Option<arb_venue::VenueError>>,
         log: Mutex<Vec<String>>,
     }
 
@@ -2287,6 +2641,7 @@ mod tests {
         fn with_fills(v: &[i64]) -> std::sync::Arc<FakeVenue> {
             std::sync::Arc::new(FakeVenue {
                 fills: Mutex::new(v.to_vec()),
+                place_err: Mutex::new(None),
                 log: Mutex::new(Vec::new()),
             })
         }
@@ -2304,7 +2659,10 @@ mod tests {
             r: &arb_venue::gateway::PlaceRequest,
         ) -> Result<String, arb_venue::VenueError> {
             self.note(format!("place {} {}x @{}", r.market, r.qty, r.price));
-            Ok("v1".into())
+            match self.place_err.lock().unwrap().clone() {
+                Some(e) => Err(e),
+                None => Ok("v1".into()),
+            }
         }
         fn cancel(
             &self,
@@ -2479,6 +2837,114 @@ mod tests {
             !std::path::Path::new(&path).exists(),
             "a half-done unwind must not be booked — the exposure is still on"
         );
+    }
+
+    // ---- the stand-off ----------------------------------------------------
+
+    /// OUR ASK ON A MARKET THE ENGINE OWES A HEDGE ON MAKES THE HEDGE THE TAKER,
+    /// and `taker_at_cross` cancels the taker — so the hedge quietly does not
+    /// happen and the leg it was covering stays naked. `naked_act` asks this
+    /// engine the same question before it acts; this is that question asked from
+    /// the other side.
+    ///
+    /// It is an ordinary refusal on the ordinary gauge, unlike the unresolved
+    /// latch: the obligation is discharged in seconds and the exit may then rest.
+    #[tokio::test]
+    async fn an_exit_is_not_rested_where_the_engine_already_owes_a_hedge() {
+        let _g = allow_all().await;
+        crate::naked_act::publish_inflight(BTreeSet::from(["K-a".to_string()]));
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 34, "0.22", "0.19")];
+        let before = refused();
+        let e = decide(
+            &mut cx, &fees, &recs, &cand(34, 1.0), "p-a",
+            &quote(Some("0.10"), Some("0.30")), &view("0.20"), Instant::now(),
+        )
+        .expect_err("the engine owes a hedge on this market");
+        assert!(e.contains("double hedge"), "the registry's own words: {e}");
+        assert!(e.contains("taker_at_cross"), "and why it matters here: {e}");
+        assert_eq!(refused(), before + 1, "'not now' is a refusal, not a halt");
+        crate::naked_act::publish_inflight(BTreeSet::new());
+    }
+
+    /// THE CRUX: THE HALT MUST NOT ALSO STRAND THE LEG IT CREATED.
+    ///
+    /// While an exit is working a market the backstop is stood off it, because a
+    /// recon IOC that crosses our own post-only ask is CANCELLED by
+    /// `taker_at_cross` and reported as the book having moved. The instant that
+    /// exit fails its close the opposite is true: the leg it just left naked is
+    /// exactly what the backstop is for, and nothing may be standing in front of
+    /// it.
+    ///
+    /// NOTHING HERE IMPLEMENTS THAT HAND-OVER. It falls out of two things that
+    /// are already true — `close_leg` clears `resting` before anything can
+    /// fail, and the latch stops `target` putting the market back — plus the
+    /// working set being rebuilt from [`Live`] on every cycle, which makes the
+    /// release at most one cycle wide. This test is what keeps the derivation
+    /// honest when any of the three moves.
+    #[tokio::test]
+    async fn an_exit_that_halted_releases_the_stand_off_so_the_backstop_can_run() {
+        let _g = allow_all().await;
+        arm_standoff();
+        let mut l = Live::new(false, "/dev/null".into());
+        l.resting = Some(resting_exit(5));
+        publish_working(l.working_set(None));
+        let why = working_check("K-a").expect_err("an ask of ours is resting there");
+        assert!(why.contains("taker_at_cross"), "it says what would happen: {why}");
+
+        // The close failed: the ask is spent and forgotten, and the module is
+        // latched off for good.
+        l.resting = None;
+        let c = [cand(10, 1.0)];
+        assert!(l.target(&c, 1_000_000.0, 1).is_err(), "the latch holds this module off");
+        publish_working(l.working_set(None));
+        assert!(
+            working_check("K-a").is_ok(),
+            "the backstop must be free to complete the leg this module just left naked"
+        );
+        reset_standoff();
+    }
+
+    /// AN ORDER WE CANNOT ADDRESS KEEPS THE STAND-OFF ON, AND NOTHING TAKES IT
+    /// OFF AGAIN.
+    ///
+    /// A place whose answer never came may be an ask resting under an id this
+    /// process never learned. It cannot be cancelled and it cannot be polled, so
+    /// the only thing left to do about it is refuse to send anything of ours
+    /// across it — for the rest of the process's life, because nothing here can
+    /// ever learn that it is gone.
+    #[tokio::test]
+    async fn an_unaddressable_order_keeps_the_stand_off_on() {
+        let _g = allow_all().await;
+        arm_standoff();
+        let kalshi = FakeVenue::with_fills(&[0]);
+        *kalshi.place_err.lock().unwrap() =
+            Some(arb_venue::VenueError::Transport("timed out".into()));
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
+        let mut live = Live::new(false, "/dev/null".into());
+        let out = place(&mut live, resting_exit(5).order, &k).await.join("\n");
+        assert!(out.contains("PLACE DID NOT COMPLETE"), "{out}");
+        assert!(live.resting.is_none(), "nothing addressable means nothing remembered");
+        publish_working(live.working_set(None));
+        let why = working_check("K-a").expect_err("an ask of ours may be resting there");
+        assert!(why.contains("K-a"), "{why}");
+        reset_standoff();
+    }
+
+    /// A SILENT LOOP IS NOT AN EMPTY ONE — AND AN UNARMED ONE IS.
+    ///
+    /// Fail-closed once something is armed, fail-open before that, which is not
+    /// `naked_act::inflight_check`'s rule and is deliberate: with no armed exit
+    /// there is no ask of ours to cross, so refusing would cost a real naked leg
+    /// its completion for a collision that cannot happen.
+    #[tokio::test]
+    async fn a_silent_maker_exit_loop_refuses_rather_than_assuming_the_ask_is_gone() {
+        let _g = allow_all().await;
+        assert!(working_check("K-a").is_ok(), "nothing armed, so nothing to collide with");
+        arm_standoff();
+        let why = working_check("K-a").expect_err("armed, and it has never said what it holds");
+        assert!(why.contains("has not yet published"), "{why}");
+        reset_standoff();
     }
 
     /// OUR ID MUST BE SWEEPABLE. `gateway::is_ours` gates the kill sweep and the
