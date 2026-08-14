@@ -69,24 +69,30 @@
 //!     a naked PM-US short, which is a real directional position. So the refusal
 //!     is loud, lands on a must-stay-0 gauge, and is left to the naked-leg
 //!     reconciliation — see the last section.
-//!   * **§1, THE BLOCKER, IS HALF RETRACTED.** Re-derived on 2026-07-31 rather
-//!     than inherited:
-//!       - the half that BLOCKED is gone. That header was written when the armed
-//!         process ran three families; it now runs `--rel-prefix xvus-`, and all
-//!         25 priced positions in `data/exec/marks.json` are `xvus-`. The
-//!         candidate set and the owned set are no longer disjoint — they are
-//!         identical. [`Live::target`] still refuses anything `unwind` marked
-//!         unactionable, so the test is enforced rather than assumed.
-//!       - the half that REMAINS is the coverage gap, and it is unchanged. All 6
-//!         `source: arb-trader` open baskets in the live ledger carry no
-//!         `cost_usd`, so `mark_positions.py:280-282` skips them and they are
-//!         absent from `marks.json` (checked 2026-07-31: 6 of 32 open baskets,
-//!         plus one `mltox-` probe basket). **THIS MODULE CANNOT EXIT A BASKET
-//!         THIS ENGINE OPENED.** That is a coverage limit, not a hazard: a
-//!         basket invisible to the input is never selected, and a ticker whose
-//!         qty is under-counted rests a SMALLER ask than we could — the safe
-//!         direction. It becomes a hazard only if someone reads
-//!         `unwind_candidates` as "the book".
+//!   * **§1, THE BLOCKER, IS RETRACTED IN FULL.** Both halves, on two dates,
+//!     re-derived rather than inherited:
+//!       - the half that BLOCKED went on 2026-07-31. That header was written
+//!         when the armed process ran three families; it now runs
+//!         `--rel-prefix xvus-`, and all 25 priced positions in
+//!         `data/exec/marks.json` are `xvus-`. The candidate set and the owned
+//!         set are no longer disjoint — they are identical. [`Live::target`]
+//!         still refuses anything `unwind` marked unactionable, so the test is
+//!         enforced rather than assumed.
+//!       - the COVERAGE GAP went on 2026-08-14, and this is what unblocks the
+//!         flywheel: an exit could only ever recycle capital somebody else's
+//!         writer had booked. `marks::build` now derives a missing cost basis
+//!         from the record's own legs (`marks::derived_basis`), so the
+//!         `source: arb-trader` baskets that were absent from `marks.json` are
+//!         rows in it — 31 records, about $133, on the ledger the day it
+//!         landed. **THIS MODULE CAN NOW EXIT A BASKET THIS ENGINE OPENED**,
+//!         and the previous sentence here said the opposite.
+//!         Two things bound what that opened. The basis those rows carry is
+//!         `naked_act::worst_lot`'s own arithmetic — the same number [`decide`]
+//!         re-derives before resting anything, so a row this module accepts and
+//!         a lot it prices cannot disagree. And an INVERTED engine basket
+//!         (Kalshi `side:"ask"`) publishes `maker_exit_ct: null`, which
+//!         `unwind::consider` refuses as `NotPriceable` before it is ever a
+//!         candidate; `worst_lot` would refuse its direction here in any case.
 //!
 //! # THE DEBOUNCE IS SIZED ON THE TAPE, NOT ON A GUESS
 //!

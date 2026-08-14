@@ -251,7 +251,11 @@ impl Held {
     /// two `mixed` legs in the file, a spelling nobody has seen — matches
     /// neither arm and the record is skipped, which is the fail-closed reading:
     /// a leg whose direction we cannot name is not a leg we may price off.
-    fn matches(self, side: &str) -> bool {
+    ///
+    /// `pub(crate)` because [`crate::marks`] reads the same table: the marker
+    /// and the placer disagreeing about which way a leg points is exactly the
+    /// drift a second copy would introduce.
+    pub(crate) fn matches(self, side: &str) -> bool {
         match self {
             Held::ShortYes => side == "no" || side == "ask",
             Held::LongYes => side == "yes" || side == "bid",
