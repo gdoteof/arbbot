@@ -400,7 +400,7 @@ pub fn worst_lot(
 /// The same fold `ledger::open_exposure` performs — corrections merged in,
 /// unwinds netted off — kept separate only because that one returns totals per
 /// relationship and this needs the records themselves.
-fn open_lots(records: &[Value], rel: &str) -> Vec<(f64, i64, Value)> {
+pub(crate) fn open_lots(records: &[Value], rel: &str) -> Vec<(f64, i64, Value)> {
     let folded = ledger::apply_corrections(records.to_vec());
     let mut unwound: BTreeMap<u64, f64> = BTreeMap::new();
     for r in &folded {

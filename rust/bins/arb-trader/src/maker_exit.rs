@@ -259,6 +259,44 @@ pub const MAX_CLIP: i64 = 5;
 /// fills. One at a time means at most one leg can be in flight, ever.
 pub const MAX_RESTING: usize = 1;
 
+/// How long a resting exit may hold the single [`MAX_RESTING`] slot while other
+/// candidates are held behind it. One hour.
+///
+/// THIS IS AN OPPORTUNITY-COST BOUND, NOT A PRICE CHECK. [`still_pays`] already
+/// pulls an ask the PM book has moved away from; nothing pulled one that was
+/// simply never going to fill. On 2026-08-14 a 4-lot ask on `KXTIME-26-AI` rested
+/// for 2.3 days without filling, and because [`MAX_RESTING`] is 1 it held the
+/// whole recycler shut against as many as 9 held candidates the entire time. The
+/// single slot is the scarce resource and nothing was rationing it.
+///
+/// ONLY WHEN THE SLOT IS CONTESTED, which is the whole of the rule. Rotating an
+/// ask costs its queue position at the venue, and paying that to re-rest the same
+/// exit at the same price is a pure loss. So age alone does not pull:
+/// [`Live::target`] arms this only while at least one held candidate sits on a
+/// DIFFERENT market, i.e. only when something else would actually use the slot.
+///
+/// An hour is 60 cycles and 4x [`DEBOUNCE_S`]. Long enough that a passive fill
+/// has had a fair run at the queue; short enough that one dead ask costs the
+/// recycler an hour rather than a weekend. A candidate still worth exiting is
+/// still admitted by the debounce when it comes back round, so a rotation
+/// re-prices it against a fresh book rather than abandoning it.
+pub const MAX_RESTING_S: f64 = 3600.0;
+
+/// How old a resting exit must be before a 404 on its id is read as GONE rather
+/// than as NOT YET VISIBLE.
+///
+/// Neither venue's create is read-your-writes (`gateway::Settle`): Kalshi 404s a
+/// GET on an order it has just accepted, which is why `filled_qty` already polls
+/// through `Settle::retry_404` — 8 attempts 500 ms apart, about 4 s. A 404 that
+/// survives that window on an order placed seconds ago may still be the query
+/// service lagging. A 404 on an order that has been resting a whole cycle cannot
+/// be: the venue has answered about this id many times since.
+///
+/// One cycle ([`CYCLE_S`]) is 15x the settle window, and is the coarsest clock
+/// this module has anyway — `manage` runs once a cycle, so the first read that
+/// could observe a 404 at this age is already a cycle old.
+const VANISHED_MIN_AGE_S: f64 = CYCLE_S as f64;
+
 /// How long the entry quoter is given to yield the Kalshi ask before an exit is
 /// rested on it.
 ///
@@ -1026,6 +1064,12 @@ pub struct Live {
     pub ledger_path: String,
     pub debounce: Debounce,
     pub resting: Option<Resting>,
+    /// Why the resting exit should give up the single [`MAX_RESTING`] slot, when
+    /// it should. Set by [`Live::target`] — which is the only place that both
+    /// knows the age of the resting ask and has the admitted candidate set to
+    /// judge whether the slot is contested — and consumed by [`cycle`], which
+    /// owns the wire. See [`MAX_RESTING_S`].
+    pub rotate: Option<String>,
     /// Markets where a place or a cancel DID NOT COMPLETE, so an ask of ours may
     /// be resting under an id nothing in this process can address.
     ///
@@ -1052,6 +1096,7 @@ impl Live {
             ledger_path,
             debounce: Debounce::default(),
             resting: None,
+            rotate: None,
             unaddressable: BTreeSet::new(),
             cx,
             fees,
@@ -1124,7 +1169,24 @@ impl Live {
                 exits.len()
             ));
         }
-        if self.resting.is_some() {
+        if let Some(r) = self.resting.as_ref() {
+            // THE SLOT IS THE SCARCE RESOURCE, and until now nothing rationed it:
+            // an ask that never filled held the recycler shut for as long as it
+            // cared to. Arm a rotation once it is older than `MAX_RESTING_S` AND
+            // somebody else would actually use the slot — a held candidate on a
+            // DIFFERENT market. Rotating for the sake of the exit's own candidate
+            // would just buy back its own queue position at full price.
+            let age = r.since.elapsed().as_secs_f64();
+            let waiting = admitted.iter().filter(|e| e.market_id != r.order.market).count();
+            self.rotate = (age > MAX_RESTING_S && waiting > 0).then(|| {
+                format!(
+                    "{} has held the only exit slot for {age:.0}s (limit {MAX_RESTING_S:.0}s) \
+                     with {waiting} other held candidate(s) waiting on it — pulling so the \
+                     next cycle can re-decide against a fresh book. If it is still the best \
+                     exit it will be chosen again and re-priced.",
+                    r.order.market
+                )
+            });
             return Err(format!(
                 "an exit is already resting ({} of {} in-scope candidate(s) held) — \
                  MAX_RESTING is {MAX_RESTING}, so nothing else may rest until it fills or is \
@@ -1355,8 +1417,17 @@ async fn cycle(
     let target = match live.target(&exits, now, unresolved()) {
         Ok(e) => e.clone(),
         Err(why) => {
-            request_suppress(live.resting.iter().map(|r| r.order.market.clone()).collect());
             out.push(format!("[maker-exit] nothing to rest: {why}"));
+            // ...but the slot may have been held too long by an ask nothing is
+            // going to lift. Pull it HERE rather than inside `target`, which is
+            // pure and does not own the wire. The next cycle then re-decides
+            // from scratch, this one rests nothing — the same one-cycle gap
+            // every other decision here takes.
+            if let Some(reason) = live.rotate.take() {
+                out.push(format!("[maker-exit] ROTATING — {reason}"));
+                out.extend(pull(live, kalshi).await);
+            }
+            request_suppress(live.resting.iter().map(|r| r.order.market.clone()).collect());
             return out;
         }
     };
@@ -1514,6 +1585,143 @@ async fn place(
     }
 }
 
+/// Is this fill-read failure the venue saying the order is GONE, rather than the
+/// venue failing to answer?
+///
+/// The distinction is the whole of card #75. `filled_qty` refuses instead of
+/// answering 0 when it cannot ask, and `manage` treated every refusal the same
+/// way — hold, ask again next cycle. That is right for a timeout, a 503 or an
+/// exhausted rate budget, where a later read gets a real answer. It is a trap for
+/// a 404, where every later read returns the same 404 forever: the module then
+/// polls a dead id once a cycle for as long as the process lives, and because
+/// [`MAX_RESTING`] is 1 nothing else can ever rest. Live, that ran 3,531 times
+/// over 58 h before anyone looked.
+///
+/// ONLY 404, and only past [`VANISHED_MIN_AGE_S`]. A 401 is a credential problem
+/// and a 500 is the venue's; neither says anything about the order, and holding
+/// is still right for both. `VenueError::Status`'s own doc note already names
+/// this shape — "some statuses are success in disguise (a 404 on cancel means the
+/// order is already gone)" — and `engine::cancel` has acted on it since quirk K4.
+/// This applies the same reading on the read path.
+fn is_vanished(e: &arb_venue::VenueError, age_s: f64) -> bool {
+    matches!(e, arb_venue::VenueError::Status { status: 404, .. }) && age_s >= VANISHED_MIN_AGE_S
+}
+
+/// The order is gone from the venue. Did it SELL anything on its way out?
+///
+/// **THIS IS THE HALF THAT MAKES "FORGET IT" SAFE, AND IT MUST NOT BE SKIPPED.**
+/// Gone has two causes with opposite consequences: the ask was cancelled or
+/// expired unfilled (nothing happened, free the slot), or it filled and the venue
+/// reaped the record (we are one leg short and the ledger still calls the basket
+/// open). The 404 alone cannot tell them apart, and guessing "unfilled" is
+/// precisely the failure the original hold was written to prevent — so this does
+/// not guess. It asks a DIFFERENT source: venue truth for the account, the same
+/// `net_positions` read `positions::read_net` reconciles against.
+///
+/// Expected is what the LEDGER says we still hold on this Kalshi market for this
+/// relationship — every open lot's remaining quantity, corrections merged and
+/// unwinds netted, via `naked_act::open_lots`. Compare with what the venue says:
+///
+///   * `venue >= expected` — nothing of ours sold. Forget the order, free the
+///     slot, and say so.
+///   * `venue < expected` — the shortfall is what traded. Close exactly that,
+///     clamped to what the exit ordered, through the ordinary fill path.
+///   * the read fails — we have learned nothing, so HOLD, exactly as before.
+///     A `net_positions` that cannot answer is not evidence of no fill.
+///
+/// The comparison is `>=` and not `==` on purpose: another lot on the same ticker
+/// from a relationship this exit does not name would make the venue count larger,
+/// and only a SHORTFALL is evidence of a sale. An excess is somebody else's
+/// business and is not this module's to interpret.
+async fn resolve_vanished(
+    live: &mut Live,
+    r: &Resting,
+    kalshi: &std::sync::Arc<dyn crate::sink::OrderSink>,
+) -> (Vec<String>, Option<i64>) {
+    let records = match ledger::read(&live.ledger_path) {
+        Ok(recs) => recs,
+        Err(e) => {
+            return (
+                vec![format!(
+                    "[maker-exit] {} has vanished from the venue (404) but the ledger is \
+                     unreadable ({e}), so what we SHOULD hold there cannot be established — \
+                     holding the slot rather than assuming it never filled",
+                    r.order.market
+                )],
+                None,
+            )
+        }
+    };
+    let expected: i64 = crate::naked_act::open_lots(&records, &r.order.rel_id)
+        .iter()
+        .filter(|(_, _, rec)| {
+            rec.get("legs")
+                .and_then(|v| v.as_array())
+                .is_some_and(|legs| {
+                    legs.iter().any(|l| {
+                        l.get("venue").and_then(|v| v.as_str()) == Some(Venue::Kalshi.as_str())
+                            && l.get("market_id").and_then(|v| v.as_str())
+                                == Some(r.order.market.as_str())
+                    })
+                })
+        })
+        .map(|(_, qty, _)| *qty)
+        .sum();
+    let k = kalshi.clone();
+    let net = match tokio::task::spawn_blocking(move || k.net_positions()).await {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            return (
+                vec![format!(
+                    "[maker-exit] {} has vanished from the venue (404) and the positions read \
+                     that would say whether it sold first also failed ({e}) — holding the slot. \
+                     This is the one case that still stalls the recycler, and it stalls it \
+                     SAFELY: no fill is being assumed away.",
+                    r.order.market
+                )],
+                None,
+            )
+        }
+        Err(e) => {
+            return (
+                vec![format!(
+                    "[maker-exit] {} has vanished (404) and the positions task failed ({e}) — \
+                     holding the slot",
+                    r.order.market
+                )],
+                None,
+            )
+        }
+    };
+    let held = net.get(&r.order.market).copied().unwrap_or(0.0);
+    let sold = (expected as f64 - held).round() as i64;
+    if sold <= 0 {
+        live.resting = None;
+        return (
+            vec![format!(
+                "[maker-exit] {} has vanished from the venue (404 on {}, after {:.0}s resting) \
+                 and venue truth says it sold nothing — we hold {held} there and the ledger's \
+                 open lots account for {expected}. Forgetting the order and freeing the slot; \
+                 the candidate is re-decided from a fresh book next cycle.",
+                r.order.market,
+                r.venue_order_id,
+                r.since.elapsed().as_secs_f64(),
+            )],
+            None,
+        );
+    }
+    let sold = sold.min(r.order.qty);
+    (
+        vec![format!(
+            "[maker-exit] {} has vanished from the venue (404) and venue truth says it SOLD \
+             first: we hold {held} on Kalshi against {expected} open in the ledger, a shortfall \
+             of {sold}. Closing the PM-US leg for that many now.",
+            r.order.market
+        )],
+        Some(sold),
+    )
+}
+
 /// Look after the resting ask: has it filled, and does it still pay?
 async fn manage(
     live: &mut Live,
@@ -1524,8 +1732,35 @@ async fn manage(
     let Some(r) = live.resting.clone() else { return Vec::new() };
     let k = kalshi.clone();
     let id = r.venue_order_id.clone();
+    let mut out: Vec<String> = Vec::new();
+    // Set on the one path where the order is known to be OFF the venue already.
+    // The close below must then neither cancel it nor re-read it: both address an
+    // id the venue has just told us it does not have, and nothing more can trade
+    // on an order that is not there.
+    let mut vanished = false;
     let filled = match tokio::task::spawn_blocking(move || k.filled_qty(&id)).await {
         Ok(Ok(n)) => n,
+        // GONE is not UNREADABLE. A 404 on an id the venue has been answering
+        // about for cycles means the order is not there any more, and asking
+        // again next cycle asks the same dead id forever — see [`is_vanished`].
+        // Which of the two things "gone" means is settled against venue truth,
+        // never assumed.
+        Ok(Err(ref e)) if is_vanished(e, r.since.elapsed().as_secs_f64()) => {
+            let (lines, sold) = resolve_vanished(live, &r, kalshi).await;
+            out.extend(lines);
+            match sold {
+                // It sold on the way out. Fall through to the ordinary close
+                // path with the quantity venue truth established, so the PM-US
+                // leg is closed and one `unwound` record books it.
+                Some(n) => {
+                    vanished = true;
+                    n
+                }
+                // Either it sold nothing (slot freed inside `resolve_vanished`)
+                // or we could not find out (slot held). Both are done here.
+                None => return out,
+            }
+        }
         Ok(Err(e)) => {
             // NOT "it did not fill". `filled_qty` refuses rather than answering
             // 0 when it cannot ask, and treating that as unfilled is how a real
@@ -1545,34 +1780,42 @@ async fn manage(
         // thing: it would keep filling while we close the PM leg, and each
         // extra contract is another naked short that nothing in this process
         // can see, cancel or book. So the remainder comes off FIRST.
-        let mut out = vec![format!(
-            "[maker-exit] {} filled {filled} of {} — cancelling the remainder before closing, \
-             so nothing else can trade while the PM-US leg is open",
-            r.order.market, r.order.qty
-        )];
-        let (lines, unaddressable) = cancel_at_venue(kalshi, &r).await;
-        out.extend(lines);
-        if let Some(m) = unaddressable {
-            live.unaddressable.insert(m);
-        }
-        // ...and the count is RE-READ after the cancel. Anything that traded
-        // between the poll and the cancel is ours too, and closing less than we
-        // sold is precisely the naked leg this path exists to avoid.
-        let k = kalshi.clone();
-        let id = r.venue_order_id.clone();
-        let settled = match tokio::task::spawn_blocking(move || k.filled_qty(&id)).await {
-            Ok(Ok(n)) => n.max(filled),
-            // Unreadable after the cancel. `filled` is a LOWER bound and is
-            // still the best number we have, so close that much rather than
-            // nothing — and say that the difference, if any, is invisible.
-            _ => {
-                out.push(format!(
-                    "[maker-exit] could not re-read {} after the cancel — closing the {filled} \
-                     we know traded. If the cancel raced a further fill, the difference is \
-                     naked and unbooked; CHECK BY HAND.",
-                    r.order.market
-                ));
-                filled
+        // A VANISHED order needs neither step: it is already off the venue, so
+        // there is no remainder to cancel and no further fill to race. Both calls
+        // would address the id that just 404ed, and the re-read would 404 again
+        // and fall to the lower bound we already have.
+        let settled = if vanished {
+            filled
+        } else {
+            out.push(format!(
+                "[maker-exit] {} filled {filled} of {} — cancelling the remainder before \
+                 closing, so nothing else can trade while the PM-US leg is open",
+                r.order.market, r.order.qty
+            ));
+            let (lines, unaddressable) = cancel_at_venue(kalshi, &r).await;
+            out.extend(lines);
+            if let Some(m) = unaddressable {
+                live.unaddressable.insert(m);
+            }
+            // ...and the count is RE-READ after the cancel. Anything that traded
+            // between the poll and the cancel is ours too, and closing less than
+            // we sold is precisely the naked leg this path exists to avoid.
+            let k = kalshi.clone();
+            let id = r.venue_order_id.clone();
+            match tokio::task::spawn_blocking(move || k.filled_qty(&id)).await {
+                Ok(Ok(n)) => n.max(filled),
+                // Unreadable after the cancel. `filled` is a LOWER bound and is
+                // still the best number we have, so close that much rather than
+                // nothing — and say that the difference, if any, is invisible.
+                _ => {
+                    out.push(format!(
+                        "[maker-exit] could not re-read {} after the cancel — closing the \
+                         {filled} we know traded. If the cancel raced a further fill, the \
+                         difference is naked and unbooked; CHECK BY HAND.",
+                        r.order.market
+                    ));
+                    filled
+                }
             }
         };
         if settled > r.order.qty {
@@ -1593,10 +1836,9 @@ async fn manage(
     // so a RISE means the PM book has moved against the exit and the price we
     // are resting at no longer locks anything.
     match still_pays(&mut live.cx, &live.fees, &r.order, view) {
-        Ok(()) => Vec::new(),
+        Ok(()) => out,
         Err(why) => {
-            let mut out =
-                vec![format!("[maker-exit] PULLING {} — {why}", r.order.market)];
+            out.push(format!("[maker-exit] PULLING {} — {why}", r.order.market));
             out.extend(pull(live, kalshi).await);
             out
         }
@@ -2647,6 +2889,13 @@ mod tests {
         /// the request that never completed — the arm that cannot say whether
         /// an ask is resting.
         place_err: Mutex<Option<arb_venue::VenueError>>,
+        /// What `filled_qty` answers INSTEAD of the scripted count. This is the
+        /// arm the vanished-order path turns on: the venue refusing to answer,
+        /// with a status that says why.
+        fill_err: Mutex<Option<arb_venue::VenueError>>,
+        /// What `net_positions` answers. `None` means the sink has no positions
+        /// wired and refuses, which is itself one of the cases under test.
+        net: Mutex<Option<BTreeMap<String, f64>>>,
         log: Mutex<Vec<String>>,
     }
 
@@ -2655,8 +2904,25 @@ mod tests {
             std::sync::Arc::new(FakeVenue {
                 fills: Mutex::new(v.to_vec()),
                 place_err: Mutex::new(None),
+                fill_err: Mutex::new(None),
+                net: Mutex::new(None),
                 log: Mutex::new(Vec::new()),
             })
+        }
+        /// The venue answers this error to every `filled_qty`.
+        fn refusing(v: &std::sync::Arc<FakeVenue>, e: arb_venue::VenueError) {
+            *v.fill_err.lock().unwrap() = Some(e);
+        }
+        /// ...and this is venue truth for the account.
+        fn holding(v: &std::sync::Arc<FakeVenue>, market: &str, qty: f64) {
+            *v.net.lock().unwrap() = Some([(market.to_string(), qty)].into_iter().collect());
+        }
+        fn status(code: u16) -> arb_venue::VenueError {
+            arb_venue::VenueError::Status {
+                endpoint: "kalshi order_status",
+                status: code,
+                body: r#"{"error":{"code":"not_found","message":"not found"}}"#.into(),
+            }
         }
         fn note(&self, s: String) {
             self.log.lock().unwrap().push(s);
@@ -2691,10 +2957,23 @@ mod tests {
             unreachable!("this path never lists")
         }
         fn filled_qty(&self, _id: &str) -> Result<i64, arb_venue::VenueError> {
+            if let Some(e) = self.fill_err.lock().unwrap().clone() {
+                self.note(format!("filled_qty -> ERR {e}"));
+                return Err(e);
+            }
             let mut f = self.fills.lock().unwrap();
             let n = if f.len() > 1 { f.remove(0) } else { *f.first().unwrap_or(&0) };
             self.note(format!("filled_qty -> {n}"));
             Ok(n)
+        }
+        fn net_positions(
+            &self,
+        ) -> Result<BTreeMap<String, f64>, arb_venue::VenueError> {
+            self.note("net_positions".into());
+            match self.net.lock().unwrap().clone() {
+                Some(m) => Ok(m),
+                None => Err(arb_venue::VenueError::NotWired),
+            }
         }
     }
 
@@ -2717,6 +2996,258 @@ mod tests {
             client_order_id: "x1".into(),
             since: Instant::now(),
         }
+    }
+
+    /// The same exit, but rested long enough ago that a 404 on it cannot be the
+    /// read-your-writes window.
+    fn stale_resting_exit(qty: i64, age_s: f64) -> Resting {
+        let mut r = resting_exit(qty);
+        r.since = Instant::now() - Duration::from_secs_f64(age_s);
+        r
+    }
+
+    /// Write one open basket to a scratch ledger so `resolve_vanished` has an
+    /// expected quantity to compare venue truth against.
+    fn ledger_with_open(tag: &str, qty: i64) -> String {
+        let path = ledger_scratch(tag);
+        std::fs::write(&path, format!("{}\n", open_basket(1.0, qty, "0.22", "0.19"))).unwrap();
+        path
+    }
+
+    // ---- the vanished order -----------------------------------------------
+
+    /// **A 404 IS THE VENUE ANSWERING, NOT THE VENUE FAILING TO ANSWER.**
+    ///
+    /// This is the wedge of card #75, as a test. `manage` treated every
+    /// `filled_qty` refusal alike — hold, ask again next cycle — which is right
+    /// for a timeout and a trap for a 404: every later read returns the same 404,
+    /// so the module polls a dead id once a cycle for ever, and `MAX_RESTING` = 1
+    /// means NOTHING ELSE CAN EVER REST. Live, that ran 3,531 times over 58 h
+    /// while nine candidates were held behind it, and only a process restart
+    /// could clear it.
+    ///
+    /// The fix must free the slot. It must NOT do so by assuming the ask went
+    /// unfilled — that is the failure the original hold existed to prevent — so
+    /// the venue's own position count is what settles it.
+    #[tokio::test]
+    async fn a_404_on_a_long_resting_exit_frees_the_slot_when_venue_truth_says_it_sold_nothing() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let kalshi = FakeVenue::with_fills(&[0]);
+        let pmus = FakeVenue::with_fills(&[0]);
+        FakeVenue::refusing(&kalshi, FakeVenue::status(404));
+        // The ledger says 5 open on K-a; the venue says we hold all 5. Nothing
+        // sold, so the vanished ask was cancelled or expired.
+        FakeVenue::holding(&kalshi, "K-a", 5.0);
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
+        let p: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let path = ledger_with_open("vanished-clean", 5);
+        let mut live = Live::new(false, path.clone());
+        live.resting = Some(stale_resting_exit(5, VANISHED_MIN_AGE_S + 1.0));
+        let out = manage(&mut live, &view("0.20"), &k, &p).await.join("\n");
+
+        assert!(live.resting.is_none(), "THE SLOT MUST BE FREED: {out}");
+        assert!(out.contains("vanished"), "{out}");
+        assert!(out.contains("sold nothing"), "and it says how it knows: {out}");
+        assert!(
+            kalshi.calls().iter().any(|c| c == "net_positions"),
+            "the answer must come from venue truth, not from an assumption: {:?}",
+            kalshi.calls()
+        );
+        // Nothing traded, so nothing is closed and nothing is booked.
+        assert!(pmus.calls().is_empty(), "no close leg: {:?}", pmus.calls());
+        assert!(crate::ledger::read(&path).unwrap().len() == 1, "no unwind record");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ...AND IF IT SOLD ON ITS WAY OUT, THE PM-US LEG IS CLOSED FOR EXACTLY THE
+    /// SHORTFALL.
+    ///
+    /// The dangerous half. A venue that reaps a FILLED order and then 404s its id
+    /// looks identical, at the id, to one that cancelled an unfilled order. Guess
+    /// "unfilled" here and the account is one leg short with the ledger still
+    /// calling the basket hedged — which is precisely `maker_exit_unresolved`'s
+    /// reason for existing. Venue truth tells the two apart: 5 open in the
+    /// ledger, 2 held at Kalshi, so 3 traded.
+    #[tokio::test]
+    async fn a_404_after_a_fill_closes_the_shortfall_venue_truth_reveals() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let kalshi = FakeVenue::with_fills(&[0]);
+        let pmus = FakeVenue::with_fills(&[3]);
+        FakeVenue::refusing(&kalshi, FakeVenue::status(404));
+        FakeVenue::holding(&kalshi, "K-a", 2.0);
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
+        let p: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let path = ledger_with_open("vanished-sold", 5);
+        let mut live = Live::new(false, path.clone());
+        live.resting = Some(stale_resting_exit(5, VANISHED_MIN_AGE_S + 1.0));
+        let out = manage(&mut live, &view("0.20"), &k, &p).await.join("\n");
+
+        assert!(out.contains("SOLD"), "{out}");
+        let ps = pmus.calls();
+        assert!(ps[0].starts_with("place p-a 3x"), "closed the shortfall: {ps:?}");
+        // ...and it is NOT cancelled or re-read: the order is already off the
+        // venue, so both calls would address the id that just 404ed.
+        assert!(
+            !kalshi.calls().iter().any(|c| c == "cancel"),
+            "nothing to cancel on an order the venue does not have: {:?}",
+            kalshi.calls()
+        );
+        let recs = crate::ledger::read(&path).expect("clean ledger");
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert_eq!(recs[1]["status"], "unwound");
+        assert_eq!(recs[1]["qty"], 3, "the shortfall, not the whole ask");
+        assert!(live.resting.is_none(), "a spent exit is not polled again");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A 404 THE POSITIONS READ CANNOT CORROBORATE STILL HOLDS THE SLOT.
+    ///
+    /// The one case that still stalls the recycler, and it stalls it SAFELY. If
+    /// `net_positions` cannot answer, we have learned nothing about whether the
+    /// ask sold, and freeing the slot on no evidence is exactly the assumption
+    /// this whole path refuses to make. Better a stalled recycler than a silent
+    /// naked leg.
+    #[tokio::test]
+    async fn a_404_whose_positions_read_fails_holds_the_slot_rather_than_assuming() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let kalshi = FakeVenue::with_fills(&[0]);
+        let pmus = FakeVenue::with_fills(&[0]);
+        FakeVenue::refusing(&kalshi, FakeVenue::status(404));
+        // `net` is left unset, so `net_positions` refuses.
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
+        let p: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let path = ledger_with_open("vanished-blind", 5);
+        let mut live = Live::new(false, path.clone());
+        live.resting = Some(stale_resting_exit(5, VANISHED_MIN_AGE_S + 1.0));
+        let out = manage(&mut live, &view("0.20"), &k, &p).await.join("\n");
+
+        assert!(live.resting.is_some(), "no evidence, no release: {out}");
+        assert!(out.contains("holding the slot"), "{out}");
+        assert!(out.contains("SAFELY"), "and says the stall is the safe side: {out}");
+        assert!(pmus.calls().is_empty(), "nothing closed on a guess");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A 404 INSIDE THE READ-YOUR-WRITES WINDOW IS STILL "NOT YET", NOT "GONE".
+    ///
+    /// Neither venue's create is read-your-writes — Kalshi 404s a GET on an order
+    /// it has just accepted — which is why `filled_qty` polls through
+    /// `Settle::retry_404` first. A blanket "404 means gone" would forget an ask
+    /// that IS resting and then rest a second one on the same market, which is
+    /// the duplicate `MAX_RESTING` exists to forbid. Age is what separates them.
+    #[tokio::test]
+    async fn a_404_on_a_freshly_rested_exit_is_held_not_forgotten() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let kalshi = FakeVenue::with_fills(&[0]);
+        let pmus = FakeVenue::with_fills(&[0]);
+        FakeVenue::refusing(&kalshi, FakeVenue::status(404));
+        FakeVenue::holding(&kalshi, "K-a", 5.0);
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
+        let p: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let mut live = Live::new(false, ledger_scratch("vanished-young"));
+        live.resting = Some(stale_resting_exit(5, VANISHED_MIN_AGE_S - 1.0));
+        let out = manage(&mut live, &view("0.20"), &k, &p).await.join("\n");
+
+        assert!(live.resting.is_some(), "too young to call gone: {out}");
+        assert!(out.contains("could not read the fill state"), "{out}");
+        assert!(
+            !kalshi.calls().iter().any(|c| c == "net_positions"),
+            "and it does not spend a positions read to find that out: {:?}",
+            kalshi.calls()
+        );
+    }
+
+    /// ONLY 404. A 503 IS THE VENUE FAILING TO ANSWER AND STILL HOLDS.
+    ///
+    /// The classification must stay narrow. A 500, a timeout or an exhausted rate
+    /// budget say nothing whatever about the order, and a later read gets a real
+    /// answer — so the original hold is right for all of them, however long the
+    /// ask has been resting.
+    #[tokio::test]
+    async fn a_non_404_refusal_holds_however_old_the_exit_is() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let kalshi = FakeVenue::with_fills(&[0]);
+        let pmus = FakeVenue::with_fills(&[0]);
+        FakeVenue::refusing(&kalshi, FakeVenue::status(503));
+        FakeVenue::holding(&kalshi, "K-a", 5.0);
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
+        let p: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let mut live = Live::new(false, ledger_scratch("vanished-503"));
+        live.resting = Some(stale_resting_exit(5, VANISHED_MIN_AGE_S * 100.0));
+        let out = manage(&mut live, &view("0.20"), &k, &p).await.join("\n");
+
+        assert!(live.resting.is_some(), "a 503 is not evidence the order is gone: {out}");
+        assert!(out.contains("could not read the fill state"), "{out}");
+    }
+
+    // ---- the contested slot -----------------------------------------------
+
+    /// **AN ASK NOBODY LIFTS MUST NOT OWN THE ONLY SLOT FOR EVER.**
+    ///
+    /// The deeper half of the same incident, and it needed no venue error at all:
+    /// the `KXTIME-26-AI` ask rested for 2.3 DAYS without filling, and because
+    /// `MAX_RESTING` is 1 the recycler was shut the whole time. `still_pays`
+    /// pulls an ask the PM book has moved away from; nothing pulled one that was
+    /// simply never going to trade. The slot is the scarce resource and nothing
+    /// rationed it.
+    #[test]
+    fn a_stale_ask_gives_up_the_slot_when_other_candidates_are_waiting() {
+        let mut l = Live::new(true, "/dev/null".into());
+        // Two candidates on DIFFERENT markets, both held past the debounce.
+        let mut other = cand(10, 2.0);
+        other.market_id = "K-b".into();
+        let c = [cand(10, 1.0), other];
+        let t0 = 1_000_000.0;
+        l.resting = Some(stale_resting_exit(5, MAX_RESTING_S + 1.0));
+        for i in 0..4 {
+            let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 0);
+        }
+        let reason = l.rotate.take().expect("the slot has been held too long");
+        assert!(reason.contains("held the only exit slot"), "{reason}");
+        assert!(reason.contains("re-decide against a fresh book"), "{reason}");
+    }
+
+    /// ...BUT NOT WHEN IT IS THE ONLY CANDIDATE.
+    ///
+    /// Rotating costs the ask its queue position at the venue. Paying that to
+    /// re-rest the SAME exit at the SAME price is a pure loss, so age alone must
+    /// not pull: the slot is only scarce when something else wants it.
+    #[test]
+    fn a_stale_ask_keeps_its_queue_position_when_nothing_else_wants_the_slot() {
+        let mut l = Live::new(true, "/dev/null".into());
+        // The only held candidate is the resting market's own.
+        let c = [cand(10, 1.0)];
+        let t0 = 1_000_000.0;
+        l.resting = Some(stale_resting_exit(5, MAX_RESTING_S * 10.0));
+        for i in 0..4 {
+            let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 0);
+        }
+        assert!(
+            l.rotate.is_none(),
+            "an uncontested slot is not scarce; rotating would just buy back our own queue \
+             position at full price"
+        );
+    }
+
+    /// A YOUNG ASK KEEPS THE SLOT EVEN WHEN CONTESTED — the bound is an
+    /// opportunity cost, not a preference for whoever asked last.
+    #[test]
+    fn a_young_ask_is_not_rotated_off_a_contested_slot() {
+        let mut l = Live::new(true, "/dev/null".into());
+        let mut other = cand(10, 2.0);
+        other.market_id = "K-b".into();
+        let c = [cand(10, 1.0), other];
+        let t0 = 1_000_000.0;
+        l.resting = Some(stale_resting_exit(5, MAX_RESTING_S - 1.0));
+        for i in 0..4 {
+            let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 0);
+        }
+        assert!(l.rotate.is_none(), "it has not had its hour yet");
     }
 
     fn ledger_scratch(tag: &str) -> String {
