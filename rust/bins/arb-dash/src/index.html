@@ -1260,8 +1260,13 @@ function nowCapital(d){
       under a topic it was never gated under. Marks are ${dur(c.marks_age_s)} old.
     </div>
     <h2 style="margin-top:18px">Cash remaining, by venue &middot; and who believes what</h2>
+    <div class="sub" style="margin-bottom:6px">engine column read from:
+      <b class="${d.engine.armed?'ok':'bad'}">${esc(v.engine_from||'unknown')}</b></div>
     <table>
-      <thead><tr><th>venue</th><th class="num">armed engine</th><th class="num">this dashboard</th>
+      <thead><tr><th>venue</th>
+        <th class="num">${d.engine.armed ? esc(d.engine.unit)
+          : '<span class="bad">no armed engine</span>'}</th>
+        <th class="num">this dashboard</th>
         <th class="num">gap</th><th class="num">measured</th><th class="num">gap</th>
         <th>measured from</th></tr></thead>
       <tbody>${(v.cash||[]).map(r => `<tr data-k="cash-${esc(r.venue)}">
@@ -1270,10 +1275,12 @@ function nowCapital(d){
         <td class="num">${usd0(r.dash_usd)}</td>
         <td class="num ${r.dash_diff_usd?'warn':'dim'}">${usd0(r.dash_diff_usd)}</td>
         <td class="num">${usd0(r.venue_usd)}</td>
-        <td class="num ${r.venue_diff_usd?'warn':'dim'}">${usd0(r.venue_diff_usd)}</td>
+        <td class="num ${r.venue_diff_usd?'warn':'dim'}">${r.venue_usd!=null&&r.venue_diff_usd==null
+          ? '<span class="dim" title="withheld: the measured side is stale or of unknown age">—</span>'
+          : usd0(r.venue_diff_usd)}</td>
         <td class="sub">${esc(r.venue_from)}${r.venue_age_s==null ? ''
           : ` &middot; <span class="${r.venue_stale?'bad':'dim'}">${dur(r.venue_age_s)} old${
-              r.venue_stale?', STALE — nothing in this repo refreshes it':''}</span>`}</td>
+              r.venue_stale?', STALE — the engine has stopped spending against it':''}</span>`}</td>
       </tr>`).join('')}</tbody>
     </table>
     <div class="sub" style="margin-top:8px">
@@ -1284,21 +1291,43 @@ function nowCapital(d){
         ? `<b class="bad">${v.unpriced_rows} row(s) could not be priced</b>, so it is a floor.`
         : 'Every marked row priced.'}
       ${v.unmarked_records ? `<b class="warn">${v.unmarked_records} open record(s) produced no
-        row at all</b> — single-leg positions have no basket to mark, and they are skipped
-        before <code>unpriced_positions</code> is counted, so that field reads 0 anyway.` : ''}
+        row at all</b>, of which <b>${v.unpriced_baskets==null?'?':v.unpriced_baskets}</b> are
+        two-leg baskets <code>marks::build</code> could not price and
+        <b>${v.single_leg_records==null?'?':v.single_leg_records}</b> are single-leg riders,
+        which have no basket to mark.
+        <b>RETRACTED:</b> this line used to call the whole gap single-leg riders and say
+        <code>unpriced_positions</code> "reads 0 anyway". It does not: an unpriceable basket is
+        counted there AND is missing from the rows, so it lands in this subtraction too — and it
+        is money sitting at a venue, not a directional bet.` : ''}
       It is not split per venue and cannot be: a marked row is a two-leg basket priced as one
       number, so there is no per-leg money in <code>marks.json</code> to attribute.
       <br><br>
-      Nothing in the cash table is a measurement of Kalshi cash. <b>armed engine</b> is the
-      <code>--balance</code> constant the live risk gate is spending against, read off its
-      <code>/proc</code> command line (the tracked unit file says something else); it is
-      hand-typed and never decremented as capital deploys, so it must not be added to
-      <b>recoverable now</b> — those shares were bought with some of it. <b>this dashboard</b>
-      is this process's own <code>--kalshi-balance</code>. The two disagree, in different unit
-      files, and either can be edited alone: that gap is the one thing here that can fail.
-      <b>measured</b> is PM-US <code>buyingPower</code> — never <code>currentBalance</code>,
-      which is <code>buyingPower + marginRequirement</code>, and that margin is already inside
-      each position's cost basis and therefore already inside <b>recoverable now</b>.
+      The <b>engine</b> column is the <code>--balance</code> constant a risk gate is spending
+      against, read off the process's <code>/proc</code> command line (the tracked unit file
+      says something else) — and it is filled ONLY when that process is ARMED. This host also
+      runs an unarmed shadow whose <code>--balance kalshi=340.09</code> is $0.0004 from this
+      dashboard's own constant, so filling the column from it with the armed slice stopped would
+      collapse the one gap here that can fail to ~$0 and render a dead engine as an all-clear.
+      The constant is hand-typed and never decremented as capital deploys, so it must not be
+      added to <b>recoverable now</b> — those shares were bought with some of it.
+      <b>this dashboard</b> is this process's own <code>--kalshi-balance</code>; it is never a
+      measurement, because putting it in the measured column would compare a hand-typed number
+      to itself. The two constants disagree, in different unit files, and either can be edited
+      alone: that gap is the one thing here that can fail.
+      <br><br>
+      <b>measured</b> is a figure some process actually read off the venue —
+      <code>data/exec/venue_cash.json</code>, written by the armed engine's cash poll, aged off
+      the reading's own <code>ts</code> where it carries one rather than off a file mtime a
+      failed poll would refresh. Where that file is absent the row says so and shows nothing;
+      the one exception is PM-US, which falls back to the hand-fetched
+      <code>data/venue/pmus_balances.json</code> the books page reconciles against — no writer
+      since 2026-07-27, so read the STALE flag and not the number. The <b>gap</b> beside it is
+      withheld (&mdash;) whenever the measured side is stale or of unknown age: a discrepancy
+      against a three-week-old snapshot is not a small finding, it is not a finding, and it
+      renders exactly like one. The figure itself is PM-US <code>buyingPower</code>, never
+      <code>currentBalance</code>, which is <code>buyingPower + marginRequirement</code> — that
+      margin is already inside each position's cost basis and therefore already inside
+      <b>recoverable now</b>.
     </div>
   </section>`);
 }

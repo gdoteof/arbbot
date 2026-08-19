@@ -346,6 +346,17 @@ fn yaml_num(v: &Option<serde_yaml::Value>) -> Option<f64> {
 /// deployed figure below from a lag into a lie.
 const MARKS_STALE_S: u64 = 120;
 
+/// Past this, a reading in `data/exec/venue_cash.json` is not a picture of now.
+///
+/// That file is written by the armed engine's own cash poll, which reads both
+/// venues on a 60s loop and EXPIRES a reading at 180s — past that the engine
+/// stops spending against it and refuses to open. Rendering the same figure as
+/// current here would put a number on the screen that the process which
+/// measured it has already stopped believing. Deliberately NOT the books page's
+/// hour: that window is sized for a snapshot somebody fetches by hand, and this
+/// one has a writer. If the engine's expiry moves, this moves with it.
+const VENUE_CASH_STALE_S: u64 = 180;
+
 /// Stale is a THIRD state, not a pass, and an age nobody could establish is
 /// UNKNOWN rather than fresh. Same rule the books page applies to its venue
 /// snapshots, and the same exclusive boundary.
@@ -354,45 +365,113 @@ fn stale(age_s: Option<u64>, past_s: u64) -> Option<bool> {
 }
 
 /// Capital DEPLOYED, out of the engine's own marks: what flattening the whole
-/// book would return, how many rows could not be priced, and how many open
-/// records were never marked at all.
+/// book would return, and each separate way an open record can be missing from
+/// that figure.
 ///
-/// Σ `liq_value_usd`, which is the basket sold at the bid and bought back at
-/// the ask NET OF BOTH EXIT FEES (`marks::compute_row`) — the recoverable
-/// figure, not a mid. Deliberately not the shortcut
-/// `totals.cost_usd + totals.mark_pnl_usd`: `marks::build` skips a row it could
-/// not price when it accumulates the mark but adds EVERY row's cost, so that
-/// sum silently carries an unpriceable row at full cost — overstating what is
-/// recoverable exactly where the book is least knowable. It happens to agree
-/// today only because all 58 rows priced.
+/// The default is what an absent marks file yields: UNKNOWN on every count
+/// except `unpriced_rows`, where zero rows really is zero rows that failed to
+/// price.
+#[derive(Default)]
+struct Deployed {
+    /// Σ `liq_value_usd` over the published rows.
+    share_value_usd: Option<f64>,
+    /// Rows that WERE published but carry no `liq_value_usd`.
+    unpriced_rows: u64,
+    /// `totals.n_open - positions.len()`: open records that produced no row at
+    /// all. NOT the single-leg riders alone — see [`deployed`].
+    unmarked_records: Option<i64>,
+    /// `totals.unpriced_positions`: of those, the two-leg baskets.
+    unpriced_baskets: Option<u64>,
+    /// ...and the remainder, which is the single-leg riders.
+    single_leg_records: Option<i64>,
+}
+
+/// Capital DEPLOYED, out of the engine's own marks.
 ///
-/// The third figure is `totals.n_open - positions.len()`, and it is not
-/// redundant with `totals.unpriced_positions`: single-leg records are skipped
-/// BEFORE that counter is incremented (`marks::build`), so the counter can read
-/// 0 while a record was in fact dropped. Live right now: 59 open, 58 rows, 0
-/// unpriced. Without this subtraction the view under-reports deployed capital
-/// and never says so.
+/// [`Deployed::share_value_usd`] is Σ `liq_value_usd`, which is the basket sold
+/// at the bid and bought back at the ask NET OF BOTH EXIT FEES
+/// (`marks::compute_row`) — the recoverable figure, not a mid. Deliberately not
+/// the shortcut `totals.cost_usd + totals.mark_pnl_usd`: `marks::build` skips a
+/// row it could not price when it accumulates the mark but adds EVERY row's
+/// cost, so that sum silently carries an unpriceable row at full cost —
+/// overstating what is recoverable exactly where the book is least knowable. It
+/// happens to agree today only because all 58 rows priced.
+///
+/// The rest is the accounting for what is NOT in that sum, and it takes three
+/// numbers rather than one. `marks::build` states the identity itself:
+///
+///   `n_open - positions.len() - unpriced_positions == single-leg records`
+///
+/// RETRACTION. The first version of this function published `n_open -
+/// positions.len()` alone and the panel called it single-leg riders. It is not.
+/// A two-leg basket `marks::build` could not price — no cost basis derivable
+/// from its legs, or a leg missing on one venue — is skipped with no row emitted
+/// AND counted in `unpriced_positions`, so it lands inside that subtraction too.
+/// Reporting the whole gap as directional riders attributes real unmarkable
+/// baskets, which is money sitting at a venue, to positions that were never part
+/// of one. Both halves are published now and the single-leg count is the
+/// remainder, so the panel can stop guessing which it is looking at.
+///
+/// [`Deployed::unpriced_rows`] is a fourth and different thing: a row that WAS
+/// published but whose `liq_value_usd` is null — no bid to liquidate into, or a
+/// market the recorder does not carry. Its cost is still inside
+/// `totals.cost_usd`, so the recoverable sum beside it is a floor.
 ///
 /// `None` rather than `0.0` when there is no marks file. A $0.00 under
 /// "recoverable" reads as "the book is flat", which is a very different claim
 /// from "the process that writes this file is not running".
-fn deployed(marks: &Value) -> (Option<f64>, u64, Option<i64>) {
+fn deployed(marks: &Value) -> Deployed {
     let Some(rows) = marks.get("positions").and_then(Value::as_array) else {
-        return (None, 0, None);
+        return Deployed::default();
     };
-    let (mut value, mut unpriced) = (0.0, 0u64);
+    let (mut value, mut unpriced_rows) = (0.0, 0u64);
     for p in rows {
         match f(p.get("liq_value_usd")) {
             Some(v) => value += v,
-            None => unpriced += 1,
+            None => unpriced_rows += 1,
         }
     }
-    let unmarked = marks
-        .get("totals")
+    let totals = marks.get("totals");
+    let unmarked_records = totals
         .and_then(|t| t.get("n_open"))
         .and_then(Value::as_u64)
         .map(|n| n as i64 - rows.len() as i64);
-    (Some(value), unpriced, unmarked)
+    let unpriced_baskets =
+        totals.and_then(|t| t.get("unpriced_positions")).and_then(Value::as_u64);
+    Deployed {
+        share_value_usd: Some(value),
+        unpriced_rows,
+        unmarked_records,
+        unpriced_baskets,
+        single_leg_records: unmarked_records.zip(unpriced_baskets).map(|(u, b)| u - b as i64),
+    }
+}
+
+/// Per-venue cash out of the snapshot the ARMED engine writes, and when it read
+/// it.
+///
+/// Coordinated with that writer by PATH and by VENUE NAME only. The names are
+/// `crate::VENUES`, which every other view in this binary already keys on, and
+/// they are looked for at the top level and under `balances` alike, so the
+/// nesting is not part of the contract. Nothing else in the document is read: a
+/// top-level `ts` is the READ TIME, not a venue, and taking every numeric key
+/// would make it one.
+///
+/// A file that parses to no venue this binary knows yields an empty map, and the
+/// caller says the measured side is unavailable rather than falling through to
+/// silence. That is also what happens if the writer lands in a shape this does
+/// not recognise, which is the honest failure for a contract that is one path
+/// and a set of names.
+fn venue_cash(text: &str) -> (BTreeMap<String, f64>, Option<f64>) {
+    let Ok(v) = serde_json::from_str::<Value>(text) else {
+        return (BTreeMap::new(), None);
+    };
+    let inner = v.get("balances").unwrap_or(&v);
+    let cash = crate::VENUES
+        .iter()
+        .filter_map(|name| Some(((*name).to_string(), f(inner.get(*name))?)))
+        .collect();
+    (cash, f(v.get("ts")))
 }
 
 /// The SPENDABLE PM-US cash in a `pmus_balances.json`.
@@ -417,8 +496,11 @@ fn spendable_pmus(text: &str) -> Option<f64> {
         .ok()
 }
 
-/// The per-venue cash the ARMED engine's risk gate is spending against, read
-/// off its command line.
+/// The per-venue cash a `--balance` command line declares, read off `/proc`.
+///
+/// Whether the process it came from is the one a risk gate is actually spending
+/// against is [`engine_cash`]'s question and not this parser's — the fallback
+/// that makes it a question is documented there.
 ///
 /// Off `/proc` and not off the unit file, for the same reason `armed_engine`
 /// detects rather than configures: the tracked unit says `--balance
@@ -441,35 +523,199 @@ fn engine_balances(cmd: &str) -> Vec<(String, f64)> {
         .collect()
 }
 
+/// The engine column: whose `--balance` constants it holds, and whether the
+/// process they were read off can actually trade.
+///
+/// [`armed_engine`] falls back to ANY `arb-trader` when none is armed. That
+/// fallback is right for the gauges — a shadow's own summary is still worth
+/// reading — and it is a TRAP for money. This host runs an unarmed shadow whose
+/// `--balance kalshi=340.09` is within $0.0004 of this dashboard's own
+/// `--kalshi-balance 340.0896`, so with the armed slice stopped a column headed
+/// "armed engine" would quietly fill with the shadow's constants, the one gap
+/// on this panel that can genuinely fail would collapse to ~$0, and a stopped
+/// engine would render as an all-clear.
+///
+/// So the column is filled ONLY off an armed process, it always names the unit
+/// it was read from, and when nothing is armed it is EMPTY and says why. A panel
+/// that cannot tell armed from shadow must not print a heading claiming it can.
+fn engine_cash(unit: &str, armed: bool, cmd: Option<&str>) -> (Vec<(String, f64)>, String) {
+    match cmd {
+        Some(c) if armed => (engine_balances(c), format!("{unit} · --balance, ARMED")),
+        Some(_) => (
+            Vec::new(),
+            format!(
+                "{unit} is running but is NOT armed. Its --balance constants are not what any \
+                 risk gate is spending against, so this column is empty rather than showing a \
+                 shadow's numbers under an armed heading."
+            ),
+        ),
+        None => (Vec::new(), "no arb-trader is running".into()),
+    }
+}
+
+/// The MEASURED side of one venue's cash: a figure some process actually read
+/// off the venue, where it came from, how old it is, and the age past which it
+/// stops being evidence about now.
+struct Measured {
+    usd: Option<f64>,
+    from: String,
+    age_s: Option<u64>,
+    stale_past_s: u64,
+}
+
 /// One venue's cash, beside every other figure that claims to know it, with the
 /// differences an operator would otherwise take on trust.
 ///
 /// Three sources, because there are three and they do not agree: the armed
 /// engine's constant, this dashboard's own constant, and a MEASURED venue
-/// figure where a snapshot exists. Live today on kalshi that is 320.43 against
+/// figure where one exists. Live today on kalshi that is 320.43 against
 /// 340.0896 — a $19.66 gap that no page in this repo said out loud, and the one
 /// comparison here that can genuinely fail, since either constant can be edited
 /// alone in its own unit file.
-fn cash_row(
-    venue: &str,
-    engine: Option<f64>,
-    dash: Option<f64>,
-    measured: Option<f64>,
-    from: &str,
-    age_s: Option<u64>,
-) -> Value {
+///
+/// A DIFF IS PUBLISHED ONLY WHEN BOTH SIDES ARE CURRENT. `dash_diff_usd` is two
+/// constants and is therefore always computable. `venue_diff_usd` is not, and it
+/// is withheld the moment the measured side is stale or of unknown age: a dollar
+/// gap against a three-week-old snapshot is not a small finding, it is not a
+/// finding at all, and it renders exactly like one. That is how a panel built to
+/// catch manufactured confidence starts manufacturing it. The measured figure
+/// itself still shows, with its true age, because that much is true.
+fn cash_row(venue: &str, engine: Option<f64>, dash: Option<f64>, m: &Measured) -> Value {
+    let venue_stale = stale(m.age_s, m.stale_past_s);
     let diff = |b: Option<f64>| engine.zip(b).map(|(e, x)| e - x);
     json!({
         "venue": venue,
         "engine_usd": engine,
         "dash_usd": dash,
         "dash_diff_usd": diff(dash),
-        "venue_usd": measured,
-        "venue_from": from,
-        "venue_age_s": age_s,
-        "venue_stale": stale(age_s, crate::endpoints::books::SNAPSHOT_STALE_S),
-        "venue_diff_usd": diff(measured),
+        "venue_usd": m.usd,
+        "venue_from": m.from,
+        "venue_age_s": m.age_s,
+        "venue_stale": venue_stale,
+        "venue_diff_usd": diff(m.usd).filter(|_| venue_stale == Some(false)),
     })
+}
+
+/// The capital block's `derived` sibling: everything on this panel that was
+/// measured rather than typed, published beside the constants it exists to
+/// check.
+///
+/// DEPLOYED is genuinely live: the engine marks the book against its own feed
+/// and rewrites `marks.json` at book-event rate. REMAINING is only ever as live
+/// as whatever last read a venue, and nothing here pretends otherwise — arb-dash
+/// holds no credentials and constructs no gateway, so every cash figure it can
+/// reach is either a constant somebody typed into a unit file or a file some
+/// other process wrote. Deriving "capital remaining" from those and serving it
+/// as a measurement would reproduce, one level up, exactly the tautology the
+/// books page carries: a new number that cannot disagree with the thing it was
+/// built to check. So they are published SIDE BY SIDE, each with its provenance
+/// and its age, and the gaps between them are the output.
+///
+/// Deployed is not attributed per venue, and cannot be from this file: a marked
+/// row is a two-leg BASKET priced as a unit (`marks::compute_row` sums the
+/// Kalshi bid and the PM-US 1−ask into one `liq_value_usd`), so there is no
+/// per-leg money in `marks.json` to split. Splitting it would need a change to
+/// the engine's writer, which is an order-path crate.
+///
+/// The engine's identity arrives as three arguments rather than being read off
+/// `/proc` in here, so the money emission is exercised by tests instead of by
+/// whatever happens to be running on the box.
+fn derived_capital(a: &Args, marks: &Value, unit: &str, armed: bool, cmd: Option<&str>) -> Value {
+    let d = deployed(marks);
+    let (engine_bal, engine_from) = engine_cash(unit, armed, cmd);
+
+    // The measured side, best source first. `data/exec/venue_cash.json` is
+    // written by the armed engine's cash poll off live venue reads.
+    // `data/venue/` is fetched BY HAND and has had no writer since 2026-07-27,
+    // so on its own it is a three-week-old number and is served as one.
+    let vc_path = format!("{}/exec/venue_cash.json", a.data_dir);
+    let vc_text = std::fs::read_to_string(&vc_path).ok();
+    let (vc, vc_at) = vc_text.as_deref().map(venue_cash).unwrap_or_default();
+    // From the reading's OWN timestamp where the writer publishes one, and from
+    // the file's mtime otherwise. They are not the same thing, and the
+    // difference is the failure this panel has to survive: a writer that
+    // rewrites the file after a FAILED poll keeps the mtime fresh while the
+    // number underneath it ages. The age is most of why this file is read at
+    // all, so the row says which of the two it got.
+    let vc_age = match vc_at {
+        Some(t) => Some((now_secs() as f64 - t).max(0.0) as u64),
+        None => crate::endpoints::age_secs(&vc_path),
+    };
+    let vc_from = format!("{vc_path} · {}", if vc_at.is_some() { "ts" } else { "file mtime" });
+    let unmeasured = match vc_text {
+        None => format!(
+            "no measured figure: {vc_path} does not exist, and this process holds no \
+             credentials to read a venue itself"
+        ),
+        Some(_) => format!("{vc_path} carries no figure for this venue"),
+    };
+
+    let pmus_path = format!("{}/pmus_balances.json", a.pmus_dir);
+    let pmus_hand = std::fs::read_to_string(&pmus_path).ok().as_deref().and_then(spendable_pmus);
+    let measured = |venue: &str| -> Measured {
+        if let Some(usd) = vc.get(venue) {
+            return Measured {
+                usd: Some(*usd),
+                from: vc_from.clone(),
+                age_s: vc_age,
+                stale_past_s: VENUE_CASH_STALE_S,
+            };
+        }
+        // PM-US only, and only as a fallback: the hand-fetched snapshot the
+        // books page reconciles against. It IS a real venue read, and it is the
+        // only one this binary has ever had, so it is shown — with its true age,
+        // 22.7 days as of this commit, and with its diff withheld, so what an
+        // operator takes off the row is the STALE flag and not the number.
+        match (venue, pmus_hand) {
+            ("polymarket_us", Some(usd)) => Measured {
+                usd: Some(usd),
+                from: format!(
+                    "{pmus_path} · buyingPower, fetched by hand — nothing in this repo writes it"
+                ),
+                age_s: crate::endpoints::age_secs(&pmus_path),
+                stale_past_s: crate::endpoints::books::SNAPSHOT_STALE_S,
+            },
+            _ => Measured {
+                usd: None,
+                from: unmeasured.clone(),
+                age_s: None,
+                stale_past_s: VENUE_CASH_STALE_S,
+            },
+        }
+    };
+
+    // Only venues something is actually known about. A row of nulls would
+    // suggest a venue is configured when it is not.
+    let dash_kalshi: Option<f64> = a.kalshi_balance.as_ref().and_then(|s| s.parse().ok());
+    let mut venues: BTreeSet<String> = engine_bal.iter().map(|(v, _)| v.clone()).collect();
+    venues.extend(vc.keys().cloned());
+    if dash_kalshi.is_some() {
+        venues.insert("kalshi".into());
+    }
+    if pmus_hand.is_some() {
+        venues.insert("polymarket_us".into());
+    }
+    let cash: Vec<Value> = venues
+        .iter()
+        .map(|v| {
+            let engine = engine_bal.iter().find(|(n, _)| n == v).map(|(_, u)| *u);
+            // `--kalshi-balance` is this process's OWN startup constant and
+            // there is no equivalent flag for any other venue, so no other row
+            // has a dashboard column. It is never a measurement: putting it in
+            // the measured column would compare a hand-typed number to itself.
+            let dash = if v == "kalshi" { dash_kalshi } else { None };
+            cash_row(v, engine, dash, &measured(v))
+        })
+        .collect();
+
+    json!({
+        "share_value_usd": d.share_value_usd,
+        "unpriced_rows": d.unpriced_rows,
+        "unmarked_records": d.unmarked_records,
+        "unpriced_baskets": d.unpriced_baskets,
+        "single_leg_records": d.single_leg_records,
+        "engine_from": engine_from,
+        "cash": cash })
 }
 
 // ---------------------------------------------------------------------------
@@ -661,67 +907,7 @@ pub fn json(a: &Args) -> String {
         .collect();
 
     // ---- the same capital, derived rather than typed ----------------------
-    //
-    // DEPLOYED is genuinely live: the engine marks the book against its own
-    // feed and rewrites `marks.json` at book-event rate. REMAINING is not, and
-    // nothing here pretends otherwise — arb-dash holds no credentials and
-    // constructs no gateway, so every cash figure it can reach is either a
-    // constant somebody typed into a unit file or a snapshot somebody fetched
-    // by hand. Deriving "capital remaining" from those and serving it as a
-    // measurement would reproduce, one level up, exactly the tautology the
-    // books page carries: a new number that cannot disagree with the thing it
-    // was built to check. So they are published SIDE BY SIDE, each with its
-    // provenance and its age, and the gaps between them are the output.
-    //
-    // Deployed is not attributed per venue, and cannot be from this file: a
-    // marked row is a two-leg BASKET priced as a unit (`marks::compute_row`
-    // sums the Kalshi bid and the PM-US 1−ask into one `liq_value_usd`), so
-    // there is no per-leg money in `marks.json` to split. Splitting it would
-    // need a change to the engine's writer, which is an order-path crate.
-    let (share_value, unpriced_rows, unmarked_records) = deployed(&marks);
-    let engine_bal = proc.map(|p| engine_balances(&p.cmd)).unwrap_or_default();
-    let dash_kalshi: Option<f64> = a.kalshi_balance.as_ref().and_then(|s| s.parse().ok());
-    let pmus_bal = format!("{}/pmus_balances.json", a.pmus_dir);
-    let pmus_cash = std::fs::read_to_string(&pmus_bal).ok().as_deref().and_then(spendable_pmus);
-    // Only venues something is actually known about. A row of nulls would
-    // suggest a venue is configured when it is not.
-    let mut venues: BTreeSet<String> = engine_bal.iter().map(|(v, _)| v.clone()).collect();
-    if dash_kalshi.is_some() {
-        venues.insert("kalshi".into());
-    }
-    if pmus_cash.is_some() {
-        venues.insert("polymarket_us".into());
-    }
-    let cash_rows: Vec<Value> = venues
-        .iter()
-        .map(|v| {
-            let engine = engine_bal.iter().find(|(n, _)| n == v).map(|(_, u)| *u);
-            match v.as_str() {
-                "polymarket_us" => cash_row(
-                    v,
-                    engine,
-                    None,
-                    pmus_cash,
-                    &format!("{pmus_bal} · buyingPower"),
-                    crate::endpoints::age_secs(&pmus_bal),
-                ),
-                // Kalshi has NO measured side. Nothing in this repo writes a
-                // kalshi balance file — the dash unit says so in as many words
-                // — and `--kalshi-balance` is this process's own startup
-                // constant, so putting it in the measured column would compare
-                // a hand-typed number to itself.
-                "kalshi" => cash_row(
-                    v,
-                    engine,
-                    dash_kalshi,
-                    None,
-                    "no kalshi balance snapshot — nothing in this repo writes one",
-                    None,
-                ),
-                _ => cash_row(v, engine, None, None, "no balance snapshot for this venue", None),
-            }
-        })
-        .collect();
+    let derived = derived_capital(a, &marks, &unit, armed, proc.map(|p| p.cmd.as_str()));
 
     // ---- what is crossing right now --------------------------------------
     let day = crate::integrity::build(&a.data_dir).today;
@@ -878,11 +1064,7 @@ pub fn json(a: &Args) -> String {
                 // `bankroll_usd` is a policy statement about risk appetite, and
                 // a class cap that floated with equity would let this page
                 // change what the engine trades.
-                "derived": json!({
-                    "share_value_usd": share_value,
-                    "unpriced_rows": unpriced_rows,
-                    "unmarked_records": unmarked_records,
-                    "cash": cash_rows }) }),
+                "derived": derived }),
     );
     out.insert(
         "opportunities".into(),
@@ -1009,6 +1191,23 @@ mod tests {
 
     // ----- capital, derived -------------------------------------------------
 
+    /// A data dir with the files this panel reads, so the emission site is
+    /// exercised over REAL files. `Args::for_test` points every path at
+    /// `/nonexistent` on purpose — a test that silently picked up this machine's
+    /// `data/` would pass here and nowhere else — and that is exactly what left
+    /// the money columns below unpinned: nothing could reach them. Per test and
+    /// per pid, because `cargo test` runs these in parallel in one process.
+    fn scratch(tag: &str) -> String {
+        let d = std::env::temp_dir().join(format!("arb-dash-cap-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("exec")).expect("a scratch dir");
+        d.to_string_lossy().into_owned()
+    }
+
+    fn measured(usd: Option<f64>, age_s: Option<u64>, stale_past_s: u64) -> Measured {
+        Measured { usd, from: "f".into(), age_s, stale_past_s }
+    }
+
     /// The recoverable figure is Σ `liq_value_usd` and never the shortcut
     /// `totals.cost_usd + totals.mark_pnl_usd`. `marks::build` skips a row it
     /// could not price when it sums the mark but adds EVERY row's cost, so the
@@ -1024,27 +1223,55 @@ mod tests {
             ],
             "totals": { "cost_usd": 150.0, "mark_pnl_usd": -10.0, "n_open": 2 }
         });
-        let (value, unpriced, unmarked) = deployed(&marks);
-        assert_eq!(value, Some(90.0), "the row that could not be priced contributes nothing");
-        assert_eq!(unpriced, 1, "and is COUNTED, so the 90 is read as partial");
-        assert_eq!(unmarked, Some(0), "both open records did produce a row");
-        assert!(150.0 - 10.0 > value.expect("a value"), "the shortcut would have claimed 140");
+        let d = deployed(&marks);
+        assert_eq!(
+            d.share_value_usd,
+            Some(90.0),
+            "the row that could not be priced contributes nothing"
+        );
+        assert_eq!(d.unpriced_rows, 1, "and is COUNTED, so the 90 is read as partial");
+        assert_eq!(d.unmarked_records, Some(0), "both open records did produce a row");
+        assert!(
+            150.0 - 10.0 > d.share_value_usd.expect("a value"),
+            "the shortcut would have claimed 140"
+        );
     }
 
-    /// `totals.n_open` is every open ledger record, and single-leg ones are
-    /// skipped BEFORE `totals.unpriced_positions` is incremented — so that
-    /// counter can read 0 while a record was in fact dropped. Live right now:
-    /// 59 open, 58 rows, 0 unpriced. Without this subtraction the panel
-    /// under-reports deployed capital and never says so.
+    /// THE GAP IS NOT ALL RIDERS. `n_open - positions.len()` is every open
+    /// record that produced no row, and `marks::build` produces no row in TWO
+    /// cases: a single-leg directional rider, which has no basket to mark, and a
+    /// two-leg basket it could not price, which it also counts in
+    /// `unpriced_positions`. Its own identity says so —
+    /// `n_open - positions.len() - unpriced_positions == single-leg records` —
+    /// and the first version of this panel published the left-hand side while
+    /// calling it the right-hand one. An unmarkable basket is money sitting at a
+    /// venue; attributing it to a rider is how it stops being looked for.
+    #[test]
+    fn an_unmarkable_basket_is_not_reported_as_a_directional_rider() {
+        let marks = json!({
+            "positions": [{ "liq_value_usd": 42.0 }],
+            "totals": { "n_open": 3, "unpriced_positions": 1 }
+        });
+        let d = deployed(&marks);
+        assert_eq!(d.share_value_usd, Some(42.0));
+        assert_eq!(d.unmarked_records, Some(2), "three open records, one row");
+        assert_eq!(d.unpriced_baskets, Some(1), "one two-leg basket that could not be priced");
+        assert_eq!(d.single_leg_records, Some(1), "and only ONE rider, not two");
+    }
+
+    /// The live file today: 59 open, 58 rows, 0 unpriced. Here the counter
+    /// really does read 0 while a record was in fact dropped, which is why the
+    /// subtraction is published at all — but that is a fact about this file, not
+    /// a rule, and the panel must not state it as one.
     #[test]
     fn a_record_that_was_never_marked_is_reported_even_when_nothing_was_unpriced() {
         let marks = json!({
             "positions": [{ "liq_value_usd": 42.0 }],
             "totals": { "n_open": 2, "unpriced_positions": 0 }
         });
-        let (value, unpriced, unmarked) = deployed(&marks);
-        assert_eq!((value, unpriced), (Some(42.0), 0));
-        assert_eq!(unmarked, Some(1), "one open record produced no row at all");
+        let d = deployed(&marks);
+        assert_eq!(d.unmarked_records, Some(1), "one open record produced no row at all");
+        assert_eq!(d.single_leg_records, Some(1), "and this time it IS the rider");
     }
 
     /// No marks file is UNKNOWN, not zero. A $0.00 under "recoverable" reads as
@@ -1052,7 +1279,11 @@ mod tests {
     /// the engine that writes it is not running.
     #[test]
     fn an_absent_marks_file_reports_unknown_rather_than_a_flat_book() {
-        assert_eq!(deployed(&Value::Null), (None, 0, None));
+        let d = deployed(&Value::Null);
+        assert_eq!(d.share_value_usd, None);
+        assert_eq!(d.unmarked_records, None);
+        assert_eq!(d.unpriced_baskets, None);
+        assert_eq!(d.single_leg_records, None);
     }
 
     /// THE DOUBLE-COUNT TRAP, pinned against the live file's own numbers.
@@ -1092,6 +1323,33 @@ mod tests {
         assert!(engine_balances("--balance kalshi=").is_empty(), "and an empty value is not 0");
     }
 
+    /// `armed_engine` falls back to ANY `arb-trader`, and this host runs an
+    /// unarmed shadow whose `--balance kalshi=340.09` is $0.0004 from this
+    /// dashboard's own `--kalshi-balance 340.0896`. So with the armed slice
+    /// stopped, a column filled from that fallback shows the shadow's constants
+    /// under an armed heading and the one gap here that can fail collapses to
+    /// ~$0: the broken state renders as an all-clear. The column is filled off
+    /// an armed process or not at all, and it always names the unit.
+    #[test]
+    fn the_engine_column_is_filled_off_an_armed_process_or_not_at_all() {
+        let shadow = "arb-trader --balance kalshi=340.09 --balance polymarket_us=349.42 \
+                      --out data/trader-rs/intents.jsonl";
+        let (bal, from) = engine_cash("arbbot-trader-rs", false, Some(shadow));
+        assert!(bal.is_empty(), "340.09 against 340.0896 would have read as agreement");
+        assert!(from.contains("arbbot-trader-rs"), "{from}");
+        assert!(from.contains("NOT armed"), "{from}");
+
+        let armed = "arb-trader --balance kalshi=320.43 --enable-orders --yes-trade-live";
+        let (bal, from) = engine_cash("arbbot-trader-m3", true, Some(armed));
+        assert_eq!(bal, vec![("kalshi".into(), 320.43)]);
+        assert!(from.contains("arbbot-trader-m3"), "{from}");
+        assert!(from.contains("ARMED"), "{from}");
+
+        let (bal, from) = engine_cash("", false, None);
+        assert!(bal.is_empty());
+        assert_eq!(from, "no arb-trader is running");
+    }
+
     /// The two hand-typed constants disagree TODAY — the armed engine spends
     /// against `kalshi=320.43` while this dashboard was started with
     /// `--kalshi-balance 340.0896` — and no page in this repo said so. Either
@@ -1099,35 +1357,193 @@ mod tests {
     /// one cash comparison on the panel that can genuinely fail.
     #[test]
     fn the_engines_balance_and_the_dashboards_are_shown_with_the_gap_between_them() {
-        let r = cash_row("kalshi", Some(320.43), Some(340.0896), None, "no snapshot", None);
+        let m = measured(None, None, VENUE_CASH_STALE_S);
+        let r = cash_row("kalshi", Some(320.43), Some(340.0896), &m);
         assert!((r["dash_diff_usd"].as_f64().expect("a gap") + 19.6596).abs() < 1e-9);
         assert!(r["venue_usd"].is_null(), "and neither constant is dressed up as a measurement");
         assert!(r["venue_diff_usd"].is_null());
         assert!(r["venue_stale"].is_null(), "an unknown age is not a fresh one");
     }
 
-    /// A measured figure carries its age and says STALE past the same hour the
-    /// books page uses. The pm-us snapshot under `data/venue` is 22.7 days old
-    /// and nothing in this repo writes it, so serving it as current would be a
-    /// worse number than the constant beside it, dressed as a better one.
+    /// A measured figure carries its age, says STALE past its own window, and —
+    /// past it — publishes NO gap. The `data/venue` snapshot is 22.7 days old
+    /// and nothing in this repo writes it; a $27 discrepancy against it is not a
+    /// small finding, it is not a finding, and it renders exactly like one.
     #[test]
-    fn a_measured_venue_figure_past_an_hour_is_served_as_stale_not_as_current() {
-        let row = |age| cash_row("polymarket_us", Some(301.92), None, Some(329.29805), "f", age);
+    fn a_measured_figure_past_its_window_is_stale_and_its_gap_is_withheld() {
+        let hour = crate::endpoints::books::SNAPSHOT_STALE_S;
+        let row = |age| cash_row("polymarket_us", Some(301.92), None, &measured(Some(329.29805), age, hour));
         let fresh = row(Some(30));
         assert_eq!(fresh["venue_stale"], false);
         assert!((fresh["venue_diff_usd"].as_f64().expect("a gap") + 27.37805).abs() < 1e-9);
-        assert_eq!(row(Some(1_963_718))["venue_stale"], true, "the live snapshot's own age");
+        let old = row(Some(1_963_718));
+        assert_eq!(old["venue_stale"], true, "the live snapshot's own age");
+        assert_eq!(old["venue_usd"], 329.29805, "the number still shows — that much is true");
+        assert!(old["venue_diff_usd"].is_null(), "the comparison does not");
     }
 
     /// Stale is a THIRD state, not a pass, and an age nobody could establish is
-    /// unknown rather than fresh. Both aged figures on this panel go through
-    /// here: the engine's marks against its own 120s heartbeat, the pm-us
-    /// snapshot against the hour the books page uses.
+    /// unknown rather than fresh. Three aged figures on this panel go through
+    /// here: the engine's marks against its own 120s heartbeat, the venue cash
+    /// snapshot against the 180s the engine expires a reading at, and the
+    /// hand-fetched pm-us snapshot against the hour the books page uses.
     #[test]
     fn a_figure_with_no_age_is_unknown_and_one_past_its_window_says_so() {
         assert_eq!(stale(None, MARKS_STALE_S), None);
         assert_eq!(stale(Some(MARKS_STALE_S), MARKS_STALE_S), Some(false), "the line is exclusive");
         assert_eq!(stale(Some(MARKS_STALE_S + 1), MARKS_STALE_S), Some(true));
+        assert_eq!(stale(Some(VENUE_CASH_STALE_S + 1), VENUE_CASH_STALE_S), Some(true));
+    }
+
+    /// The contract with the engine's cash poll is a PATH and a set of VENUE
+    /// NAMES, and nothing else. Both shapes such a file gets written in read the
+    /// same, `ts` is the read time rather than a venue, and anything this binary
+    /// cannot make a number of measures nothing rather than something wrong.
+    #[test]
+    fn a_venue_cash_snapshot_is_read_by_venue_name_in_either_shape() {
+        let (flat, at) =
+            venue_cash(r#"{"ts": 1755600000.0, "kalshi": 301.11, "polymarket_us": 288.4}"#);
+        assert_eq!(flat.get("kalshi"), Some(&301.11));
+        assert_eq!(flat.len(), 2, "and `ts` did not become a third venue");
+        assert_eq!(at, Some(1755600000.0));
+        assert_eq!(venue_cash(r#"{"balances": {"kalshi": 5.0}}"#).0.get("kalshi"), Some(&5.0));
+        assert!(venue_cash(r#"{"kalshi": "n/a"}"#).0.is_empty(), "not a number, not a balance");
+        assert!(venue_cash("not json").0.is_empty(), "and an unreadable file measures nothing");
+    }
+
+    /// THE MONEY COLUMNS, at the site that emits them. Both figures the panel
+    /// exists to compare, the measured one beside them, and both gaps — nulling
+    /// any of them, or serving one under another's key, fails here.
+    #[test]
+    fn the_money_columns_are_pinned_at_the_site_that_emits_them() {
+        let dir = scratch("emit");
+        std::fs::write(
+            format!("{dir}/exec/venue_cash.json"),
+            format!(
+                r#"{{"ts": {}, "balances": {{"kalshi": 301.11, "polymarket_us": 288.4}}}}"#,
+                now_secs() - 30
+            ),
+        )
+        .expect("a venue cash snapshot");
+        let mut a = Args::for_test();
+        a.data_dir = dir;
+        a.kalshi_balance = Some("340.0896".into());
+        let marks = json!({
+            "positions": [{ "liq_value_usd": 90.0 }, { "liq_value_usd": 42.5 }],
+            "totals": { "n_open": 2, "unpriced_positions": 0 }
+        });
+        let cmd = "arb-trader --balance kalshi=320.43 --balance polymarket_us=301.92 \
+                   --enable-orders --yes-trade-live";
+        let v = derived_capital(&a, &marks, "arbbot-trader-m3", true, Some(cmd));
+
+        assert_eq!(v["share_value_usd"], 132.5, "Σ liq_value_usd, at the key it is served under");
+        assert_eq!(v["unpriced_rows"], 0);
+        assert_eq!(v["unmarked_records"], 0);
+        assert!(v["engine_from"].as_str().expect("provenance").contains("arbbot-trader-m3"));
+
+        let rows = v["cash"].as_array().expect("one row per venue");
+        let k = &rows[0];
+        assert_eq!(k["venue"], "kalshi");
+        assert_eq!(k["engine_usd"], 320.43, "what the armed gate is spending against");
+        assert_eq!(k["dash_usd"], 340.0896, "what this process was started with");
+        assert!((k["dash_diff_usd"].as_f64().expect("the constants' gap") + 19.6596).abs() < 1e-9);
+        assert_eq!(k["venue_usd"], 301.11, "and what the engine last read off the venue");
+        assert_eq!(k["venue_stale"], false);
+        assert!((k["venue_diff_usd"].as_f64().expect("a gap") - 19.32).abs() < 1e-9);
+        assert_eq!(rows[1]["venue_usd"], 288.4, "the other venue is measured too");
+    }
+
+    /// With the armed slice stopped, `armed_engine` hands this panel the SHADOW.
+    /// Nothing of the shadow's may appear in a money column: its `kalshi=340.09`
+    /// against `--kalshi-balance 340.0896` is a $0.0004 gap, which renders as
+    /// agreement, on a panel whose entire job is to show that gap.
+    #[test]
+    fn a_shadows_constants_never_fill_a_column_the_page_heads_as_armed() {
+        let dir = scratch("shadow");
+        let mut a = Args::for_test();
+        a.data_dir = dir;
+        a.kalshi_balance = Some("340.0896".into());
+        let shadow = "arb-trader --balance kalshi=340.09 --balance polymarket_us=349.42 \
+                      --out data/trader-rs/intents.jsonl";
+        let v = derived_capital(&a, &Value::Null, "arbbot-trader-rs", false, Some(shadow));
+        let k = &v["cash"].as_array().expect("rows")[0];
+        assert_eq!(k["venue"], "kalshi");
+        assert!(k["engine_usd"].is_null(), "no risk gate is spending against this");
+        assert!(k["dash_diff_usd"].is_null(), "so there is no gap, not a $0.0004 one");
+        assert!(v["engine_from"].as_str().expect("provenance").contains("NOT armed"));
+    }
+
+    /// `data/venue/` has had no writer for 22.7 days, so the measured side of
+    /// this panel only becomes real when the armed engine publishes what its
+    /// cash poll reads. Aged off the reading's OWN timestamp: a writer that
+    /// rewrites the file after a failed poll keeps the mtime fresh while the
+    /// number under it ages. Past the window the engine itself stops spending
+    /// against a reading, so the gap goes, and the reading is served as stale.
+    #[test]
+    fn an_expired_venue_reading_is_served_as_stale_and_aged_off_its_own_timestamp() {
+        let dir = scratch("expired");
+        std::fs::write(
+            format!("{dir}/exec/venue_cash.json"),
+            format!(r#"{{"ts": {}, "kalshi": 301.11}}"#, now_secs() - 4 * 3600),
+        )
+        .expect("a venue cash snapshot");
+        let mut a = Args::for_test();
+        a.data_dir = dir;
+        let v = derived_capital(&a, &Value::Null, "u", true, Some("--balance kalshi=320.43"));
+        let k = &v["cash"].as_array().expect("rows")[0];
+        assert_eq!(k["venue_usd"], 301.11, "the number still shows — that much is true");
+        assert_eq!(k["venue_stale"], true);
+        assert!(k["venue_age_s"].as_u64().expect("an age") >= 4 * 3600, "not the file's mtime");
+        assert!(k["venue_diff_usd"].is_null(), "a gap against an expired reading is not a finding");
+        assert!(k["venue_from"].as_str().expect("provenance").ends_with("· ts"));
+    }
+
+    /// And with no snapshot at all — the state this repo has been in since
+    /// 2026-07-27 — the measured side says it is unavailable and NAMES the file
+    /// that would fill it, rather than showing a three-week-old number or a $0.
+    #[test]
+    fn with_no_snapshot_the_measured_side_says_unavailable_rather_than_guessing() {
+        let dir = scratch("nosnap");
+        let mut a = Args::for_test();
+        a.data_dir = dir.clone();
+        a.kalshi_balance = Some("340.0896".into());
+        let v = derived_capital(&a, &Value::Null, "u", true, Some("--balance kalshi=320.43"));
+        let k = &v["cash"].as_array().expect("rows")[0];
+        assert!(k["venue_usd"].is_null());
+        assert!(k["venue_diff_usd"].is_null());
+        assert!(k["venue_stale"].is_null(), "unknown is not fresh");
+        let from = k["venue_from"].as_str().expect("a reason");
+        assert!(from.contains(&format!("{dir}/exec/venue_cash.json")), "{from}");
+        assert!(from.contains("does not exist"), "{from}");
+        assert!(v["share_value_usd"].is_null(), "and no marks file is unknown, not a flat book");
+    }
+
+    /// The payload itself, over real files. The `derived` block is what this
+    /// whole panel was added for and nothing reached it: `Args::for_test` points
+    /// every path at `/nonexistent`, so `json()` could serve any number here, or
+    /// none, and the suite stayed green.
+    #[test]
+    fn the_capital_payload_carries_the_derived_figures_over_real_files() {
+        let dir = scratch("payload");
+        std::fs::write(
+            format!("{dir}/exec/marks.json"),
+            json!({
+                "positions": [{ "liq_value_usd": 90.0 }, { "liq_value_usd": null }],
+                "totals": { "cost_usd": 150.0, "n_open": 4, "unpriced_positions": 1 }
+            })
+            .to_string(),
+        )
+        .expect("a marks file");
+        let mut a = Args::for_test();
+        a.data_dir = dir;
+        let v: Value = serde_json::from_str(&json(&a)).expect("a payload");
+        let c = &v["capital"]["derived"];
+        assert_eq!(c["share_value_usd"], 90.0, "Σ liq_value_usd, not totals.cost_usd");
+        assert_eq!(c["unpriced_rows"], 1, "the row with no bid to liquidate into");
+        assert_eq!(c["unmarked_records"], 2, "four open records, two rows");
+        assert_eq!(c["unpriced_baskets"], 1, "one of the two is a basket that could not price");
+        assert_eq!(c["single_leg_records"], 1, "and only the OTHER one is a rider");
+        assert_eq!(v["capital"]["marks_stale"], false, "written a moment ago");
     }
 
     /// `topic_of` is arb-core's, so a position is bucketed exactly the way the
