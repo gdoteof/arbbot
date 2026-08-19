@@ -1688,16 +1688,50 @@ fn publish_balances(path: &str, pairs: &[(String, String)]) -> Result<(), String
             .map(|d| d.as_secs())
             .unwrap_or(0),
         "max_age_s": risk::BALANCE_MAX_AGE.as_secs(),
+        // WHOSE snapshot this is. Without it a reader has a figure and an age and
+        // must GUESS the rest, and three review rounds on the dashboard found
+        // three different ways that guess is wrong: it cannot tell a reading this
+        // process is spending against from one a DEAD process left behind, and it
+        // cannot tell a build that polls from one that never could — a binary
+        // predating the poll writes no file at all, which is indistinguishable at
+        // the reader from a poll whose first cycle is merely outstanding.
+        //
+        // NO `source` FIELD, and the attempt to add one is why this comment is
+        // long. `RiskView::balances_source` was published here for one draft, and
+        // it is a TAUTOLOGY at this call site: `publish_balances` runs only inside
+        // the `Ok` branch, after a successful install, so the answer is always
+        // "live" and a reader learns nothing. `at` + `max_age_s` already answer
+        // "is this figure still good"; what they cannot answer is WHOSE it is,
+        // and that is the only thing this adds.
+        "pid": std::process::id(),
+        "started_at": *PROCESS_STARTED_AT,
         "balances": pairs.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(),
     });
     marks::write_atomic(path, &format!("{body}\n"))
 }
+
+/// Unix seconds at which this process began. Captured once, so every snapshot
+/// this run writes carries the SAME identity — a reader comparing two snapshots
+/// can tell "the same engine refreshed it" from "a different engine replaced it",
+/// which is the distinction an mtime cannot make across a restart.
+static PROCESS_STARTED_AT: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+});
 
 /// The periodic loop. Runs until the process exits.
 async fn balance_loop(
     risk: std::sync::Arc<risk::RiskView>,
     kalshi: std::sync::Arc<dyn sink::OrderSink>,
     pmus: std::sync::Arc<dyn sink::OrderSink>,
+    // A PARAMETER so the publish CALL SITE is reachable from a test. It was a
+    // const, and with it a const the only thing a test could reach was
+    // `publish_balances` itself — which is why hardcoding the source argument
+    // here passed all 521 tests. The file's claim about what the gate is
+    // spending against is decided on this line, not in the writer.
+    snapshot: &str,
 ) {
     // `tokio::time::interval`'s first tick is ready immediately, and that is
     // wanted: until it lands the gate is spending against the `--balance` seed,
@@ -1733,9 +1767,9 @@ async fn balance_loop(
                     );
                     last = Some(pairs.clone());
                 }
-                if let Err(e) = publish_balances(BALANCE_SNAPSHOT, &pairs) {
+                if let Err(e) = publish_balances(snapshot, &pairs) {
                     eprintln!("[balance] snapshot not published ({e}) — the GATE is fed; \
-                               only the readers of {BALANCE_SNAPSHOT} are blind");
+                               only the readers of {snapshot} are blind");
                 }
             }
             Err(e) => eprintln!(
@@ -1797,7 +1831,7 @@ fn spawn_balance_poll(
     // scheduled. Until this call the declaration never expires, which is right
     // for a run that holds no credentials and wrong for this one.
     rv.expect_live_balances();
-    tokio::spawn(balance_loop(rv.clone(), k.clone(), p.clone()));
+    tokio::spawn(balance_loop(rv.clone(), k.clone(), p.clone(), BALANCE_SNAPSHOT));
 }
 
 fn spawn_positions_recon(
@@ -3698,6 +3732,56 @@ mod balance_poll_tests {
             "a reader must not have to re-transcribe the gate's bound"
         );
         assert!(v["at"].as_u64().expect("at") > 1_700_000_000, "a wall clock, so it can be aged");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// **A SNAPSHOT SAYS WHOSE IT IS, so no reader has to guess.**
+    ///
+    /// The defect this prevents was found by three separate adversarial rounds on
+    /// the dashboard, each time wearing different clothes, because each time the
+    /// reader was inferring from an age what only the writer knows:
+    ///
+    ///   * a reading left behind by a process that has since DIED reads, at the
+    ///     reader, exactly like one the running engine is spending against — an
+    ///     mtime cannot separate them across a restart, and `started_at` can;
+    ///   * a `source` field was tried here and REMOVED as a tautology: this file
+    ///     is written only inside the poll's `Ok` branch, so the gate's own word
+    ///     for its state is always "live" at the moment of writing and a reader
+    ///     learns nothing from it. Whether the figure is still good is `at` +
+    ///     `max_age_s`, which a reader can evaluate for itself; the `balances_source`
+    ///     gauge is where the gate's CURRENT state is honestly readable;
+    ///   * a build PREDATING the poll writes no file at all, which at the reader
+    ///     is indistinguishable from a poll whose first cycle is merely
+    ///     outstanding. That one an absent file genuinely cannot resolve — but a
+    ///     PRESENT file now resolves itself, which is the half that was inferable
+    ///     and wrong.
+    #[test]
+    fn a_snapshot_names_its_source_and_the_process_that_wrote_it() {
+        let d = std::env::temp_dir().join(format!("arbbot-bal-prov-{}", std::process::id()));
+        let path = d.join("balances.json");
+        let p = path.to_str().expect("utf8");
+        publish_balances(p, &[("kalshi".to_string(), "1".to_string())])
+            .expect("published");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(p).expect("read")).expect("json");
+        assert_eq!(
+            v["pid"].as_u64().expect("pid"),
+            u64::from(std::process::id()),
+            "so a reader can ask whether that process is still alive"
+        );
+        assert!(
+            v["started_at"].as_u64().expect("started_at") > 1_700_000_000,
+            "and tell one run of it from the next"
+        );
+
+        // Rewritten by the same process: the identity is STABLE, which is what
+        // makes "the same engine refreshed it" a distinguishable observation.
+        let first = v["started_at"].as_u64().expect("started_at");
+        publish_balances(p, &[("kalshi".to_string(), "2".to_string())])
+            .expect("published again");
+        let v2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(p).expect("read")).expect("json");
+        assert_eq!(v2["started_at"].as_u64().expect("started_at"), first);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
