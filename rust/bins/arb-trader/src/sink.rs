@@ -1120,4 +1120,30 @@ mod tests {
         )
         .is_err());
     }
+
+    /// THE ONE LINE THAT CONNECTS THE LIVE GATEWAYS TO THE CASH POLL, pinned.
+    /// Drop `spendable_cash` from the blanket impl above and everything still
+    /// compiles and links — the trait's own default answers instead, so every
+    /// cycle of `main::balance_loop` abandons on `NotWired` for ever, the armed
+    /// engine spends the `--balance` seed until it expires, and then refuses
+    /// everything. A delegation nothing exercises is a wire nothing tugs on.
+    ///
+    /// Asked through `Arc<dyn OrderSink>` because that is exactly what the poll
+    /// holds: it is the object-safe vtable that has to carry the answer, and
+    /// calling the gateway's own inherent method would prove nothing about it.
+    #[test]
+    fn the_cash_read_reaches_the_gateway_through_the_sink_vtable() {
+        let mock = Mock {
+            replies: Mutex::new(vec![(200, r#"{"balance_dollars":"320.4300"}"#.to_string())]),
+            sent: Mutex::new(Vec::new()),
+        };
+        let s: std::sync::Arc<dyn OrderSink> = std::sync::Arc::new(
+            KalshiGateway::with_transport(signer(), RateLimiter::from_per_minute(600.0, 0), mock),
+        );
+        assert_eq!(
+            s.spendable_cash().expect("the gateway answered"),
+            "320.4300",
+            "the sink must hand back the venue's figure, not the NotWired default"
+        );
+    }
 }

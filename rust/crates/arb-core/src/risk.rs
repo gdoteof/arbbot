@@ -211,6 +211,36 @@ fn lookup(cx: &mut Ctx, pairs: &[(String, String)], key: &str, zero: D) -> D {
     zero
 }
 
+/// Would [`check_order`] survive being handed this string as a venue balance?
+///
+/// THE FOLD CANNOT REFUSE ONE, and that is deliberate: `lookup` reads balances
+/// with `Ctx::parse`, which `.expect`s, because this is a pinned decision fold
+/// whose digests are the evidence that a refactor changed no decision — making
+/// its arithmetic fallible would rewrite every caller of it. So the check
+/// belongs at the BOUNDARY, and it lives here rather than at that boundary so
+/// it cannot drift from the parse it protects.
+/// `arb_trader::risk::RiskView::set_live_balances` is what asks: since the
+/// trader started polling venues, the balances this fold reads arrive on a wire
+/// rather than off the command line.
+///
+/// FINITE, not merely parseable, and that half is the one that bites.
+/// decNumber's string conversion accepts "Infinity" and "NaN" (and, case
+/// -insensitively, "inf"), so neither PANICS — verified 2026-08-19 against the
+/// fold itself and pinned by the tests below: a balance of "Infinity" comes
+/// back ALLOWED WITH NO REASONS, so a three-byte body would authorise every
+/// order the caps had not already refused, while "NaN" refuses everything and
+/// renders `insufficient kalshi balance: 5 > NaN` as its explanation.
+///
+/// A FRESH CONTEXT PER STRING, and that is not tidiness. `Context::parse`
+/// reports failure by reading a STICKY status flag, so a context that has once
+/// seen an unparseable string answers `Err` for every good one after it —
+/// checking both venues' figures on one context would reject Polymarket's
+/// perfectly good number because Kalshi's was malformed.
+pub fn is_usable_balance(s: &str) -> bool {
+    let mut cx = Ctx::new();
+    matches!(cx.even.parse(s), Ok(d) if d.is_finite())
+}
+
 // ---------- the fold ----------
 
 /// Port of `RiskManager.check_order`: gate one new basket. Every reason string
@@ -494,6 +524,53 @@ mod tests {
         let d = check_order(&inp);
         assert!(!d.allowed);
         assert_eq!(d.max_notional, "0");
+    }
+
+    /// WHY THE BOUNDARY OWES THE FOLD A CHECK, half one: a balance string this
+    /// crate cannot parse does not produce a refusal, it produces a PANIC — in
+    /// the armed trader's decision path, on a string a venue put on the wire.
+    /// `is_usable_balance` exists to make sure one never gets this far, and
+    /// this is the behaviour it is protecting against.
+    #[test]
+    #[should_panic(expected = "decimal string")]
+    fn a_balance_the_fold_cannot_parse_panics_it() {
+        let mut inp = base();
+        inp.balances = vec![("kalshi".into(), "temporarily unavailable".into())];
+        let _ = check_order(&inp);
+    }
+
+    /// Half two, and the worse half. "Infinity" PARSES, so it never reaches the
+    /// panic above — it sails through the cash check and the order is ALLOWED
+    /// WITH NO REASONS. A gate whose whole job is to refuse when the money has
+    /// run out is turned all the way open by a three-byte body. That is why the
+    /// predicate demands a FINITE decimal and not merely a parseable one.
+    #[test]
+    fn an_infinite_balance_would_authorise_every_order() {
+        let mut inp = base();
+        inp.balances = vec![("kalshi".into(), "Infinity".into())];
+        let d = check_order(&inp);
+        assert!(d.allowed, "{:?}", d.reasons);
+        assert!(d.reasons.is_empty(), "{:?}", d.reasons);
+        assert!(!is_usable_balance("Infinity"), "so the boundary must refuse it");
+    }
+
+    /// What the predicate answers, in the shapes a venue can actually hand us:
+    /// a real figure, a body that is not a number at all, an empty field, and
+    /// the two non-finite spellings decNumber accepts.
+    ///
+    /// The last pair is the sticky-status trap: `Context::parse` reports
+    /// failure through a flag that is never cleared, so a shared context would
+    /// answer `Err` for "1.00" merely because "abc" was checked before it.
+    #[test]
+    fn only_a_finite_decimal_is_a_usable_balance() {
+        assert!(is_usable_balance("320.4300"));
+        assert!(is_usable_balance("0"));
+        assert!(!is_usable_balance("abc"));
+        assert!(!is_usable_balance(""));
+        assert!(!is_usable_balance("NaN"));
+        assert!(!is_usable_balance("inf"));
+        assert!(!is_usable_balance("abc"));
+        assert!(is_usable_balance("1.00"), "a bad figure must not poison the next check");
     }
 
     #[test]

@@ -1457,16 +1457,21 @@ impl Engine {
             // leak, which ratchets the caps shut and stops all trading.
             "risk_reserved": self.cfg.risk.as_ref().map(|r| r.reserved_ct()).unwrap_or(0.0),
             // Where the per-venue cash gate's numbers come from right now:
-            // `declared` (--balance — the shadow, and an armed run's first
-            // round trip), `live`, or `stale`. `stale` refuses EVERY order, and
-            // without this gauge that is indistinguishable from a quiet market.
+            // `declared` (--balance on a run that will never poll — bench and
+            // the shadow), `seed` (--balance on an armed run whose first cycle
+            // has not landed), `live`, or `stale`. `stale` refuses EVERY order,
+            // and without this gauge that is indistinguishable from a quiet
+            // market — and it does more than refuse: a refusal that persists
+            // pulls resting quotes too (`risk::BALANCE_MAX_AGE`).
             "balances_source":
                 self.cfg.risk.as_ref().map(|r| r.balances_source()).unwrap_or("none"),
             // Seconds since the venues were last read; -1 = never, which is
             // bench, the shadow, and the window before the first poll returns.
             // Read it WITH the line above: `live` while this climbs toward
             // `risk::BALANCE_MAX_AGE` is a poll that has started failing, and
-            // the `[balance] CYCLE ABANDONED` lines say why.
+            // the `[balance] CYCLE ABANDONED` lines say why. `stale` at -1 is
+            // sharper still — a poll that has NEVER once succeeded, so suspect
+            // credentials rather than the venue.
             "balances_age_s": self.cfg.risk.as_ref().map(|r| r.balances_age_s()).unwrap_or(-1),
             // Cancels the engine has DECIDED and the venue has not yet
             // confirmed: waiting on an ack to become addressable, on the wire,

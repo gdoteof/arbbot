@@ -52,8 +52,8 @@ struct Exposure {
 /// reprice REPLACES its own reservation rather than stacking a second one.
 type Slot = (String, String, BookSide);
 
-/// How old a LIVE balance reading may be and still authorise spending. Three
-/// poll cycles (`main::BALANCE_POLL` is 60s).
+/// How old a balance figure may be and still authorise spending, whatever its
+/// provenance. Three poll cycles (`main::BALANCE_POLL` is 60s).
 ///
 /// `maker_exit::VIEW_MAX_AGE`'s number and its reasoning: one missed cycle is
 /// ordinary — a 503, a background token bucket spent by the fill
@@ -62,10 +62,28 @@ type Slot = (String, String, BookSide);
 /// cash have we got" from a venue that has not spoken in three minutes is not
 /// the last number it gave.
 ///
-/// FAIL-CLOSED, and affordable HERE for the reason [`RiskGate::check`] states
-/// about itself: it gates OPENING only, and the hedge path consults risk
-/// nowhere. An expired reading therefore costs entries and can never strand a
-/// leg.
+/// WHAT EXPIRY ACTUALLY COSTS (retracting this comment's own first draft, which
+/// said "costs entries and can never strand a leg" and was half right). The
+/// second half stands: [`RiskGate::check`] gates OPENING, the hedge path
+/// consults risk nowhere, so no leg can be left half-done by a refusal. The
+/// first half was too kind. A refusal does not merely withhold NEW quotes —
+/// `arb_core::quoter` starts a clock on any (leg, side) that wants to move its
+/// price while the gate refuses, and after `CAP_REFUSAL_PULL_S` (30s) of that
+/// it CANCELS the resting order rather than leave it fillable at a price the
+/// quoter has rejected (pinned by
+/// `quoter::risk_gate_tests::a_cap_refusal_that_outlives_the_pull_delay_pulls_the_stale_quote`).
+/// So past this bound the book does not go quiet, it goes progressively FLAT:
+/// every quote whose fair price drifts for 30 continuous seconds comes off, one
+/// cancel each. Only quotes the book still agrees with survive, and they
+/// survive precisely because they are not stale.
+///
+/// The bound stays 180s in light of that, and the asymmetry is why. De-quoting
+/// is recoverable and self-reversing — the moment a reading lands, every side
+/// re-posts on its next book event — whereas spending against a figure that has
+/// stopped tracking the account is the C13 defect this whole path exists to
+/// remove, and it is not recoverable: the money is gone. A shorter bound would
+/// pull the book on an ordinary 503; a longer one buys quoting time with
+/// somebody else's cash.
 pub const BALANCE_MAX_AGE: Duration = Duration::from_secs(180);
 
 /// Where the cash the gate spends against came from.
@@ -75,13 +93,40 @@ pub const BALANCE_MAX_AGE: Duration = Duration::from_secs(180);
 /// tempting collapse here is "fall back to `--balance` when the poll goes
 /// quiet", which re-arms the exact defect the poll was added to remove the
 /// moment the endpoint flaps, and does it silently.
+///
+/// AND "NOBODY IS POLLING" IS NOT "THE POLL HAS NOT ANSWERED YET", which is the
+/// second split and the reason there are three variants rather than two. An
+/// armed run that expects a reading and has never got one is in trouble; a
+/// bench, a replay or the unarmed shadow is not, because it holds no
+/// credentials and was never going to poll anything.
 enum Cash {
-    /// `--balance`, hand-typed on the command line. It carries no age because
-    /// there is nothing to age it against: it is a declaration, not a reading.
-    /// This is the unarmed shadow's ONLY source — it holds no credentials — and
-    /// on an armed run it is the seed that covers the window before the first
-    /// poll returns, which is one venue round trip.
+    /// `--balance`, hand-typed on the command line, on a run where NOTHING is
+    /// expected to replace it: bench, replay, and the unarmed shadow, none of
+    /// which hold credentials. It carries no age because there is nothing to
+    /// age it against — no reading is coming — so it never expires. That is not
+    /// a hole in the fail-closed rule: those runs place no orders at all, or
+    /// place them against a declaration an operator typed knowing it was one.
     Declared(Vec<(String, String)>),
+    /// `--balance` on a run that IS polling and has not yet been answered.
+    /// `since` is when the poll was armed, and the seed expires at
+    /// [`BALANCE_MAX_AGE`] like any other figure.
+    ///
+    /// WITHOUT THIS THE FAIL-CLOSED GUARANTEE DID NOT EXIST UNTIL THE FIRST
+    /// SUCCESSFUL POLL. `Declared` never ages, so an armed run whose poll never
+    /// once succeeded — wrong credentials, a dead endpoint, a geoblock — sat on
+    /// the hand-typed C13 constant for as long as it stayed up, which is
+    /// exactly the defect the poll was added to remove, and the gauges called
+    /// it `declared` as though that were fine.
+    ///
+    /// The bound is [`BALANCE_MAX_AGE`] and not something shorter even though
+    /// the seed is only meant to cover ONE venue round trip (the first interval
+    /// tick fires immediately). One number, one rule: the gate never spends
+    /// against a figure nothing has refreshed in three minutes, and it does not
+    /// matter whether that figure came from a venue or from a command line. A
+    /// tighter bound here would also punish a slow first cycle harder than it
+    /// punishes an endpoint that died after answering once, which is backwards
+    /// — the second run has at least proved the credentials work.
+    Seed { pairs: Vec<(String, String)>, since: Instant },
     /// What the venues themselves last said, and when they said it.
     Live { pairs: Vec<(String, String)>, at: Instant },
 }
@@ -477,15 +522,32 @@ impl RiskView {
     }
 
     /// The cash the gate may spend right now, and NOTHING else: an expired
-    /// live reading yields no pairs at all, so `arb_core::risk`'s `lookup`
-    /// reads $0 for every venue and the existing `insufficient <venue> balance`
-    /// refusal fires unchanged. There is deliberately no fall back to
-    /// `--balance` here — see [`Cash`].
+    /// figure yields no pairs at all, so `arb_core::risk`'s `lookup` reads $0
+    /// for every venue and the existing `insufficient <venue> balance` refusal
+    /// fires unchanged. There is deliberately no fall back to `--balance` from
+    /// an expired reading, and no exemption for a seed that was never
+    /// answered — see [`Cash`].
     fn spendable(&self) -> Vec<(String, String)> {
         match &*self.balances.lock().expect("balances") {
             Cash::Declared(pairs) => pairs.clone(),
+            Cash::Seed { pairs, since } if since.elapsed() <= BALANCE_MAX_AGE => pairs.clone(),
             Cash::Live { pairs, at } if at.elapsed() <= BALANCE_MAX_AGE => pairs.clone(),
-            Cash::Live { .. } => Vec::new(),
+            Cash::Seed { .. } | Cash::Live { .. } => Vec::new(),
+        }
+    }
+
+    /// A poll IS coming, so start ageing the `--balance` seed against its
+    /// arrival. `main::spawn_balance_poll` calls this once, when it has the
+    /// sinks that make polling possible; nothing else may, because nothing else
+    /// can promise the reading.
+    ///
+    /// Only from [`Cash::Declared`]: this is a statement about what the process
+    /// is going to do, not a way to un-age a live reading, and re-arming it
+    /// over a `Live` would hand an expired figure a fresh three minutes.
+    pub fn expect_live_balances(&self) {
+        let mut g = self.balances.lock().expect("balances");
+        if let Cash::Declared(pairs) = &*g {
+            *g = Cash::Seed { pairs: pairs.clone(), since: Instant::now() };
         }
     }
 
@@ -493,8 +555,33 @@ impl RiskView {
     /// only caller, and it calls this only with a reading for BOTH of them:
     /// writing one venue's figure alone would leave the other at $0 and close
     /// every basket, since `venue_costs` charges both legs.
-    pub fn set_live_balances(&self, pairs: Vec<(String, String)>) {
+    ///
+    /// IT REFUSES A FIGURE THE FOLD COULD NOT READ BACK, and the `Err` is the
+    /// point: these strings are venue-controlled — they are whatever
+    /// `balance_dollars` and `buyingPower` held on the wire — and
+    /// `arb_core::risk` parses them with an `.expect`, so installing an
+    /// unparseable one panics the armed engine at the next quote, and
+    /// installing "Infinity" (which parses) opens the gate all the way. See
+    /// [`arb_core::risk::is_usable_balance`], which owns both facts. A reading
+    /// that is not a usable decimal is a FAILED POLL, not a balance: nothing is
+    /// installed, the previous figure keeps ageing, and the caller reports it
+    /// like any other abandoned cycle.
+    ///
+    /// `num` above enforces the identical rule on the caps, and deliberately
+    /// not with the identical code: it screens YAML an operator typed and can
+    /// afford `f64`, having trimmed the whitespace that costs it. These strings
+    /// are not typed by anyone and cannot be second-guessed, so this one asks
+    /// libdecnumber itself — the parser that will actually read them — and the
+    /// two answers differ at the edges in both directions ("1e400" is a finite
+    /// decimal to one and an infinity to the other).
+    pub fn set_live_balances(&self, pairs: Vec<(String, String)>) -> Result<(), String> {
+        if let Some((v, b)) =
+            pairs.iter().find(|(_, b)| !arb_core::risk::is_usable_balance(b))
+        {
+            return Err(format!("{v} answered {b:?}, which is not an amount of money"));
+        }
         *self.balances.lock().expect("balances") = Cash::Live { pairs, at: Instant::now() };
+        Ok(())
     }
 
     /// Seconds since the venues were last read; `-1` = never, which covers
@@ -504,22 +591,32 @@ impl RiskView {
     /// call for different responses.
     pub fn balances_age_s(&self) -> i64 {
         match &*self.balances.lock().expect("balances") {
-            Cash::Declared(_) => -1,
+            Cash::Declared(_) | Cash::Seed { .. } => -1,
             Cash::Live { at, .. } => at.elapsed().as_secs() as i64,
         }
     }
 
-    /// What the gate is spending against RIGHT NOW: `declared` (`--balance`),
-    /// `live`, or `stale`.
+    /// What the gate is spending against RIGHT NOW: `declared` (`--balance` on
+    /// a run that will never poll), `seed` (`--balance` on a run whose poll has
+    /// not answered yet), `live`, or `stale`.
     ///
     /// `stale` refuses every order, and without a gauge saying so that is
     /// indistinguishable from a quiet market — `describe()` prints once at
     /// startup and never again, so nothing else would ever report it.
+    ///
+    /// A SEED THAT EXPIRED REPORTS `stale` TOO, deliberately: it means the same
+    /// thing to the operator — the gate is refusing because nothing has
+    /// refreshed its figure — and folding it in keeps the alarm one word.
+    /// [`Self::balances_age_s`] is what separates the two cases, and it is
+    /// worth separating: `stale` with an age of `-1` is a poll that has NEVER
+    /// once succeeded (credentials, geoblock, a URL that moved), while `stale`
+    /// with a number is one that worked and then stopped.
     pub fn balances_source(&self) -> &'static str {
         match &*self.balances.lock().expect("balances") {
             Cash::Declared(_) => "declared",
+            Cash::Seed { since, .. } if since.elapsed() <= BALANCE_MAX_AGE => "seed",
             Cash::Live { at, .. } if at.elapsed() <= BALANCE_MAX_AGE => "live",
-            Cash::Live { .. } => "stale",
+            Cash::Seed { .. } | Cash::Live { .. } => "stale",
         }
     }
 
@@ -935,16 +1032,21 @@ mod tests {
         assert!(d.allowed, "{:?}", d.reasons);
     }
 
-    /// Backdate a live reading, since nothing else can make one age inside a
-    /// test. Reaches into the private field rather than adding a production
-    /// setter that only tests would ever call.
-    fn age_the_live_reading(v: &RiskView, by: Duration) {
+    /// Backdate whatever figure the view is holding, since nothing else can
+    /// make one age inside a test. Reaches into the private field rather than
+    /// adding a production setter that only tests would ever call.
+    ///
+    /// A `Declared` has nothing to backdate, and that is the whole distinction
+    /// [`Cash`] draws: a run nobody is polling holds a declaration, not a
+    /// reading, and no clock runs against it.
+    fn age_the_reading(v: &RiskView, by: Duration) {
         let mut g = v.balances.lock().expect("balances");
-        let pairs = match &*g {
-            Cash::Live { pairs, .. } => pairs.clone(),
-            Cash::Declared(_) => panic!("nothing has been polled yet"),
+        let then = Instant::now().checked_sub(by).expect("monotonic");
+        *g = match &*g {
+            Cash::Live { pairs, .. } => Cash::Live { pairs: pairs.clone(), at: then },
+            Cash::Seed { pairs, .. } => Cash::Seed { pairs: pairs.clone(), since: then },
+            Cash::Declared(_) => panic!("a declaration has no age to move"),
         };
-        *g = Cash::Live { pairs, at: Instant::now().checked_sub(by).expect("monotonic") };
     }
 
     /// The C13 defect itself: `--balance` is hand-typed and never decremented,
@@ -958,7 +1060,8 @@ mod tests {
         v.set_live_balances(vec![
             ("kalshi".into(), "0.42".into()),
             ("polymarket_us".into(), "1000".into()),
-        ]);
+        ])
+        .expect("a usable reading");
         let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
         assert!(!d.allowed, "the declared figure must not outvote the venue");
         assert!(
@@ -979,7 +1082,8 @@ mod tests {
         v.set_live_balances(vec![
             ("kalshi".into(), "1000".into()),
             ("polymarket_us".into(), "1000".into()),
-        ]);
+        ])
+        .expect("a usable reading");
         let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
         assert!(d.allowed, "{:?}", d.reasons);
     }
@@ -995,9 +1099,10 @@ mod tests {
         v.set_live_balances(vec![
             ("kalshi".into(), "1000".into()),
             ("polymarket_us".into(), "1000".into()),
-        ]);
+        ])
+        .expect("a usable reading");
         assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
-        age_the_live_reading(&v, BALANCE_MAX_AGE + Duration::from_secs(1));
+        age_the_reading(&v, BALANCE_MAX_AGE + Duration::from_secs(1));
         let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
         assert!(!d.allowed, "a reading nobody is refreshing must not authorise spending");
         assert!(
@@ -1016,24 +1121,127 @@ mod tests {
         v.set_live_balances(vec![
             ("kalshi".into(), "1000".into()),
             ("polymarket_us".into(), "1000".into()),
-        ]);
-        age_the_live_reading(&v, BALANCE_MAX_AGE - Duration::from_secs(1));
+        ])
+        .expect("a usable reading");
+        age_the_reading(&v, BALANCE_MAX_AGE - Duration::from_secs(1));
         assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
+    }
+
+    /// THE FAIL-CLOSED GUARANTEE HAS TO EXIST BEFORE THE FIRST SUCCESSFUL
+    /// POLL, TOO. An armed run that expects a reading and never gets one — bad
+    /// credentials, a moved URL, a venue that geoblocks us — used to sit on the
+    /// hand-typed `--balance` constant for as long as it stayed up, spending
+    /// against a number that never moved. That is the C13 defect itself, and
+    /// "the poll is wired up" is not a fix for it if the poll never lands.
+    #[test]
+    fn an_armed_run_whose_poll_never_answers_stops_spending_the_declaration() {
+        let v = funded("low"); // --balance says both venues hold $1000
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
+        v.expect_live_balances();
+        assert!(
+            v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed,
+            "the seed still covers the first round trip"
+        );
+        age_the_reading(&v, BALANCE_MAX_AGE + Duration::from_secs(1));
+        let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
+        assert!(!d.allowed, "a promised reading that never came must not keep the seed alive");
+        assert!(
+            d.reasons.iter().any(|r| r.contains("insufficient kalshi balance")),
+            "{:?}",
+            d.reasons
+        );
+    }
+
+    /// ...AND DO NOT OVERCORRECT. Bench, replay and the unarmed shadow hold no
+    /// credentials: they are unpollable, not broken, and their `--balance` is a
+    /// declaration an operator typed knowing it was one. Nothing ages it —
+    /// there is no reading it is waiting for — and the only thing that can
+    /// start it ageing is the poll announcing that one is coming.
+    #[test]
+    fn a_declaration_ages_only_once_a_poll_has_promised_to_replace_it() {
+        let v = funded("low");
+        assert_eq!(v.balances_source(), "declared");
+        assert!(
+            matches!(&*v.balances.lock().expect("balances"), Cash::Declared(_)),
+            "an unpollable run holds a declaration, which has no clock to run out"
+        );
+        v.expect_live_balances();
+        assert_eq!(v.balances_source(), "seed");
+
+        // ...and that promise is about the FUTURE, not a way to un-age the
+        // past: re-arming over a reading that has expired must not hand it
+        // three fresh minutes by falling back to the command line.
+        v.set_live_balances(vec![("kalshi".into(), "1000".into())]).expect("usable");
+        age_the_reading(&v, BALANCE_MAX_AGE + Duration::from_secs(1));
+        v.expect_live_balances();
+        assert_eq!(v.balances_source(), "stale");
+    }
+
+    /// A READING THAT IS NOT A NUMBER IS A FAILED POLL. These strings are
+    /// venue-controlled, and `arb_core::risk` parses them with an `.expect`, so
+    /// installing this body would not refuse an order — it would PANIC the
+    /// armed engine at the very next quote. Nothing is installed, the previous
+    /// figure goes on ageing, and the caller reports the cycle abandoned.
+    #[test]
+    fn a_reading_that_is_not_a_number_is_a_failed_poll_and_not_a_balance() {
+        let v = funded("low");
+        v.expect_live_balances();
+        let e = v
+            .set_live_balances(vec![
+                ("kalshi".into(), "320.4300".into()),
+                ("polymarket_us".into(), "<html>502 Bad Gateway</html>".into()),
+            ])
+            .expect_err("a gateway error page is not an amount of money");
+        assert!(e.contains("polymarket_us"), "{e}");
+        assert_eq!(v.balances_source(), "seed", "nothing was installed");
+        assert_eq!(v.balances_age_s(), -1, "and no reading was recorded");
+        // The check that would have panicked.
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
+    }
+
+    /// The same rule, in the direction that spends money rather than crashing.
+    /// "Infinity" PARSES — decNumber accepts it — so it never reaches the panic
+    /// above; it reaches the cash comparison and wins it, and a gate whose only
+    /// job is to refuse when the money runs out is opened all the way by an
+    /// eight-byte body. It must not be installed either.
+    #[test]
+    fn an_unbounded_reading_never_becomes_unbounded_spending() {
+        let v = view(vec![], "low"); // nothing declared: only a reading can fund it
+        assert!(v
+            .set_live_balances(vec![
+                ("kalshi".into(), "Infinity".into()),
+                ("polymarket_us".into(), "Infinity".into()),
+            ])
+            .is_err());
+        assert!(
+            !v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed,
+            "an infinite balance must never have authorised anything"
+        );
     }
 
     /// The gauges the stats JSON publishes. A gate that has silently closed
     /// because its readings expired is indistinguishable from a quiet market,
     /// and `describe()` prints once at startup and never again — so these two
     /// are the only way an operator can tell the difference.
+    ///
+    /// Read together they say more than either alone: `stale` with an age of
+    /// `-1` is a poll that has never once succeeded, `stale` with a number is
+    /// one that worked and then stopped.
     #[test]
     fn the_gauges_say_which_number_the_gate_is_spending_against() {
         let v = funded("low");
         assert_eq!(v.balances_source(), "declared");
         assert_eq!(v.balances_age_s(), -1, "never polled is not an old poll");
-        v.set_live_balances(vec![("kalshi".into(), "1000".into())]);
+        v.expect_live_balances();
+        assert_eq!(v.balances_source(), "seed", "a poll is expected and has not landed");
+        assert_eq!(v.balances_age_s(), -1);
+        age_the_reading(&v, BALANCE_MAX_AGE + Duration::from_secs(30));
+        assert_eq!(v.balances_source(), "stale", "a poll that has never once answered");
+        assert_eq!(v.balances_age_s(), -1, "and still no reading to be old");
+        v.set_live_balances(vec![("kalshi".into(), "1000".into())]).expect("usable");
         assert_eq!(v.balances_source(), "live");
         assert_eq!(v.balances_age_s(), 0);
-        age_the_live_reading(&v, BALANCE_MAX_AGE + Duration::from_secs(30));
+        age_the_reading(&v, BALANCE_MAX_AGE + Duration::from_secs(30));
         assert_eq!(v.balances_source(), "stale");
         assert_eq!(v.balances_age_s(), BALANCE_MAX_AGE.as_secs() as i64 + 30);
     }

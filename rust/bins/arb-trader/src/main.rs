@@ -1657,6 +1657,42 @@ async fn balance_cycle(
     Ok(out)
 }
 
+/// Where the armed run publishes what it just read.
+///
+/// ONE GATEWAY PER VENUE PER PROCESS is the rule this exists to keep (quirk
+/// `xv-shared-api-budget`): the armed trader is now the only process holding a
+/// live balance reading, and the alternative to publishing it is every dashboard
+/// opening a second gateway against the same account and spending the same
+/// per-venue token bucket the hedge path needs. `scripts/capital_snapshot.py`
+/// does exactly that today and cannot be changed here (the Python tree is
+/// frozen), so nothing reads this file yet — it is a write of what was already
+/// read, on a path a reader can find.
+///
+/// The freshness rule belongs to the reader, which is why `at` and `max_age_s`
+/// are both in the file: `at` is when the venues answered, and `max_age_s` is
+/// the bound the GATE is using, so a dashboard can say "the engine is refusing
+/// on this" without re-transcribing 180 and drifting from it later.
+const BALANCE_SNAPSHOT: &str = "data/exec/balances.json";
+
+/// Publish the reading. Best effort by construction: the file exists so
+/// somebody else can see the number, and a disk that will not take it is not a
+/// reason to stop feeding the gate that authorises trading.
+///
+/// Written ONLY on a cycle that produced a usable reading, so the file ages
+/// exactly as the gate's own figure does: a stale `at` IS an abandoned cycle,
+/// visible to a reader holding no credential of its own.
+fn publish_balances(path: &str, pairs: &[(String, String)]) -> Result<(), String> {
+    let body = serde_json::json!({
+        "at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "max_age_s": risk::BALANCE_MAX_AGE.as_secs(),
+        "balances": pairs.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(),
+    });
+    marks::write_atomic(path, &format!("{body}\n"))
+}
+
 /// The periodic loop. Runs until the process exits.
 async fn balance_loop(
     risk: std::sync::Arc<risk::RiskView>,
@@ -1671,7 +1707,17 @@ async fn balance_loop(
     let mut last: Option<Vec<(String, String)>> = None;
     loop {
         iv.tick().await;
-        match balance_cycle(&kalshi, &pmus).await {
+        // The INSTALL is part of the cycle, not a step after it. A figure the
+        // decision fold cannot read back is a failed poll however cleanly the
+        // venue delivered it — see `RiskView::set_live_balances` — so it takes
+        // the same abandoned path as a 503 and leaves the previous figure
+        // ageing rather than replacing it with something that would panic the
+        // engine at the next quote.
+        let cycle = match balance_cycle(&kalshi, &pmus).await {
+            Ok(pairs) => risk.set_live_balances(pairs.clone()).map(|()| pairs),
+            Err(e) => Err(e),
+        };
+        match cycle {
             Ok(pairs) => {
                 // Only when the number MOVES. A 60s heartbeat would bury the
                 // one line that matters — cash falling as capital deploys,
@@ -1687,7 +1733,10 @@ async fn balance_loop(
                     );
                     last = Some(pairs.clone());
                 }
-                risk.set_live_balances(pairs);
+                if let Err(e) = publish_balances(BALANCE_SNAPSHOT, &pairs) {
+                    eprintln!("[balance] snapshot not published ({e}) — the GATE is fed; \
+                               only the readers of {BALANCE_SNAPSHOT} are blind");
+                }
             }
             Err(e) => eprintln!(
                 "[balance] CYCLE ABANDONED ({e}) — the gate is still spending against a \
@@ -1713,6 +1762,13 @@ async fn balance_loop(
 /// `balances_source` / `balances_age_s` in the stats JSON are what distinguish
 /// it from a quiet market.
 ///
+/// AND THE SAME IS TRUE OF A POLL THAT NEVER STARTS ANSWERING. Arming this is a
+/// promise the gate holds us to: `expect_live_balances` starts the `--balance`
+/// seed ageing on the same `risk::BALANCE_MAX_AGE` clock as a reading, so an
+/// armed run with wrong credentials or a moved endpoint closes after three
+/// minutes instead of trading the hand-typed constant indefinitely, which was
+/// C13 wearing a new coat. `stale` with `balances_age_s` of `-1` is that case.
+///
 /// It reads through the SINKS rather than building its own gateways, for
 /// `spawn_positions_recon`'s reason — they are where this process's
 /// credentials and its single background token bucket live — which is also
@@ -1731,10 +1787,16 @@ fn spawn_balance_poll(
     };
     eprintln!(
         "[balance] polling both venues every {}s; the gate refuses everything once a \
-         reading is over {}s old",
+         reading is over {}s old, INCLUDING the --balance seed if the first cycle \
+         never lands",
         BALANCE_POLL.as_secs(),
         risk::BALANCE_MAX_AGE.as_secs()
     );
+    // Announce the poll to the gate BEFORE spawning it, so the seed starts
+    // ageing from the promise rather than from whenever the task first gets
+    // scheduled. Until this call the declaration never expires, which is right
+    // for a run that holds no credentials and wrong for this one.
+    rv.expect_live_balances();
     tokio::spawn(balance_loop(rv.clone(), k.clone(), p.clone()));
 }
 
@@ -3536,9 +3598,11 @@ mod balance_poll_tests {
 
     /// The unarmed shadow holds no credentials, so `arm_venues` hands it no
     /// sinks and the poll must simply not start — leaving `--balance` as its
-    /// only source. If it could start, it would install nothing, every reading
-    /// would be absent, and the shadow would refuse every order and stop
-    /// producing the intent stream the daily decision gate diffs.
+    /// only source, and leaving it UNAGED. If it could start, it would install
+    /// nothing, the seed would expire after `BALANCE_MAX_AGE`, and the shadow
+    /// would refuse every order and stop producing the intent stream the daily
+    /// decision gate diffs. `declared` rather than `seed` is what says the
+    /// promise was never made.
     #[tokio::test]
     async fn an_unarmed_run_starts_no_poll() {
         let rv = std::sync::Arc::new(risk::RiskView::load(
@@ -3551,5 +3615,35 @@ mod balance_poll_tests {
         tokio::task::yield_now().await;
         assert_eq!(rv.balances_source(), "declared");
         assert_eq!(rv.balances_age_s(), -1);
+    }
+
+    /// The snapshot is the whole reason a dashboard need not open a second
+    /// gateway against the same account (quirk `xv-shared-api-budget`), so what
+    /// it publishes has to be the figure the gate is actually spending, under
+    /// the key the gate is keyed by, plus enough for a reader to age it itself.
+    #[test]
+    fn the_snapshot_publishes_what_was_read_and_the_bound_it_is_read_against() {
+        let d = std::env::temp_dir().join(format!("arbbot-bal-{}", std::process::id()));
+        let path = d.join("balances.json");
+        let p = path.to_str().expect("utf8");
+        publish_balances(
+            p,
+            &[
+                ("kalshi".to_string(), "320.4300".to_string()),
+                ("polymarket_us".to_string(), "329.29805".to_string()),
+            ],
+        )
+        .expect("published");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(p).expect("read")).expect("json");
+        assert_eq!(v["balances"]["kalshi"], "320.4300");
+        assert_eq!(v["balances"]["polymarket_us"], "329.29805");
+        assert_eq!(
+            v["max_age_s"],
+            risk::BALANCE_MAX_AGE.as_secs(),
+            "a reader must not have to re-transcribe the gate's bound"
+        );
+        assert!(v["at"].as_u64().expect("at") > 1_700_000_000, "a wall clock, so it can be aged");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
