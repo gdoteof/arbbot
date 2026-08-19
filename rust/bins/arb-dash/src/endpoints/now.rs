@@ -292,9 +292,14 @@ fn engine_summary(unit: &str, up_s: u64) -> (Option<Value>, Option<u64>, Option<
 /// The gauges worth a headline, in the order an operator reads them. Anything
 /// not named here is still returned under `all`, because a 75-gauge summary is
 /// exactly the thing you want in full when something is wrong.
-const HEADLINE: [(&str, &str); 12] = [
+const HEADLINE: [(&str, &str); 13] = [
     ("risk_allowed", "orders the risk gate passed"),
     ("risk_rejected", "orders the risk gate refused"),
+    // The capital panel's `gate_on` is derived from the snapshot file, which
+    // dates itself; this is the engine's own answer, and it is the only thing
+    // that separates a poll which has not answered YET from one that never
+    // will. Read it with `summary_age_s` — it is as old as the line it came in.
+    ("balances_source", "what the cash gate is spending against"),
     ("take_take_found", "immediately-executable crossings seen"),
     ("take_take_fired", "…of those, taken"),
     ("take_take_gated", "…of those, refused by a gate"),
@@ -346,20 +351,17 @@ fn yaml_num(v: &Option<serde_yaml::Value>) -> Option<f64> {
 /// deployed figure below from a lag into a lie.
 const MARKS_STALE_S: u64 = 120;
 
-/// Past this, a reading in `data/exec/venue_cash.json` is not a picture of now.
-///
-/// That file is written by the armed engine's own cash poll, which reads both
-/// venues on a 60s loop and EXPIRES a reading at 180s — past that the engine
-/// stops spending against it and refuses to open. Rendering the same figure as
-/// current here would put a number on the screen that the process which
-/// measured it has already stopped believing. Deliberately NOT the books page's
-/// hour: that window is sized for a snapshot somebody fetches by hand, and this
-/// one has a writer. If the engine's expiry moves, this moves with it.
-const VENUE_CASH_STALE_S: u64 = 180;
-
 /// Stale is a THIRD state, not a pass, and an age nobody could establish is
 /// UNKNOWN rather than fresh. Same rule the books page applies to its venue
 /// snapshots, and the same exclusive boundary.
+///
+/// There is deliberately no constant here for the engine's cash snapshot. That
+/// bound is the gate's own `risk::BALANCE_MAX_AGE`, and the engine PUBLISHES it
+/// in the file it writes (`max_age_s`) so a reader does not re-transcribe 180
+/// and drift from it the first time the expiry moves — see
+/// [`balances_snapshot`]. A source that publishes no bound therefore has an
+/// UNKNOWN staleness rather than a defaulted one, which is why the measured
+/// side carries an optional bound and not a constant.
 fn stale(age_s: Option<u64>, past_s: u64) -> Option<bool> {
     age_s.map(|x| x > past_s)
 }
@@ -447,31 +449,118 @@ fn deployed(marks: &Value) -> Deployed {
     }
 }
 
-/// Per-venue cash out of the snapshot the ARMED engine writes, and when it read
-/// it.
+/// Per-venue cash out of the snapshot the ARMED engine publishes: the figures,
+/// the moment the venues answered, and the age past which the engine itself
+/// stops believing them.
 ///
-/// Coordinated with that writer by PATH and by VENUE NAME only. The names are
-/// `crate::VENUES`, which every other view in this binary already keys on, and
-/// they are looked for at the top level and under `balances` alike, so the
-/// nesting is not part of the contract. Nothing else in the document is read: a
-/// top-level `ts` is the READ TIME, not a venue, and taking every numeric key
-/// would make it one.
+/// THE CONTRACT, read out of `arb-trader`'s `publish_balances` rather than
+/// assumed: `data/exec/balances.json`, holding
+/// `{"at": <unix seconds>, "max_age_s": <seconds>, "balances": {"<venue>":
+/// "<figure>"}}`. The figures are STRINGS — they are whatever Kalshi's
+/// `balance_dollars` and PM-US's `buyingPower` held on the wire, and the engine
+/// installs them into its gate unparsed — which is why [`f`] takes both. The
+/// venue names are `crate::VENUES`, the keys every other view in this binary
+/// already reads.
 ///
-/// A file that parses to no venue this binary knows yields an empty map, and the
-/// caller says the measured side is unavailable rather than falling through to
-/// silence. That is also what happens if the writer lands in a shape this does
-/// not recognise, which is the honest failure for a contract that is one path
-/// and a set of names.
-fn venue_cash(text: &str) -> (BTreeMap<String, f64>, Option<f64>) {
+/// `max_age_s` IS READ, NOT RE-TRANSCRIBED. It is the gate's own
+/// `risk::BALANCE_MAX_AGE`, and the writer publishes it precisely so a reader
+/// can say "the engine has stopped believing this" without copying 180 into a
+/// second file and drifting from it. A snapshot carrying no bound has an
+/// unknown staleness here rather than a guessed one.
+///
+/// `at` AND NOTHING ELSE DATES THE READING — deliberately no fall back to the
+/// file's mtime. `publish_balances` is called only on a cycle that produced a
+/// usable reading, so for THIS writer the two agree; but a file with no `at` is
+/// not this writer's file, and dating an unknown writer off its mtime is the
+/// manufactured confidence this panel exists to remove.
+///
+/// A document without a `balances` object, or one carrying no venue this binary
+/// knows, measures NOTHING: the caller says the measured side is unavailable
+/// rather than falling through to silence.
+fn balances_snapshot(text: &str) -> (BTreeMap<String, f64>, Option<f64>, Option<u64>) {
     let Ok(v) = serde_json::from_str::<Value>(text) else {
-        return (BTreeMap::new(), None);
+        return Default::default();
     };
-    let inner = v.get("balances").unwrap_or(&v);
+    let Some(inner) = v.get("balances") else {
+        return Default::default();
+    };
     let cash = crate::VENUES
         .iter()
         .filter_map(|name| Some(((*name).to_string(), f(inner.get(*name))?)))
         .collect();
-    (cash, f(v.get("ts")))
+    (cash, f(v.get("at")), v.get("max_age_s").and_then(Value::as_u64))
+}
+
+/// What the armed engine's cash gate is spending against RIGHT NOW, decided
+/// from the snapshot's own two fields.
+///
+/// This is the fact that stops the measured column being read as a second
+/// opinion. When the reading is inside its published bound the gate IS spending
+/// against it, so the measured column and the engine's working figure are one
+/// number and there is nothing to compare. When it is past that bound the gate
+/// has no figure at all — `RiskView::spendable` yields no pairs, every venue
+/// looks up $0, and the `insufficient <venue> balance` refusal fires on
+/// everything. Those are opposite states behind the same displayed number.
+///
+/// Off the FILE rather than off the engine's `balances_source` gauge, which is
+/// the more direct answer and the wrong one to build on here: that gauge
+/// reaches this page inside a `summary()` line that can be up to fifteen
+/// minutes old, so it says what the gate was on, while the snapshot dates
+/// itself and says what it is on. The gauge is on the page beside it (it is in
+/// [`HEADLINE`]) and it is what resolves the one case this cannot: with no file
+/// at all, a poll that has not answered YET (the gate is still spending the
+/// `--balance` seed) and a poll that has never once answered (the gate is
+/// refusing) look identical from out here.
+fn gate_state(
+    armed: bool,
+    path: &str,
+    age_s: Option<u64>,
+    bound_s: Option<u64>,
+) -> (&'static str, String) {
+    if !armed {
+        return (
+            "none",
+            "no armed engine is polling a venue, so nothing on this panel is a figure a risk \
+             gate is spending against."
+                .into(),
+        );
+    }
+    match (age_s, bound_s) {
+        (Some(age), Some(bound)) if age <= bound => (
+            "live",
+            format!(
+                "the gate is spending against the MEASURED column: {path} is {age}s old \
+                 against the {bound}s bound the engine publishes for itself, so the venues' \
+                 own figure is what authorises every order."
+            ),
+        ),
+        (Some(age), Some(bound)) => (
+            "stale",
+            format!(
+                "the gate is REFUSING EVERY ORDER: {path} is {age}s old, past the {bound}s \
+                 bound the engine publishes for itself, and only a successful poll rewrites \
+                 it. Past that bound the gate holds no cash at all — every venue reads $0 \
+                 and refuses on `insufficient <venue> balance`."
+            ),
+        ),
+        (Some(_), None) => (
+            "unknown",
+            format!(
+                "{path} publishes no max_age_s, so nothing out here can say whether the \
+                 engine still believes its own reading. Read `balances_source` in the gauges \
+                 above."
+            ),
+        ),
+        (None, _) => (
+            "unknown",
+            format!(
+                "{path} is not there. Either the poll has not answered yet — the gate is \
+                 still spending the --balance seed — or it has never answered, in which case \
+                 the gate is refusing everything. An absent file cannot tell those apart; \
+                 `balances_source` in the gauges above can."
+            ),
+        ),
+    }
 }
 
 /// The SPENDABLE PM-US cash in a `pmus_balances.json`.
@@ -508,10 +597,22 @@ fn spendable_pmus(text: &str) -> Option<f64> {
 /// with `320.43`, so a figure read out of this repo is a figure nobody is
 /// trading against.
 ///
-/// This is NOT a measurement of venue cash and must never be added to the
-/// deployed figure. `RiskView::balances` (audit C13) is hand-typed and is never
-/// decremented as capital deploys, so the shares already counted as deployed
-/// were bought with some of the very cash it still reports.
+/// RETRACTION (#77 landed). This doc used to say the constant is "what the risk
+/// gate is spending against" and that it "is never decremented as capital
+/// deploys" — audit C13. That was true of every armed run before #77 and is
+/// true of NO armed run after it. `--balance` is now a SEED: `RiskView` holds
+/// it as `Cash::Seed`, an armed engine's balance poll replaces it with a venue
+/// reading inside one round trip, and the seed EXPIRES on the same
+/// `risk::BALANCE_MAX_AGE` clock as a reading, so an armed run whose poll never
+/// answers stops trading rather than trading the constant forever. It is what
+/// the gate spends against only while `balances_source` reads `seed` (armed,
+/// first cycle outstanding) or `declared` (a run that will never poll — bench,
+/// replay, the unarmed shadow).
+///
+/// What has NOT changed: this is not a measurement of venue cash, and it must
+/// never be added to the deployed figure. It is a number somebody typed, and on
+/// an armed run the shares already counted as deployed were bought with some of
+/// the very cash it still names.
 fn engine_balances(cmd: &str) -> Vec<(String, f64)> {
     cmd.split("--balance ")
         .skip(1)
@@ -523,7 +624,7 @@ fn engine_balances(cmd: &str) -> Vec<(String, f64)> {
         .collect()
 }
 
-/// The engine column: whose `--balance` constants it holds, and whether the
+/// The seed column: whose `--balance` constants it holds, and whether the
 /// process they were read off can actually trade.
 ///
 /// [`armed_engine`] falls back to ANY `arb-trader` when none is armed. That
@@ -540,7 +641,7 @@ fn engine_balances(cmd: &str) -> Vec<(String, f64)> {
 /// that cannot tell armed from shadow must not print a heading claiming it can.
 fn engine_cash(unit: &str, armed: bool, cmd: Option<&str>) -> (Vec<(String, f64)>, String) {
     match cmd {
-        Some(c) if armed => (engine_balances(c), format!("{unit} · --balance, ARMED")),
+        Some(c) if armed => (engine_balances(c), format!("{unit} · --balance seed, ARMED")),
         Some(_) => (
             Vec::new(),
             format!(
@@ -554,45 +655,65 @@ fn engine_cash(unit: &str, armed: bool, cmd: Option<&str>) -> (Vec<(String, f64)
 }
 
 /// The MEASURED side of one venue's cash: a figure some process actually read
-/// off the venue, where it came from, how old it is, and the age past which it
-/// stops being evidence about now.
+/// off the venue, where it came from, how old it is, the age past which it stops
+/// being evidence about now, and WHAT THAT AGE MEANS.
+///
+/// The last two are per-source and not per-panel, which is the whole reason they
+/// live here. The two measured sources this binary can reach age for completely
+/// different reasons: one is the reading a risk gate is holding, which the gate
+/// abandons at a bound it publishes; the other is a file a person fetched by
+/// hand that no gate has ever read. Printing one sentence over both makes one of
+/// them false — see [`derived_capital`], which fills these in.
 struct Measured {
     usd: Option<f64>,
     from: String,
     age_s: Option<u64>,
-    stale_past_s: u64,
+    /// `None` where the source publishes no bound; staleness is then UNKNOWN.
+    stale_past_s: Option<u64>,
+    /// What it means that THIS source has gone stale. Empty where there is no
+    /// figure to go stale.
+    stale_means: String,
 }
 
 /// One venue's cash, beside every other figure that claims to know it, with the
-/// differences an operator would otherwise take on trust.
+/// one difference between them that means a single thing.
 ///
-/// Three sources, because there are three and they do not agree: the armed
-/// engine's constant, this dashboard's own constant, and a MEASURED venue
-/// figure where one exists. Live today on kalshi that is 320.43 against
-/// 340.0896 — a $19.66 gap that no page in this repo said out loud, and the one
-/// comparison here that can genuinely fail, since either constant can be edited
-/// alone in its own unit file.
+/// `dash_diff_usd` IS THAT DIFFERENCE: the `--balance` seed against this
+/// dashboard's `--kalshi-balance`. Two numbers a person typed, in two unit
+/// files, for the same quantity, either editable alone — 320.43 against
+/// 340.0896 today. Nothing moves either of them, so a gap is a typo or a stale
+/// edit and can be nothing else.
 ///
-/// A DIFF IS PUBLISHED ONLY WHEN BOTH SIDES ARE CURRENT. `dash_diff_usd` is two
-/// constants and is therefore always computable. `venue_diff_usd` is not, and it
-/// is withheld the moment the measured side is stale or of unknown age: a dollar
-/// gap against a three-week-old snapshot is not a small finding, it is not a
-/// finding at all, and it renders exactly like one. That is how a panel built to
-/// catch manufactured confidence starts manufacturing it. The measured figure
-/// itself still shows, with its true age, because that much is true.
+/// `venue_diff_usd` IS GONE, and this is the retraction. It published
+/// `--balance` minus the measured figure and the page painted any non-zero as a
+/// warning. It never meant one thing. BEFORE #77 `--balance` was a launch-time
+/// constant nothing decremented, so the gap was CAPITAL DEPLOYED SINCE LAUNCH —
+/// the healthiest number on the panel, rendered as a fault. AFTER #77 it is
+/// worse, because the two sides are no longer even about the same instant:
+/// while `balances_source` reads `live` the gate is spending against the
+/// measured column ITSELF (`data/exec/balances.json` is that reading, published)
+/// so the honest gap is structurally zero and a subtraction against the seed is
+/// deployment plus whatever the seed was mistyped by; while it reads
+/// `seed`/`declared` the gate is on the constant and the measured figure is a
+/// number no gate consulted. A constant and a measurement are not two opinions
+/// about one instant, and subtracting them implies they should match.
+///
+/// What replaces it is not a number: `gate_on` on the block says which of the
+/// two columns the gate is actually spending against, and `venue_stale_means`
+/// on the row says what this source's age costs. The measured figure, its age
+/// and its published bound all still show, because all of that is true.
 fn cash_row(venue: &str, engine: Option<f64>, dash: Option<f64>, m: &Measured) -> Value {
-    let venue_stale = stale(m.age_s, m.stale_past_s);
-    let diff = |b: Option<f64>| engine.zip(b).map(|(e, x)| e - x);
     json!({
         "venue": venue,
         "engine_usd": engine,
         "dash_usd": dash,
-        "dash_diff_usd": diff(dash),
+        "dash_diff_usd": engine.zip(dash).map(|(e, x)| e - x),
         "venue_usd": m.usd,
         "venue_from": m.from,
         "venue_age_s": m.age_s,
-        "venue_stale": venue_stale,
-        "venue_diff_usd": diff(m.usd).filter(|_| venue_stale == Some(false)),
+        "venue_stale_past_s": m.stale_past_s,
+        "venue_stale": m.stale_past_s.and_then(|p| stale(m.age_s, p)),
+        "venue_stale_means": m.stale_means,
     })
 }
 
@@ -609,7 +730,14 @@ fn cash_row(venue: &str, engine: Option<f64>, dash: Option<f64>, m: &Measured) -
 /// as a measurement would reproduce, one level up, exactly the tautology the
 /// books page carries: a new number that cannot disagree with the thing it was
 /// built to check. So they are published SIDE BY SIDE, each with its provenance
-/// and its age, and the gaps between them are the output.
+/// and its age.
+///
+/// AND THE GAPS BETWEEN THEM ARE NOT ALL OUTPUT — the earlier version of this
+/// doc said they were, and that is retracted here. Exactly one of them can fail
+/// on its own: seed against dashboard constant, two typed numbers. The gap
+/// between a constant and a measurement is capital deployed since the constant
+/// was typed, which is what a working engine looks like. [`cash_row`] carries
+/// that argument in full and is where the second gap was deleted.
 ///
 /// Deployed is not attributed per venue, and cannot be from this file: a marked
 /// row is a two-leg BASKET priced as a unit (`marks::compute_row` sums the
@@ -624,48 +752,54 @@ fn derived_capital(a: &Args, marks: &Value, unit: &str, armed: bool, cmd: Option
     let d = deployed(marks);
     let (engine_bal, engine_from) = engine_cash(unit, armed, cmd);
 
-    // The measured side, best source first. `data/exec/venue_cash.json` is
-    // written by the armed engine's cash poll off live venue reads.
-    // `data/venue/` is fetched BY HAND and has had no writer since 2026-07-27,
-    // so on its own it is a three-week-old number and is served as one.
-    let vc_path = format!("{}/exec/venue_cash.json", a.data_dir);
-    let vc_text = std::fs::read_to_string(&vc_path).ok();
-    let (vc, vc_at) = vc_text.as_deref().map(venue_cash).unwrap_or_default();
-    // From the reading's OWN timestamp where the writer publishes one, and from
-    // the file's mtime otherwise. They are not the same thing, and the
-    // difference is the failure this panel has to survive: a writer that
-    // rewrites the file after a FAILED poll keeps the mtime fresh while the
-    // number underneath it ages. The age is most of why this file is read at
-    // all, so the row says which of the two it got.
-    let vc_age = match vc_at {
-        Some(t) => Some((now_secs() as f64 - t).max(0.0) as u64),
-        None => crate::endpoints::age_secs(&vc_path),
-    };
-    let vc_from = format!("{vc_path} · {}", if vc_at.is_some() { "ts" } else { "file mtime" });
-    let unmeasured = match vc_text {
+    // The measured side, best source first. `data/exec/balances.json` is the
+    // armed engine's balance poll publishing what the venues just told it, on
+    // every cycle that produced a usable reading — see `balances_snapshot` for
+    // the contract and `gate_state` for what its age costs. `data/venue/` is
+    // fetched BY HAND and has had no writer since 2026-07-27, so on its own it
+    // is a three-week-old number and is served as one.
+    let snap_path = format!("{}/exec/balances.json", a.data_dir);
+    let snap_text = std::fs::read_to_string(&snap_path).ok();
+    let (snap, snap_at, snap_bound) =
+        snap_text.as_deref().map(balances_snapshot).unwrap_or_default();
+    let snap_age = snap_at.map(|t| (now_secs() as f64 - t).max(0.0) as u64);
+    let (gate_on, gate_why) = gate_state(armed, &snap_path, snap_age, snap_bound);
+    let unmeasured = match snap_text {
         None => format!(
-            "no measured figure: {vc_path} does not exist, and this process holds no \
+            "no measured figure: {snap_path} does not exist, and this process holds no \
              credentials to read a venue itself"
         ),
-        Some(_) => format!("{vc_path} carries no figure for this venue"),
+        Some(_) => format!("{snap_path} carries no figure for this venue"),
     };
 
     let pmus_path = format!("{}/pmus_balances.json", a.pmus_dir);
     let pmus_hand = std::fs::read_to_string(&pmus_path).ok().as_deref().and_then(spendable_pmus);
     let measured = |venue: &str| -> Measured {
-        if let Some(usd) = vc.get(venue) {
+        if let Some(usd) = snap.get(venue) {
             return Measured {
                 usd: Some(*usd),
-                from: vc_from.clone(),
-                age_s: vc_age,
-                stale_past_s: VENUE_CASH_STALE_S,
+                from: format!(
+                    "{snap_path} · the armed engine's balance poll, dated by its own `at`"
+                ),
+                age_s: snap_age,
+                stale_past_s: snap_bound,
+                // TRUE OF THIS SOURCE AND OF NO OTHER. This IS the reading the
+                // gate installed, and the bound is the gate's own, published in
+                // the same file: past it `RiskView::spendable` returns no pairs
+                // at all, so every venue looks up $0 and `insufficient <venue>
+                // balance` refuses everything.
+                stale_means: "the engine has stopped spending against it: this is the reading \
+                              its gate installed, and past the bound the engine publishes here \
+                              the gate holds no cash at all — every venue reads $0 and refuses \
+                              on `insufficient <venue> balance`"
+                    .into(),
             };
         }
         // PM-US only, and only as a fallback: the hand-fetched snapshot the
-        // books page reconciles against. It IS a real venue read, and it is the
-        // only one this binary has ever had, so it is shown — with its true age,
-        // 22.7 days as of this commit, and with its diff withheld, so what an
-        // operator takes off the row is the STALE flag and not the number.
+        // books page reconciles against. It IS a real venue read, and it was the
+        // only one this binary had until #77, so it is shown — with its true
+        // age (the live file was last fetched 2026-07-27) and with a sentence
+        // that does NOT borrow the row above's alarm. No gate ever read it.
         match (venue, pmus_hand) {
             ("polymarket_us", Some(usd)) => Measured {
                 usd: Some(usd),
@@ -673,13 +807,19 @@ fn derived_capital(a: &Args, marks: &Value, unit: &str, armed: bool, cmd: Option
                     "{pmus_path} · buyingPower, fetched by hand — nothing in this repo writes it"
                 ),
                 age_s: crate::endpoints::age_secs(&pmus_path),
-                stale_past_s: crate::endpoints::books::SNAPSHOT_STALE_S,
+                // The books page's hour, because this is the books page's file.
+                stale_past_s: Some(crate::endpoints::books::SNAPSHOT_STALE_S),
+                stale_means: "just old, and nothing changed behaviour when it aged: no risk \
+                              gate has ever read this file. It is the books page's hand-fetched \
+                              snapshot, not a figure any engine is spending against"
+                    .into(),
             },
             _ => Measured {
                 usd: None,
                 from: unmeasured.clone(),
                 age_s: None,
-                stale_past_s: VENUE_CASH_STALE_S,
+                stale_past_s: None,
+                stale_means: String::new(),
             },
         }
     };
@@ -688,7 +828,7 @@ fn derived_capital(a: &Args, marks: &Value, unit: &str, armed: bool, cmd: Option
     // suggest a venue is configured when it is not.
     let dash_kalshi: Option<f64> = a.kalshi_balance.as_ref().and_then(|s| s.parse().ok());
     let mut venues: BTreeSet<String> = engine_bal.iter().map(|(v, _)| v.clone()).collect();
-    venues.extend(vc.keys().cloned());
+    venues.extend(snap.keys().cloned());
     if dash_kalshi.is_some() {
         venues.insert("kalshi".into());
     }
@@ -715,6 +855,8 @@ fn derived_capital(a: &Args, marks: &Value, unit: &str, armed: bool, cmd: Option
         "unpriced_baskets": d.unpriced_baskets,
         "single_leg_records": d.single_leg_records,
         "engine_from": engine_from,
+        "gate_on": gate_on,
+        "gate_why": gate_why,
         "cash": cash })
 }
 
@@ -1204,8 +1346,8 @@ mod tests {
         d.to_string_lossy().into_owned()
     }
 
-    fn measured(usd: Option<f64>, age_s: Option<u64>, stale_past_s: u64) -> Measured {
-        Measured { usd, from: "f".into(), age_s, stale_past_s }
+    fn measured(usd: Option<f64>, age_s: Option<u64>, stale_past_s: Option<u64>) -> Measured {
+        Measured { usd, from: "f".into(), age_s, stale_past_s, stale_means: "m".into() }
     }
 
     /// The recoverable figure is Σ `liq_value_usd` and never the shortcut
@@ -1350,81 +1492,131 @@ mod tests {
         assert_eq!(from, "no arb-trader is running");
     }
 
-    /// The two hand-typed constants disagree TODAY — the armed engine spends
-    /// against `kalshi=320.43` while this dashboard was started with
+    /// The two hand-typed constants disagree TODAY — the armed engine seeds its
+    /// gate with `kalshi=320.43` while this dashboard was started with
     /// `--kalshi-balance 340.0896` — and no page in this repo said so. Either
-    /// can be edited alone in its own unit file, which is what makes this the
-    /// one cash comparison on the panel that can genuinely fail.
+    /// can be edited alone in its own unit file, and nothing moves either of
+    /// them, which is what leaves this the one cash comparison on the panel that
+    /// can genuinely fail.
+    ///
+    /// AND `venue_diff_usd` IS NOT A KEY ANY MORE. `is_null()` would pass on a
+    /// deleted key and on a nulled one alike, so this asks the object, which is
+    /// the only assertion that fails if the subtraction comes back.
     #[test]
     fn the_engines_balance_and_the_dashboards_are_shown_with_the_gap_between_them() {
-        let m = measured(None, None, VENUE_CASH_STALE_S);
+        let m = measured(None, None, None);
         let r = cash_row("kalshi", Some(320.43), Some(340.0896), &m);
         assert!((r["dash_diff_usd"].as_f64().expect("a gap") + 19.6596).abs() < 1e-9);
         assert!(r["venue_usd"].is_null(), "and neither constant is dressed up as a measurement");
-        assert!(r["venue_diff_usd"].is_null());
+        assert!(
+            r.as_object().expect("a row").get("venue_diff_usd").is_none(),
+            "a constant minus a measurement is deployed capital, not a discrepancy"
+        );
         assert!(r["venue_stale"].is_null(), "an unknown age is not a fresh one");
     }
 
-    /// A measured figure carries its age, says STALE past its own window, and —
-    /// past it — publishes NO gap. The `data/venue` snapshot is 22.7 days old
-    /// and nothing in this repo writes it; a $27 discrepancy against it is not a
-    /// small finding, it is not a finding, and it renders exactly like one.
+    /// A measured figure carries its age, the BOUND IT WAS JUDGED AGAINST, and
+    /// what going stale costs — and the last of those is per-source, which is
+    /// the point. The bound rides in from the source rather than from a constant
+    /// in this file, so a row whose source publishes none says UNKNOWN rather
+    /// than borrowing somebody else's window.
     #[test]
-    fn a_measured_figure_past_its_window_is_stale_and_its_gap_is_withheld() {
+    fn a_measured_figure_is_judged_against_its_own_published_bound() {
         let hour = crate::endpoints::books::SNAPSHOT_STALE_S;
-        let row = |age| cash_row("polymarket_us", Some(301.92), None, &measured(Some(329.29805), age, hour));
-        let fresh = row(Some(30));
+        let row = |age, bound| {
+            cash_row("polymarket_us", Some(301.92), None, &measured(Some(329.29805), age, bound))
+        };
+        let fresh = row(Some(30), Some(hour));
         assert_eq!(fresh["venue_stale"], false);
-        assert!((fresh["venue_diff_usd"].as_f64().expect("a gap") + 27.37805).abs() < 1e-9);
-        let old = row(Some(1_963_718));
+        assert_eq!(fresh["venue_stale_past_s"], hour, "and the row says what it was judged on");
+        let old = row(Some(1_963_718), Some(hour));
         assert_eq!(old["venue_stale"], true, "the live snapshot's own age");
         assert_eq!(old["venue_usd"], 329.29805, "the number still shows — that much is true");
-        assert!(old["venue_diff_usd"].is_null(), "the comparison does not");
+        assert_eq!(old["venue_stale_means"], "m", "with what its age costs, from the source");
+        let no_bound = row(Some(1_963_718), None);
+        assert!(no_bound["venue_stale"].is_null(), "no published bound, no verdict");
+        assert_eq!(no_bound["venue_age_s"], 1_963_718, "the age is still reported honestly");
     }
 
     /// Stale is a THIRD state, not a pass, and an age nobody could establish is
-    /// unknown rather than fresh. Three aged figures on this panel go through
-    /// here: the engine's marks against its own 120s heartbeat, the venue cash
-    /// snapshot against the 180s the engine expires a reading at, and the
-    /// hand-fetched pm-us snapshot against the hour the books page uses.
+    /// unknown rather than fresh. The engine's marks go through here against
+    /// their own 120s heartbeat; the two cash sources bring their own bounds.
     #[test]
     fn a_figure_with_no_age_is_unknown_and_one_past_its_window_says_so() {
         assert_eq!(stale(None, MARKS_STALE_S), None);
         assert_eq!(stale(Some(MARKS_STALE_S), MARKS_STALE_S), Some(false), "the line is exclusive");
         assert_eq!(stale(Some(MARKS_STALE_S + 1), MARKS_STALE_S), Some(true));
-        assert_eq!(stale(Some(VENUE_CASH_STALE_S + 1), VENUE_CASH_STALE_S), Some(true));
     }
 
-    /// The contract with the engine's cash poll is a PATH and a set of VENUE
-    /// NAMES, and nothing else. Both shapes such a file gets written in read the
-    /// same, `ts` is the read time rather than a venue, and anything this binary
-    /// cannot make a number of measures nothing rather than something wrong.
+    /// THE CONTRACT WITH THE ENGINE'S BALANCE POLL, as `publish_balances`
+    /// actually writes it: venue figures under `balances` as STRINGS, the read
+    /// time under `at`, and the gate's own expiry under `max_age_s`. The first
+    /// version of this panel read `venue_cash.json` and a `ts` key — a file
+    /// nothing writes and a name nothing publishes — so the measured column
+    /// could never populate at all while six sentences said it did.
+    ///
+    /// `max_age_s` is read rather than re-transcribed: it is the bound the GATE
+    /// is using, and copying 180 into this file is how the two drift apart.
     #[test]
-    fn a_venue_cash_snapshot_is_read_by_venue_name_in_either_shape() {
-        let (flat, at) =
-            venue_cash(r#"{"ts": 1755600000.0, "kalshi": 301.11, "polymarket_us": 288.4}"#);
-        assert_eq!(flat.get("kalshi"), Some(&301.11));
-        assert_eq!(flat.len(), 2, "and `ts` did not become a third venue");
+    fn the_balance_snapshot_is_read_at_the_contract_the_engine_actually_publishes() {
+        let (cash, at, bound) = balances_snapshot(
+            r#"{"at":1755600000,"max_age_s":180,
+                "balances":{"kalshi":"301.11","polymarket_us":"288.4"}}"#,
+        );
+        assert_eq!(cash.get("kalshi"), Some(&301.11), "the figures are venue STRINGS");
+        assert_eq!(cash.len(), 2, "and neither `at` nor `max_age_s` became a third venue");
         assert_eq!(at, Some(1755600000.0));
-        assert_eq!(venue_cash(r#"{"balances": {"kalshi": 5.0}}"#).0.get("kalshi"), Some(&5.0));
-        assert!(venue_cash(r#"{"kalshi": "n/a"}"#).0.is_empty(), "not a number, not a balance");
-        assert!(venue_cash("not json").0.is_empty(), "and an unreadable file measures nothing");
+        assert_eq!(bound, Some(180), "the gate's own bound, off the file");
+
+        let (_, _, none) = balances_snapshot(r#"{"at":1,"balances":{"kalshi":"5"}}"#);
+        assert_eq!(none, None, "a file with no bound has an unknown staleness, not a default");
+        assert!(
+            balances_snapshot(r#"{"ts":1,"kalshi":301.11}"#).0.is_empty(),
+            "the pre-#77 shape this panel invented is not written by anything"
+        );
+        assert!(balances_snapshot(r#"{"balances":{"kalshi":"n/a"}}"#).0.is_empty(), "not money");
+        assert!(balances_snapshot("not json").0.is_empty(), "an unreadable file measures nothing");
     }
 
-    /// THE MONEY COLUMNS, at the site that emits them. Both figures the panel
-    /// exists to compare, the measured one beside them, and both gaps — nulling
-    /// any of them, or serving one under another's key, fails here.
+    /// WHAT THE GATE IS ACTUALLY SPENDING AGAINST, which is the fact that stops
+    /// the measured column reading as a second opinion. Inside its published
+    /// bound the gate spends against that very reading; past it the gate holds
+    /// no cash at all and refuses everything — opposite states behind the same
+    /// displayed number. An absent file cannot separate "has not answered yet"
+    /// from "never will", and says so rather than picking one.
+    #[test]
+    fn the_panel_says_which_figure_the_gate_is_spending_against() {
+        let p = "data/exec/balances.json";
+        assert_eq!(gate_state(false, p, Some(1), Some(180)).0, "none", "no armed engine, no gate");
+        assert_eq!(gate_state(true, p, Some(180), Some(180)).0, "live", "the bound is inclusive");
+        let (on, why) = gate_state(true, p, Some(181), Some(180));
+        assert_eq!(on, "stale");
+        assert!(why.contains("REFUSING EVERY ORDER"), "{why}");
+        assert_eq!(gate_state(true, p, None, Some(180)).0, "unknown", "no file: seed or refusing");
+        assert_eq!(gate_state(true, p, Some(1), None).0, "unknown", "no bound, no verdict");
+    }
+
+    /// THE MONEY COLUMNS, at the site that emits them, over a file written in
+    /// the shape `arb-trader`'s `publish_balances` really writes: nulling any of
+    /// them, serving one under another's key, or going back to the invented
+    /// `venue_cash.json`/`ts` contract fails here.
+    ///
+    /// THIS IS THE BLOCKER THE FIRST VERSION SHIPPED. The measured column read a
+    /// path nothing writes and a timestamp key nothing publishes, so it could
+    /// never populate on any machine — and every test that touched it wrote the
+    /// invented file itself and passed.
     #[test]
     fn the_money_columns_are_pinned_at_the_site_that_emits_them() {
         let dir = scratch("emit");
         std::fs::write(
-            format!("{dir}/exec/venue_cash.json"),
+            format!("{dir}/exec/balances.json"),
             format!(
-                r#"{{"ts": {}, "balances": {{"kalshi": 301.11, "polymarket_us": 288.4}}}}"#,
+                r#"{{"at": {}, "max_age_s": 180,
+                     "balances": {{"kalshi": "301.11", "polymarket_us": "288.4"}}}}"#,
                 now_secs() - 30
             ),
         )
-        .expect("a venue cash snapshot");
+        .expect("a balance snapshot");
         let mut a = Args::for_test();
         a.data_dir = dir;
         a.kalshi_balance = Some("340.0896".into());
@@ -1440,16 +1632,17 @@ mod tests {
         assert_eq!(v["unpriced_rows"], 0);
         assert_eq!(v["unmarked_records"], 0);
         assert!(v["engine_from"].as_str().expect("provenance").contains("arbbot-trader-m3"));
+        assert_eq!(v["gate_on"], "live", "a reading inside the bound IS what the gate spends");
 
         let rows = v["cash"].as_array().expect("one row per venue");
         let k = &rows[0];
         assert_eq!(k["venue"], "kalshi");
-        assert_eq!(k["engine_usd"], 320.43, "what the armed gate is spending against");
+        assert_eq!(k["engine_usd"], 320.43, "the --balance seed, off /proc");
         assert_eq!(k["dash_usd"], 340.0896, "what this process was started with");
         assert!((k["dash_diff_usd"].as_f64().expect("the constants' gap") + 19.6596).abs() < 1e-9);
         assert_eq!(k["venue_usd"], 301.11, "and what the engine last read off the venue");
         assert_eq!(k["venue_stale"], false);
-        assert!((k["venue_diff_usd"].as_f64().expect("a gap") - 19.32).abs() < 1e-9);
+        assert_eq!(k["venue_stale_past_s"], 180, "judged on the bound the engine published");
         assert_eq!(rows[1]["venue_usd"], 288.4, "the other venue is measured too");
     }
 
@@ -1471,36 +1664,81 @@ mod tests {
         assert!(k["engine_usd"].is_null(), "no risk gate is spending against this");
         assert!(k["dash_diff_usd"].is_null(), "so there is no gap, not a $0.0004 one");
         assert!(v["engine_from"].as_str().expect("provenance").contains("NOT armed"));
+        assert_eq!(v["gate_on"], "none", "and nothing here is a figure a gate is spending");
     }
 
-    /// `data/venue/` has had no writer for 22.7 days, so the measured side of
-    /// this panel only becomes real when the armed engine publishes what its
-    /// cash poll reads. Aged off the reading's OWN timestamp: a writer that
-    /// rewrites the file after a failed poll keeps the mtime fresh while the
-    /// number under it ages. Past the window the engine itself stops spending
-    /// against a reading, so the gap goes, and the reading is served as stale.
+    /// A reading past the bound the engine published for it is served as stale
+    /// and aged off its OWN `at`, never off the file's mtime — the age is most
+    /// of why this file is read at all, and a file with no `at` is not this
+    /// writer's file. Here the sentence beside the age is the true one: the gate
+    /// really has stopped, because `RiskView::spendable` hands back no pairs
+    /// past that bound and every venue then looks up $0.
     #[test]
-    fn an_expired_venue_reading_is_served_as_stale_and_aged_off_its_own_timestamp() {
+    fn an_expired_engine_reading_is_stale_and_says_the_gate_has_stopped() {
         let dir = scratch("expired");
         std::fs::write(
-            format!("{dir}/exec/venue_cash.json"),
-            format!(r#"{{"ts": {}, "kalshi": 301.11}}"#, now_secs() - 4 * 3600),
+            format!("{dir}/exec/balances.json"),
+            format!(r#"{{"at": {}, "max_age_s": 180, "balances": {{"kalshi": "301.11"}}}}"#,
+                    now_secs() - 4 * 3600),
         )
-        .expect("a venue cash snapshot");
+        .expect("a balance snapshot");
         let mut a = Args::for_test();
         a.data_dir = dir;
         let v = derived_capital(&a, &Value::Null, "u", true, Some("--balance kalshi=320.43"));
+        assert_eq!(v["gate_on"], "stale");
         let k = &v["cash"].as_array().expect("rows")[0];
         assert_eq!(k["venue_usd"], 301.11, "the number still shows — that much is true");
         assert_eq!(k["venue_stale"], true);
         assert!(k["venue_age_s"].as_u64().expect("an age") >= 4 * 3600, "not the file's mtime");
-        assert!(k["venue_diff_usd"].is_null(), "a gap against an expired reading is not a finding");
-        assert!(k["venue_from"].as_str().expect("provenance").ends_with("· ts"));
+        let means = k["venue_stale_means"].as_str().expect("what the age costs");
+        assert!(means.contains("stopped spending against it"), "{means}");
+        assert!(k["venue_from"].as_str().expect("provenance").contains("balance poll"));
     }
 
-    /// And with no snapshot at all — the state this repo has been in since
-    /// 2026-07-27 — the measured side says it is unavailable and NAMES the file
-    /// that would fill it, rather than showing a three-week-old number or a $0.
+    /// THE PM-US FALLBACK, which until #77 was the ONLY measured figure this
+    /// panel ever served in production and which no test reached: it could be
+    /// deleted, mis-keyed onto kalshi, or judged against the wrong window with
+    /// the suite green. It is buyingPower and never currentBalance, it lands on
+    /// the PM-US row alone, it is judged against the books page's hour because
+    /// it is the books page's file, and — M1 — the sentence beside its age is
+    /// NOT the one above. No risk gate has ever read this file, so its ageing
+    /// stopped nothing; borrowing the engine's alarm for it would raise a fault
+    /// against a snapshot the engine never consulted.
+    #[test]
+    fn the_hand_fetched_pmus_snapshot_is_the_fallback_and_says_so_in_its_own_words() {
+        let dir = scratch("pmus");
+        std::fs::write(
+            format!("{dir}/pmus_balances.json"),
+            r#"{"currentBalance": 653.15805, "buyingPower": 329.29805,
+                "marginRequirement": 323.86}"#,
+        )
+        .expect("a hand-fetched pm-us snapshot");
+        let mut a = Args::for_test();
+        a.data_dir = dir.clone();
+        a.pmus_dir = dir;
+        a.kalshi_balance = Some("340.0896".into());
+        let v = derived_capital(&a, &Value::Null, "u", true, Some("--balance kalshi=320.43"));
+        assert_eq!(v["gate_on"], "unknown", "no snapshot: the seed may or may not still be live");
+        let rows = v["cash"].as_array().expect("rows");
+        assert!(rows[0]["venue_usd"].is_null(), "kalshi is NOT measured by a pm-us file");
+        let p = rows.iter().find(|r| r["venue"] == "polymarket_us").expect("a pm-us row");
+        assert_eq!(p["venue_usd"], 329.29805, "buyingPower, never the 653.15805 currentBalance");
+        assert_eq!(
+            p["venue_stale_past_s"],
+            crate::endpoints::books::SNAPSHOT_STALE_S,
+            "the books page's hour, because this is the books page's file"
+        );
+        let means = p["venue_stale_means"].as_str().expect("what its age costs");
+        assert!(means.contains("no risk gate has ever read this file"), "{means}");
+        assert!(!means.contains("stopped spending"), "the gate never spent against this: {means}");
+        assert!(p["venue_from"].as_str().expect("provenance").contains("fetched by hand"));
+    }
+
+    /// And with no snapshot at all — the state this repo was in until #77 — the
+    /// measured side says it is unavailable and NAMES the file that would fill
+    /// it, rather than showing a three-week-old number or a $0. `gate_on` is
+    /// honest about the same hole: an absent file cannot tell a poll that has
+    /// not answered yet from one that never will.
     #[test]
     fn with_no_snapshot_the_measured_side_says_unavailable_rather_than_guessing() {
         let dir = scratch("nosnap");
@@ -1510,11 +1748,13 @@ mod tests {
         let v = derived_capital(&a, &Value::Null, "u", true, Some("--balance kalshi=320.43"));
         let k = &v["cash"].as_array().expect("rows")[0];
         assert!(k["venue_usd"].is_null());
-        assert!(k["venue_diff_usd"].is_null());
         assert!(k["venue_stale"].is_null(), "unknown is not fresh");
         let from = k["venue_from"].as_str().expect("a reason");
-        assert!(from.contains(&format!("{dir}/exec/venue_cash.json")), "{from}");
+        assert!(from.contains(&format!("{dir}/exec/balances.json")), "{from}");
         assert!(from.contains("does not exist"), "{from}");
+        assert_eq!(v["gate_on"], "unknown");
+        let why = v["gate_why"].as_str().expect("a reason");
+        assert!(why.contains("balances_source"), "and it names what would settle it: {why}");
         assert!(v["share_value_usd"].is_null(), "and no marks file is unknown, not a flat book");
     }
 

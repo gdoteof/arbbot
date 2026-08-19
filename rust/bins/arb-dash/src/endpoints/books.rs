@@ -168,11 +168,16 @@ fn recon_checks(
             "compared against --kalshi-balance, a constant typed at startup. NOT a tautology \
              like cash:pmus — the books side really does move when the fills snapshot does — \
              but the snapshot and the constant are hand-updated in the same act (the dash unit \
-             says so), so the two sides can only ever agree. Making it a check needs a SECOND, \
-             independently-sourced venue figure at request time, and nothing in this repo \
-             writes one. The Now view's capital panel puts this same --kalshi-balance constant \
-             against the armed engine's own --balance instead: that pair really can disagree, \
-             and today it does.",
+             says so), so the two sides can only ever agree. RETRACTED: this row used to say \
+             the missing ingredient was a second, independently-sourced venue figure and that \
+             nothing in this repo wrote one. Something does now — data/exec/balances.json, the \
+             armed engine's balance poll — and it still would not make this a check, because \
+             the two sides would be pictures of DIFFERENT INSTANTS: the books side is as of the \
+             fills snapshot, that figure is as of a minute ago, and everything traded in \
+             between is a legitimate difference rather than an error. What this row needs is a \
+             venue figure taken as of the snapshot. The Now view's capital panel puts this same \
+             --kalshi-balance constant against the armed engine's --balance SEED instead: two \
+             typed numbers that nothing moves, so they really can disagree, and today they do.",
         ));
         sources.push(serde_json::json!({
             "what": "kalshi cash balance",
@@ -329,12 +334,24 @@ mod tests {
     /// buyingPower that `PmusImport::apply`'s plug entry forces it to equal.
     /// They are kept because the figures are worth seeing, but a page that
     /// renders them as passing checks is a page that manufactures confidence.
+    ///
+    /// `cash:kalshi` STAYS unfalsifiable after #77, and its reason had to change
+    /// rather than its verdict. It used to say no second, independently-sourced
+    /// venue figure existed; `data/exec/balances.json` is one. It does not
+    /// rescue this row — a poll from a minute ago against books as of the fills
+    /// snapshot differs by everything traded in between — so the row must name
+    /// the file and say why, not keep claiming nothing writes one.
     #[test]
     fn the_two_cash_rows_declare_themselves_not_checks() {
         let mut a = Args::for_test();
         a.kalshi_balance = Some("123.45".into());
         let (out, _) = checks(&a, &pmus_figures("10.00", "11.00", "1.00", "1.00"));
-        assert_eq!(row(&out, accounts::CASH_KALSHI)["falsifiable"], false);
+        let k = row(&out, accounts::CASH_KALSHI);
+        assert_eq!(k["falsifiable"], false);
+        let why = k["why"].as_str().expect("a reason");
+        assert!(!why.contains("nothing in this repo writes one"), "#77 writes one: {why}");
+        assert!(why.contains("data/exec/balances.json"), "{why}");
+        assert!(why.contains("DIFFERENT INSTANTS"), "and why that one does not help: {why}");
         assert_eq!(row(&out, accounts::CASH_PMUS)["falsifiable"], false);
         assert_eq!(
             row(&out, "cash:pmus vs currentBalance − marginRequirement")["falsifiable"],

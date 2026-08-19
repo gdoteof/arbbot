@@ -1260,14 +1260,17 @@ function nowCapital(d){
       under a topic it was never gated under. Marks are ${dur(c.marks_age_s)} old.
     </div>
     <h2 style="margin-top:18px">Cash remaining, by venue &middot; and who believes what</h2>
-    <div class="sub" style="margin-bottom:6px">engine column read from:
+    <div class="sub" style="margin-bottom:6px">seed column read from:
       <b class="${d.engine.armed?'ok':'bad'}">${esc(v.engine_from||'unknown')}</b></div>
+    <div class="sub" style="margin-bottom:6px">the cash gate is on
+      <b class="${({live:'ok',stale:'bad',unknown:'warn'})[v.gate_on]||'dim'}">${esc(v.gate_on||'?')}</b>
+      &middot; ${esc(v.gate_why||'')}</div>
     <table>
       <thead><tr><th>venue</th>
-        <th class="num">${d.engine.armed ? esc(d.engine.unit)
+        <th class="num">${d.engine.armed ? esc(d.engine.unit)+' seed'
           : '<span class="bad">no armed engine</span>'}</th>
         <th class="num">this dashboard</th>
-        <th class="num">gap</th><th class="num">measured</th><th class="num">gap</th>
+        <th class="num">gap</th><th class="num">measured</th>
         <th>measured from</th></tr></thead>
       <tbody>${(v.cash||[]).map(r => `<tr data-k="cash-${esc(r.venue)}">
         <td>${esc(r.venue)}</td>
@@ -1275,12 +1278,10 @@ function nowCapital(d){
         <td class="num">${usd0(r.dash_usd)}</td>
         <td class="num ${r.dash_diff_usd?'warn':'dim'}">${usd0(r.dash_diff_usd)}</td>
         <td class="num">${usd0(r.venue_usd)}</td>
-        <td class="num ${r.venue_diff_usd?'warn':'dim'}">${r.venue_usd!=null&&r.venue_diff_usd==null
-          ? '<span class="dim" title="withheld: the measured side is stale or of unknown age">—</span>'
-          : usd0(r.venue_diff_usd)}</td>
         <td class="sub">${esc(r.venue_from)}${r.venue_age_s==null ? ''
           : ` &middot; <span class="${r.venue_stale?'bad':'dim'}">${dur(r.venue_age_s)} old${
-              r.venue_stale?', STALE — the engine has stopped spending against it':''}</span>`}</td>
+              r.venue_stale_past_s==null?'' : `, bound ${dur(r.venue_stale_past_s)}`}${
+              r.venue_stale?` &middot; <b>STALE</b> — ${esc(r.venue_stale_means)}`:''}</span>`}</td>
       </tr>`).join('')}</tbody>
     </table>
     <div class="sub" style="margin-top:8px">
@@ -1302,32 +1303,53 @@ function nowCapital(d){
       It is not split per venue and cannot be: a marked row is a two-leg basket priced as one
       number, so there is no per-leg money in <code>marks.json</code> to attribute.
       <br><br>
-      The <b>engine</b> column is the <code>--balance</code> constant a risk gate is spending
-      against, read off the process's <code>/proc</code> command line (the tracked unit file
-      says something else) — and it is filled ONLY when that process is ARMED. This host also
-      runs an unarmed shadow whose <code>--balance kalshi=340.09</code> is $0.0004 from this
+      The <b>seed</b> column is the <code>--balance</code> constant the armed process was
+      started with, read off its <code>/proc</code> command line (the tracked unit file says
+      something else) — and it is filled ONLY when that process is ARMED. This host also runs
+      an unarmed shadow whose <code>--balance kalshi=340.09</code> is $0.0004 from this
       dashboard's own constant, so filling the column from it with the armed slice stopped would
       collapse the one gap here that can fail to ~$0 and render a dead engine as an all-clear.
-      The constant is hand-typed and never decremented as capital deploys, so it must not be
-      added to <b>recoverable now</b> — those shares were bought with some of it.
+      <b>RETRACTED:</b> this column used to be headed "engine" and described as "the constant a
+      risk gate is spending against&hellip; never decremented as capital deploys". That was
+      audit C13 and #77 closed it. The armed engine now POLLS both venues every 60s and installs
+      what they say; <code>--balance</code> is only a seed, it is what the gate spends against
+      only while <code>balances_source</code> reads <code>seed</code> or <code>declared</code>,
+      and it EXPIRES on the same 180s clock as a reading — an armed run whose poll never answers
+      stops trading rather than trading the constant forever. It is still a number somebody
+      typed, so it still must not be added to <b>recoverable now</b>.
       <b>this dashboard</b> is this process's own <code>--kalshi-balance</code>; it is never a
       measurement, because putting it in the measured column would compare a hand-typed number
-      to itself. The two constants disagree, in different unit files, and either can be edited
-      alone: that gap is the one thing here that can fail.
+      to itself. Nothing moves either constant, so the <b>gap</b> between them is a typo or a
+      stale edit and can be nothing else: it is the one comparison here that can genuinely fail.
       <br><br>
-      <b>measured</b> is a figure some process actually read off the venue —
-      <code>data/exec/venue_cash.json</code>, written by the armed engine's cash poll, aged off
-      the reading's own <code>ts</code> where it carries one rather than off a file mtime a
-      failed poll would refresh. Where that file is absent the row says so and shows nothing;
-      the one exception is PM-US, which falls back to the hand-fetched
+      <b>measured</b> is a figure a process actually read off the venue.
+      <code>data/exec/balances.json</code> is the armed engine's balance poll publishing what
+      the venues just told it — Kalshi <code>balance_dollars</code>, PM-US
+      <code>buyingPower</code> — written on every cycle that produced a usable reading and on no
+      other, so an abandoned poll leaves the last reading to age rather than refreshing it. It
+      is dated by the reading's own <code>at</code> and judged against the <code>max_age_s</code>
+      the engine publishes in the same file, which is the gate's own expiry rather than a number
+      copied into this page. Where that file is absent the row says so and shows nothing; the one
+      exception is PM-US, which falls back to the hand-fetched
       <code>data/venue/pmus_balances.json</code> the books page reconciles against — no writer
-      since 2026-07-27, so read the STALE flag and not the number. The <b>gap</b> beside it is
-      withheld (&mdash;) whenever the measured side is stale or of unknown age: a discrepancy
-      against a three-week-old snapshot is not a small finding, it is not a finding, and it
-      renders exactly like one. The figure itself is PM-US <code>buyingPower</code>, never
-      <code>currentBalance</code>, which is <code>buyingPower + marginRequirement</code> — that
-      margin is already inside each position's cost basis and therefore already inside
-      <b>recoverable now</b>.
+      since 2026-07-27. Read each row's STALE note: they do not mean the same thing. A stale
+      <code>balances.json</code> means the gate has stopped — past its bound it holds no cash at
+      all, every venue reads $0 and <code>insufficient &lt;venue&gt; balance</code> refuses
+      everything. A stale hand-fetched snapshot means only that it is old; no gate ever read it.
+      The PM-US figure is <code>buyingPower</code>, never <code>currentBalance</code>, which is
+      <code>buyingPower + marginRequirement</code> — that margin is already inside each
+      position's cost basis and therefore already inside <b>recoverable now</b>.
+      <br><br>
+      <b>There is deliberately no gap beside <i>measured</i>.</b> The previous version of this
+      panel published <code>--balance</code> minus the measured figure and painted any non-zero
+      amber. It never meant one thing. Before #77 the seed was a launch-time constant nothing
+      decremented, so that number was CAPITAL DEPLOYED SINCE LAUNCH — the healthiest reading on
+      the page, rendered as a fault. After #77 it is worse: while the gate is on
+      <code>live</code> it is spending against the measured column <i>itself</i>, so an honest
+      gap is structurally zero, and while it is on <code>seed</code> the measured figure is one
+      no gate consulted. A constant and a measurement are not two opinions about one instant.
+      What the line above the table says instead — which of the two columns the gate is actually
+      on — is the fact that number was pretending to carry.
     </div>
   </section>`);
 }
