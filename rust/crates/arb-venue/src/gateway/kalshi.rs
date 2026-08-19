@@ -1117,4 +1117,17 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
         }
         Ok(out)
     }
+
+    /// `balance_dollars`, UNMODIFIED.
+    ///
+    /// Not "cash minus short collateral", and the symmetry with PM-US that
+    /// invites is a trap: this number is ALREADY net of it. Quirk
+    /// `kalshi-short-collateral-one-dollar-per-contract` says a net-short YES
+    /// position encumbers $1.00 per contract *of `balance_dollars`* — so the
+    /// field is the analogue of PM-US's `buyingPower`, not of its
+    /// `currentBalance`, and deducting shorts here again would double-deduct
+    /// them.
+    fn spendable_cash(&self) -> Result<String, VenueError> {
+        Ok(self.balances()?.balance_dollars)
+    }
 }

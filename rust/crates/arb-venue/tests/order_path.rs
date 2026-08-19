@@ -1602,3 +1602,27 @@ fn a_market_row_with_no_tick_ladder_is_refused() {
         other => panic!("a ladder we never read must not be defaulted: {other:?}"),
     }
 }
+
+// ------------------------------------------------- spendable_cash (C13) ---
+
+/// `balance_dollars`, handed over UNMODIFIED. Kalshi's figure is ALREADY net of
+/// the $1.00 per short contract it withholds (quirk
+/// `kalshi-short-collateral-one-dollar-per-contract`), so a symmetry argument
+/// with PM-US's `buyingPower` that subtracts shorts here double-deducts them.
+/// The mock panics on an unexpected request, so this also pins that nothing
+/// else — the position list above all — is consulted to derive it.
+#[test]
+fn kalshi_spendable_cash_is_the_balance_field_untouched() {
+    let g = gw(vec![(200, r#"{"balance_dollars":"320.4300"}"#)]);
+    assert_eq!(g.spendable_cash().expect("read"), "320.4300");
+    assert_eq!(g.transport.sent().len(), 1, "one read, and it is the balance endpoint");
+}
+
+/// A venue that did not answer is not an account with no money in it: a cash
+/// gate reading "$0" refuses every order, so folding a 503 into one would be a
+/// self-inflicted trading halt wearing the costume of a real balance.
+#[test]
+fn a_kalshi_read_that_failed_is_not_zero_spendable_cash() {
+    let g = gw(vec![(503, "service unavailable")]);
+    assert!(g.spendable_cash().is_err());
+}

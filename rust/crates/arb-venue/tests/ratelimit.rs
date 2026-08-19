@@ -99,6 +99,10 @@ fn gateways_are_not_wired() {
     assert_eq!(g.rehearse("KXTIME-26-ZOH").unwrap_err(), VenueError::NotWired);
     assert_eq!(g.balances().unwrap_err(), VenueError::NotWired);
     assert_eq!(g.positions().unwrap_err(), VenueError::NotWired);
+    // ...and the normalized cash read too: an unwired gateway must refuse, not
+    // report an account with no money in it, which is what a cash gate would
+    // act on by refusing every order.
+    assert_eq!(g.spendable_cash().unwrap_err(), VenueError::NotWired);
 
     // PM-US stub is likewise inert.
     let pm = PmusGateway::new(
@@ -107,4 +111,5 @@ fn gateways_are_not_wired() {
     );
     assert_eq!(pm.positions().unwrap_err(), VenueError::NotWired);
     assert_eq!(pm.balances().unwrap_err(), VenueError::NotWired);
+    assert_eq!(pm.spendable_cash().unwrap_err(), VenueError::NotWired);
 }

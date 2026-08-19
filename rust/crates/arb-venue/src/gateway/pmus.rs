@@ -507,6 +507,35 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
         }
         Ok(out)
     }
+
+    /// `buyingPower`, and NEVER `currentBalance`.
+    ///
+    /// THE DOUBLE-COUNT TRAP. `currentBalance = buyingPower +
+    /// marginRequirement` (quirk `pmus-margin-is-one-dollar-per-short`; live on
+    /// 2026-08-14, 653.15805 = 329.29805 + 323.86), and `marginRequirement` is
+    /// $1.00 per short contract that the position's own cost basis already
+    /// carries. Spending against `currentBalance` counts that collateral twice
+    /// — the bug the 2026-08-14 accounting audit found. [`resp::PmBalance`]
+    /// does not deserialize the other two fields at all, which is what keeps
+    /// the wrong one out of reach here; `arb-ledger` has its own `Balances`
+    /// type that DOES carry all three, and it is the books' importer, not this.
+    ///
+    /// NO ROWS is an error, never "$0", by [`VenueGateway::net_positions`]'
+    /// rule: an empty answer is an affirmative claim about the account, and
+    /// this one reads as "this venue can buy nothing", which closes every
+    /// basket with a leg on it.
+    fn spendable_cash(&self) -> Result<String, VenueError> {
+        match self.balances()?.balances.into_iter().next() {
+            Some(b) => Ok(b.buying_power),
+            None => Err(VenueError::Status {
+                endpoint: "pmus balances",
+                status: 0,
+                body: "EMPTY balances array — refusing to report $0 spendable, which a cash \
+                       gate cannot tell from an account with no money in it."
+                    .into(),
+            }),
+        }
+    }
 }
 
 fn json_empty() -> Value {

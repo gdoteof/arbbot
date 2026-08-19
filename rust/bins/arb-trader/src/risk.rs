@@ -29,6 +29,7 @@ use arb_core::risk::{check_order, ConfigIn, ExposureIn, Input, RelIn, TopicIn};
 use arb_core::scan::Rel;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Python `RiskConfig` defaults (src/arbbot/risk/manager.py:37-59). Only
 /// bankroll and per_class_cap are file-driven; the rest are code defaults there
@@ -51,6 +52,40 @@ struct Exposure {
 /// reprice REPLACES its own reservation rather than stacking a second one.
 type Slot = (String, String, BookSide);
 
+/// How old a LIVE balance reading may be and still authorise spending. Three
+/// poll cycles (`main::BALANCE_POLL` is 60s).
+///
+/// `maker_exit::VIEW_MAX_AGE`'s number and its reasoning: one missed cycle is
+/// ordinary — a 503, a background token bucket spent by the fill
+/// reconciliation — and refusing on it would make the gate flap; three missed
+/// in a row is an endpoint that is down, and the honest answer to "how much
+/// cash have we got" from a venue that has not spoken in three minutes is not
+/// the last number it gave.
+///
+/// FAIL-CLOSED, and affordable HERE for the reason [`RiskGate::check`] states
+/// about itself: it gates OPENING only, and the hedge path consults risk
+/// nowhere. An expired reading therefore costs entries and can never strand a
+/// leg.
+pub const BALANCE_MAX_AGE: Duration = Duration::from_secs(180);
+
+/// Where the cash the gate spends against came from.
+///
+/// A STALE READING IS NOT A MISSING ONE, and this type exists so a caller
+/// cannot collapse the two — `taketake::Bar`'s rule, for the same reason. The
+/// tempting collapse here is "fall back to `--balance` when the poll goes
+/// quiet", which re-arms the exact defect the poll was added to remove the
+/// moment the endpoint flaps, and does it silently.
+enum Cash {
+    /// `--balance`, hand-typed on the command line. It carries no age because
+    /// there is nothing to age it against: it is a declaration, not a reading.
+    /// This is the unarmed shadow's ONLY source — it holds no credentials — and
+    /// on an armed run it is the seed that covers the window before the first
+    /// poll returns, which is one venue round trip.
+    Declared(Vec<(String, String)>),
+    /// What the venues themselves last said, and when they said it.
+    Live { pairs: Vec<(String, String)>, at: Instant },
+}
+
 pub struct RiskView {
     bankroll: String,
     per_class_cap: String,
@@ -64,18 +99,26 @@ pub struct RiskView {
     /// Why the bankroll and class cap cannot be trusted, when they cannot. Both
     /// are then $0 — see `Caps::corrupt`.
     caps_corrupt: Option<String>,
-    /// venue -> available cash. Empty means the per-venue cash check sees $0
-    /// and refuses everything, so this is REQUIRED for the gate to pass — an
-    /// unconfigured balance fails closed, which is the right direction. BOTH of
+    /// venue -> available cash, and where that number came from. No pairs means
+    /// the per-venue cash check sees $0 and refuses everything, so a source
+    /// that cannot answer fails closed, which is the right direction. BOTH of
     /// a basket's legs are checked against this (see `venue_costs`), so a venue
-    /// omitted from `--balance` closes every relationship that touches it.
+    /// missing from it closes every relationship that touches it.
     ///
-    /// STILL A HAND-TYPED CONSTANT (audit C13): `--balance kalshi=340.09` is
-    /// passed in the unit file and is never decremented as capital is deployed,
-    /// so this gate catches "that venue is not funded at all", not "we have
-    /// spent our cash". Wiring the real figure needs the gateways' `balances()`
-    /// at startup and after each fill, which lives in main.rs/arb-venue.
-    balances: Vec<(String, String)>,
+    /// NO LONGER A HAND-TYPED CONSTANT ON AN ARMED RUN (audit C13, retracted).
+    /// It used to be `--balance kalshi=340.09` and nothing else — passed in the
+    /// unit file, never decremented as capital deployed — so the gate caught
+    /// "that venue is not funded at all" and never "we have spent our cash".
+    /// `main::spawn_balance_poll` now reads both venues on a 60s tick and
+    /// installs the real spendable figure through
+    /// [`RiskView::set_live_balances`]; `--balance` is the seed that covers the
+    /// first round trip, and remains the whole story for the unarmed shadow,
+    /// which holds no credentials to read anything with.
+    ///
+    /// Behind a `Mutex` because [`RiskGate::check`] takes `&self` through an
+    /// `Arc` — it joins `exposure`, `reserved` and `checked` below for exactly
+    /// that reason.
+    balances: Mutex<Cash>,
     /// rel id -> oracle_risk, from the registry. It scales the per-rel cap and
     /// is not carried on `Rel`, so it is looked up by id.
     oracle_risk: HashMap<String, String>,
@@ -386,9 +429,10 @@ fn caps_from_yaml(path: &str) -> Caps {
 }
 
 impl RiskView {
-    /// `balances` are venue->cash pairs. The dry-run engine has no credentials,
-    /// so they arrive on the command line; once the engine reads them from the
-    /// venue at startup (as the Python runner did) that becomes the source.
+    /// `balances` are the `--balance` venue->cash pairs. The dry-run engine has
+    /// no credentials, so they arrive on the command line; an armed run
+    /// replaces them with the venues' own answer on its first poll (see the
+    /// `balances` field and [`Self::set_live_balances`]).
     pub fn load(
         exec_yaml: &str,
         topics_yaml: &str,
@@ -405,7 +449,7 @@ impl RiskView {
             default_only_below_util: t.default_gate,
             topics_corrupt: t.corrupt,
             caps_corrupt: c.corrupt,
-            balances,
+            balances: Mutex::new(Cash::Declared(balances)),
             oracle_risk,
             exposure: Mutex::new(Exposure::default()),
             reserved: Mutex::new(HashMap::new()),
@@ -424,12 +468,59 @@ impl RiskView {
                 Some(why) => format!("UNUSABLE (all budgets $0): {why}"),
                 None => self.topics.len().to_string(),
             },
-            self.balances
+            self.spendable()
                 .iter()
                 .map(|(v, b)| format!("{v}=${b}"))
                 .collect::<Vec<_>>()
                 .join(" ")
         )
+    }
+
+    /// The cash the gate may spend right now, and NOTHING else: an expired
+    /// live reading yields no pairs at all, so `arb_core::risk`'s `lookup`
+    /// reads $0 for every venue and the existing `insufficient <venue> balance`
+    /// refusal fires unchanged. There is deliberately no fall back to
+    /// `--balance` here — see [`Cash`].
+    fn spendable(&self) -> Vec<(String, String)> {
+        match &*self.balances.lock().expect("balances") {
+            Cash::Declared(pairs) => pairs.clone(),
+            Cash::Live { pairs, at } if at.elapsed() <= BALANCE_MAX_AGE => pairs.clone(),
+            Cash::Live { .. } => Vec::new(),
+        }
+    }
+
+    /// Install what the venues just said. `main::spawn_balance_poll` is the
+    /// only caller, and it calls this only with a reading for BOTH of them:
+    /// writing one venue's figure alone would leave the other at $0 and close
+    /// every basket, since `venue_costs` charges both legs.
+    pub fn set_live_balances(&self, pairs: Vec<(String, String)>) {
+        *self.balances.lock().expect("balances") = Cash::Live { pairs, at: Instant::now() };
+    }
+
+    /// Seconds since the venues were last read; `-1` = never, which covers
+    /// bench, the unarmed shadow, and an armed run before its first cycle
+    /// returns. A distinct value rather than a large number, for
+    /// `positions::age_s`'s reason: "no reading yet" and "a very old reading"
+    /// call for different responses.
+    pub fn balances_age_s(&self) -> i64 {
+        match &*self.balances.lock().expect("balances") {
+            Cash::Declared(_) => -1,
+            Cash::Live { at, .. } => at.elapsed().as_secs() as i64,
+        }
+    }
+
+    /// What the gate is spending against RIGHT NOW: `declared` (`--balance`),
+    /// `live`, or `stale`.
+    ///
+    /// `stale` refuses every order, and without a gauge saying so that is
+    /// indistinguishable from a quiet market — `describe()` prints once at
+    /// startup and never again, so nothing else would ever report it.
+    pub fn balances_source(&self) -> &'static str {
+        match &*self.balances.lock().expect("balances") {
+            Cash::Declared(_) => "declared",
+            Cash::Live { at, .. } if at.elapsed() <= BALANCE_MAX_AGE => "live",
+            Cash::Live { .. } => "stale",
+        }
     }
 
     /// A fill opened `qty` more contracts on this relationship — the exposure
@@ -708,7 +799,7 @@ impl RiskGate for RiskView {
                 by_class: pairs(&by_class),
                 by_topic: pairs(&by_topic),
             },
-            balances: self.balances.clone(),
+            balances: self.spendable(),
             notional: n.clone(),
             venue_costs: venue_costs(rel, venue, &n),
             // The maker path passes no APR, so the great-opportunity overflow
@@ -842,6 +933,109 @@ mod tests {
         let v = funded("low");
         let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
         assert!(d.allowed, "{:?}", d.reasons);
+    }
+
+    /// Backdate a live reading, since nothing else can make one age inside a
+    /// test. Reaches into the private field rather than adding a production
+    /// setter that only tests would ever call.
+    fn age_the_live_reading(v: &RiskView, by: Duration) {
+        let mut g = v.balances.lock().expect("balances");
+        let pairs = match &*g {
+            Cash::Live { pairs, .. } => pairs.clone(),
+            Cash::Declared(_) => panic!("nothing has been polled yet"),
+        };
+        *g = Cash::Live { pairs, at: Instant::now().checked_sub(by).expect("monotonic") };
+    }
+
+    /// The C13 defect itself: `--balance` is hand-typed and never decremented,
+    /// so a venue whose cash we have actually spent still looks funded. What
+    /// the venue says must WIN over what the command line declared, or the
+    /// poll is decoration.
+    #[test]
+    fn what_the_venue_says_beats_what_the_command_line_declared() {
+        let v = funded("low"); // --balance says both venues hold $1000
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
+        v.set_live_balances(vec![
+            ("kalshi".into(), "0.42".into()),
+            ("polymarket_us".into(), "1000".into()),
+        ]);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
+        assert!(!d.allowed, "the declared figure must not outvote the venue");
+        assert!(
+            d.reasons.iter().any(|r| r.contains("insufficient kalshi balance")),
+            "{:?}",
+            d.reasons
+        );
+    }
+
+    /// ...and the other direction, which is the one that spends money: a live
+    /// reading that CLEARS a venue the command line under-declared must be
+    /// believed too. Without this, "live wins" could be satisfied by a gate
+    /// that merely refuses more often.
+    #[test]
+    fn a_live_reading_can_fund_a_venue_the_command_line_starved() {
+        let v = view(vec![("kalshi", "0"), ("polymarket_us", "0")], "low");
+        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
+        v.set_live_balances(vec![
+            ("kalshi".into(), "1000".into()),
+            ("polymarket_us".into(), "1000".into()),
+        ]);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
+        assert!(d.allowed, "{:?}", d.reasons);
+    }
+
+    /// FAIL-CLOSED ON AGE, and specifically NOT back to `--balance`. A reading
+    /// nothing is refreshing is not a balance, and the tempting fallback
+    /// re-arms the C13 constant the instant the endpoint flaps — silently, and
+    /// for as long as it stays down. Affordable because `check` gates OPENING
+    /// only: an expired reading costs entries and can never strand a leg.
+    #[test]
+    fn a_live_reading_that_has_aged_out_refuses_rather_than_falling_back() {
+        let v = funded("low"); // --balance would allow this order
+        v.set_live_balances(vec![
+            ("kalshi".into(), "1000".into()),
+            ("polymarket_us".into(), "1000".into()),
+        ]);
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
+        age_the_live_reading(&v, BALANCE_MAX_AGE + Duration::from_secs(1));
+        let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
+        assert!(!d.allowed, "a reading nobody is refreshing must not authorise spending");
+        assert!(
+            d.reasons.iter().any(|r| r.contains("insufficient kalshi balance")),
+            "{:?}",
+            d.reasons
+        );
+    }
+
+    /// A reading inside the bound is still spent against — the gate must not
+    /// flap on one missed cycle, which is an ordinary 503 or a spent token
+    /// bucket rather than an endpoint that is down.
+    #[test]
+    fn a_reading_from_two_cycles_ago_is_still_good_enough_to_spend() {
+        let v = view(vec![], "low"); // nothing declared: only the poll can fund it
+        v.set_live_balances(vec![
+            ("kalshi".into(), "1000".into()),
+            ("polymarket_us".into(), "1000".into()),
+        ]);
+        age_the_live_reading(&v, BALANCE_MAX_AGE - Duration::from_secs(1));
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
+    }
+
+    /// The gauges the stats JSON publishes. A gate that has silently closed
+    /// because its readings expired is indistinguishable from a quiet market,
+    /// and `describe()` prints once at startup and never again — so these two
+    /// are the only way an operator can tell the difference.
+    #[test]
+    fn the_gauges_say_which_number_the_gate_is_spending_against() {
+        let v = funded("low");
+        assert_eq!(v.balances_source(), "declared");
+        assert_eq!(v.balances_age_s(), -1, "never polled is not an old poll");
+        v.set_live_balances(vec![("kalshi".into(), "1000".into())]);
+        assert_eq!(v.balances_source(), "live");
+        assert_eq!(v.balances_age_s(), 0);
+        age_the_live_reading(&v, BALANCE_MAX_AGE + Duration::from_secs(30));
+        assert_eq!(v.balances_source(), "stale");
+        assert_eq!(v.balances_age_s(), BALANCE_MAX_AGE.as_secs() as i64 + 30);
     }
 
     /// C13a. Quoting Kalshi obliges us to hedge on PM-US, so PM-US's cash is

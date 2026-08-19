@@ -323,6 +323,18 @@ pub trait OrderSink: Send + Sync {
     fn net_positions(&self) -> Result<std::collections::BTreeMap<String, f64>, VenueError> {
         Err(VenueError::NotWired)
     }
+    /// Venue truth for SPENDABLE CASH — what the risk gate may open against.
+    /// Through the SINK for the same reason `net_positions` is: one gateway per
+    /// venue per process, so this spends the same background token bucket as
+    /// every other read (quirk `xv-shared-api-budget`).
+    ///
+    /// The default REFUSES — see
+    /// [`arb_venue::gateway::VenueGateway::spendable_cash`], which explains
+    /// which field each venue means by "spendable" and why "$0" is the one
+    /// answer this must never invent.
+    fn spendable_cash(&self) -> Result<String, VenueError> {
+        Err(VenueError::NotWired)
+    }
     /// Venue truth for a market's TOP OF BOOK, for a market this process holds
     /// no feed subscription for — see
     /// [`arb_venue::gateway::VenueGateway::market_quote`], which explains why
@@ -371,6 +383,9 @@ where
     }
     fn net_positions(&self) -> Result<std::collections::BTreeMap<String, f64>, VenueError> {
         VenueGateway::net_positions(self)
+    }
+    fn spendable_cash(&self) -> Result<String, VenueError> {
+        VenueGateway::spendable_cash(self)
     }
     fn market_quote(&self, market: &str) -> Result<arb_venue::gateway::Quote, VenueError> {
         VenueGateway::market_quote(self, market)
