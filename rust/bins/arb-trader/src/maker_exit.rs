@@ -282,6 +282,34 @@ pub const MAX_RESTING: usize = 1;
 /// re-prices it against a fresh book rather than abandoning it.
 pub const MAX_RESTING_S: f64 = 3600.0;
 
+/// Cycles [`heal`] will retry a failed close PROFITABLY-ONLY before it crosses
+/// out regardless of price. Ten, so ten minutes.
+///
+/// WHY IT CROSSES AT ALL. Being one-legged after an exit is not a pricing
+/// problem, it is a directional position: the Kalshi contracts are sold and the
+/// PM-US side is naked until the market resolves, which for this book is 51 to
+/// 249 days away. `risk.rs` already states the governing invariant for the
+/// symmetric case — "never consult this for a HEDGE. Refusing a hedge leaves the
+/// first leg naked, which is strictly worse than being a little over budget" —
+/// and completing a close is the same trade with the same asymmetry. The sizes
+/// make it lopsided rather than arguable: [`MAX_CLIP`] is 5 and [`MAX_RESTING`]
+/// is 1, so at most five contracts are ever naked at once. Crossing out costs
+/// cents; carrying them costs up to $5 of unhedged direction for months.
+///
+/// WHY THERE IS A PROFITABLE-ONLY WINDOW FIRST. Most of the ways a close fails
+/// are transient — an IOC that missed, a book that moved for a second, a refused
+/// order — and on the next cycle the same close often pays. Ten cycles is the
+/// cheap half of the trade; the eleventh admits it is not going to be cheap and
+/// takes the flat position anyway.
+///
+/// THE PROFITABLE-ONLY HALF CANNOT BE THE WHOLE RULE, which is the measurement
+/// that settled this. `--positions-recon-act` is the backstop the old alarm text
+/// pointed at, and it is profitable-only: `positions_recon_acted` is 0 across
+/// thousands of refusals over the life of the deployment, because a leg that is
+/// underwater fails its profit floor every time. A profitable-only self-heal
+/// inherits that 0% rate in exactly the case that needs it.
+const HEAL_PROFITABLE_CYCLES: u32 = 10;
+
 /// How old a resting exit must be before a 404 on its id is read as GONE rather
 /// than as NOT YET VISIBLE.
 ///
@@ -339,6 +367,30 @@ static REFUSED: AtomicU64 = AtomicU64::new(0);
 /// is not hedged. Never folded into [`REFUSED`] — "the book did not pay" and
 /// "we are naked and our books disagree" must never share a number.
 static UNRESOLVED: AtomicU64 = AtomicU64::new(0);
+/// Unresolved legs this process closed BY ITSELF, via [`heal`].
+///
+/// A SECOND COUNTER RATHER THAN A DECREMENT ON [`UNRESOLVED`].
+///
+/// NOT because decrementing would break the page. An earlier draft of this
+/// comment claimed a heal-then-relapse would return the gauge to a value it had
+/// already reported and so fail to read as a rise; that is FALSE, and driving
+/// `scripts/gauge_deltas.py` through 0 -> 1 -> 0 -> 1 shows it paging both
+/// times. Its RISE rule re-clamps with `base = min(base, cur)` for exactly this
+/// case — "a level that fell needs its baseline to fall with it".
+///
+/// The real reasons are quieter and all three still hold:
+///
+///   * `UNRESOLVED` is an INCIDENT COUNT. Decrementing it answers "are we naked
+///     now", which [`outstanding`] already answers, and destroys "how many times
+///     has this happened" — the number that says whether the close path is
+///     unreliable rather than unlucky.
+///   * `gauge_deltas.py` picked RISE *because* this gauge is a ratchet, and says
+///     so. Making it fall would leave that rule reading something it was not
+///     chosen for.
+///   * `maker_exit_healed` is worth reading on its own: it is how an operator
+///     tells "the engine fixed it" from "nothing has happened yet", which a
+///     single gauge returning to 0 cannot express.
+static HEALED: AtomicU64 = AtomicU64::new(0);
 
 pub fn placed() -> u64 {
     PLACED.load(AtomicOrd::Relaxed)
@@ -351,6 +403,18 @@ pub fn refused() -> u64 {
 }
 pub fn unresolved() -> u64 {
     UNRESOLVED.load(AtomicOrd::Relaxed)
+}
+pub fn healed() -> u64 {
+    HEALED.load(AtomicOrd::Relaxed)
+}
+
+/// Naked legs this process is carrying RIGHT NOW: raised minus healed.
+///
+/// This is the latch. It replaces the old `unresolved() > 0` test, which could
+/// only ever be cleared by restarting the process — correct while nothing could
+/// close a naked leg, and the wrong shape once something can.
+pub fn outstanding() -> u64 {
+    unresolved().saturating_sub(healed())
 }
 
 fn refuse(why: String) -> String {
@@ -1050,6 +1114,25 @@ pub struct Resting {
     pub since: Instant,
 }
 
+/// A Kalshi exit that SOLD and whose PM-US close did not complete.
+///
+/// The old code had nowhere to put this: every failure arm called
+/// `alarm_unresolved` and returned, so the only record that we were one-legged
+/// was a log line and a counter, and the only recovery was a human. This is that
+/// state made durable enough to act on.
+pub struct PendingClose {
+    /// The exit whose Kalshi leg is already gone. Carries the markets, the two
+    /// bases and the `closes_ts` the eventual `unwound` record must name.
+    pub order: Order,
+    /// Contracts the Kalshi ask sold. The PM-US side owes exactly this many.
+    pub filled: i64,
+    /// When the Kalshi fill happened — how long we have been naked.
+    pub since: Instant,
+    /// Cycles [`heal`] has tried. Past [`HEAL_PROFITABLE_CYCLES`] it stops
+    /// insisting the close be profitable.
+    pub attempts: u32,
+}
+
 /// Everything the armed pass keeps between cycles.
 pub struct Live {
     /// DECIDE, LOG, AND STOP. Everything above the wire runs — the view, the
@@ -1064,6 +1147,9 @@ pub struct Live {
     pub ledger_path: String,
     pub debounce: Debounce,
     pub resting: Option<Resting>,
+    /// A close that did not complete, carried across cycles so [`heal`] can
+    /// finish it. `Some` IS the latch's cause; [`outstanding`] is its effect.
+    pub pending: Option<PendingClose>,
     /// Why the resting exit should give up the single [`MAX_RESTING`] slot, when
     /// it should. Set by [`Live::target`] — which is the only place that both
     /// knows the age of the resting ask and has the admitted candidate set to
@@ -1096,6 +1182,7 @@ impl Live {
             ledger_path,
             debounce: Debounce::default(),
             resting: None,
+            pending: None,
             rotate: None,
             unaddressable: BTreeSet::new(),
             cx,
@@ -1143,13 +1230,13 @@ impl Live {
         &mut self,
         exits: &'a [crate::unwind::Exit],
         now: f64,
-        unresolved: u64,
+        outstanding: u64,
     ) -> Result<&'a crate::unwind::Exit, String> {
         // The debounce is folded on EVERY cycle, including one that will not
         // place: forgetting a scan because an exit was already resting would
         // restart the clock for every other candidate.
         let admitted = self.debounce.admit(exits, now);
-        if unresolved > 0 {
+        if outstanding > 0 {
             // NOT `refuse()`. The REFUSED gauge is the resting state of a module
             // that mostly declines — "the book did not pay" — and this is a
             // halt: an exit of ours filled and its close did not, so the ledger
@@ -1157,14 +1244,15 @@ impl Live {
             // at the venue. See the gauge's own doc for why the two must never
             // share a number.
             return Err(format!(
-                "maker_exit_unresolved is {unresolved} — a Kalshi exit SOLD contracts whose \
+                "{outstanding} naked leg(s) outstanding — a Kalshi exit SOLD contracts whose \
                  PM-US leg this process could not close or could not read, so the lot the \
                  ledger still calls open is one the venue has already sold. Resting another \
                  ask against it compounds the naked short by a clip a cycle, which is the \
-                 failure this halt exists to make unexpressible. It is a LATCH: the counter \
-                 never decrements, so nothing new rests until the leg has been reconciled by \
-                 hand and this process has been RESTARTED. ({} of {} candidate(s) are still \
-                 held, and the debounce is still being folded for all of them.)",
+                 failure this halt exists to make unexpressible. `heal` IS WORKING ON IT every \
+                 cycle — re-reading venue truth, re-sizing to the shortfall and re-pricing — \
+                 and this clears the moment it is flat; no restart, and no hand. ({} of {} \
+                 candidate(s) are still held, and the debounce is still being folded for all \
+                 of them.)",
                 admitted.len(),
                 exits.len()
             ));
@@ -1298,16 +1386,31 @@ pub fn book(path: &str, o: &Order, k_fill: &str, pm_fill: &str, filled: i64, ts:
 /// Its own function because it is the one outcome here that is not a non-event,
 /// and the wording is the deliverable: a naked leg the ledger does not know
 /// about is worse than either half alone.
+/// Alarm on a naked leg AND hand it to [`heal`].
+///
+/// One function, because the two must not be able to drift. A leg that alarms
+/// and is not parked waits for a human — the old behaviour, and the defect. A
+/// leg that is parked and does not alarm is worse: it would self-heal silently,
+/// so nobody would learn the close path had failed at all. Every arm does both.
+fn park(live: &mut Live, o: &Order, qty: i64, since: Instant, why: &str) -> String {
+    let line = alarm_unresolved(o, qty, why);
+    live.pending = Some(PendingClose { order: o.clone(), filled: qty, since, attempts: 0 });
+    line
+}
+
 pub fn alarm_unresolved(o: &Order, filled: i64, why: &str) -> String {
     UNRESOLVED.fetch_add(1, AtomicOrd::Relaxed);
     format!(
         "[maker-exit] ### NAKED AFTER EXIT ### {filled}x {} SOLD on Kalshi and the PM-US \
          close on {} did NOT complete ({why}). We are short {} PM-US YES with nothing against \
          it, and the ledger still says the basket opened at ts {} is OPEN — so no exposure \
-         fold, no cap and no unwind can see this. --positions-recon-act will report it as a \
-         PmShort next cycle and, if armed, will try to complete it by BUYING KALSHI BACK, \
-         which re-opens what this just exited. RECONCILE BY HAND. \
-         maker_exit_unresolved is now {}.",
+         fold, no cap and no unwind can see this. `heal` HAS IT: from the next 60s cycle it \
+         re-reads PM-US venue truth, sizes the retry to the shortfall and re-prices, \
+         profitable-only for {HEAL_PROFITABLE_CYCLES} cycles and then crossing out regardless. \
+         NO HAND NEEDED unless it is still saying this in ~15 minutes. (Do NOT also let \
+         --positions-recon-act complete it by BUYING KALSHI BACK — that re-opens what this \
+         just exited; it is profitable-only and has acted 0 times to date, so in practice it \
+         will not.) maker_exit_unresolved is now {}.",
         o.market,
         o.pm_market,
         filled,
@@ -1390,7 +1493,15 @@ async fn cycle(
             return out;
         }
     };
-    // MANAGE FIRST. A resting ask is money already at a venue; a new candidate
+    // HEAL FIRST OF ALL. A pending close is a NAKED LEG — a real directional
+    // position, already at the venue, that nothing else here can see. It
+    // outranks a resting ask for the same reason a resting ask outranks a new
+    // candidate, only more so, and while it is outstanding `Live::target`
+    // refuses everything anyway.
+    if live.pending.is_some() {
+        out.extend(heal(live, &view, pmus).await);
+    }
+    // MANAGE NEXT. A resting ask is money already at a venue; a new candidate
     // is not, and `MAX_RESTING` means nothing new can rest until this is done.
     if live.resting.is_some() {
         out.extend(manage(live, &view, kalshi, pmus).await);
@@ -1414,7 +1525,7 @@ async fn cycle(
         }
     };
     let now = wall_now();
-    let target = match live.target(&exits, now, unresolved()) {
+    let target = match live.target(&exits, now, outstanding()) {
         Ok(e) => e.clone(),
         Err(why) => {
             out.push(format!("[maker-exit] nothing to rest: {why}"));
@@ -1962,6 +2073,262 @@ async fn cancel_at_venue(
 /// bullet — "RE-PRICE AT FILL TIME ... AND ABANDON THE CLOSE IF IT NO LONGER
 /// PAYS" — and a decision that lives inside an `async fn` that places orders is
 /// a decision no test can reach.
+/// Finish a close that did not complete, and clear the latch when it has.
+///
+/// Runs FIRST in [`cycle`], before `manage` and before anything is selected: a
+/// naked leg is a real directional position and everything else here is
+/// optional next to closing it.
+///
+/// It never assumes. Each cycle it re-reads venue truth, sizes the retry to the
+/// shortfall ([`close_shortfall`]), re-prices against the current book, and
+/// sends an IOC for exactly what is still owed. The latch clears only on
+/// evidence — the shortfall reaching zero — never on a timer and never on a
+/// count of attempts.
+///
+/// The price rule changes once, at [`HEAL_PROFITABLE_CYCLES`]: profitable-only
+/// before it, and whatever the book asks after it. See that constant for why
+/// the second half has to exist.
+async fn heal(
+    live: &mut Live,
+    view: &EngineView,
+    pmus: &std::sync::Arc<dyn crate::sink::OrderSink>,
+) -> Vec<String> {
+    use arb_venue::gateway::{PlaceRequest, Side, Tif};
+    let Some(mut p) = live.pending.take() else { return Vec::new() };
+    p.attempts += 1;
+    let mut out: Vec<String> = Vec::new();
+
+    // 1. VENUE TRUTH FIRST. Without it there is no honest size for the retry,
+    //    and a guess here is the naked-long failure `close_shortfall` exists to
+    //    prevent. A read that cannot answer holds the state for the next cycle.
+    let s = pmus.clone();
+    let net = match tokio::task::spawn_blocking(move || s.net_positions()).await {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            out.push(format!(
+                "[maker-exit] HEAL {} — cannot read PM-US positions ({e}), so there is no \
+                 honest size for the retry. Still naked, still latched; trying again next cycle \
+                 (attempt {}).",
+                p.order.pm_market, p.attempts
+            ));
+            live.pending = Some(p);
+            return out;
+        }
+        Err(e) => {
+            out.push(format!(
+                "[maker-exit] HEAL {} — positions task failed ({e}); retrying next cycle",
+                p.order.pm_market
+            ));
+            live.pending = Some(p);
+            return out;
+        }
+    };
+    let records = match ledger::read(&live.ledger_path) {
+        Ok(r) => r,
+        Err(e) => {
+            out.push(format!(
+                "[maker-exit] HEAL {} — the ledger is unreadable ({e}); nothing may be sized \
+                 off it. Still latched; retrying next cycle.",
+                p.order.pm_market
+            ));
+            live.pending = Some(p);
+            return out;
+        }
+    };
+    let owed = close_shortfall(
+        &records,
+        &p,
+        net.get(&p.order.pm_market).copied().unwrap_or(0.0),
+    );
+
+    // 2. NOTHING OWED IS A SUCCESS, NOT A NO-OP. The close completed — most
+    //    likely the IOC whose fill we could not read — so the only thing missing
+    //    is the ledger record, and writing it is what makes the books true again.
+    if owed <= 0 {
+        let ts = arb_core::clock::now_s();
+        out.push(format!(
+            "[maker-exit] HEALED {} — venue truth says the close completed after all ({}x owed, \
+             0 outstanding). Booking the unwind and clearing the latch.",
+            p.order.pm_market, p.filled
+        ));
+        out.push(book(&live.ledger_path, &p.order, &p.order.limit, &p.order.limit, p.filled, ts));
+        HEALED.fetch_add(1, AtomicOrd::Relaxed);
+        return out;
+    }
+
+    // 3. PRICE IT. Profitable-only while the cheap window lasts.
+    let forced = p.attempts > HEAL_PROFITABLE_CYCLES;
+    let limit = match price_close(&mut live.cx, &live.fees, &p.order, owed, view) {
+        Ok(l) => l,
+        Err(why) if !forced => {
+            out.push(format!(
+                "[maker-exit] HEAL {} — {owed} still owed and the close does not pay yet \
+                 ({why}). Attempt {} of {HEAL_PROFITABLE_CYCLES} profitable-only; after that it \
+                 crosses out regardless, because five naked contracts for months costs more \
+                 than the spread does.",
+                p.order.pm_market, p.attempts
+            ));
+            live.pending = Some(p);
+            return out;
+        }
+        Err(why) => {
+            // Past the window. Take the book's price: the ask, one tick through,
+            // so the IOC actually clears rather than reporting "unfilled" at a
+            // limit nothing will meet.
+            let Some(ask) = view.pm_ask.get(&p.order.pm_market) else {
+                out.push(format!(
+                    "[maker-exit] HEAL {} — {owed} still owed, past the profitable-only window, \
+                     and the PM-US book has gone DARK ({why}). A close cannot be priced against \
+                     no book at any policy. Still latched; retrying next cycle.",
+                    p.order.pm_market
+                ));
+                live.pending = Some(p);
+                return out;
+            };
+            let Some(ask_d) = live.cx.parse(ask) else {
+                out.push(format!(
+                    "[maker-exit] HEAL {} — the PM-US ask {ask} does not parse; retrying",
+                    p.order.pm_market
+                ));
+                live.pending = Some(p);
+                return out;
+            };
+            let tick = live.cx.parse_exact(TICK);
+            let through = live.cx.add(ask_d, tick);
+            let through = live.cx.quantize_4dp(through);
+            out.push(format!(
+                "[maker-exit] HEAL {} — CROSSING OUT. {owed} contract(s) still owed after {} \
+                 attempts, and the close has not paid at any of them ({why}). Taking the book at \
+                 {} to be FLAT: this realises a loss, and it is the cheaper side of the trade — \
+                 the alternative is carrying {owed} naked contract(s) to resolution.",
+                p.order.pm_market,
+                p.attempts,
+                through.to_standard_notation_string()
+            ));
+            through.to_standard_notation_string()
+        }
+    };
+
+    // 4. SEND IT, sized to the shortfall and never to `filled`.
+    let coid = client_order_id();
+    let req = PlaceRequest {
+        market: p.order.pm_market.clone(),
+        side: Side::Bid,
+        price: limit.clone(),
+        qty: owed,
+        tif: Tif::Ioc,
+        post_only: false,
+        client_order_id: coid.clone(),
+    };
+    let s = pmus.clone();
+    let rq = req.clone();
+    let oid = match tokio::task::spawn_blocking(move || s.place(&rq)).await {
+        Ok(Ok(id)) => id,
+        Ok(Err(e)) => {
+            out.push(format!(
+                "[maker-exit] HEAL {} — PM-US refused the retry ({e}); {owed} still owed, \
+                 retrying next cycle (attempt {})",
+                p.order.pm_market, p.attempts
+            ));
+            live.pending = Some(p);
+            return out;
+        }
+        Err(e) => {
+            out.push(format!(
+                "[maker-exit] HEAL {} — retry task failed ({e}); retrying next cycle",
+                p.order.pm_market
+            ));
+            live.pending = Some(p);
+            return out;
+        }
+    };
+    crate::engine::fill::note_sidecar_order(&oid);
+
+    // 5. WHATEVER IT FILLED, THE NEXT CYCLE RE-MEASURES. The poll here decides
+    //    only whether to book NOW; an unreadable answer is not a failure any
+    //    more, because `close_shortfall` will settle it against the venue in
+    //    sixty seconds. That is the difference this whole path buys.
+    let mut got = 0i64;
+    for i in 0..crate::naked_act::FILL_POLLS {
+        let s = pmus.clone();
+        let id = oid.clone();
+        if let Ok(Ok(n)) = tokio::task::spawn_blocking(move || s.filled_qty(&id)).await {
+            got = n;
+            if got >= 1 {
+                break;
+            }
+        }
+        if i + 1 < crate::naked_act::FILL_POLLS {
+            tokio::time::sleep(crate::naked_act::FILL_POLL_GAP).await;
+        }
+    }
+    if got >= owed {
+        let ts = arb_core::clock::now_s();
+        out.push(format!(
+            "[maker-exit] HEALED {} — the retry closed the last {owed} contract(s) at {limit} \
+             after {} attempt(s) and {:.0}s naked. Booking the unwind and clearing the latch.",
+            p.order.pm_market,
+            p.attempts,
+            p.since.elapsed().as_secs_f64()
+        ));
+        out.push(book(&live.ledger_path, &p.order, &p.order.limit, &limit, p.filled, ts));
+        HEALED.fetch_add(1, AtomicOrd::Relaxed);
+        return out;
+    }
+    out.push(format!(
+        "[maker-exit] HEAL {} — the retry filled {got} of {owed} at {limit}. Still short; the \
+         next cycle re-measures against the venue and finishes it.",
+        p.order.pm_market
+    ));
+    live.pending = Some(p);
+    out
+}
+
+/// How many PM-US YES a pending close still owes, measured at the VENUE.
+///
+/// **NEVER `filled`, AND THAT IS THE WHOLE POINT.** Two of the five ways a close
+/// fails leave us genuinely unsure whether it traded — the place task failing,
+/// and an accepted IOC whose fill could not be read. Retrying `filled` on either
+/// of those buys the leg a second time and turns a naked short into a naked
+/// LONG, which is a worse position arrived at by trying to be safe. So the retry
+/// is sized the same way [`resolve_vanished`] sizes the Kalshi side: against a
+/// shortfall the account can be asked about.
+///
+/// The arithmetic, where the basket is long PM-US NO (short YES) and long Kalshi
+/// YES, and `net_positions` reports PM-US NO as a NEGATIVE yes-count (`recon`
+/// prints exactly that: `pmus tpoyc-2026-popleo -69`):
+///
+/// ```text
+///   L = NO contracts the ledger's open lots claim on this PM-US market
+///   V = NO contracts the venue says we actually hold   (= -net)
+///   already_bought = L - V     (a completed close shows up here, however it
+///                               completed, and whether or not we could read it)
+///   still_owed     = filled - already_bought,  clamped to [0, filled]
+/// ```
+///
+/// `still_owed == 0` means the close DID complete — the unreadable IOC filled
+/// after all — and the only thing left to do is book it.
+fn close_shortfall(records: &[Value], p: &PendingClose, venue_net: f64) -> i64 {
+    let ledger_no: i64 = crate::naked_act::open_lots(records, &p.order.rel_id)
+        .iter()
+        .filter(|(_, _, rec)| {
+            rec.get("legs").and_then(|v| v.as_array()).is_some_and(|legs| {
+                legs.iter().any(|l| {
+                    l.get("venue").and_then(|v| v.as_str()) == Some(Venue::PolymarketUs.as_str())
+                        && l.get("market_id").and_then(|v| v.as_str())
+                            == Some(p.order.pm_market.as_str())
+                })
+            })
+        })
+        .map(|(_, qty, _)| *qty)
+        .sum();
+    // A long (positive) net means we are not short this market at all, so there
+    // is nothing of ours left to buy back: `held` floors at zero.
+    let held = (-venue_net).round().max(0.0) as i64;
+    let already = (ledger_no - held).max(0);
+    (p.filled - already).clamp(0, p.filled)
+}
+
 fn price_close(
     cx: &mut Cx,
     fees: &FeeSchedule,
@@ -2026,7 +2393,7 @@ async fn close_leg(
     let limit = match price_close(&mut live.cx, &live.fees, &r.order, filled, view) {
         Ok(p) => p,
         Err(why) => {
-            out.push(alarm_unresolved(&r.order, filled, &why));
+            out.push(park(live, &r.order, filled, r.since, &why));
             return out;
         }
     };
@@ -2048,11 +2415,11 @@ async fn close_leg(
     let oid = match tokio::task::spawn_blocking(move || p.place(&rq)).await {
         Ok(Ok(id)) => id,
         Ok(Err(e)) => {
-            out.push(alarm_unresolved(&r.order, filled, &format!("PM-US refused the close: {e}")));
+            out.push(park(live, &r.order, filled, r.since, &format!("PM-US refused the close: {e}")));
             return out;
         }
         Err(e) => {
-            out.push(alarm_unresolved(&r.order, filled, &format!("close task failed: {e}")));
+            out.push(park(live, &r.order, filled, r.since, &format!("close task failed: {e}")));
             return out;
         }
     };
@@ -2080,24 +2447,28 @@ async fn close_leg(
         }
     }
     if let Some(e) = unreadable {
-        out.push(alarm_unresolved(
+        out.push(park(
+            live,
             &r.order,
             filled,
+            r.since,
             &format!("the close IOC {oid} (client {coid}) was ACCEPTED and its fill could not be read: {e}"),
         ));
         return out;
     }
     if got < 1 {
-        out.push(alarm_unresolved(&r.order, filled, "the close IOC did not fill"));
+        out.push(park(live, &r.order, filled, r.since, "the close IOC did not fill"));
         return out;
     }
     let booked = got.min(filled);
     if booked < filled {
         // Part of the exit closed. The remainder is a real naked short, and it
         // is alarmed for exactly what it is rather than folded into the book.
-        out.push(alarm_unresolved(
+        out.push(park(
+            live,
             &r.order,
             filled - booked,
+            r.since,
             "the close IOC filled only partly",
         ));
     }
@@ -2355,8 +2726,12 @@ mod tests {
         }
         let before = refused();
         let why = l.target(&c, t0 + 3.0 * DEBOUNCE_S, 1).expect_err("one naked leg is enough");
-        assert!(why.contains("maker_exit_unresolved is 1"), "it names the gauge: {why}");
-        assert!(why.contains("RESTARTED"), "and says only a restart clears it: {why}");
+        assert!(why.contains("1 naked leg(s) outstanding"), "it names the count: {why}");
+        // The copy must NOT still promise a restart: `heal` clears this, and an
+        // operator who reads "RESTARTED" at 3am restarts a process that was
+        // already fixing itself — losing the debounce and the queue for nothing.
+        assert!(!why.contains("RESTARTED"), "the restart claim is retracted: {why}");
+        assert!(why.contains("`heal` IS WORKING ON IT"), "and says what clears it: {why}");
         assert_eq!(
             refused(),
             before,
@@ -2869,11 +3244,18 @@ mod tests {
         assert_eq!(unresolved(), before + 1);
         assert_eq!(refused(), refused_before, "a naked leg is NOT a refusal");
         assert!(line.contains("NAKED AFTER EXIT"), "{line}");
-        assert!(line.contains("RECONCILE BY HAND"), "{line}");
+        // It still names the fight with --positions-recon-act, because that
+        // hazard is unchanged: recon-act completes a PmShort by buying Kalshi
+        // back, which re-opens the basket this just exited.
         assert!(
             line.contains("BUYING KALSHI BACK"),
             "and it names the fight with --positions-recon-act: {line}"
         );
+        // ...but it no longer sends anyone to do it by hand. The alarm's job is
+        // now to say a heal is UNDER WAY and when to stop trusting it.
+        assert!(!line.contains("RECONCILE BY HAND"), "the by-hand instruction is retracted: {line}");
+        assert!(line.contains("`heal` HAS IT"), "{line}");
+        assert!(line.contains("NO HAND NEEDED"), "{line}");
     }
 
     // ---- the fill path ----------------------------------------------------
@@ -3248,6 +3630,193 @@ mod tests {
             let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 0);
         }
         assert!(l.rotate.is_none(), "it has not had its hour yet");
+    }
+
+    // ---- the self-heal ----------------------------------------------------
+
+    fn pending_for(qty: i64, attempts: u32) -> PendingClose {
+        PendingClose {
+            order: resting_exit(qty).order,
+            filled: qty,
+            since: Instant::now(),
+            attempts,
+        }
+    }
+
+    /// **THE RETRY IS SIZED AT THE VENUE, NEVER AT `filled`.**
+    ///
+    /// This is the arithmetic the whole self-heal rests on, and getting it wrong
+    /// is worse than not healing at all. Two of the five ways a close fails
+    /// leave us unsure whether it traded — the place task failing, and an
+    /// accepted IOC whose fill could not be read. Re-sending `filled` on either
+    /// buys the leg TWICE and turns a naked short into a naked long.
+    #[test]
+    fn a_retry_is_sized_to_the_venue_shortfall_and_never_to_the_fill() {
+        let recs = vec![open_basket(1.0, 5, "0.22", "0.19")];
+        let p = pending_for(5, 1);
+        // Ledger claims 5 NO; venue confirms 5 short. Nothing was bought back,
+        // so the whole 5 is still owed.
+        assert_eq!(close_shortfall(&recs, &p, -5.0), 5, "nothing closed yet");
+        // The IOC we could not read actually filled 3: venue is short 2.
+        assert_eq!(close_shortfall(&recs, &p, -2.0), 2, "only the remainder is owed");
+        // ...and if it filled the lot, NOTHING is owed. Re-sending `filled`
+        // here is the naked-long bug this exists to prevent.
+        assert_eq!(close_shortfall(&recs, &p, 0.0), 0, "the close completed after all");
+        // A position that has gone LONG is not ours to buy more of either.
+        assert_eq!(close_shortfall(&recs, &p, 3.0), 0, "never buy into a long");
+    }
+
+    /// A SHORTFALL OF ZERO IS A SUCCESS, AND IT IS BOOKED.
+    ///
+    /// The unreadable-IOC case: the close DID complete, we just could not see
+    /// it. The position is right and only the ledger is wrong, so the heal is a
+    /// pure bookkeeping act — and it must still write the `unwound` record, or
+    /// the exposure fold keeps counting a basket that is closed.
+    #[tokio::test]
+    async fn a_heal_that_finds_nothing_owed_books_the_unwind_and_clears_the_latch() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let pmus = FakeVenue::with_fills(&[0]);
+        FakeVenue::holding(&pmus, "p-a", 0.0); // flat: the close landed
+        let pm: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let path = ledger_with_open("heal-done", 5);
+        let mut live = Live::new(false, path.clone());
+        live.pending = Some(pending_for(5, 0));
+        let healed_before = healed();
+        let out = heal(&mut live, &view("0.20"), &pm).await.join("\n");
+
+        assert!(live.pending.is_none(), "the latch is cleared: {out}");
+        assert_eq!(healed(), healed_before + 1);
+        assert!(out.contains("completed after all"), "{out}");
+        // No order is sent to fix a position that is already right.
+        assert!(!pmus.calls().iter().any(|c| c.starts_with("place")), "{:?}", pmus.calls());
+        let recs = crate::ledger::read(&path).expect("clean ledger");
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert_eq!(recs[1]["status"], "unwound");
+        assert_eq!(recs[1]["qty"], 5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// AN UNREADABLE POSITIONS READ HOLDS THE LEG. It does not guess a size.
+    ///
+    /// The same rule as `resolve_vanished`: no evidence, no action. Sending an
+    /// IOC sized on a guess is how the naked short becomes a naked long.
+    #[tokio::test]
+    async fn a_heal_that_cannot_read_positions_sends_nothing_and_stays_latched() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let pmus = FakeVenue::with_fills(&[0]); // `net` unset -> refuses
+        let pm: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let mut live = Live::new(false, ledger_scratch("heal-blind"));
+        live.pending = Some(pending_for(5, 0));
+        let out = heal(&mut live, &view("0.20"), &pm).await.join("\n");
+
+        assert!(live.pending.is_some(), "still latched: {out}");
+        assert!(out.contains("no honest size"), "{out}");
+        assert!(!pmus.calls().iter().any(|c| c.starts_with("place")), "{:?}", pmus.calls());
+    }
+
+    /// INSIDE THE CHEAP WINDOW A CLOSE THAT DOES NOT PAY IS LEFT ALONE...
+    #[tokio::test]
+    async fn a_heal_inside_the_profitable_window_waits_rather_than_crossing() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let pmus = FakeVenue::with_fills(&[0]);
+        FakeVenue::holding(&pmus, "p-a", -5.0); // all 5 still owed
+        let pm: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let path = ledger_with_open("heal-wait", 5);
+        let mut live = Live::new(false, path.clone());
+        live.pending = Some(pending_for(5, 0));
+        // A PM-US ask of 0.60 puts the close far above what the basis allows.
+        let out = heal(&mut live, &view("0.60"), &pm).await.join("\n");
+
+        assert!(live.pending.is_some(), "still owed, still latched: {out}");
+        assert!(out.contains("does not pay yet"), "{out}");
+        assert!(!pmus.calls().iter().any(|c| c.starts_with("place")), "{:?}", pmus.calls());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ...AND PAST IT, IT CROSSES OUT AND TAKES THE LOSS.
+    ///
+    /// The whole point of the change. Profitable-only is what
+    /// `--positions-recon-act` already is, and `positions_recon_acted` is 0
+    /// across thousands of refusals over the life of the deployment — a leg that
+    /// is underwater fails a profit floor EVERY time. A self-heal that stopped
+    /// at the cheap window would inherit that 0% rate in exactly the case that
+    /// needs it, and the leg would go on waiting for a human.
+    #[tokio::test]
+    async fn a_heal_past_the_profitable_window_crosses_out_and_says_it_is_taking_a_loss() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let pmus = FakeVenue::with_fills(&[5]);
+        FakeVenue::holding(&pmus, "p-a", -5.0);
+        let pm: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let path = ledger_with_open("heal-cross", 5);
+        let mut live = Live::new(false, path.clone());
+        live.pending = Some(pending_for(5, HEAL_PROFITABLE_CYCLES));
+        let out = heal(&mut live, &view("0.60"), &pm).await.join("\n");
+
+        assert!(out.contains("CROSSING OUT"), "{out}");
+        assert!(out.contains("realises a loss"), "and it says so plainly: {out}");
+        // It takes the book one tick THROUGH the ask, so the IOC actually clears.
+        let ps = pmus.calls();
+        assert!(ps.iter().any(|c| c.starts_with("place p-a 5x @0.61")), "{ps:?}");
+        assert!(live.pending.is_none(), "flat, so the latch clears: {out}");
+        let recs = crate::ledger::read(&path).expect("clean ledger");
+        assert_eq!(recs[1]["status"], "unwound");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE LATCH CLEARS ON EVIDENCE, NOT ON ATTEMPTS. A retry that fills only
+    /// part of what is owed leaves the leg parked, and the next cycle
+    /// re-measures against the venue rather than trusting this one's arithmetic.
+    #[tokio::test]
+    async fn a_partial_heal_stays_latched_and_re_measures_next_cycle() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let pmus = FakeVenue::with_fills(&[2]); // asked for 5, got 2
+        FakeVenue::holding(&pmus, "p-a", -5.0);
+        let pm: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let path = ledger_with_open("heal-partial", 5);
+        let mut live = Live::new(false, path.clone());
+        live.pending = Some(pending_for(5, HEAL_PROFITABLE_CYCLES));
+        let out = heal(&mut live, &view("0.60"), &pm).await.join("\n");
+
+        assert!(out.contains("filled 2 of 5"), "{out}");
+        assert!(live.pending.is_some(), "not flat, so not cleared: {out}");
+        assert_eq!(crate::ledger::read(&path).expect("ledger").len(), 1, "nothing booked yet");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE RATCHET IS NOT DECREMENTED, AND THE LATCH IS THE PAIR.
+    ///
+    /// `maker_exit_unresolved` answers "how many times have we been one-legged
+    /// after an exit" and only ever climbs; `outstanding()` answers "are we naked
+    /// right now" and is what gates new exits. Collapsing the two into one
+    /// falling gauge would lose the first question — which is the one that says
+    /// whether the close path is unreliable rather than unlucky.
+    ///
+    /// (It would NOT break the page. That claim was in an earlier draft and is
+    /// false: `gauge_deltas.py`'s RISE rule re-clamps its baseline with
+    /// `base = min(base, cur)`, and driven through 0 -> 1 -> 0 -> 1 it pages
+    /// both times. The reason here is legibility, not alerting.)
+    #[tokio::test]
+    async fn healing_leaves_the_incident_count_up_and_clears_only_the_latch() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let pmus = FakeVenue::with_fills(&[0]);
+        FakeVenue::holding(&pmus, "p-a", 0.0);
+        let pm: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let path = ledger_with_open("heal-ratchet", 5);
+        let mut live = Live::new(false, path.clone());
+        live.pending = Some(pending_for(5, 0));
+        let before = unresolved();
+        let out_before = outstanding();
+        heal(&mut live, &view("0.20"), &pm).await;
+
+        assert_eq!(unresolved(), before, "the incident count is a RATCHET and does not fall");
+        assert_eq!(outstanding(), out_before.saturating_sub(1), "but the LATCH clears");
+        let _ = std::fs::remove_file(&path);
     }
 
     fn ledger_scratch(tag: &str) -> String {

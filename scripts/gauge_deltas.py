@@ -300,13 +300,19 @@ WATCH = [
         "PAGE",
         0,
         "a Kalshi exit ask FILLED and its PM-US close did not complete — the "
-        "account is one-legged and the ledger still calls the basket OPEN; "
-        "new exits are latched off until restart",
-    ),  # doc (maker_exit.rs): the module's own alarm gauge — every arm that
-    # bumps it prints CHECK/RECONCILE BY HAND. NO OBSERVED HISTORY: the
-    # maker-exit loop has never been armed; this row lands BEFORE the flag so
-    # the first unresolved leg is read by something. Structurally bounded like
-    # sweeps_owed: the unresolved latch halts new rests, so it cannot spam.
+        "account is one-legged and the ledger still calls the basket OPEN. "
+        "maker_exit::heal is retrying it every 60s against venue truth and "
+        "crosses out after ~10 min; read maker_exit_healed to see if it won. "
+        "ACT ONLY IF THIS IS STILL OUTSTANDING IN ~15 MINUTES",
+    ),  # doc (maker_exit.rs): the module's own alarm gauge. It is an INCIDENT
+    # count, not a level — `maker_exit_healed` is how many of these the engine
+    # closed by itself, and the difference is what is naked right now. The old
+    # copy here said "latched off until restart", which was true until the
+    # self-heal landed and is now the opposite of what an operator should do:
+    # restarting throws away the exit debounce and the queue for a leg that was
+    # already being fixed. Still cannot spam — MAX_RESTING is 1, so there is at
+    # most one exit in flight and therefore at most one incident at a time, and
+    # a heal takes cycles — but it is no longer bounded at one per PROCESS.
     (
         "positions_recon_act_unresolved",
         "RISE",

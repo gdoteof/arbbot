@@ -1591,10 +1591,15 @@ fn spawn_maker_exit(
              one-legged with the ledger still calling the basket open. ALARM ON \
              `maker_exit_unresolved`; it must stay 0. If --positions-recon-act is also armed \
              the two WILL fight over that leg — it completes a PmShort by buying Kalshi back, \
-             which re-opens what this just exited. ONE naked leg LATCHES THIS OFF: while \
-             `maker_exit_unresolved` is non-zero no new exit rests until the process is \
-             RESTARTED, and the 60s cycle repeats that refusal on every tick, which is the \
-             alarm rather than a stuck loop."
+             which re-opens what this just exited. ONE naked leg HALTS NEW EXITS while it \
+             lasts — but it no longer waits for you: `maker_exit::heal` runs first on every \
+             60s cycle, re-reads PM-US venue truth, re-sizes to the SHORTFALL (never to the \
+             fill, or an unreadable IOC gets bought twice) and re-prices. It stays \
+             profitable-only for 10 cycles and then CROSSES OUT regardless, because at most 5 \
+             contracts are ever naked and carrying them to resolution costs more than the \
+             spread. The halt clears on evidence — the shortfall reaching zero — not on a \
+             timer and not on a restart. `maker_exit_unresolved` still ratchets, so the page \
+             still fires; `maker_exit_healed` is how many it closed by itself."
         );
     }
     tokio::spawn(maker_exit::exit_loop(
