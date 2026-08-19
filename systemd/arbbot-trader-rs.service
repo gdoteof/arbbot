@@ -19,11 +19,16 @@
 # and every order on it is refused. Update when the real balances move.
 #
 # These are HAND-ENTERED and go stale silently — on 2026-07-28 the PM-US figure
-# was $20.12 low, so the gate had been under-sizing that venue. Both venues DO
-# expose live cash (`arb-order --venue <v> --preflight-only` is a signed read:
-# Kalshi balance_dollars, PM-US buying_power), so an armed run should read them
-# at startup instead of trusting this line. The shadow can't — it holds no
-# credentials, which is why the flag exists at all.
+# was $20.12 low, so the gate had been under-sizing that venue. An ARMED run no
+# longer trusts them: it polls both venues every 60s (Kalshi balance_dollars,
+# PM-US buyingPower) and spends against what they say, refusing everything if a
+# reading goes 180s unrefreshed. THIS unit is the shadow and cannot — it holds
+# no credentials, which is why the flag still exists at all, and why these two
+# numbers are the whole story here — and why they never expire on THIS unit: a
+# run that was never going to poll is unpollable, not stale. On the armed unit
+# they are only the seed that covers the first round trip, and they expire on
+# that same 180s clock, so an armed run whose poll never once succeeds closes
+# instead of trading these numbers for ever.
 #
 # It subscribes to data/arbbot.sock, which since 2026-07-31 is served by
 # `arb-recorder` — the Python recorder is retired. The socket path did not

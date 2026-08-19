@@ -289,6 +289,34 @@ pub trait VenueGateway {
     fn net_positions(&self) -> Result<BTreeMap<String, f64>, VenueError> {
         Err(VenueError::NotWired)
     }
+    /// The cash this account can SPEND right now, under one name. Kalshi calls
+    /// it `balance_dollars`, PM-US calls it `buyingPower`; a caller sizing an
+    /// order against real capital needs one name the same way it needs
+    /// [`Self::order_id`], and [`Self::balances`] cannot give it — its type is
+    /// per-venue by construction.
+    ///
+    /// SPENDABLE, NOT EQUITY, and the distinction is the whole point. Both
+    /// venues withhold $1.00 per short contract (`docs/venue-quirks.md`
+    /// §`kalshi-short-collateral-one-dollar-per-contract`,
+    /// §`pmus-margin-is-one-dollar-per-short`), and that collateral is already
+    /// inside the position's cost basis — so a figure carrying it is not money
+    /// to open with, and adding it to position value counts it twice. Each
+    /// implementation names the field it means and says why; neither computes
+    /// one.
+    ///
+    /// MONEY STAYS A STRING, as everywhere else here ([`resp::KalshiBalance`],
+    /// and `resp`'s `money_string`, which coerces PM-US's bare JSON number to
+    /// text specifically so nothing downstream ever sees a float).
+    /// [`Self::net_positions`] returns `f64` because a signed contract count is
+    /// not a price; that argument does not transfer to cash.
+    ///
+    /// The default REFUSES rather than answering "0", for exactly the reason
+    /// [`Self::net_positions`] refuses an empty map: "$0" is not inert. It is
+    /// an affirmative claim that this account can buy nothing, and a caller
+    /// gating on it acts by refusing every order.
+    fn spendable_cash(&self) -> Result<String, VenueError> {
+        Err(VenueError::NotWired)
+    }
     /// Top of book and tick ladder for ONE market, from the venue's public
     /// listing — the only quote a process can get for a market it does not
     /// subscribe to.

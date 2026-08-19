@@ -323,6 +323,18 @@ pub trait OrderSink: Send + Sync {
     fn net_positions(&self) -> Result<std::collections::BTreeMap<String, f64>, VenueError> {
         Err(VenueError::NotWired)
     }
+    /// Venue truth for SPENDABLE CASH — what the risk gate may open against.
+    /// Through the SINK for the same reason `net_positions` is: one gateway per
+    /// venue per process, so this spends the same background token bucket as
+    /// every other read (quirk `xv-shared-api-budget`).
+    ///
+    /// The default REFUSES — see
+    /// [`arb_venue::gateway::VenueGateway::spendable_cash`], which explains
+    /// which field each venue means by "spendable" and why "$0" is the one
+    /// answer this must never invent.
+    fn spendable_cash(&self) -> Result<String, VenueError> {
+        Err(VenueError::NotWired)
+    }
     /// Venue truth for a market's TOP OF BOOK, for a market this process holds
     /// no feed subscription for — see
     /// [`arb_venue::gateway::VenueGateway::market_quote`], which explains why
@@ -371,6 +383,9 @@ where
     }
     fn net_positions(&self) -> Result<std::collections::BTreeMap<String, f64>, VenueError> {
         VenueGateway::net_positions(self)
+    }
+    fn spendable_cash(&self) -> Result<String, VenueError> {
+        VenueGateway::spendable_cash(self)
     }
     fn market_quote(&self, market: &str) -> Result<arb_venue::gateway::Quote, VenueError> {
         VenueGateway::market_quote(self, market)
@@ -1104,5 +1119,31 @@ mod tests {
             },
         )
         .is_err());
+    }
+
+    /// THE ONE LINE THAT CONNECTS THE LIVE GATEWAYS TO THE CASH POLL, pinned.
+    /// Drop `spendable_cash` from the blanket impl above and everything still
+    /// compiles and links — the trait's own default answers instead, so every
+    /// cycle of `main::balance_loop` abandons on `NotWired` for ever, the armed
+    /// engine spends the `--balance` seed until it expires, and then refuses
+    /// everything. A delegation nothing exercises is a wire nothing tugs on.
+    ///
+    /// Asked through `Arc<dyn OrderSink>` because that is exactly what the poll
+    /// holds: it is the object-safe vtable that has to carry the answer, and
+    /// calling the gateway's own inherent method would prove nothing about it.
+    #[test]
+    fn the_cash_read_reaches_the_gateway_through_the_sink_vtable() {
+        let mock = Mock {
+            replies: Mutex::new(vec![(200, r#"{"balance_dollars":"320.4300"}"#.to_string())]),
+            sent: Mutex::new(Vec::new()),
+        };
+        let s: std::sync::Arc<dyn OrderSink> = std::sync::Arc::new(
+            KalshiGateway::with_transport(signer(), RateLimiter::from_per_minute(600.0, 0), mock),
+        );
+        assert_eq!(
+            s.spendable_cash().expect("the gateway answered"),
+            "320.4300",
+            "the sink must hand back the venue's figure, not the NotWired default"
+        );
     }
 }

@@ -1614,6 +1614,192 @@ fn spawn_maker_exit(
     ));
 }
 
+/// How often an armed run re-reads venue cash.
+///
+/// One call per venue per minute is ~1.7% of the 60/min background bucket the
+/// sinks share with positions recon, maker-exit and fill reconciliation (quirk
+/// `xv-shared-api-budget`), which is negligible; a sub-10s poll would not be.
+/// It is also what makes `risk::BALANCE_MAX_AGE` three cycles rather than a
+/// number picked on its own.
+const BALANCE_POLL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One cycle's reads: both venues' spendable cash, or why the cycle is
+/// abandoned.
+///
+/// BOTH VENUES OR NOTHING, the same rule `spawn_positions_recon` and
+/// `spawn_maker_exit` state, and here it is about the write rather than the
+/// read. The gate's map is keyed by venue and an ABSENT key is $0, so writing
+/// only Kalshi's figure does not degrade the gate — it closes PM-US, and with
+/// it every basket, because `venue_costs` charges both legs. Abandoning
+/// instead leaves the previous reading to age, which refuses the same orders
+/// three minutes later and says why.
+///
+/// A REFUSAL IS NOT $0 (`positions`' guard 5). A 429, a 503, a spent token
+/// bucket or a body we cannot parse all say the venue did not answer; folding
+/// any of them into a number is how a gate stops spending money it has, or
+/// spends money it has not.
+async fn balance_cycle(
+    kalshi: &std::sync::Arc<dyn sink::OrderSink>,
+    pmus: &std::sync::Arc<dyn sink::OrderSink>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for (venue, s) in [(Venue::Kalshi, kalshi), (Venue::PolymarketUs, pmus)] {
+        // Blocking sink calls go through `spawn_blocking` for `read_net`'s
+        // reason: the sink is synchronous and this runtime is not somewhere to
+        // park a venue round trip.
+        let s = s.clone();
+        match tokio::task::spawn_blocking(move || s.spendable_cash()).await {
+            Ok(Ok(cash)) => out.push((venue.as_str().to_string(), cash)),
+            Ok(Err(e)) => return Err(format!("{}: {e}", venue.as_str())),
+            Err(e) => return Err(format!("{}: read task failed: {e}", venue.as_str())),
+        }
+    }
+    Ok(out)
+}
+
+/// Where the armed run publishes what it just read.
+///
+/// ONE GATEWAY PER VENUE PER PROCESS is the rule this exists to keep (quirk
+/// `xv-shared-api-budget`): the armed trader is now the only process holding a
+/// live balance reading, and the alternative to publishing it is every dashboard
+/// opening a second gateway against the same account and spending the same
+/// per-venue token bucket the hedge path needs. `scripts/capital_snapshot.py`
+/// does exactly that today and cannot be changed here (the Python tree is
+/// frozen), so nothing reads this file yet — it is a write of what was already
+/// read, on a path a reader can find.
+///
+/// The freshness rule belongs to the reader, which is why `at` and `max_age_s`
+/// are both in the file: `at` is when the venues answered, and `max_age_s` is
+/// the bound the GATE is using, so a dashboard can say "the engine is refusing
+/// on this" without re-transcribing 180 and drifting from it later.
+const BALANCE_SNAPSHOT: &str = "data/exec/balances.json";
+
+/// Publish the reading. Best effort by construction: the file exists so
+/// somebody else can see the number, and a disk that will not take it is not a
+/// reason to stop feeding the gate that authorises trading.
+///
+/// Written ONLY on a cycle that produced a usable reading, so the file ages
+/// exactly as the gate's own figure does: a stale `at` IS an abandoned cycle,
+/// visible to a reader holding no credential of its own.
+fn publish_balances(path: &str, pairs: &[(String, String)]) -> Result<(), String> {
+    let body = serde_json::json!({
+        "at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        "max_age_s": risk::BALANCE_MAX_AGE.as_secs(),
+        "balances": pairs.iter().cloned().collect::<std::collections::BTreeMap<_, _>>(),
+    });
+    marks::write_atomic(path, &format!("{body}\n"))
+}
+
+/// The periodic loop. Runs until the process exits.
+async fn balance_loop(
+    risk: std::sync::Arc<risk::RiskView>,
+    kalshi: std::sync::Arc<dyn sink::OrderSink>,
+    pmus: std::sync::Arc<dyn sink::OrderSink>,
+) {
+    // `tokio::time::interval`'s first tick is ready immediately, and that is
+    // wanted: until it lands the gate is spending against the `--balance` seed,
+    // so the window where the C13 constant is still in force is one venue round
+    // trip rather than a minute.
+    let mut iv = tokio::time::interval(BALANCE_POLL);
+    let mut last: Option<Vec<(String, String)>> = None;
+    loop {
+        iv.tick().await;
+        // The INSTALL is part of the cycle, not a step after it. A figure the
+        // decision fold cannot read back is a failed poll however cleanly the
+        // venue delivered it — see `RiskView::set_live_balances` — so it takes
+        // the same abandoned path as a 503 and leaves the previous figure
+        // ageing rather than replacing it with something that would panic the
+        // engine at the next quote.
+        let cycle = match balance_cycle(&kalshi, &pmus).await {
+            Ok(pairs) => risk.set_live_balances(pairs.clone()).map(|()| pairs),
+            Err(e) => Err(e),
+        };
+        match cycle {
+            Ok(pairs) => {
+                // Only when the number MOVES. A 60s heartbeat would bury the
+                // one line that matters — cash falling as capital deploys,
+                // which is the thing `--balance` could never show.
+                if last.as_ref() != Some(&pairs) {
+                    eprintln!(
+                        "[balance] live {}",
+                        pairs
+                            .iter()
+                            .map(|(v, b)| format!("{v}=${b}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                    last = Some(pairs.clone());
+                }
+                if let Err(e) = publish_balances(BALANCE_SNAPSHOT, &pairs) {
+                    eprintln!("[balance] snapshot not published ({e}) — the GATE is fed; \
+                               only the readers of {BALANCE_SNAPSHOT} are blind");
+                }
+            }
+            Err(e) => eprintln!(
+                "[balance] CYCLE ABANDONED ({e}) — the gate is still spending against a \
+                 reading {}s old (source={}); past {}s it refuses every order rather than \
+                 authorise spending against a number nothing is refreshing",
+                risk.balances_age_s(),
+                risk.balances_source(),
+                risk::BALANCE_MAX_AGE.as_secs()
+            ),
+        }
+    }
+}
+
+/// Poll live venue cash into the risk gate.
+///
+/// THE DEFECT THIS CLOSES (audit C13): `--balance` is hand-typed in the unit
+/// file and is never decremented as capital deploys, so the cash gate could
+/// only ever catch "that venue is not funded at all". The venues both report
+/// spendable cash — Kalshi `balance_dollars`, PM-US `buyingPower` — and both
+/// figures fall as we spend AND as the venue withholds $1.00 per short
+/// contract, so an armed engine now stops OPENING when it actually runs out.
+/// That is a live behaviour change and it reads as the engine going quiet:
+/// `balances_source` / `balances_age_s` in the stats JSON are what distinguish
+/// it from a quiet market.
+///
+/// AND THE SAME IS TRUE OF A POLL THAT NEVER STARTS ANSWERING. Arming this is a
+/// promise the gate holds us to: `expect_live_balances` starts the `--balance`
+/// seed ageing on the same `risk::BALANCE_MAX_AGE` clock as a reading, so an
+/// armed run with wrong credentials or a moved endpoint closes after three
+/// minutes instead of trading the hand-typed constant indefinitely, which was
+/// C13 wearing a new coat. `stale` with `balances_age_s` of `-1` is that case.
+///
+/// It reads through the SINKS rather than building its own gateways, for
+/// `spawn_positions_recon`'s reason — they are where this process's
+/// credentials and its single background token bucket live — which is also
+/// what ties it to `--enable-orders`. `arm_venues` returns either an empty map
+/// or BOTH venues, so falling through here is the unarmed case and not a
+/// half-armed one, and the unarmed shadow keeps `--balance` as its only
+/// possible source.
+fn spawn_balance_poll(
+    sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
+    risk: Option<&std::sync::Arc<risk::RiskView>>,
+) {
+    let (Some(k), Some(p), Some(rv)) =
+        (sinks.get(&Venue::Kalshi), sinks.get(&Venue::PolymarketUs), risk)
+    else {
+        return;
+    };
+    eprintln!(
+        "[balance] polling both venues every {}s; the gate refuses everything once a \
+         reading is over {}s old, INCLUDING the --balance seed if the first cycle \
+         never lands",
+        BALANCE_POLL.as_secs(),
+        risk::BALANCE_MAX_AGE.as_secs()
+    );
+    // Announce the poll to the gate BEFORE spawning it, so the seed starts
+    // ageing from the promise rather than from whenever the task first gets
+    // scheduled. Until this call the declaration never expires, which is right
+    // for a run that holds no credentials and wrong for this one.
+    rv.expect_live_balances();
+    tokio::spawn(balance_loop(rv.clone(), k.clone(), p.clone()));
+}
+
 fn spawn_positions_recon(
     args: &Args,
     sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
@@ -1927,6 +2113,10 @@ async fn main() {
     let armed = !sinks.is_empty();
     spawn_positions_recon(&args, &sinks);
     spawn_maker_exit(&args, &sinks);
+    // Here and not earlier: the risk view is built before `arm_venues`, so the
+    // sinks it reads through do not exist when it is constructed, which is why
+    // the live figure arrives through a setter rather than the constructor.
+    spawn_balance_poll(&sinks, risk.as_ref());
 
     // Before the first quote: what did the LAST run of this unit leave naked?
     // ...and it does not merely REPORT it: an obligation the ledger cannot see
@@ -3318,6 +3508,196 @@ mod undischarged_seed_tests {
             "an unclassifiable id must not inflate a class cap it may not belong to: {:?}",
             dec.reasons
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod balance_poll_tests {
+    use super::*;
+    use arb_venue::gateway::{CancelRequest, PlaceRequest};
+    use arb_venue::VenueError;
+
+    /// Answers with one venue's cash, or refuses. Nothing else is reachable —
+    /// the poll must not be able to reach for a second read to derive its
+    /// figure.
+    struct CashSink(Result<&'static str, ()>);
+    impl sink::OrderSink for CashSink {
+        fn place(&self, _r: &PlaceRequest) -> Result<String, VenueError> {
+            unreachable!("the balance poll places nothing")
+        }
+        fn cancel(&self, _r: &CancelRequest) -> Result<(), VenueError> {
+            unreachable!("the balance poll cancels nothing")
+        }
+        fn cancel_all_open(&self) -> Result<(), VenueError> {
+            unreachable!("the balance poll cancels nothing")
+        }
+        fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+            unreachable!("the balance poll reads no book")
+        }
+        fn spendable_cash(&self) -> Result<String, VenueError> {
+            self.0.map(|s| s.to_string()).map_err(|_| VenueError::Status {
+                endpoint: "test",
+                status: 503,
+                body: "upstream unavailable".into(),
+            })
+        }
+    }
+
+    fn sink_of(r: Result<&'static str, ()>) -> std::sync::Arc<dyn sink::OrderSink> {
+        std::sync::Arc::new(CashSink(r))
+    }
+
+    /// The keys are what `risk::venue_costs` charges against, so a cycle that
+    /// spelled a venue any other way would install cash nobody looks up, every
+    /// lookup would read $0, and the engine would go silent with a full
+    /// account. `polymarket` (INTL) must never appear: no `--balance` names it
+    /// today and 38 relationships correctly close on that, so inventing a key
+    /// for it would fail 38 unhedgeable relationships OPEN.
+    #[tokio::test]
+    async fn a_cycle_reports_each_venue_under_the_name_the_gate_keys_on() {
+        let pairs = balance_cycle(&sink_of(Ok("320.4300")), &sink_of(Ok("329.29805")))
+            .await
+            .expect("both venues answered");
+        assert_eq!(
+            pairs,
+            vec![
+                ("kalshi".to_string(), "320.4300".to_string()),
+                ("polymarket_us".to_string(), "329.29805".to_string()),
+            ]
+        );
+    }
+
+    /// BOTH VENUES OR NOTHING. A partial write does not degrade the gate, it
+    /// CLOSES the venue it left out — an absent key reads as $0 — and since
+    /// `venue_costs` charges both legs of a basket, that closes every basket.
+    /// Abandoning leaves the previous reading to age out instead, which refuses
+    /// the same orders three minutes later and says why.
+    #[tokio::test]
+    async fn a_venue_that_could_not_be_read_abandons_the_whole_cycle() {
+        let e = balance_cycle(&sink_of(Ok("320.4300")), &sink_of(Err(())))
+            .await
+            .expect_err("half an answer is not an answer");
+        assert!(e.contains("polymarket_us"), "{e}");
+        let e = balance_cycle(&sink_of(Err(())), &sink_of(Ok("329.29805")))
+            .await
+            .expect_err("and symmetrically");
+        assert!(e.contains("kalshi"), "{e}");
+    }
+
+    /// A REFUSAL IS NOT $0 (`positions`' guard 5). The failure path must return
+    /// an error rather than a zero for the venue that would not answer, or a
+    /// 503 becomes a self-inflicted trading halt wearing the costume of a real
+    /// balance — and one that outlives the outage, since it would install
+    /// cleanly and then age normally.
+    #[tokio::test]
+    async fn a_refusal_never_becomes_a_zero_balance() {
+        let r = balance_cycle(&sink_of(Err(())), &sink_of(Err(()))).await;
+        assert!(r.is_err(), "got {r:?}");
+    }
+
+    /// The unarmed shadow holds no credentials, so `arm_venues` hands it no
+    /// sinks and the poll must simply not start — leaving `--balance` as its
+    /// only source, and leaving it UNAGED. If it could start, it would install
+    /// nothing, the seed would expire after `BALANCE_MAX_AGE`, and the shadow
+    /// would refuse every order and stop producing the intent stream the daily
+    /// decision gate diffs. `declared` rather than `seed` is what says the
+    /// promise was never made.
+    #[tokio::test]
+    async fn an_unarmed_run_starts_no_poll() {
+        let rv = std::sync::Arc::new(risk::RiskView::load(
+            "/nonexistent/exec.yaml",
+            "/nonexistent/topics.yaml",
+            vec![("kalshi".to_string(), "320.43".to_string())],
+            HashMap::new(),
+        ));
+        spawn_balance_poll(&HashMap::new(), Some(&rv));
+        tokio::task::yield_now().await;
+        assert_eq!(rv.balances_source(), "declared");
+        assert_eq!(rv.balances_age_s(), -1);
+    }
+
+    /// THE ARMED WIRING ITSELF, which nothing pinned. `an_unarmed_run_starts_no_poll`
+    /// proves this does not fire when it must not; this proves it DOES fire when
+    /// it must, and they are not the same test. Three mutations of this function
+    /// survived the whole suite until this landed — deleting the
+    /// `expect_live_balances()` announcement, replacing the `tokio::spawn` with a
+    /// no-op, and handing the Kalshi sink in for BOTH venues so PM-US cash is
+    /// published under Kalshi's figure.
+    ///
+    /// The first of those is the C13 regression this change exists to remove: with
+    /// the announcement gone the run holds `Cash::Declared`, the seed never ages,
+    /// and an armed engine whose credentials are wrong or whose endpoint is dead
+    /// spends the hand-typed constant for ever — while the gauges call it fine.
+    /// A test that only checks the over-trigger direction cannot see that.
+    #[tokio::test]
+    async fn an_armed_run_announces_the_poll_and_installs_each_venue_under_its_own_name() {
+        let rv = std::sync::Arc::new(risk::RiskView::load(
+            "/nonexistent/exec.yaml",
+            "/nonexistent/topics.yaml",
+            vec![("kalshi".to_string(), "320.43".to_string())],
+            HashMap::new(),
+        ));
+        let mut sinks: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> = HashMap::new();
+        // Distinct figures, so a swapped pair is visible and not a coincidence.
+        sinks.insert(Venue::Kalshi, std::sync::Arc::new(CashSink(Ok("111.11"))));
+        sinks.insert(Venue::PolymarketUs, std::sync::Arc::new(CashSink(Ok("222.22"))));
+
+        spawn_balance_poll(&sinks, Some(&rv));
+        // The ANNOUNCEMENT is synchronous and lands before the task is scheduled —
+        // that ordering is the point of it, so assert it before yielding.
+        assert_eq!(
+            rv.balances_source(),
+            "seed",
+            "an armed run must promise a poll, or the declaration never ages and C13 stands"
+        );
+        // Real sleeps, not `yield_now`: the read goes through `spawn_blocking`, so
+        // the current-thread runtime has to actually make progress on the blocking
+        // pool. Bounded rather than fixed — the first `interval` tick is ready
+        // immediately by design, so this normally lands on the first pass.
+        for _ in 0..40 {
+            if rv.balances_source() == "live" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(rv.balances_source(), "live", "the spawned loop must actually install a reading");
+        assert_eq!(rv.balance_of("kalshi").as_deref(), Some("111.11"));
+        assert_eq!(
+            rv.balance_of("polymarket_us").as_deref(),
+            Some("222.22"),
+            "each venue under ITS OWN key — one sink handed in twice publishes one venue's cash \
+             as the other's, and the gate keys its per-venue cash check on this name"
+        );
+    }
+
+    /// The snapshot is the whole reason a dashboard need not open a second
+    /// gateway against the same account (quirk `xv-shared-api-budget`), so what
+    /// it publishes has to be the figure the gate is actually spending, under
+    /// the key the gate is keyed by, plus enough for a reader to age it itself.
+    #[test]
+    fn the_snapshot_publishes_what_was_read_and_the_bound_it_is_read_against() {
+        let d = std::env::temp_dir().join(format!("arbbot-bal-{}", std::process::id()));
+        let path = d.join("balances.json");
+        let p = path.to_str().expect("utf8");
+        publish_balances(
+            p,
+            &[
+                ("kalshi".to_string(), "320.4300".to_string()),
+                ("polymarket_us".to_string(), "329.29805".to_string()),
+            ],
+        )
+        .expect("published");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(p).expect("read")).expect("json");
+        assert_eq!(v["balances"]["kalshi"], "320.4300");
+        assert_eq!(v["balances"]["polymarket_us"], "329.29805");
+        assert_eq!(
+            v["max_age_s"],
+            risk::BALANCE_MAX_AGE.as_secs(),
+            "a reader must not have to re-transcribe the gate's bound"
+        );
+        assert!(v["at"].as_u64().expect("at") > 1_700_000_000, "a wall clock, so it can be aged");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -663,3 +663,34 @@ fn a_503_is_not_an_empty_portfolio() {
     let g = gw(vec![(503, "upstream unavailable")]);
     assert!(g.net_positions().is_err());
 }
+
+// ------------------------------------------------- spendable_cash (C13) ---
+
+/// THE DOUBLE-COUNT TRAP, pinned. `currentBalance = buyingPower +
+/// marginRequirement` (quirk `pmus-margin-is-one-dollar-per-short`), and the
+/// margin is $1.00 per short contract that the position's own cost basis
+/// already carries — so spending against `currentBalance` counts it twice, the
+/// bug the 2026-08-14 accounting audit found. The wire body here is the live
+/// 2026-08-14 shape: 653.15805 = 329.29805 + 323.86.
+#[test]
+fn pmus_spendable_cash_is_buying_power_and_never_current_balance() {
+    let g = gw(vec![(
+        200,
+        r#"{"balances":[{"currentBalance":653.15805,"marginRequirement":323.86,
+            "buyingPower":329.29805}]}"#,
+    )]);
+    assert_eq!(g.spendable_cash().expect("read"), "329.29805");
+}
+
+/// NO ROWS is an error, never "$0" — [`VenueGateway::net_positions`]' rule. An
+/// empty answer is an affirmative claim about the account, and this one reads
+/// as "this venue can buy nothing", which closes every basket with a leg on it
+/// while the endpoint is merely being odd.
+#[test]
+fn an_empty_balances_array_is_refused_rather_than_read_as_no_money() {
+    let g = gw(vec![(200, r#"{"balances":[]}"#)]);
+    match g.spendable_cash() {
+        Err(VenueError::Status { body, .. }) => assert!(body.contains("EMPTY"), "{body}"),
+        other => panic!("an empty array must not be reported as $0 spendable: {other:?}"),
+    }
+}
