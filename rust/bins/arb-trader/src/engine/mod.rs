@@ -1407,13 +1407,19 @@ impl Engine {
             "unwind_near_miss": self.n_unwind_near_miss,
             "unwind_near_miss_usd": self.unwind_near_miss_usd,
             // The maker-exit placer (`--maker-exit` only; 0 forever without it).
-            // `maker_exit_unresolved` MUST STAY 0: it counts a Kalshi exit that
-            // FILLED and whose PM-US leg did not close, which is a naked short
-            // the ledger still records as a hedged basket.
+            // `maker_exit_unresolved` counts a Kalshi exit that FILLED and whose
+            // PM-US leg did not close — a naked short the ledger still records
+            // as a hedged basket. It is a RATCHET and is READ ON A RISE (see
+            // `scripts/gauge_deltas.py`), so it is an INCIDENT COUNT, not a
+            // level: `maker_exit_healed` says how many of those incidents
+            // `maker_exit::heal` closed by itself, and the difference between
+            // the two is what is naked RIGHT NOW. Alarm on the rise of the
+            // former; read the pair to know whether it is still true.
             "maker_exit_placed": crate::maker_exit::placed(),
             "maker_exit_closed": crate::maker_exit::closed(),
             "maker_exit_refused": crate::maker_exit::refused(),
             "maker_exit_unresolved": crate::maker_exit::unresolved(),
+            "maker_exit_healed": crate::maker_exit::healed(),
             // ...and WHY the scan decided nothing, when it refused to decide at
             // all. `null` = it ran. Every gauge above reads zero on a converged
             // book AND on a degenerate class cap, an off-band hurdle and torn
