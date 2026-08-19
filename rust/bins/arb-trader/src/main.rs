@@ -3617,6 +3617,60 @@ mod balance_poll_tests {
         assert_eq!(rv.balances_age_s(), -1);
     }
 
+    /// THE ARMED WIRING ITSELF, which nothing pinned. `an_unarmed_run_starts_no_poll`
+    /// proves this does not fire when it must not; this proves it DOES fire when
+    /// it must, and they are not the same test. Three mutations of this function
+    /// survived the whole suite until this landed — deleting the
+    /// `expect_live_balances()` announcement, replacing the `tokio::spawn` with a
+    /// no-op, and handing the Kalshi sink in for BOTH venues so PM-US cash is
+    /// published under Kalshi's figure.
+    ///
+    /// The first of those is the C13 regression this change exists to remove: with
+    /// the announcement gone the run holds `Cash::Declared`, the seed never ages,
+    /// and an armed engine whose credentials are wrong or whose endpoint is dead
+    /// spends the hand-typed constant for ever — while the gauges call it fine.
+    /// A test that only checks the over-trigger direction cannot see that.
+    #[tokio::test]
+    async fn an_armed_run_announces_the_poll_and_installs_each_venue_under_its_own_name() {
+        let rv = std::sync::Arc::new(risk::RiskView::load(
+            "/nonexistent/exec.yaml",
+            "/nonexistent/topics.yaml",
+            vec![("kalshi".to_string(), "320.43".to_string())],
+            HashMap::new(),
+        ));
+        let mut sinks: HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>> = HashMap::new();
+        // Distinct figures, so a swapped pair is visible and not a coincidence.
+        sinks.insert(Venue::Kalshi, std::sync::Arc::new(CashSink(Ok("111.11"))));
+        sinks.insert(Venue::PolymarketUs, std::sync::Arc::new(CashSink(Ok("222.22"))));
+
+        spawn_balance_poll(&sinks, Some(&rv));
+        // The ANNOUNCEMENT is synchronous and lands before the task is scheduled —
+        // that ordering is the point of it, so assert it before yielding.
+        assert_eq!(
+            rv.balances_source(),
+            "seed",
+            "an armed run must promise a poll, or the declaration never ages and C13 stands"
+        );
+        // Real sleeps, not `yield_now`: the read goes through `spawn_blocking`, so
+        // the current-thread runtime has to actually make progress on the blocking
+        // pool. Bounded rather than fixed — the first `interval` tick is ready
+        // immediately by design, so this normally lands on the first pass.
+        for _ in 0..40 {
+            if rv.balances_source() == "live" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(rv.balances_source(), "live", "the spawned loop must actually install a reading");
+        assert_eq!(rv.balance_of("kalshi").as_deref(), Some("111.11"));
+        assert_eq!(
+            rv.balance_of("polymarket_us").as_deref(),
+            Some("222.22"),
+            "each venue under ITS OWN key — one sink handed in twice publishes one venue's cash \
+             as the other's, and the gate keys its per-venue cash check on this name"
+        );
+    }
+
     /// The snapshot is the whole reason a dashboard need not open a second
     /// gateway against the same account (quirk `xv-shared-api-budget`), so what
     /// it publishes has to be the figure the gate is actually spending, under

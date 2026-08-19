@@ -620,6 +620,24 @@ impl RiskView {
         }
     }
 
+    /// What the gate is spending against, per venue, whatever the provenance.
+    ///
+    /// TEST-ONLY, and it exists because its absence hid a live defect: with no
+    /// way to read the pairs back, a mutation handing the SAME sink in for both
+    /// venues — publishing Kalshi's cash under `polymarket_us`, which is the key
+    /// the per-venue cash check is keyed on — survived the entire suite. The
+    /// cycle-level labelling was pinned; the call site that fills the two slots
+    /// was not. Nothing in production needs this, so it does not exist there.
+    #[cfg(test)]
+    pub fn balance_of(&self, venue: &str) -> Option<String> {
+        let g = self.balances.lock().expect("balances");
+        let pairs = match &*g {
+            Cash::Declared(p) => p,
+            Cash::Seed { pairs, .. } | Cash::Live { pairs, .. } => pairs,
+        };
+        pairs.iter().find(|(k, _)| k == venue).map(|(_, v)| v.clone())
+    }
+
     /// A fill opened `qty` more contracts on this relationship — the exposure
     /// the NEXT check must see. Python: `risk.record_open(rel, filled)`.
     /// Takes the id/class rather than a `&Rel` so the engine can record from a
@@ -1091,8 +1109,21 @@ mod tests {
     /// FAIL-CLOSED ON AGE, and specifically NOT back to `--balance`. A reading
     /// nothing is refreshing is not a balance, and the tempting fallback
     /// re-arms the C13 constant the instant the endpoint flaps — silently, and
-    /// for as long as it stays down. Affordable because `check` gates OPENING
-    /// only: an expired reading costs entries and can never strand a leg.
+    /// for as long as it stays down.
+    ///
+    /// WHAT THAT COSTS IS NOT "ENTRIES". An earlier draft of this doc said an
+    /// expired reading "costs entries and can never strand a leg", and
+    /// [`BALANCE_MAX_AGE`] already retracts that sentence — but it was written
+    /// twice in the same commit and this was the copy that survived. The half
+    /// that stands: `check` gates OPENING only, so no leg is ever stranded
+    /// half-hedged by this. The half that does not: a refusal that PERSISTS
+    /// also de-quotes. `arb_core::quoter` sets `refused_since` on a (leg, side)
+    /// that wants to move its price under refusal, and at `CAP_REFUSAL_PULL_S`
+    /// of continuous refusal it drops the quote from `resting` and emits a
+    /// cancel, which an armed engine turns into a real venue command. So an
+    /// expiry that outlives that window takes the book progressively FLAT.
+    /// That is the argument the bound is chosen against, and it belongs
+    /// wherever the cost is described — not only at the constant.
     #[test]
     fn a_live_reading_that_has_aged_out_refuses_rather_than_falling_back() {
         let v = funded("low"); // --balance would allow this order
