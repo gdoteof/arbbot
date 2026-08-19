@@ -26,7 +26,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, String> {
 /// A venue snapshot older than this is not evidence of anything current. The
 /// 2026-07-28 audit found both reconciliation rows reading EXACT over snapshots
 /// 20.2 hours old, which is a third state — frozen — not a pass.
-const SNAPSHOT_STALE_S: u64 = 3600;
+pub const SNAPSHOT_STALE_S: u64 = 3600;
 
 /// One row of the reconciliation table, with an explicit claim about whether it
 /// is a check at all.
@@ -165,9 +165,14 @@ fn recon_checks(
             &books,
             kb,
             false,
-            "compared against --kalshi-balance, a constant typed at startup. A number that \
-             cannot move cannot disagree, so this is a display of the books figure, not a \
-             check. Re-pull the venue balance and restart to actually check it.",
+            "compared against --kalshi-balance, a constant typed at startup. NOT a tautology \
+             like cash:pmus — the books side really does move when the fills snapshot does — \
+             but the snapshot and the constant are hand-updated in the same act (the dash unit \
+             says so), so the two sides can only ever agree. Making it a check needs a SECOND, \
+             independently-sourced venue figure at request time, and nothing in this repo \
+             writes one. The Now view's capital panel puts this same --kalshi-balance constant \
+             against the armed engine's own --balance instead: that pair really can disagree, \
+             and today it does.",
         ));
         sources.push(serde_json::json!({
             "what": "kalshi cash balance",

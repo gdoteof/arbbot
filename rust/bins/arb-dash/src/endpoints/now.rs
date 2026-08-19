@@ -41,7 +41,7 @@
 //! `class cap` and `global cap` name no scope and apply to everything. Rows
 //! say which of the two they are getting.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use arb_core::clock::now_secs;
 use arb_core::risk::{topic_of, TopicIn};
@@ -334,6 +334,145 @@ fn yaml_num(v: &Option<serde_yaml::Value>) -> Option<f64> {
 }
 
 // ---------------------------------------------------------------------------
+// Capital, derived rather than typed
+// ---------------------------------------------------------------------------
+
+/// Past this, `data/exec/marks.json` is not a picture of now.
+///
+/// The armed engine rewrites it on a book event, coalesced to at most one write
+/// per second and at LEAST one per `engine::MarksOut::max_idle_s`, which is
+/// 120s. So an older file does not mean the book went quiet — it means the
+/// writer is dead or wedged, and that is the one failure mode that turns the
+/// deployed figure below from a lag into a lie.
+const MARKS_STALE_S: u64 = 120;
+
+/// Stale is a THIRD state, not a pass, and an age nobody could establish is
+/// UNKNOWN rather than fresh. Same rule the books page applies to its venue
+/// snapshots, and the same exclusive boundary.
+fn stale(age_s: Option<u64>, past_s: u64) -> Option<bool> {
+    age_s.map(|x| x > past_s)
+}
+
+/// Capital DEPLOYED, out of the engine's own marks: what flattening the whole
+/// book would return, how many rows could not be priced, and how many open
+/// records were never marked at all.
+///
+/// Σ `liq_value_usd`, which is the basket sold at the bid and bought back at
+/// the ask NET OF BOTH EXIT FEES (`marks::compute_row`) — the recoverable
+/// figure, not a mid. Deliberately not the shortcut
+/// `totals.cost_usd + totals.mark_pnl_usd`: `marks::build` skips a row it could
+/// not price when it accumulates the mark but adds EVERY row's cost, so that
+/// sum silently carries an unpriceable row at full cost — overstating what is
+/// recoverable exactly where the book is least knowable. It happens to agree
+/// today only because all 58 rows priced.
+///
+/// The third figure is `totals.n_open - positions.len()`, and it is not
+/// redundant with `totals.unpriced_positions`: single-leg records are skipped
+/// BEFORE that counter is incremented (`marks::build`), so the counter can read
+/// 0 while a record was in fact dropped. Live right now: 59 open, 58 rows, 0
+/// unpriced. Without this subtraction the view under-reports deployed capital
+/// and never says so.
+///
+/// `None` rather than `0.0` when there is no marks file. A $0.00 under
+/// "recoverable" reads as "the book is flat", which is a very different claim
+/// from "the process that writes this file is not running".
+fn deployed(marks: &Value) -> (Option<f64>, u64, Option<i64>) {
+    let Some(rows) = marks.get("positions").and_then(Value::as_array) else {
+        return (None, 0, None);
+    };
+    let (mut value, mut unpriced) = (0.0, 0u64);
+    for p in rows {
+        match f(p.get("liq_value_usd")) {
+            Some(v) => value += v,
+            None => unpriced += 1,
+        }
+    }
+    let unmarked = marks
+        .get("totals")
+        .and_then(|t| t.get("n_open"))
+        .and_then(Value::as_u64)
+        .map(|n| n as i64 - rows.len() as i64);
+    (Some(value), unpriced, unmarked)
+}
+
+/// The SPENDABLE PM-US cash in a `pmus_balances.json`.
+///
+/// `buyingPower`, NEVER `currentBalance`. PM-US reports
+/// `currentBalance = buyingPower + marginRequirement` (live: 653.15805 =
+/// 329.29805 + 323.86), and the $1.00 it withholds per short contract — the
+/// whole of `marginRequirement` — is ALREADY inside each position's cost basis,
+/// so it is already inside the deployed figure this sits beside. Taking
+/// `currentBalance` here would count that $323.86 of collateral twice, which is
+/// the exact bug the 2026-08-14 accounting audit found. `arb_ledger::pmus`
+/// documents the convention, and going through its `Balances` means the only
+/// accessor this file can reach for is the spendable one.
+///
+/// Takes the TEXT rather than the path so the trap above is pinned by a test
+/// against the live file's own numbers.
+fn spendable_pmus(text: &str) -> Option<f64> {
+    serde_json::from_str::<arb_ledger::pmus::Balances>(text)
+        .ok()?
+        .buying_power_str()
+        .parse()
+        .ok()
+}
+
+/// The per-venue cash the ARMED engine's risk gate is spending against, read
+/// off its command line.
+///
+/// Off `/proc` and not off the unit file, for the same reason `armed_engine`
+/// detects rather than configures: the tracked unit says `--balance
+/// kalshi=340.09` and the drop-in that actually arms the engine overrides it
+/// with `320.43`, so a figure read out of this repo is a figure nobody is
+/// trading against.
+///
+/// This is NOT a measurement of venue cash and must never be added to the
+/// deployed figure. `RiskView::balances` (audit C13) is hand-typed and is never
+/// decremented as capital deploys, so the shares already counted as deployed
+/// were bought with some of the very cash it still reports.
+fn engine_balances(cmd: &str) -> Vec<(String, f64)> {
+    cmd.split("--balance ")
+        .skip(1)
+        .filter_map(|s| s.split_whitespace().next())
+        .filter_map(|kv| {
+            let (venue, usd) = kv.split_once('=')?;
+            Some((venue.to_string(), usd.parse().ok()?))
+        })
+        .collect()
+}
+
+/// One venue's cash, beside every other figure that claims to know it, with the
+/// differences an operator would otherwise take on trust.
+///
+/// Three sources, because there are three and they do not agree: the armed
+/// engine's constant, this dashboard's own constant, and a MEASURED venue
+/// figure where a snapshot exists. Live today on kalshi that is 320.43 against
+/// 340.0896 — a $19.66 gap that no page in this repo said out loud, and the one
+/// comparison here that can genuinely fail, since either constant can be edited
+/// alone in its own unit file.
+fn cash_row(
+    venue: &str,
+    engine: Option<f64>,
+    dash: Option<f64>,
+    measured: Option<f64>,
+    from: &str,
+    age_s: Option<u64>,
+) -> Value {
+    let diff = |b: Option<f64>| engine.zip(b).map(|(e, x)| e - x);
+    json!({
+        "venue": venue,
+        "engine_usd": engine,
+        "dash_usd": dash,
+        "dash_diff_usd": diff(dash),
+        "venue_usd": measured,
+        "venue_from": from,
+        "venue_age_s": age_s,
+        "venue_stale": stale(age_s, crate::endpoints::books::SNAPSHOT_STALE_S),
+        "venue_diff_usd": diff(measured),
+    })
+}
+
+// ---------------------------------------------------------------------------
 
 pub fn json(a: &Args) -> String {
     let now = now_secs() as f64;
@@ -475,7 +614,8 @@ pub fn json(a: &Args) -> String {
         .collect();
 
     // ---- capital, by the same topic buckets the gate uses -----------------
-    let marks: Value = std::fs::read_to_string(format!("{}/exec/marks.json", a.data_dir))
+    let marks_path = format!("{}/exec/marks.json", a.data_dir);
+    let marks: Value = std::fs::read_to_string(&marks_path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or(Value::Null);
@@ -517,6 +657,69 @@ pub fn json(a: &Args) -> String {
                     "headroom_usd": budget.map(|b| b - cost),
                     "gate": topics.topics.iter().find(|x| x.family == *t)
                               .and_then(|x| x.only_below_util.clone()) })
+        })
+        .collect();
+
+    // ---- the same capital, derived rather than typed ----------------------
+    //
+    // DEPLOYED is genuinely live: the engine marks the book against its own
+    // feed and rewrites `marks.json` at book-event rate. REMAINING is not, and
+    // nothing here pretends otherwise — arb-dash holds no credentials and
+    // constructs no gateway, so every cash figure it can reach is either a
+    // constant somebody typed into a unit file or a snapshot somebody fetched
+    // by hand. Deriving "capital remaining" from those and serving it as a
+    // measurement would reproduce, one level up, exactly the tautology the
+    // books page carries: a new number that cannot disagree with the thing it
+    // was built to check. So they are published SIDE BY SIDE, each with its
+    // provenance and its age, and the gaps between them are the output.
+    //
+    // Deployed is not attributed per venue, and cannot be from this file: a
+    // marked row is a two-leg BASKET priced as a unit (`marks::compute_row`
+    // sums the Kalshi bid and the PM-US 1−ask into one `liq_value_usd`), so
+    // there is no per-leg money in `marks.json` to split. Splitting it would
+    // need a change to the engine's writer, which is an order-path crate.
+    let (share_value, unpriced_rows, unmarked_records) = deployed(&marks);
+    let engine_bal = proc.map(|p| engine_balances(&p.cmd)).unwrap_or_default();
+    let dash_kalshi: Option<f64> = a.kalshi_balance.as_ref().and_then(|s| s.parse().ok());
+    let pmus_bal = format!("{}/pmus_balances.json", a.pmus_dir);
+    let pmus_cash = std::fs::read_to_string(&pmus_bal).ok().as_deref().and_then(spendable_pmus);
+    // Only venues something is actually known about. A row of nulls would
+    // suggest a venue is configured when it is not.
+    let mut venues: BTreeSet<String> = engine_bal.iter().map(|(v, _)| v.clone()).collect();
+    if dash_kalshi.is_some() {
+        venues.insert("kalshi".into());
+    }
+    if pmus_cash.is_some() {
+        venues.insert("polymarket_us".into());
+    }
+    let cash_rows: Vec<Value> = venues
+        .iter()
+        .map(|v| {
+            let engine = engine_bal.iter().find(|(n, _)| n == v).map(|(_, u)| *u);
+            match v.as_str() {
+                "polymarket_us" => cash_row(
+                    v,
+                    engine,
+                    None,
+                    pmus_cash,
+                    &format!("{pmus_bal} · buyingPower"),
+                    crate::endpoints::age_secs(&pmus_bal),
+                ),
+                // Kalshi has NO measured side. Nothing in this repo writes a
+                // kalshi balance file — the dash unit says so in as many words
+                // — and `--kalshi-balance` is this process's own startup
+                // constant, so putting it in the measured column would compare
+                // a hand-typed number to itself.
+                "kalshi" => cash_row(
+                    v,
+                    engine,
+                    dash_kalshi,
+                    None,
+                    "no kalshi balance snapshot — nothing in this repo writes one",
+                    None,
+                ),
+                _ => cash_row(v, engine, None, None, "no balance snapshot for this venue", None),
+            }
         })
         .collect();
 
@@ -662,14 +865,24 @@ pub fn json(a: &Args) -> String {
                 "resting": resting.values().cloned().collect::<Vec<_>>() }),
     );
     out.insert("constraints".into(), Value::Array(constraint_rows));
+    let marks_age = crate::endpoints::age_secs(&marks_path);
     out.insert(
         "capital".into(),
         json!({ "bankroll_usd": bankroll, "per_class_cap": per_class,
                 "class_cap_usd": class_cap,
                 "totals": marks.get("totals").cloned().unwrap_or(Value::Null),
-                "marks_age_s": crate::endpoints::age_secs(
-                    &format!("{}/exec/marks.json", a.data_dir)),
-                "topics": topic_rows }),
+                "marks_age_s": marks_age,
+                "marks_stale": stale(marks_age, MARKS_STALE_S),
+                "topics": topic_rows,
+                // Beside the declared figures, never wired to move them:
+                // `bankroll_usd` is a policy statement about risk appetite, and
+                // a class cap that floated with equity would let this page
+                // change what the engine trades.
+                "derived": json!({
+                    "share_value_usd": share_value,
+                    "unpriced_rows": unpriced_rows,
+                    "unmarked_records": unmarked_records,
+                    "cash": cash_rows }) }),
     );
     out.insert(
         "opportunities".into(),
@@ -792,6 +1005,129 @@ mod tests {
         assert!(stale(60, 3600), "edited a minute ago, engine up an hour");
         assert!(!stale(7200, 3600), "edited before the engine started: it read this");
         assert!(!stale(3600, 3600), "same instant is not evidence of a later edit");
+    }
+
+    // ----- capital, derived -------------------------------------------------
+
+    /// The recoverable figure is Σ `liq_value_usd` and never the shortcut
+    /// `totals.cost_usd + totals.mark_pnl_usd`. `marks::build` skips a row it
+    /// could not price when it sums the mark but adds EVERY row's cost, so the
+    /// shortcut carries an unpriceable row at full cost — reporting capital as
+    /// recoverable exactly where the book is least knowable. The shortcut is
+    /// right on today's file only because all 58 rows priced.
+    #[test]
+    fn an_unpriceable_row_is_counted_as_unknown_not_as_recoverable_at_cost() {
+        let marks = json!({
+            "positions": [
+                { "cost_usd": 100.0, "liq_value_usd": 90.0, "mark_pnl_usd": -10.0 },
+                { "cost_usd": 50.0,  "liq_value_usd": null, "mark_pnl_usd": null },
+            ],
+            "totals": { "cost_usd": 150.0, "mark_pnl_usd": -10.0, "n_open": 2 }
+        });
+        let (value, unpriced, unmarked) = deployed(&marks);
+        assert_eq!(value, Some(90.0), "the row that could not be priced contributes nothing");
+        assert_eq!(unpriced, 1, "and is COUNTED, so the 90 is read as partial");
+        assert_eq!(unmarked, Some(0), "both open records did produce a row");
+        assert!(150.0 - 10.0 > value.expect("a value"), "the shortcut would have claimed 140");
+    }
+
+    /// `totals.n_open` is every open ledger record, and single-leg ones are
+    /// skipped BEFORE `totals.unpriced_positions` is incremented — so that
+    /// counter can read 0 while a record was in fact dropped. Live right now:
+    /// 59 open, 58 rows, 0 unpriced. Without this subtraction the panel
+    /// under-reports deployed capital and never says so.
+    #[test]
+    fn a_record_that_was_never_marked_is_reported_even_when_nothing_was_unpriced() {
+        let marks = json!({
+            "positions": [{ "liq_value_usd": 42.0 }],
+            "totals": { "n_open": 2, "unpriced_positions": 0 }
+        });
+        let (value, unpriced, unmarked) = deployed(&marks);
+        assert_eq!((value, unpriced), (Some(42.0), 0));
+        assert_eq!(unmarked, Some(1), "one open record produced no row at all");
+    }
+
+    /// No marks file is UNKNOWN, not zero. A $0.00 under "recoverable" reads as
+    /// "the book is flat", which is the opposite of what an absent file means:
+    /// the engine that writes it is not running.
+    #[test]
+    fn an_absent_marks_file_reports_unknown_rather_than_a_flat_book() {
+        assert_eq!(deployed(&Value::Null), (None, 0, None));
+    }
+
+    /// THE DOUBLE-COUNT TRAP, pinned against the live file's own numbers.
+    /// PM-US reports `currentBalance = buyingPower + marginRequirement`, and
+    /// the $1.00 per short contract behind `marginRequirement` is already
+    /// inside each position's cost basis — so it is already inside the deployed
+    /// figure this sits beside. Taking `currentBalance` here counts $323.86 of
+    /// collateral twice, which is the bug the 2026-08-14 accounting audit found.
+    #[test]
+    fn the_pmus_cash_figure_is_buying_power_and_not_the_margin_inflated_balance() {
+        let live = r#"{"currentBalance": 653.15805, "currency": "USD", "buyingPower": 329.29805,
+                       "openOrders": 0, "unsettledFunds": 0, "marginRequirement": 323.86}"#;
+        assert_eq!(spendable_pmus(live), Some(329.29805), "not 653.15805, and not 653.15805−0");
+        assert_eq!(spendable_pmus("not json"), None, "and an unreadable snapshot is unknown");
+    }
+
+    /// The constants the ARMED risk gate is spending against, off its command
+    /// line. The tracked unit file says `kalshi=340.09`; the drop-in that arms
+    /// the engine overrides it with 320.43, so a figure read out of this repo
+    /// is a figure nobody is trading against.
+    #[test]
+    fn the_balances_the_engine_is_spending_against_come_off_its_command_line() {
+        let cmd = "arb-trader --rel-prefix xvus- --balance kalshi=320.43 \
+                   --balance polymarket_us=301.92 --enable-orders --yes-trade-live";
+        assert_eq!(
+            engine_balances(cmd),
+            vec![("kalshi".into(), 320.43), ("polymarket_us".into(), 301.92)]
+        );
+    }
+
+    /// A venue the engine was never given a balance for must be ABSENT, not
+    /// zero. `RiskView` fails closed on a missing balance, so a $0.00 row would
+    /// read as "that venue is out of cash" rather than "it was never funded".
+    #[test]
+    fn a_venue_with_no_balance_flag_yields_no_row_rather_than_a_zero() {
+        assert!(engine_balances("arb-trader --socket data/arbbot.sock").is_empty());
+        assert!(engine_balances("--balance kalshi=").is_empty(), "and an empty value is not 0");
+    }
+
+    /// The two hand-typed constants disagree TODAY — the armed engine spends
+    /// against `kalshi=320.43` while this dashboard was started with
+    /// `--kalshi-balance 340.0896` — and no page in this repo said so. Either
+    /// can be edited alone in its own unit file, which is what makes this the
+    /// one cash comparison on the panel that can genuinely fail.
+    #[test]
+    fn the_engines_balance_and_the_dashboards_are_shown_with_the_gap_between_them() {
+        let r = cash_row("kalshi", Some(320.43), Some(340.0896), None, "no snapshot", None);
+        assert!((r["dash_diff_usd"].as_f64().expect("a gap") + 19.6596).abs() < 1e-9);
+        assert!(r["venue_usd"].is_null(), "and neither constant is dressed up as a measurement");
+        assert!(r["venue_diff_usd"].is_null());
+        assert!(r["venue_stale"].is_null(), "an unknown age is not a fresh one");
+    }
+
+    /// A measured figure carries its age and says STALE past the same hour the
+    /// books page uses. The pm-us snapshot under `data/venue` is 22.7 days old
+    /// and nothing in this repo writes it, so serving it as current would be a
+    /// worse number than the constant beside it, dressed as a better one.
+    #[test]
+    fn a_measured_venue_figure_past_an_hour_is_served_as_stale_not_as_current() {
+        let row = |age| cash_row("polymarket_us", Some(301.92), None, Some(329.29805), "f", age);
+        let fresh = row(Some(30));
+        assert_eq!(fresh["venue_stale"], false);
+        assert!((fresh["venue_diff_usd"].as_f64().expect("a gap") + 27.37805).abs() < 1e-9);
+        assert_eq!(row(Some(1_963_718))["venue_stale"], true, "the live snapshot's own age");
+    }
+
+    /// Stale is a THIRD state, not a pass, and an age nobody could establish is
+    /// unknown rather than fresh. Both aged figures on this panel go through
+    /// here: the engine's marks against its own 120s heartbeat, the pm-us
+    /// snapshot against the hour the books page uses.
+    #[test]
+    fn a_figure_with_no_age_is_unknown_and_one_past_its_window_says_so() {
+        assert_eq!(stale(None, MARKS_STALE_S), None);
+        assert_eq!(stale(Some(MARKS_STALE_S), MARKS_STALE_S), Some(false), "the line is exclusive");
+        assert_eq!(stale(Some(MARKS_STALE_S + 1), MARKS_STALE_S), Some(true));
     }
 
     /// `topic_of` is arb-core's, so a position is bucketed exactly the way the

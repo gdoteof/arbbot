@@ -1228,11 +1228,13 @@ function nowConstraints(d){
 }
 
 function nowCapital(d){
-  const c = d.capital, t = c.totals || {};
+  const c = d.capital, t = c.totals || {}, v = c.derived || {};
   return $(`<section class="wide">
     <h2>Capital</h2>
     <div class="rowflex">
       <div class="stat"><div class="big">${usd0(t.cost_usd)}</div><div class="sub">at cost, open</div></div>
+      <div class="stat"><div class="big ${c.marks_stale?'bad':''}">${usd0(v.share_value_usd)}</div>
+        <div class="sub">recoverable now${c.marks_stale?' &middot; <b class="bad">STALE</b>':''}<br>net of exit fees</div></div>
       <div class="stat"><div class="big ok">${usd0(t.locked_profit_usd)}</div><div class="sub">locked in</div></div>
       <div class="stat"><div class="big dim">${usd0(c.class_cap_usd)}</div>
         <div class="sub">class cap<br>${usd0(c.bankroll_usd)} &times; ${c.per_class_cap}</div></div>
@@ -1256,6 +1258,47 @@ function nowCapital(d){
       Positions are bucketed by <code>arb_core::risk::topic_of</code> — the same
       function the gate that refuses them uses, so a pair cannot appear here
       under a topic it was never gated under. Marks are ${dur(c.marks_age_s)} old.
+    </div>
+    <h2 style="margin-top:18px">Cash remaining, by venue &middot; and who believes what</h2>
+    <table>
+      <thead><tr><th>venue</th><th class="num">armed engine</th><th class="num">this dashboard</th>
+        <th class="num">gap</th><th class="num">measured</th><th class="num">gap</th>
+        <th>measured from</th></tr></thead>
+      <tbody>${(v.cash||[]).map(r => `<tr data-k="cash-${esc(r.venue)}">
+        <td>${esc(r.venue)}</td>
+        <td class="num">${usd0(r.engine_usd)}</td>
+        <td class="num">${usd0(r.dash_usd)}</td>
+        <td class="num ${r.dash_diff_usd?'warn':'dim'}">${usd0(r.dash_diff_usd)}</td>
+        <td class="num">${usd0(r.venue_usd)}</td>
+        <td class="num ${r.venue_diff_usd?'warn':'dim'}">${usd0(r.venue_diff_usd)}</td>
+        <td class="sub">${esc(r.venue_from)}${r.venue_age_s==null ? ''
+          : ` &middot; <span class="${r.venue_stale?'bad':'dim'}">${dur(r.venue_age_s)} old${
+              r.venue_stale?', STALE — nothing in this repo refreshes it':''}</span>`}</td>
+      </tr>`).join('')}</tbody>
+    </table>
+    <div class="sub" style="margin-top:8px">
+      <b>recoverable now</b> is &Sigma;<code>liq_value_usd</code> over the engine's own
+      marks — each basket sold at the bid and bought back at the ask, net of both
+      exit fees — and NOT <code>cost_usd + mark_pnl_usd</code>, which carries a row
+      that could not be priced at full cost. ${v.unpriced_rows
+        ? `<b class="bad">${v.unpriced_rows} row(s) could not be priced</b>, so it is a floor.`
+        : 'Every marked row priced.'}
+      ${v.unmarked_records ? `<b class="warn">${v.unmarked_records} open record(s) produced no
+        row at all</b> — single-leg positions have no basket to mark, and they are skipped
+        before <code>unpriced_positions</code> is counted, so that field reads 0 anyway.` : ''}
+      It is not split per venue and cannot be: a marked row is a two-leg basket priced as one
+      number, so there is no per-leg money in <code>marks.json</code> to attribute.
+      <br><br>
+      Nothing in the cash table is a measurement of Kalshi cash. <b>armed engine</b> is the
+      <code>--balance</code> constant the live risk gate is spending against, read off its
+      <code>/proc</code> command line (the tracked unit file says something else); it is
+      hand-typed and never decremented as capital deploys, so it must not be added to
+      <b>recoverable now</b> — those shares were bought with some of it. <b>this dashboard</b>
+      is this process's own <code>--kalshi-balance</code>. The two disagree, in different unit
+      files, and either can be edited alone: that gap is the one thing here that can fail.
+      <b>measured</b> is PM-US <code>buyingPower</code> — never <code>currentBalance</code>,
+      which is <code>buyingPower + marginRequirement</code>, and that margin is already inside
+      each position's cost basis and therefore already inside <b>recoverable now</b>.
     </div>
   </section>`);
 }
