@@ -278,6 +278,162 @@ pub struct Lot {
     pub qty: i64,
 }
 
+/// Why one open record cannot price a leg, for the caller that scans many and
+/// has to say what it skipped.
+enum LegSkip {
+    /// The record carries no leg on this venue and market at all.
+    Absent,
+    /// It carries one, pointing the other way — an inverted basket.
+    Direction,
+    /// It carries one, with no price this can read.
+    Price,
+}
+
+/// The all-in cost per contract, fees in, of ONE record's leg on
+/// `venue`/`market`.
+///
+/// Split out of [`worst_lot`] so [`lot_at`] can ask the same question of ONE
+/// NAMED record. The fee handling is why it is shared rather than written
+/// twice: the leg's own `fees` field when it has one, and otherwise the
+/// schedule at its `role`, with a missing role read as the dearer `Taker`.
+fn leg_cost(
+    cx: &mut Cx,
+    fees: &FeeSchedule,
+    rec: &Value,
+    rec_qty: i64,
+    venue: Venue,
+    market: &str,
+    held: Held,
+) -> Result<D, LegSkip> {
+    let legs = rec.get("legs").and_then(|v| v.as_array()).ok_or(LegSkip::Absent)?;
+    let leg = legs
+        .iter()
+        .find(|l| {
+            l.get("venue").and_then(|v| v.as_str()) == Some(venue.as_str())
+                && l.get("market_id").and_then(|v| v.as_str()) == Some(market)
+        })
+        .ok_or(LegSkip::Absent)?;
+    let side = leg.get("side").and_then(|v| v.as_str()).unwrap_or("");
+    if !held.matches(side) {
+        return Err(LegSkip::Direction);
+    }
+    let px = str_field(leg, "yes_price")
+        .or_else(|| str_field(leg, "avg_price"))
+        .ok_or(LegSkip::Price)?;
+    let px = cx.parse(&px).ok_or(LegSkip::Price)?;
+    // The YES price is what the ledger records on both sides; the COST of a
+    // short-yes contract is what is left of the dollar.
+    let paid = match held {
+        Held::ShortYes => cx.one_minus(px),
+        Held::LongYes => px,
+    };
+    let leg_qty = leg.get("qty").and_then(|v| v.as_f64()).unwrap_or(rec_qty as f64);
+    if leg_qty <= 0.0 {
+        return Err(LegSkip::Price);
+    }
+    let fee_total = match str_field(leg, "fees").and_then(|s| cx.parse(&s)) {
+        Some(f) => f,
+        None => {
+            let role = match leg.get("role").and_then(|v| v.as_str()) {
+                Some("maker") => Role::Maker,
+                // `None` and the two `maker+taker` legs both land here: the
+                // dearer schedule, because a fee we guessed low is a basis
+                // we beat by less than we thought.
+                _ => Role::Taker,
+            };
+            let size = cx.parse(&leg_qty.to_string()).unwrap_or_else(|| cx.zero());
+            fees.fee(cx, venue, role, px, size, "")
+        }
+    };
+    let size = cx.parse(&leg_qty.to_string()).unwrap_or_else(|| cx.zero());
+    let fee_ct = cx.div(fee_total, size);
+    Ok(cx.add(paid, fee_ct))
+}
+
+/// The ONE still-open lot opened at `open_ts`, priced on one leg.
+///
+/// # Why this and not [`worst_lot`], for an exit
+///
+/// [`worst_lot`] answers a question about a position of UNKNOWN provenance: a
+/// leg that is real at the venue and that our ledger cannot attribute to any
+/// particular basket. Contracts are fungible, so the dearest open lot is the
+/// only basis that makes the completed basket profitable under every
+/// attribution.
+///
+/// AN EXIT IS NOT THAT QUESTION. `unwind::select` names the basket it chose by
+/// `(rel_id, opened_ts)` — the same key a correction or an unwind addresses —
+/// and `maker_exit::Order::closes_ts` books the close against that one record.
+/// Nothing needs attributing; the lot is known. Pricing it off `worst_lot`
+/// anyway did two things, both wrong, and they compound:
+///
+///   1. It priced a lot we did not choose. On 2026-08-20 `select` picked the
+///      4-contract `xvus-time-poty-26-artificialintelligence` basket, basis
+///      0.9263, and the exit was priced off a 1.0023 one.
+///   2. Called once per venue, as a two-leg exit must be, it pairs the dearest
+///      Kalshi leg with the dearest PM-US leg — and those come from DIFFERENT
+///      records. That 1.0023 is Kalshi 0.1063 from the record opened at
+///      1784678809 against PM-US 0.8960 from the one opened at 1784671274. No
+///      basket we ever traded cost that. The pair cannot pay more than $1, so
+///      the synthetic one is unexitable by construction: `exit_limit` duly
+///      demanded a Kalshi ask of 0.08 against a book offering 0.05, and the ask
+///      sat outside the market until it was rotated out. `maker_exit_closed`
+///      was 0 for the life of the deployment.
+///
+/// A lot the ledger does not have is an ERROR here and not a fallback to the
+/// dearest, because falling back is precisely how (1) happens.
+// [`worst_lot`]'s arguments plus the one that distinguishes this from it. The
+// identity is the whole point of the function, so hiding it in a struct with
+// the leg selectors would bury the difference between the two.
+#[allow(clippy::too_many_arguments)]
+pub fn lot_at(
+    cx: &mut Cx,
+    fees: &FeeSchedule,
+    records: &[Value],
+    rel: &str,
+    open_ts: f64,
+    venue: Venue,
+    market: &str,
+    held: Held,
+) -> Result<Lot, String> {
+    let lots = open_lots(records, rel);
+    // Bit equality, and not a tolerance, because this is an IDENTITY and it is
+    // already treated as one: `unwind::identity_set` and `maker_exit::Debounce`
+    // both key on `opened_ts.to_bits()`. The value makes one trip through
+    // serde_json on its way into the marks file and back, which is round-trip
+    // exact. A near miss is therefore a real mismatch, and is reported as one
+    // with the timestamps we do hold.
+    let Some((ts, qty, rec)) =
+        lots.iter().find(|(ts, _, _)| ts.to_bits() == open_ts.to_bits()).cloned()
+    else {
+        let have: Vec<String> = lots.iter().map(|(t, q, _)| format!("{t} ({q})")).collect();
+        return Err(format!(
+            "no open ledger record for {rel} opened at {open_ts} — the basket \
+             unwind::select named is not one data/exec/trades.jsonl still calls open. \
+             Open lots we do hold: [{}]. No other lot is substituted: pricing an exit off \
+             a basket it was not selected for is the bug this function exists to make \
+             unexpressible.",
+            have.join(", ")
+        ));
+    };
+    let cost = leg_cost(cx, fees, &rec, qty, venue, market, held).map_err(|e| {
+        let v = venue.as_str();
+        match e {
+            LegSkip::Absent => {
+                format!("the {rel} record opened at {open_ts} has no {v} leg on {market}")
+            }
+            LegSkip::Direction => format!(
+                "the {v} leg on {market} of the {rel} record opened at {open_ts} points the \
+                 other way — completing an inverted basket is not the trade this exit is"
+            ),
+            LegSkip::Price => format!(
+                "the {v} leg on {market} of the {rel} record opened at {open_ts} carries no \
+                 usable price"
+            ),
+        }
+    })?;
+    Ok(Lot { open_ts: ts, cost_per_ct: cx.emit_6dp(cost), qty })
+}
+
 /// The DEAREST still-open lot for one leg of one relationship — the basis a
 /// completion must clear.
 ///
@@ -293,6 +449,10 @@ pub struct Lot {
 ///
 /// It is also what gives a Kalshi-long close somewhere to book against:
 /// [`Lot::open_ts`] is the record a partial unwind names in `closes_ts`.
+///
+/// NOT FOR A CALLER THAT ALREADY KNOWS ITS LOT. Use [`lot_at`], which carries
+/// the argument in full: the dearest-lot rule answers "which basket did these
+/// contracts come from", and a caller holding an `opened_ts` is not asking it.
 ///
 /// # What makes a record unusable, every case being a refusal and not a default
 ///
@@ -323,54 +483,18 @@ pub fn worst_lot(
     let mut skipped_direction = 0usize;
     let mut skipped_price = 0usize;
     for (open_ts, qty, rec) in open_lots(records, rel) {
-        let Some(legs) = rec.get("legs").and_then(|v| v.as_array()) else { continue };
-        let Some(leg) = legs.iter().find(|l| {
-            l.get("venue").and_then(|v| v.as_str()) == Some(venue.as_str())
-                && l.get("market_id").and_then(|v| v.as_str()) == Some(market)
-        }) else {
-            continue;
-        };
-        let side = leg.get("side").and_then(|v| v.as_str()).unwrap_or("");
-        if !held.matches(side) {
-            skipped_direction += 1;
-            continue;
-        }
-        let Some(px) = str_field(leg, "yes_price").or_else(|| str_field(leg, "avg_price")) else {
-            skipped_price += 1;
-            continue;
-        };
-        let Some(px) = cx.parse(&px) else {
-            skipped_price += 1;
-            continue;
-        };
-        // The YES price is what the ledger records on both sides; the COST of a
-        // short-yes contract is what is left of the dollar.
-        let paid = match held {
-            Held::ShortYes => cx.one_minus(px),
-            Held::LongYes => px,
-        };
-        let leg_qty = leg.get("qty").and_then(|v| v.as_f64()).unwrap_or(qty as f64);
-        if leg_qty <= 0.0 {
-            skipped_price += 1;
-            continue;
-        }
-        let fee_total = match str_field(leg, "fees").and_then(|s| cx.parse(&s)) {
-            Some(f) => f,
-            None => {
-                let role = match leg.get("role").and_then(|v| v.as_str()) {
-                    Some("maker") => Role::Maker,
-                    // `None` and the two `maker+taker` legs both land here: the
-                    // dearer schedule, because a fee we guessed low is a basis
-                    // we beat by less than we thought.
-                    _ => Role::Taker,
-                };
-                let size = cx.parse(&leg_qty.to_string()).unwrap_or_else(|| cx.zero());
-                fees.fee(cx, venue, role, px, size, "")
+        let cost = match leg_cost(cx, fees, &rec, qty, venue, market, held) {
+            Ok(c) => c,
+            Err(LegSkip::Absent) => continue,
+            Err(LegSkip::Direction) => {
+                skipped_direction += 1;
+                continue;
+            }
+            Err(LegSkip::Price) => {
+                skipped_price += 1;
+                continue;
             }
         };
-        let size = cx.parse(&leg_qty.to_string()).unwrap_or_else(|| cx.zero());
-        let fee_ct = cx.div(fee_total, size);
-        let cost = cx.add(paid, fee_ct);
         let lot = Lot {
             open_ts,
             cost_per_ct: cx.emit_6dp(cost),
