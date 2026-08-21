@@ -225,8 +225,37 @@ struct RestingQuote {
     first_at_price: bool,
 }
 
+/// The clip a quote rests is SIZED TO THE HEDGE, between these bounds.
+///
+/// It used to be a flat 5 with a binary gate: `hedge_has_depth` refused the
+/// side unless the hedge leg's touch held at least 5, and every quote that
+/// passed rested exactly 5 however deep that touch was. Both halves cost us.
+/// Measured over the 101 markets of the tradable universe on 2026-08-20, the
+/// Kalshi touch — the thin side, and the one that gates most hedges — has a
+/// MEDIAN of 21 contracts:
+///
+/// ```text
+///   flat 5     quote 84.8% of the time x  5 =  4.2 contracts/opportunity
+///   flat 25    quote 49.2% of the time x 25 = 12.3   (loses half the books)
+///   adaptive   quote 84.8% of the time, sized  = 16.5
+/// ```
+///
+/// So a flat raise buys size by dropping the thin books out of quoting
+/// altogether, and sizing to the hedge beats it on BOTH counts. `MIN_CLIP` is
+/// what replaces the old gate: below it the hedge cannot cover a fill and the
+/// side is not quoted at all.
+///
+/// `MAX_CLIP` is a LEGGING bound, not a capital one. Between a maker fill and
+/// the hedge IOC landing (~40-70ms observed) we are one-legged for the whole
+/// clip, so this caps that exposure at 5x the old one. Raising it wants
+/// `hedges_naked` watched, not just headroom.
+pub const MIN_CLIP: i64 = 3;
+pub const MAX_CLIP: i64 = 25;
+
 pub struct Quoter {
     pub rel: Rel,
+    /// The FALLBACK clip, and the reservation a side takes before its hedge
+    /// depth is known. Live sizing is [`Quoter::hedge_clip`].
     clip: i64,
     min_requote_s: f64,
     /// Pre-computed `_apr_margin()` (min_apr/resolve_years are static per
@@ -401,6 +430,7 @@ impl Quoter {
         books: &BookBuilder,
         i: usize,
         side: BookSide,
+        clip: i64,
     ) -> Option<D> {
         let leg = &self.rel.legs[i];
         if self.suppress.contains(&(leg.market_id.clone(), side)) {
@@ -411,7 +441,11 @@ impl Quoter {
         let cur = self.resting.get(&(i, side));
         let comp = self.touch_excl_self(cx, books, i, side);
         let tick = cx.parse_exact("0.01");
-        let clip = cx.from_i64(self.clip);
+        // The clip is PRICED, not just sized: Kalshi's fee ceils to the cent
+        // on the whole order, so a bigger clip amortises it and affords a
+        // keener quote (`arb-scenario`'s
+        // `kalshi_fee_ceiling_makes_small_clips_much_worse_per_contract`).
+        let clip = cx.from_i64(clip);
         let metas = |l: &crate::scan::RelLeg| {
             let _ = l;
             default_meta(&mut Cx::default())
@@ -524,29 +558,36 @@ impl Quoter {
         None
     }
 
-    fn hedge_has_depth(
+    /// The largest clip this side may rest, given what the HEDGE leg's touch
+    /// can absorb right now. `None` = do not quote this side at all.
+    ///
+    /// Top of book only, because that is what the hedge IOC actually takes:
+    /// counting depth we would have to walk through prices a hedge we would
+    /// not want at that price.
+    fn hedge_clip(
         &self,
         cx: &mut Cx,
         books: &BookBuilder,
         i: usize,
         side: BookSide,
-    ) -> bool {
+    ) -> Option<i64> {
         let hedge_leg = &self.rel.legs[1 - i];
-        let Some(b) = books.get(hedge_leg.venue, &hedge_leg.market_id) else {
-            return false;
-        };
+        let b = books.get(hedge_leg.venue, &hedge_leg.market_id)?;
         let lvl = match side {
             BookSide::Bid => b.bids.first(),
             BookSide::Ask => b.asks.first(),
-        };
-        match lvl {
-            Some(l) => {
-                let Some(sz) = cx.parse(&l.size) else { return false };
-                let clip = cx.from_i64(self.clip);
-                cx.cmp(sz, clip) != Ordering::Less
+        }?;
+        let sz = cx.parse(&lvl.size)?;
+        // Walked DOWN through the decimal context rather than converted to an
+        // integer, so the comparison is the same exact-decimal one the old
+        // gate made and no float rounding decides a size.
+        for k in (MIN_CLIP..=MAX_CLIP).rev() {
+            let want = cx.from_i64(k);
+            if cx.cmp(sz, want) != Ordering::Less {
+                return Some(k);
             }
-            None => false,
         }
+        None
     }
 
     /// Emit price exactly like Python str(Decimal) of the quantized value.
@@ -620,12 +661,23 @@ impl Quoter {
                 let key = (i, side);
                 let leg_venue = self.rel.legs[i].venue;
                 let leg_market = self.rel.legs[i].market_id.clone();
-                let mut target = match &crossed {
+                // SIZE BEFORE PRICE, because the price depends on the size.
+                // `target` is `&self` and pure, so asking the hedge first only
+                // reorders two reads of the same book.
+                let clip = match &crossed {
                     Some(_) => None,
-                    None => self.target(cx, fees, books, i, side),
+                    None => self.hedge_clip(cx, books, i, side),
                 };
-                if target.is_some() && !self.hedge_has_depth(cx, books, i, side) {
-                    target = None;
+                let mut target = clip.and_then(|c| self.target(cx, fees, books, i, side, c));
+                // RESTING MORE THAN THE HEDGE CAN NOW ABSORB is a legging
+                // exposure, not a stale size, so it is cancelled PROMPTLY —
+                // the same answer the old binary gate gave when the touch fell
+                // under the flat clip, and deliberately not a resize behind the
+                // requote throttle. The next book event re-posts smaller.
+                if let (Some(c), Some(curq)) = (clip, self.resting.get(&key)) {
+                    if curq.count > c {
+                        target = None;
+                    }
                 }
                 // toxgate (card 059ce700): a toxic (market, side) is unviable —
                 // emit the skip record, cancel any resting quote, rest nothing.
@@ -663,6 +715,8 @@ impl Quoter {
                         target = None;
                     }
                 }
+                // `target` is Some only on the `clip.and_then` arm above.
+                let clip = clip.unwrap_or(self.clip);
                 let Some(target) = target else {
                     if let Some(curq) = self.resting.remove(&key) {
                         // RELEASE. This is the ordinary way a quote goes away —
@@ -771,7 +825,7 @@ impl Quoter {
                     let v = gate.check(
                         &self.rel,
                         self.rel.legs[i].venue,
-                        self.clip,
+                        clip,
                         // What this quote will rest on, so the gate can hold
                         // the capital until it fills or comes off.
                         Some((&leg_market, side)),
@@ -845,7 +899,7 @@ impl Quoter {
                     None => (None, None),
                 };
                 intents.push(Intent::Place(intent::Place {
-                    count: self.clip,
+                    count: clip,
                     old_price,
                     order_id: oid.clone(),
                     place: leg_market,
@@ -862,7 +916,7 @@ impl Quoter {
                 }));
                 self.resting.insert(
                     key,
-                    RestingQuote { order_id: oid, price: target, count: self.clip, first_at_price },
+                    RestingQuote { order_id: oid, price: target, count: clip, first_at_price },
                 );
                 self.last_quote_ts.insert(key, now);
             }
@@ -1864,6 +1918,102 @@ mod crossed_book_tests {
     }
 }
 
+/// Sizing the clip to what the HEDGE leg can absorb, rather than resting a
+/// flat 5 behind a binary depth gate. See [`MIN_CLIP`]/[`MAX_CLIP`].
+#[cfg(test)]
+mod clip_sizing_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    /// `fixture()` quotes the PM leg (index 1), whose hedge is Kalshi. Quoting
+    /// the PM BID means selling into the Kalshi BID if it fills, so that is
+    /// the touch the clip is sized from — `size` is the only thing varied.
+    fn k_bid(bb: &mut BookBuilder, size: &str) {
+        bb.apply_snapshot(
+            Venue::Kalshi, "K", vec![lvl("0.60", size)],
+            vec![lvl("0.99", "1")], 9, 9_000_000_000, None,
+        );
+    }
+
+    /// The clip that gets placed on P against a Kalshi bid of `size`.
+    fn placed_count(size: &str) -> Option<i64> {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        k_bid(&mut bb, size);
+        pm_bid(&mut bb, "0.24", 2, 2_000_000_000);
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        place_on(&intents, "P").map(|p| p.count)
+    }
+
+    /// THE CHANGE. A deep hedge used to rest 5 and now rests [`MAX_CLIP`]; a
+    /// shallow one rests exactly what the touch holds instead of being refused
+    /// or oversized. Measured on the live book, the Kalshi touch has a median
+    /// of 21 contracts, so the flat 5 was leaving most of it unused.
+    #[test]
+    fn the_clip_is_sized_to_the_hedge_touch() {
+        assert_eq!(placed_count("500"), Some(MAX_CLIP), "a deep hedge takes the ceiling");
+        assert_eq!(placed_count("25"), Some(25), "exactly the ceiling");
+        assert_eq!(placed_count("12"), Some(12), "sized to the touch, not to 5");
+        assert_eq!(placed_count("7"), Some(7));
+        assert_eq!(placed_count("3"), Some(MIN_CLIP), "the floor still quotes");
+    }
+
+    /// [`MIN_CLIP`] is what replaced the old binary gate, and it must still
+    /// refuse: below it a fill cannot be hedged at the touch at all.
+    #[test]
+    fn a_hedge_thinner_than_min_clip_quotes_nothing() {
+        assert_eq!(placed_count("2"), None);
+        assert_eq!(placed_count("1"), None);
+        assert_eq!(placed_count("0"), None);
+    }
+
+    /// A resting clip the hedge can no longer cover is a LEGGING exposure, not
+    /// merely a stale size, so it comes off promptly rather than waiting out
+    /// `min_requote_s` — the same answer the old gate gave when the touch fell
+    /// under the flat clip. `now` is only 1s past the entry, so the requote
+    /// throttle is still in force and cannot be what produced the cancel.
+    #[test]
+    fn a_resting_quote_the_hedge_can_no_longer_cover_is_cancelled_promptly() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        k_bid(&mut bb, "500");
+        pm_bid(&mut bb, "0.24", 2, 2_000_000_000);
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(place_on(&intents, "P").map(|p| p.count), Some(MAX_CLIP));
+
+        // The hedge touch collapses to 8 while we rest 25.
+        k_bid(&mut bb, "8");
+        let mut intents = Vec::new();
+        q.on_book(&mut cx, &fees, &bb, 101.0, &mut oid, &mut intents);
+        assert!(
+            cancel_on(&intents, "P").is_some(),
+            "25 resting against a hedge that can absorb 8 must come off: {intents:?}"
+        );
+    }
+
+    /// The other direction is NOT urgent and must not churn: a hedge that gets
+    /// DEEPER leaves the resting quote alone until something else moves it.
+    /// Growing through a cancel/replace would trade a filled 25 for a queue
+    /// position at the back.
+    #[test]
+    fn a_deeper_hedge_does_not_disturb_a_resting_quote() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        k_bid(&mut bb, "10");
+        pm_bid(&mut bb, "0.24", 2, 2_000_000_000);
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(place_on(&intents, "P").map(|p| p.count), Some(10));
+
+        k_bid(&mut bb, "500");
+        let mut intents = Vec::new();
+        q.on_book(&mut cx, &fees, &bb, 101.0, &mut oid, &mut intents);
+        assert!(
+            place_on(&intents, "P").is_none() && cancel_on(&intents, "P").is_none(),
+            "a deeper hedge is not a reason to requote: {intents:?}"
+        );
+    }
+}
+
 /// Who is ahead of us at our own price, both sides. The books are the two
 /// shapes `touch_excl_self` documents: the KXNOBELPEACE-26-SUD:bid join-behind
 /// cycle, and the `cpc-btc-*-140k:ask` wall that makes the skip conditional.
@@ -1875,7 +2025,8 @@ mod queue_priority_tests {
     use crate::scan::RelLeg;
 
     /// The PM-US book with `bids` as given. The 1-lot ask is the `fixture()`
-    /// shape and it is load-bearing: `hedge_has_depth` refuses the P ask and
+    /// shape and it is load-bearing: one lot is under `MIN_CLIP`, so
+    /// `hedge_clip` refuses the P ask and
     /// the K ask against it, and K's own bid never beats its 0.60 touch, so the
     /// P BID is the only side that can emit anything. An unexpected intent in
     /// these tests is therefore the defect, not the fixture.
@@ -1892,7 +2043,7 @@ mod queue_priority_tests {
     }
 
     fn bid_target(q: &Quoter, cx: &mut Cx, fees: &FeeSchedule, bb: &BookBuilder) -> String {
-        let t = q.target(cx, fees, bb, 1, BookSide::Bid).expect("a bid target");
+        let t = q.target(cx, fees, bb, 1, BookSide::Bid, 5).expect("a bid target");
         Quoter::px(cx, t)
     }
 
@@ -1988,8 +2139,9 @@ mod queue_priority_tests {
     }
 
     /// The ask side is a separate branch of `target`, so it gets its own pair.
-    /// K is deep on BOTH sides here (the P ask is hedged by taking K's ask, and
-    /// `hedge_has_depth` wants 5 lots there), and the P bid is 1 lot, which
+    /// K is deep on BOTH sides here (the P ask is hedged by taking K's ask, so
+    /// `hedge_clip` sizes from that touch), and the P bid is 1 lot — under
+    /// `MIN_CLIP` — which
     /// keeps K's own bid quiet the way the 1-lot ask does above.
     fn ask_fixture(asks: Vec<Level>) -> (Cx, FeeSchedule, BookBuilder, Quoter) {
         let mut cx = Cx::default();
@@ -2021,7 +2173,7 @@ mod queue_priority_tests {
     }
 
     fn ask_target(q: &Quoter, cx: &mut Cx, fees: &FeeSchedule, bb: &BookBuilder) -> String {
-        let t = q.target(cx, fees, bb, 1, BookSide::Ask).expect("an ask target");
+        let t = q.target(cx, fees, bb, 1, BookSide::Ask, 5).expect("an ask target");
         Quoter::px(cx, t)
     }
 

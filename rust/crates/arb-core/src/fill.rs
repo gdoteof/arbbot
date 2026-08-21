@@ -33,7 +33,7 @@ pub struct HedgeAnchor {
     /// hedge-leg BOOK side the anchor price came from — consistent with
     /// `price` (maker bid fills => we sell into the hedge bid => `Bid`).
     /// Matches the engine's capture convention (see engine.rs, which mirrors
-    /// `Quoter::hedge_has_depth` side selection).
+    /// `Quoter::hedge_clip` side selection).
     ///
     /// The obligation's whole direction hangs off this one field: it picks the
     /// side of the book the retry reads its touch from, which way `max_slip`

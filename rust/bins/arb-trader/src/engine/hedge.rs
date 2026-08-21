@@ -501,7 +501,7 @@ fn naked_alarm_due(
 /// hedge would TAKE. A maker bid that fills leaves us long, so the hedge sells
 /// into the hedge leg's bid; a maker ask that fills leaves us short, so the
 /// hedge lifts the hedge leg's ask. That is the same side selection
-/// `Quoter::hedge_has_depth` gates places on, so a place intent always has a
+/// `Quoter::hedge_clip` sizes places from, so a place intent always has a
 /// live top level here — `HedgeAnchor::side` therefore names the hedge-leg
 /// BOOK side whose price is in `HedgeAnchor::price`.
 ///

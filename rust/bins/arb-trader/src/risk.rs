@@ -37,6 +37,26 @@ use std::time::{Duration, Instant};
 const TAIL_FRACTION: &str = "0.02";
 const PER_REL_CAP: &str = "150";
 const GLOBAL_CAP: &str = "0.50";
+/// The share of NET ASSET VALUE this engine may hold as open positions, when
+/// the venues have told us what the cash actually is (see
+/// [`RiskView::live_cash`]).
+///
+/// REPLACES A CEILING THAT WAS HALF THE BOOK BY CONSTRUCTION. `GLOBAL_CAP`
+/// 0.50 times a hand-typed `bankroll_usd: 980` capped deployment at $490
+/// against a measured NAV of $1,001 — so roughly half of NAV could never be
+/// deployed at all, whatever the opportunity, and $603 sat in cash earning
+/// nothing while the deployed half carried 23.31%/yr.
+///
+/// It is also SELF-CORRECTING in a way a constant is not: NAV is cash plus the
+/// book, and deploying moves a dollar from one to the other, so the ceiling
+/// does not move as capital is put to work — it moves when we make or lose
+/// money, which is when it should.
+///
+/// 0.85 rather than 1.0 leaves an operational buffer: cash to take the second
+/// leg on concurrent fills, and room under the naked legs
+/// `positions_recon` is carrying. It is NOT a venue-solvency judgement; that
+/// would be a much larger number to argue about.
+const TARGET_DEPLOY: &str = "0.85";
 const OVERFLOW_MIN_APR: &str = "0.12";
 const OVERFLOW_FRAC: &str = "0.10";
 
@@ -832,11 +852,15 @@ impl RiskView {
     /// contract now moves the bar, and a book whose capital is committed to
     /// RESTING quotes rather than fills still reads as idle here.
     pub fn utilization(&self) -> f64 {
-        let cap = self.global_cap_usd();
+        // ONE read of the exposure map, feeding both terms. The cap depends on
+        // the book (it is a fraction of NAV, and the book is part of NAV), so
+        // taking the lock twice could straddle a fill and divide a post-fill
+        // numerator by a pre-fill denominator.
+        let total: f64 = self.exposure.lock().expect("exposure").by_rel.values().sum();
+        let cap = self.cap_over_book(total);
         if cap <= 0.0 {
             return 1.0;
         }
-        let total: f64 = self.exposure.lock().expect("exposure").by_rel.values().sum();
         (total / cap).clamp(0.0, 1.0)
     }
 
@@ -854,7 +878,60 @@ impl RiskView {
     /// A damaged `exec.yaml` is still degenerate here: `Caps::corrupt` forces
     /// the BANKROLL to "0", and every cap in this file is a fraction of it.
     pub fn global_cap_usd(&self) -> f64 {
-        self.bankroll.parse::<f64>().unwrap_or(0.0) * GLOBAL_CAP.parse::<f64>().unwrap_or(0.0)
+        let book: f64 = self.exposure.lock().expect("exposure").by_rel.values().sum();
+        self.cap_over_book(book)
+    }
+
+    /// [`Self::global_cap_usd`] with the book already summed, so a caller
+    /// holding that number does not take the lock twice.
+    ///
+    /// MUST NOT be called with the `exposure` lock held — it is not reentrant.
+    /// Today nothing does: `check` drops its guard before anything else runs,
+    /// and `utilization` and `global_cap_usd` are the only internal callers.
+    fn cap_over_book(&self, book: f64) -> f64 {
+        let configured =
+            self.bankroll.parse::<f64>().unwrap_or(0.0) * GLOBAL_CAP.parse::<f64>().unwrap_or(0.0);
+        // A damaged `exec.yaml` forces the bankroll to $0 and must stay
+        // degenerate; deriving a cap from live cash would quietly undo it.
+        if self.caps_corrupt.is_some() {
+            return configured;
+        }
+        match self.live_cash() {
+            Some(cash) => {
+                let target = TARGET_DEPLOY.parse::<f64>().unwrap_or(0.0);
+                target * (cash + book)
+            }
+            None => configured,
+        }
+    }
+
+    /// Spendable cash, but ONLY from a fresh reading the venues themselves
+    /// gave us. `None` = fall back to the configured bankroll.
+    ///
+    /// `Cash::Declared` and `Cash::Seed` are excluded deliberately. Both are
+    /// the `--balance` command line — a hand-typed constant that was
+    /// $67.14 stale the last time anyone checked it (audit C13) — and a
+    /// deployment ceiling derived from a number nobody measured is the thing
+    /// this replaces, not a fallback for it. The dry-run shadow holds no
+    /// credentials and so keeps the configured cap, which is what pins its
+    /// decisions.
+    ///
+    /// STALENESS FALLS BACK UP, NOT DOWN, and that asymmetry is the point.
+    /// An expired reading returns `None` and the cap reverts to the configured
+    /// $490 rather than shrinking toward the book. Entry is already
+    /// fail-closed on staleness by a different lever — `spendable` yields no
+    /// pairs, so every venue reads $0 cash and `check` refuses — and routing
+    /// staleness through the CAP as well would hit the exit side, where a
+    /// shrunken cap pins `utilization` at 1.0, charges the ceiling hurdle and
+    /// tells `crate::unwind` to liquidate the book. Fail-closed for entry is
+    /// fail-OPEN for exit; that file says so, and this is where it would bite.
+    fn live_cash(&self) -> Option<f64> {
+        match &*self.balances.lock().expect("balances") {
+            Cash::Live { pairs, at } if at.elapsed() <= BALANCE_MAX_AGE => {
+                Some(pairs.iter().filter_map(|(_, b)| b.parse::<f64>().ok()).sum())
+            }
+            _ => None,
+        }
     }
 
     pub fn stats(&self) -> (u64, u64) {
@@ -2270,5 +2347,92 @@ mod tests {
         assert_eq!(v.release_closed(&closed, &HashMap::new()), (1, 12.0));
         assert_eq!(v.open_ct("ghost"), 0.0);
         assert_eq!(v.utilization(), 0.0);
+    }
+
+    // ---- the deployment ceiling follows live NAV ----
+
+    /// THE CHANGE. `bankroll_usd: 980` x `GLOBAL_CAP` 0.50 capped the book at
+    /// $490 against a measured NAV of $1,001 — half of NAV undeployable by
+    /// construction, with $603 in cash earning nothing beside a book carrying
+    /// 23.31%/yr.
+    #[test]
+    fn the_cap_follows_live_nav_not_the_hand_typed_bankroll() {
+        let v = funded("low");
+        assert_eq!(v.global_cap_usd(), 490.0, "the configured cap, before any venue answers");
+        // The live book on 2026-08-21: $603.29 cash, 430 open contracts.
+        v.record_open("r1", "cross-venue-equivalent", 430.0);
+        v.set_live_balances(vec![
+            ("kalshi".to_string(), "314.5661".to_string()),
+            ("polymarket_us".to_string(), "288.72805".to_string()),
+        ])
+        .expect("a real reading");
+        let cap = v.global_cap_usd();
+        assert!((cap - 0.85 * (603.29415 + 430.0)).abs() < 0.01, "cap was {cap}");
+        assert!(cap > 850.0, "the ceiling roughly doubles: {cap}");
+    }
+
+    /// Deploying moves a dollar from cash to book, and NAV holds both, so the
+    /// ceiling must NOT move as capital is put to work. A cap that fell as we
+    /// deployed would chase its own tail.
+    #[test]
+    fn deploying_capital_does_not_move_the_ceiling() {
+        let v = funded("low");
+        v.set_live_balances(vec![("kalshi".to_string(), "500".to_string())]).unwrap();
+        let before = v.global_cap_usd();
+        // 100 contracts bought for ~$100 of the cash.
+        v.record_open("r1", "cross-venue-equivalent", 100.0);
+        v.set_live_balances(vec![("kalshi".to_string(), "400".to_string())]).unwrap();
+        assert!((v.global_cap_usd() - before).abs() < 0.01, "{} vs {before}", v.global_cap_usd());
+    }
+
+    /// THE EXIT-STAMPEDE GUARD. Entry is already fail-closed on a stale
+    /// balance — `spendable` yields nothing and every venue reads $0 — but
+    /// routing staleness through the CAP too would pin `utilization` at 1.0,
+    /// charge the ceiling hurdle and tell `crate::unwind` to liquidate. So an
+    /// expired reading reverts UP to the configured cap, never down.
+    #[test]
+    fn a_stale_reading_reverts_to_the_configured_cap_rather_than_shrinking_it() {
+        let v = funded("low");
+        v.record_open("r1", "cross-venue-equivalent", 430.0);
+        v.set_live_balances(vec![("kalshi".to_string(), "600".to_string())]).unwrap();
+        assert!(v.global_cap_usd() > 850.0);
+        // Age the reading past BALANCE_MAX_AGE.
+        {
+            let mut g = v.balances.lock().expect("balances");
+            if let Cash::Live { pairs, .. } = &*g {
+                *g = Cash::Live {
+                    pairs: pairs.clone(),
+                    at: Instant::now() - BALANCE_MAX_AGE - Duration::from_secs(1),
+                };
+            }
+        }
+        assert_eq!(v.global_cap_usd(), 490.0, "back to the configured ceiling, not below the book");
+        assert!(v.utilization() < 1.0, "and the exit hurdle is not pinned at its ceiling");
+    }
+
+    /// `--balance` is a hand-typed constant that was $67.14 stale the last
+    /// time anyone checked (audit C13). It funds the gate; it must not size
+    /// the ceiling, or the dry-run shadow's decisions stop being pinned.
+    #[test]
+    fn a_declared_balance_does_not_move_the_ceiling() {
+        let v = view(vec![("kalshi", "9000"), ("polymarket_us", "9000")], "low");
+        assert_eq!(v.global_cap_usd(), 490.0);
+    }
+
+    /// A damaged `exec.yaml` forces the bankroll to $0, and live cash must not
+    /// quietly undo that.
+    #[test]
+    fn a_corrupt_exec_still_forces_a_zero_cap_even_with_live_cash() {
+        let p = write_exec("cap-corrupt-nav", "bankroll_usd: not-a-number
+");
+        let v = view_with_configs(
+            p.to_str().unwrap(),
+            "/nonexistent/topics.yaml",
+            vec![("kalshi", "1000"), ("polymarket_us", "1000")],
+            "low",
+        );
+        v.set_live_balances(vec![("kalshi".to_string(), "5000".to_string())]).unwrap();
+        assert_eq!(v.global_cap_usd(), 0.0);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 }
