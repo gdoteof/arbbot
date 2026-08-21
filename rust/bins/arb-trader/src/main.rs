@@ -1129,6 +1129,10 @@ fn seed_exposure_from_ledger(
             for (id, q) in seeded.iter().take(5) {
                 eprintln!("[risk]   {q:>7.0}  {id}");
             }
+            // The fold above already netted every `unwound` record, so those
+            // closes are spent. Declaring them keeps `release_closed` from
+            // subtracting the whole close history again on its first poll.
+            rv.seed_released(&ledger::closed_lots(recs.clone()));
         }
         Err(e) => {
             // Fail LOUD: an unreadable ledger means unknown exposure, and
@@ -1623,6 +1627,14 @@ fn spawn_maker_exit(
 /// number picked on its own.
 const BALANCE_POLL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How often the running process re-reads the ledger for closes to release.
+///
+/// 60s, matching [`BALANCE_POLL`], and the cadence is not sensitive: what this
+/// fixes is exposure that used to stay charged until the next RESTART, so any
+/// interval short of that is the whole win. Slower is also cheaper — the read
+/// is the entire trade ledger, parsed and folded.
+const EXPOSURE_RELEASE_POLL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// One cycle's reads: both venues' spendable cash, or why the cycle is
 /// abandoned.
 ///
@@ -1832,6 +1844,74 @@ fn spawn_balance_poll(
     // for a run that holds no credentials and wrong for this one.
     rv.expect_live_balances();
     tokio::spawn(balance_loop(rv.clone(), k.clone(), p.clone(), BALANCE_SNAPSHOT));
+}
+
+/// Give back the capital an exit has already returned, without a restart.
+///
+/// `RiskView::record_open` is `+=` only. Before this, the ONLY thing that ever
+/// lowered exposure was `seed_exposure_from_ledger` at startup, so a basket
+/// this process closed stayed charged against its relationship, class and
+/// topic until the process died — and the flywheel's own documented loop was
+/// "exit, restart, redeploy". On 2026-08-21 that cost the engine every order
+/// it tried to place for the back half of a run: `time-poty-26` refused at
+/// `185+5 > 185` while the book actually held 175, the extra 10 being lots the
+/// engine itself had exited hours earlier.
+///
+/// Reads the LEDGER rather than hooking the exit paths, because there is more
+/// than one way a basket closes — `maker_exit`, venue-truth naked-leg
+/// completion, the settlement sweeper, a hand-appended correction — and only
+/// some of them run in this process at all. All of them append an `unwound`
+/// record. `RiskView::release_closed` applies each exactly once, so re-reading
+/// the whole file every cycle is not merely tolerable, it is the mechanism.
+///
+/// OFF IN BENCH/REPLAY for free: those runs build no `RiskView` at all, so
+/// there is nothing here to poll and the decision digest is untouched.
+fn spawn_exposure_release(
+    risk: Option<&std::sync::Arc<risk::RiskView>>,
+    ledger_path: &str,
+    rel_meta: &HashMap<String, (String, String)>,
+) {
+    let Some(rv) = risk else { return };
+    eprintln!(
+        "[risk] releasing closed lots from {} every {}s — an exit now frees its budget in \
+         place, not at the next restart",
+        ledger_path,
+        EXPOSURE_RELEASE_POLL.as_secs()
+    );
+    let (rv, path, meta) = (rv.clone(), ledger_path.to_string(), rel_meta.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(EXPOSURE_RELEASE_POLL);
+        tick.tick().await; // fires immediately; the seed just ran
+        loop {
+            tick.tick().await;
+            // OFF THE RUNTIME WORKER. This parses the whole trade ledger, and
+            // it shares its threads with the decision loop, whose p99 is tens
+            // of microseconds. A blocking read there buys back capital at the
+            // cost of jitter on every quote — exactly the wrong trade.
+            let p2 = path.clone();
+            let read = tokio::task::spawn_blocking(move || ledger::read(&p2)).await;
+            let Ok(read) = read else {
+                eprintln!("[risk] ledger read panicked; released nothing this cycle");
+                continue;
+            };
+            // An unreadable ledger releases NOTHING and says so. Exposure then
+            // stays where it is, which is the conservative direction: the old
+            // behaviour, for one cycle.
+            match read {
+                Ok(recs) => {
+                    let (lots, ct) = rv.release_closed(&ledger::closed_lots(recs), &meta);
+                    if lots > 0 {
+                        eprintln!(
+                            "[risk] released {ct:.0} contract(s) across {lots} closed lot(s); \
+                             utilization now {:.3}",
+                            rv.utilization()
+                        );
+                    }
+                }
+                Err(e) => eprintln!("[risk] ledger unreadable, released nothing this cycle: {e}"),
+            }
+        }
+    });
 }
 
 fn spawn_positions_recon(
@@ -2151,6 +2231,7 @@ async fn main() {
     // sinks it reads through do not exist when it is constructed, which is why
     // the live figure arrives through a setter rather than the constructor.
     spawn_balance_poll(&sinks, risk.as_ref());
+    spawn_exposure_release(risk.as_ref(), &args.ledger, &rel_meta);
 
     // Before the first quote: what did the LAST run of this unit leave naked?
     // ...and it does not merely REPORT it: an obligation the ledger cannot see

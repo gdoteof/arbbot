@@ -27,7 +27,7 @@ use arb_core::model::{BookSide, Venue};
 use arb_core::quoter::{RiskGate, RiskVerdict};
 use arb_core::risk::{check_order, ConfigIn, ExposureIn, Input, RelIn, TopicIn};
 use arb_core::scan::Rel;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -168,6 +168,35 @@ pub struct RiskView {
     /// is not carried on `Rel`, so it is looked up by id.
     oracle_risk: HashMap<String, String>,
     exposure: Mutex<Exposure>,
+    /// Which ledger closes have already been taken out of `exposure`, keyed
+    /// exactly as `ledger::closed_lots` keys them.
+    ///
+    /// THIS IS THE OTHER HALF OF [`Self::record_open`], and the reason it is a
+    /// SET rather than a subtraction at the exit sites. Exposure used to move
+    /// in one direction only: `record_open` is `+=`, there was no
+    /// `record_close`, and so a basket this process exited went on being
+    /// charged against its relationship, class and topic for the rest of the
+    /// run. The budget came back solely at the next restart, when
+    /// `main::seed_exposure_from_ledger` re-read the netted ledger — which is
+    /// what made "exit, restart, redeploy" the loop, and what let ONE topic sit
+    /// at `185+5 > 185` against 175 contracts actually held, refusing every
+    /// order the engine tried to place for hours.
+    ///
+    /// Releasing from the LEDGER rather than from the exit path is what makes
+    /// this complete. There is more than one way a basket closes — the maker
+    /// exit, venue-truth naked-leg completion, the settlement sweeper, a
+    /// correction appended by hand — and a `record_close` call bolted to each
+    /// would be one `git grep` away from missing the next one. Every one of
+    /// them appends an `unwound` record, so reading the ledger catches all of
+    /// them, including the ones written by other processes entirely.
+    ///
+    /// SEEDED FULL, NOT EMPTY. The startup seed already folds `unwound`
+    /// against `open`, so every close the ledger holds at startup is ALREADY
+    /// absent from the seeded figure. Beginning with an empty set would
+    /// subtract the whole close history a second time on the first poll and
+    /// drive exposure to zero, which is why `main` fills this in the same
+    /// breath as the seed (see [`Self::seed_released`]).
+    released: Mutex<HashSet<(String, u64)>>,
     /// Capital COMMITTED by a quote that is resting and has not filled, by the
     /// slot it rests on -> (class, contracts). Folded into the exposure every
     /// `check` sees, so headroom can be spent only once.
@@ -497,6 +526,7 @@ impl RiskView {
             balances: Mutex::new(Cash::Declared(balances)),
             oracle_risk,
             exposure: Mutex::new(Exposure::default()),
+            released: Mutex::new(HashSet::new()),
             reserved: Mutex::new(HashMap::new()),
             checked: Mutex::new((0, 0)),
         }
@@ -648,6 +678,59 @@ impl RiskView {
         *e.by_class.entry(rtype.to_string()).or_default() += qty;
         let topic = topic_of(rel_id, &self.topics);
         *e.by_topic.entry(topic).or_default() += qty;
+    }
+
+    /// Declare the closes already reflected in the seeded exposure, so
+    /// [`Self::release_closed`] does not subtract them a second time.
+    ///
+    /// Called once, beside `main::seed_exposure_from_ledger`, with the SAME
+    /// records that seed folded. See the `released` field.
+    pub fn seed_released(&self, closed: &[(String, f64, f64)]) {
+        let mut seen = self.released.lock().expect("released");
+        for (rel, closes_ts, _) in closed {
+            seen.insert((rel.clone(), closes_ts.to_bits()));
+        }
+    }
+
+    /// Take every close the ledger records and this view has not yet applied
+    /// back out of the exposure. Returns `(lots, contracts)` actually released.
+    ///
+    /// The mirror of [`Self::record_open`]: same three maps, same class
+    /// fallback as the startup seed, opposite sign. Idempotent — a close is
+    /// applied on the first poll that sees it and never again — so the caller
+    /// may hand it the whole ledger every time, which is what makes it robust
+    /// to a record appended by some other process between polls.
+    ///
+    /// FLOORED AT ZERO, per map. A close whose open record this view never
+    /// booked would otherwise drive an entry negative, and negative exposure
+    /// does not merely mis-report — it hands out headroom that does not exist,
+    /// which is the one direction this must never fail in.
+    pub fn release_closed(
+        &self,
+        closed: &[(String, f64, f64)],
+        rel_meta: &HashMap<String, (String, String)>,
+    ) -> (usize, f64) {
+        let mut seen = self.released.lock().expect("released");
+        let mut e = self.exposure.lock().expect("exposure");
+        let (mut lots, mut total) = (0usize, 0.0);
+        for (rel, closes_ts, qty) in closed {
+            if *qty <= 0.0 || !seen.insert((rel.clone(), closes_ts.to_bits())) {
+                continue;
+            }
+            // `seed_exposure_from_ledger`'s rule, exactly: an id the registry
+            // cannot classify was booked under `unknown`, so it is released
+            // from `unknown` too. Releasing it from anywhere else would leave
+            // that class charged forever.
+            let class = rel_meta.get(rel).map(|(_, k)| k.as_str()).unwrap_or("unknown");
+            let topic = topic_of(rel, &self.topics);
+            let drain = |slot: &mut f64| *slot = (*slot - qty).max(0.0);
+            drain(e.by_rel.entry(rel.clone()).or_default());
+            drain(e.by_class.entry(class.to_string()).or_default());
+            drain(e.by_topic.entry(topic).or_default());
+            lots += 1;
+            total += qty;
+        }
+        (lots, total)
     }
 
     /// `qty` of the quote resting on this slot has FILLED, so it is no longer a
@@ -2036,5 +2119,156 @@ mod tests {
         assert!(!v.describe().contains("UNUSABLE"), "{}", v.describe());
         assert!(v.check(&rel("xvus-nobel-peace-26-djt"), Venue::Kalshi, 5, None).allowed);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// A view with real per-topic budgets whose named relationships are all
+    /// `oracle_risk=low`, so the per-rel TAIL cap (150) is not what refuses —
+    /// these tests are about the topic budget and must not pass or fail on a
+    /// different gate. `view_with_topics` registers only `r1`, and everything
+    /// else defaults to `high` (tail cap 37.50).
+    fn view_topics_low(topics: &str, rels: &[&str]) -> RiskView {
+        let mut o = HashMap::new();
+        for r in rels {
+            o.insert((*r).to_string(), "low".to_string());
+        }
+        RiskView::load(
+            &valid_exec(),
+            topics,
+            vec![
+                ("kalshi".to_string(), "1000".to_string()),
+                ("polymarket_us".to_string(), "1000".to_string()),
+            ],
+            o,
+        )
+    }
+
+    /// `main`'s `rel_meta` shape: id -> (title, class).
+    fn meta_for(rel_id: &str, class: &str) -> HashMap<String, (String, String)> {
+        let mut m = HashMap::new();
+        m.insert(rel_id.to_string(), (String::new(), class.to_string()));
+        m
+    }
+
+    // ---- releasing the exposure a close has already returned ----
+
+    /// One lot, closed once. `release_closed` is handed the WHOLE ledger every
+    /// cycle, so the thing that must hold is that re-reading it is inert.
+    #[test]
+    fn a_close_is_released_once_however_often_the_ledger_is_reread() {
+        let v = funded("low");
+        v.record_open("r1", "cross-venue-equivalent", 20.0);
+        let closed = vec![("r1".to_string(), 1_700_000_000.0, 5.0)];
+        let meta = meta_for("r1", "cross-venue-equivalent");
+        assert_eq!(v.release_closed(&closed, &meta), (1, 5.0));
+        assert_eq!(v.open_ct("r1"), 15.0);
+        for _ in 0..5 {
+            assert_eq!(v.release_closed(&closed, &meta), (0, 0.0), "re-reads must be inert");
+        }
+        assert_eq!(v.open_ct("r1"), 15.0);
+    }
+
+    /// THE TRAP THIS FIELD EXISTS FOR. `seed_exposure_from_ledger` folds
+    /// `unwound` against `open`, so a close already in the ledger at startup is
+    /// spent before the process is up. Starting the seen-set empty would take
+    /// the entire close history out a SECOND time on the first poll.
+    #[test]
+    fn the_closes_the_seed_already_netted_are_not_subtracted_again() {
+        let v = funded("low");
+        // What the seed does: book the NET, then declare the closes spent.
+        v.record_open("r1", "cross-venue-equivalent", 15.0);
+        let history = vec![("r1".to_string(), 1_700_000_000.0, 5.0)];
+        v.seed_released(&history);
+        let meta = meta_for("r1", "cross-venue-equivalent");
+        assert_eq!(v.release_closed(&history, &meta), (0, 0.0));
+        assert_eq!(v.open_ct("r1"), 15.0, "the seed already netted this close");
+    }
+
+    /// A close whose open record this view never booked must not push the
+    /// entry below zero: negative exposure hands out headroom that does not
+    /// exist, which is the one direction this may never fail in.
+    #[test]
+    fn releasing_never_drives_an_entry_negative() {
+        let v = funded("low");
+        v.record_open("r1", "cross-venue-equivalent", 3.0);
+        let closed = vec![("r1".to_string(), 1_700_000_000.0, 99.0)];
+        v.release_closed(&closed, &meta_for("r1", "cross-venue-equivalent"));
+        assert_eq!(v.open_ct("r1"), 0.0);
+        assert_eq!(v.utilization(), 0.0, "and no phantom headroom anywhere else");
+    }
+
+    /// `record_open` charges three maps, so a release that only credited
+    /// `by_rel` would leave the class and the topic charged forever — the
+    /// original bug, moved rather than fixed.
+    #[test]
+    fn release_gives_back_the_class_and_the_topic_not_only_the_relationship() {
+        let p = write_topics(
+            "release-3maps",
+            "topics:\n  - {family: nobel-peace-26, budget_usd: 80}\ndefault_topic_budget: 30\n",
+        );
+        let rel_id = "xvus-nobel-peace-26-djt";
+        let v = view_topics_low(p.to_str().unwrap(), &[rel_id]);
+        v.record_open(rel_id, "cross-venue-equivalent", 80.0);
+        let d = v.check(&rel(rel_id), Venue::Kalshi, 5, None);
+        assert!(!d.allowed, "80 of 80 is full");
+        assert!(d.reasons.iter().any(|r| r.contains("topic budget")), "{:?}", d.reasons);
+        let closed = vec![(rel_id.to_string(), 1_700_000_000.0, 20.0)];
+        let released = v.release_closed(&closed, &meta_for(rel_id, "cross-venue-equivalent"));
+        assert_eq!(released, (1, 20.0));
+        let d2 = v.check(&rel(rel_id), Venue::Kalshi, 5, None);
+        assert!(d2.allowed, "the topic budget must come back too: {:?}", d2.reasons);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// THE 2026-08-21 REGRESSION, to the contract. `time-poty-26` refused
+    /// `185+5 > 185` for the back half of a run while the book held 175 — the
+    /// extra 10 were lots the engine had itself exited hours earlier, and 100%
+    /// of that run's refusals were this one line. Before `release_closed` the
+    /// only cure was a restart.
+    #[test]
+    fn an_exit_frees_its_topic_budget_without_a_restart() {
+        let p = write_topics(
+            "release-poty",
+            "topics:\n  - {family: time-poty-26, budget_usd: 185}\ndefault_topic_budget: 30\n",
+        );
+        // The live book's own shape: one family, three relationships. Spread
+        // matters — 185 on ONE id would trip the per-rel cap (150) first and
+        // the test would pass for the wrong reason.
+        let (pope, mamdani, ai) = (
+            "xvus-time-poty-26-popeleoxiv",
+            "xvus-time-poty-26-zohranmamdani",
+            "xvus-time-poty-26-artificialintelligence",
+        );
+        let v = view_topics_low(p.to_str().unwrap(), &[pope, mamdani, ai]);
+        let meta = meta_for(pope, "cross-venue-equivalent");
+        // 185 charged. 175 of it is real; the other 10 are two 5-lots this
+        // process exited hours ago and went on being charged for.
+        v.record_open(mamdani, "cross-venue-equivalent", 102.0);
+        v.record_open(pope, "cross-venue-equivalent", 68.0);
+        v.record_open(ai, "cross-venue-equivalent", 15.0);
+        let d = v.check(&rel(pope), Venue::Kalshi, 5, None);
+        assert!(!d.allowed);
+        assert!(d.reasons.iter().any(|r| r.contains("185+5 > 185")), "{:?}", d.reasons);
+        let closed = vec![
+            (pope.to_string(), 1_786_247_562.603_515_3, 5.0),
+            (pope.to_string(), 1_786_273_409.747_190_5, 5.0),
+        ];
+        assert_eq!(v.release_closed(&closed, &meta), (2, 10.0));
+        assert_eq!(v.open_ct(pope), 58.0, "the lots the venues actually hold");
+        let d2 = v.check(&rel(pope), Venue::Kalshi, 5, None);
+        assert!(d2.allowed, "175 + 5 fits under 185 — the order the phantom refused: {:?}", d2.reasons);
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// An id the registry cannot classify was seeded under `unknown`
+    /// (`seed_exposure_from_ledger`), so it must be released from `unknown`
+    /// too — releasing it from anywhere else leaves that class charged.
+    #[test]
+    fn an_unregistered_relationship_is_released_from_the_class_it_was_booked_under() {
+        let v = funded("low");
+        v.record_open("ghost", "unknown", 12.0);
+        let closed = vec![("ghost".to_string(), 1_700_000_000.0, 12.0)];
+        assert_eq!(v.release_closed(&closed, &HashMap::new()), (1, 12.0));
+        assert_eq!(v.open_ct("ghost"), 0.0);
+        assert_eq!(v.utilization(), 0.0);
     }
 }

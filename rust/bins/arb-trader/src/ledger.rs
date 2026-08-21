@@ -102,6 +102,27 @@ pub fn open_exposure(records: Vec<Value>) -> HashMap<String, f64> {
     out
 }
 
+/// Every unwind the ledger records, as `(relationship, closes_ts, qty)`.
+///
+/// [`open_exposure`] folds these records INTO a net position, because it
+/// answers "what is open". This answers the different question "which closes
+/// have happened", so a process whose counter was seeded from that same fold
+/// can go on applying each later close to it exactly once.
+///
+/// Same `unwound` records and the same `closes_ts` identity as the fold, read
+/// two ways rather than defined twice: a close this returns is precisely a
+/// close `open_exposure` would have netted, so seeding from one and releasing
+/// from the other cannot drift.
+pub fn closed_lots(records: Vec<Value>) -> Vec<(String, f64, f64)> {
+    apply_corrections(records)
+        .iter()
+        .filter(|r| status_of(r) == "unwound")
+        .filter_map(|r| {
+            Some((rel_of(r)?.to_string(), f64_of(r, "closes_ts")?, f64_of(r, "qty").unwrap_or(0.0)))
+        })
+        .collect()
+}
+
 /// What this engine stamps every basket it authors with.
 ///
 /// The single-author rule reads off this field: a record carrying it was written
