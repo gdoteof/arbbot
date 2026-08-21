@@ -841,7 +841,7 @@ fn rung_step(
     Err(format!("{} is outside every rung of the tick ladder", cx.emit_6dp(x)))
 }
 
-/// The price to actually REST at: the floor, lifted clear of the bid.
+/// The price to actually REST at: the best offer this lot can legally make.
 ///
 /// # Why the floor is not already the answer
 ///
@@ -858,45 +858,91 @@ fn rung_step(
 /// The invariant behind the refusal is kept, because it is a real one:
 /// post-only rejects an ask at or below the bid, and an ask that crossed would
 /// trade at a price nothing here decided to take. The answer to "our price is
-/// too low to rest" is to RAISE it. One rung above the bid is post-only-safe by
-/// construction, and being above the floor it locks strictly more than
-/// [`MIN_LOCK`].
+/// too low to rest" is to RAISE it.
 ///
-/// # Why one rung above the bid and not somewhere near the ask
+/// # Why the touch and not one rung over the bid
 ///
-/// `bid + 1` is the lowest offer the book can hold, so it is already in front
-/// of every resting ask. There is nothing to gain by pricing dearer and a fill
-/// to lose. Where the floor is ABOVE the bid this returns the floor unchanged
-/// and the ask may well sit outside the market — that is the honest answer to a
-/// lot the book will not pay for yet, and [`MAX_RESTING_S`] bounds what it
-/// costs to be wrong about it.
+/// Because `marks` already said so, and the two have to agree. `maker_exit_ct`
+/// — the number `unwind::consider` gates eligibility on — is computed at
+/// `k_ask - TICK`, "one tick inside the competing ask". A placer that rested at
+/// `bid + TICK` instead would be selecting exits on one price and asking
+/// another: on a three-tick book like `KXBRPRES-26-FBOL` (bid 0.32, ask 0.35)
+/// marks promises 0.34 and the wire would see 0.33. That is the same shape as
+/// the bug this module was just fixed for — the marker and the placer pricing
+/// different things — so it is answered the same way, by making them one rule.
+///
+/// UNDERCUTTING THE OFFER IS ALSO THE BETTER TRADE. `ask - TICK` is strictly in
+/// front of every ask resting at the touch, so it buys the same queue position
+/// `bid + TICK` does, and it collects the spread instead of giving it away.
+/// Where the spread is one tick the two collapse onto the same rung anyway,
+/// which is most of this book.
+///
+/// # The three floors, in order
+///
+///   * NEVER at or under the bid — post-only rejects it. This one is hard.
+///   * never under [`exit_limit`]'s floor — that is the whole profit test, and
+///     where the floor sits ABOVE the touch it wins and the ask rests outside
+///     the market. That is the honest answer for a lot the book will not pay
+///     for yet, and [`MAX_RESTING_S`] bounds what being wrong about it costs.
+///   * never at or over $1, which is not a price this pair can pay.
 fn rest_price(
     cx: &mut Cx,
     ladder: &[(String, String, String)],
     floor: D,
     yes_bid: Option<&str>,
+    yes_ask: Option<&str>,
 ) -> Result<D, String> {
-    // No bid at all is not a bid of zero — `gateway::Quote::yes_bid` carries
-    // that distinction precisely so this does not have to guess. Nothing to
-    // clear, so the floor stands.
-    let Some(bid) = yes_bid.and_then(|b| cx.parse(b)) else { return Ok(floor) };
-    if cx.cmp(floor, bid) == Ordering::Greater {
-        return Ok(floor);
-    }
-    let (_, step) = rung_step(cx, ladder, bid)?;
-    let up = cx.add(bid, step);
-    let Some(p) = ceil_to_tick(cx, ladder, up) else {
+    // Neither side is not a book, and a missing side is not a side priced at
+    // zero — `gateway::Quote` carries that distinction precisely so this does
+    // not have to guess. With nothing to price against, the floor stands.
+    let bid = yes_bid.and_then(|b| cx.parse(b));
+    let ask = yes_ask.and_then(|a| cx.parse(a));
+    // One rung INSIDE the competing ask: in front of the whole offer queue.
+    let inside = match ask {
+        Some(a) => {
+            let (_, step) = rung_step(cx, ladder, a)?;
+            let down = cx.sub(a, step);
+            cx.is_pos(down).then_some(down)
+        }
+        None => None,
+    };
+    // ...but never at or under the bid, whatever the spread is. Where the
+    // spread is one tick `inside` IS the bid, and this is what lifts it off.
+    let over_bid = match bid {
+        Some(b) => {
+            let (_, step) = rung_step(cx, ladder, b)?;
+            let up = cx.add(b, step);
+            ceil_to_tick(cx, ladder, up)
+        }
+        None => None,
+    };
+    let touch = match (inside, over_bid) {
+        (Some(i), Some(o)) => Some(if cx.cmp(i, o) == Ordering::Greater { i } else { o }),
+        (x, None) => x,
+        (None, y) => y,
+    };
+    let Some(touch) = touch else { return Ok(floor) };
+    let p = if cx.cmp(floor, touch) == Ordering::Greater { floor } else { touch };
+    let Some(p) = ceil_to_tick(cx, ladder, p) else {
         return Err(format!(
-            "the book is bid {} and the venue's ladder has no rung above it, so this exit \
-             has no post-only price",
-            cx.emit_6dp(bid)
+            "{} is outside every rung of the venue's tick ladder, so it has no legal spelling",
+            cx.emit_6dp(p)
         ));
     };
+    if let Some(b) = bid {
+        if cx.cmp(p, b) != Ordering::Greater {
+            return Err(format!(
+                "the book is bid {} and the best post-only price the ladder offers is {} — \
+                 not above it, so this exit has no price that is not a take",
+                cx.emit_6dp(b),
+                cx.emit_6dp(p)
+            ));
+        }
+    }
     if cx.cmp(p, cx.one) != Ordering::Less {
         return Err(format!(
-            "the book is bid {} and the only post-only price above it is {} — at or above \
-             $1, which is not a price this pair can pay",
-            cx.emit_6dp(bid),
+            "the best post-only price for this exit is {} — at or above $1, which is not a \
+             price this pair can pay",
             cx.emit_6dp(p)
         ));
     }
@@ -1122,7 +1168,9 @@ pub fn decide(
     let pm_close = cx.add(pm_ask_d, tick);
     let floor = exit_limit(cx, fees, &quote.ladder, k_basis, pm_basis, pm_close, qty)
         .map_err(refuse)?;
-    let limit = rest_price(cx, &quote.ladder, floor, quote.yes_bid.as_deref()).map_err(refuse)?;
+    let limit =
+        rest_price(cx, &quote.ladder, floor, quote.yes_bid.as_deref(), quote.yes_ask.as_deref())
+            .map_err(refuse)?;
     let limit = cx.quantize_4dp(limit);
     Ok(Order {
         rel_id: cand.rel_id.clone(),
@@ -3310,10 +3358,12 @@ mod tests {
         let (mut cx, fees) = ready();
         // Two lots differing ONLY in what the PM leg cost.
         let recs = vec![open_basket(1.0, 5, "0.10", "0.19"), open_basket(2.0, 5, "0.30", "0.19")];
+        // A book whose touch (0.09) is under BOTH floors, so what is being
+        // compared is the lots' own arithmetic and not the offer they share.
         let px = |cx: &mut Cx, ts: f64| {
             decide(
                 cx, &fees, &recs, &cand(5, ts), "p-a",
-                &quote(Some("0.0100"), Some("0.9500")), &view("0.20"), Instant::now(),
+                &quote(Some("0.0100"), Some("0.1000")), &view("0.20"), Instant::now(),
             )
             .map(|o| o.limit)
         };
@@ -3327,7 +3377,8 @@ mod tests {
     }
 
     /// A FLOOR AT OR UNDER THE BID MEANS THE BOOK IS PAYING MORE THAN THE LOT
-    /// NEEDS, WHICH IS THE BEST CASE AN EXIT CAN BE HANDED.
+    /// NEEDS, WHICH IS THE BEST CASE AN EXIT CAN BE HANDED — so it is priced
+    /// off the BOOK (one rung inside the offer) rather than off the floor.
     ///
     /// This used to be `an_exit_that_would_cross_the_book_is_refused_rather_
     /// than_crossed`, and it asserted the refusal. The rule it pinned — "an ask
@@ -3347,38 +3398,59 @@ mod tests {
             &quote(Some("0.9000"), Some("0.9500")), &view("0.20"), Instant::now(),
         )
         .expect("a bid above the floor is the best case, not a refusal");
-        assert_eq!(o.limit, "0.9100", "one rung above the bid, not the floor: {o:?}");
+        assert_eq!(o.limit, "0.9400", "one rung inside the 0.95 offer, not the floor: {o:?}");
     }
 
     /// ...AND IT IS STILL A MAKER ORDER. The invariant the old refusal was
     /// protecting is the one that survives: post-only rejects an ask at or
-    /// below the bid, so the lift has to clear it STRICTLY. This pins the
-    /// boundary the `!=  Ordering::Greater` comparison used to guard.
+    /// below the bid, so the price has to clear it STRICTLY. This pins the
+    /// boundary the `!= Ordering::Greater` comparison used to guard, on the
+    /// shape that tests it — a ONE-TICK spread, where "one rung inside the
+    /// offer" IS the bid and only the lift saves it.
     #[test]
     fn the_lift_clears_the_bid_strictly_so_post_only_cannot_reject_it() {
         let (mut cx, _fees) = ready();
-        let ladder = vec![("0.0000".into(), "1.0000".into(), "0.0100".into())];
-        // Floor exactly ON the bid is the case post-only rejects.
+        let l = &penny();
+        let floor = cx.parse_exact("0.0100");
+        let p = rest_price(&mut cx, l, floor, Some("0.3000"), Some("0.3100")).expect("liftable");
+        assert_eq!(cx.emit_6dp(p), "0.310000", "join the offer; an ask AT the bid is a take");
+        // No ask to work inside, so the bid is the only thing to clear.
         let floor = cx.parse_exact("0.3000");
-        let p = rest_price(&mut cx, &ladder, floor, Some("0.3000")).expect("liftable");
-        assert_eq!(cx.emit_6dp(p), "0.310000", "an ask AT the bid is not a maker order");
+        let p = rest_price(&mut cx, l, floor, Some("0.3000"), None).expect("liftable");
+        assert_eq!(cx.emit_6dp(p), "0.310000");
     }
 
-    /// A FLOOR ABOVE THE BID IS THE FLOOR, UNCHANGED.
+    /// THE TOUCH IS ONE RUNG INSIDE THE OFFER, WHICH IS WHAT `marks` PROMISED.
     ///
-    /// [`rest_price`] lifts, it does not chase: where the book is not yet
-    /// paying what the lot needs, the honest ask is the one the lot needs, even
-    /// when that sits outside the market.
+    /// `marks::compute_row` prices `maker_exit_ct` at `k_ask - TICK`, and that
+    /// is the number `unwind::consider` gates on. Resting at `bid + TICK`
+    /// instead would select an exit on one price and ask another — 0.34
+    /// promised against 0.33 asked on a `KXBRPRES-26-FBOL`-shaped book. It also
+    /// gives away a spread we are under no obligation to give away.
     #[test]
-    fn a_floor_above_the_bid_is_left_exactly_where_it_is() {
+    fn a_wide_book_is_undercut_at_the_offer_rather_than_dumped_on_the_bid() {
         let (mut cx, _fees) = ready();
-        let ladder = vec![("0.0000".into(), "1.0000".into(), "0.0100".into())];
+        let floor = cx.parse_exact("0.1000");
+        let p = rest_price(&mut cx, &penny(), floor, Some("0.3200"), Some("0.3500"))
+            .expect("a three-tick book");
+        assert_eq!(cx.emit_6dp(p), "0.340000", "inside the offer, not on top of the bid");
+    }
+
+    /// A FLOOR ABOVE THE TOUCH IS THE FLOOR, UNCHANGED.
+    ///
+    /// [`rest_price`] prices the book, it does not chase it below cost: where
+    /// the book is not yet paying what the lot needs, the honest ask is the one
+    /// the lot needs, even when that sits outside the market.
+    #[test]
+    fn a_floor_above_the_touch_is_left_exactly_where_it_is() {
+        let (mut cx, _fees) = ready();
+        let l = &penny();
         let floor = cx.parse_exact("0.0800");
-        let p = rest_price(&mut cx, &ladder, floor, Some("0.0300")).expect("no lift needed");
+        let p = rest_price(&mut cx, l, floor, Some("0.0300"), Some("0.0500")).expect("floor wins");
         assert_eq!(cx.emit_6dp(p), "0.080000");
-        // ...and a market with NO bid at all is not a market bidding zero.
+        // ...and a market with NO sides at all is not a market priced at zero.
         let floor = cx.parse_exact("0.0800");
-        let p = rest_price(&mut cx, &ladder, floor, None).expect("no bid, no lift");
+        let p = rest_price(&mut cx, l, floor, None, None).expect("no book, no touch");
         assert_eq!(cx.emit_6dp(p), "0.080000");
     }
 
