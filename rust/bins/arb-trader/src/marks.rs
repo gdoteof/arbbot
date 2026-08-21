@@ -1265,49 +1265,80 @@ mod tests {
     }
 
     /// **THE PARITY THAT MATTERS.** The basis this file derives is the basis
-    /// `naked_act::worst_lot` prices a real order off — the same lot, to the
-    /// last of its six decimal places.
+    /// `naked_act::lot_at` prices a real order off — the same lot, to the last
+    /// of its six decimal places.
     ///
-    /// `worst_lot` is what `maker_exit` sizes a resting ask against. If the two
+    /// `lot_at` is what `maker_exit` sizes a resting ask against. If the two
     /// disagreed, this file would offer the placer a basket the placer then
     /// prices differently — selecting an exit that does not clear its own lot,
     /// or refusing one that does. `leg_cost` exists to be the same arithmetic,
     /// and this is the test that says so.
+    ///
+    /// TWO RECORDS, AND THAT IS THE WHOLE POINT. This test used to hold ONE,
+    /// and it passed for a month against a placer that was pricing neither of
+    /// them: `maker_exit` called `worst_lot` once per venue, which on a
+    /// single-record ledger is the same lot and on a real one is a COMPOSITE of
+    /// the dearest Kalshi leg and the dearest PM-US leg — different records,
+    /// a basket nobody traded, and a floor no book would pay. One record cannot
+    /// tell the two functions apart, so the parity it claimed was vacuous.
     #[test]
     fn the_derived_basis_is_the_placers_own_lot_arithmetic() {
         let mut cx = Cx::default();
         let fees = FeeSchedule::new(&mut cx);
-        let recs = vec![engine_written()];
         let rel = "xvus-nobel-peace-26-donaldtrump";
-        let k = crate::naked_act::worst_lot(
-            &mut cx,
-            &fees,
-            &recs,
-            rel,
-            Venue::Kalshi,
-            "K",
-            Held::LongYes,
-        )
-        .expect("the placer prices the Kalshi lot");
-        let p = crate::naked_act::worst_lot(
-            &mut cx,
-            &fees,
-            &recs,
-            rel,
-            Venue::PolymarketUs,
-            "P",
-            Held::ShortYes,
-        )
-        .expect("...and the PM-US lot");
-        assert_eq!((k.cost_per_ct.as_str(), p.cost_per_ct.as_str()), ("0.044000", "0.920000"));
+        // A second lot, dearer on PM and CHEAPER on Kalshi, so the dearest leg
+        // of each venue is on a different record.
+        let second = v(r#"{"ts":1785257999.5,"relationship_id":"xvus-nobel-peace-26-donaldtrump",
+            "title":"second lot","qty":5,"strategy":"maker-hedge","status":"open",
+            "source":"arb-trader","fees_pending":true,
+            "legs":[{"venue":"polymarket_us","market_id":"P","side":"ask","role":"maker",
+                     "qty":5,"yes_price":"0.0600","order_id":"t2"},
+                    {"venue":"kalshi","market_id":"K","side":"bid","role":"taker",
+                     "qty":5,"yes_price":"0.0300","order_id":"h2"}]}"#);
+        let recs = vec![engine_written(), second];
 
-        let (cost, profit) = derived_basis(&mut cx, &fees, &recs[0]).expect("a basis");
-        let kc = q(&mut cx, &k.cost_per_ct).expect("k");
-        let pc = q(&mut cx, &p.cost_per_ct).expect("p");
-        let per_ct = cx.add(kc, pc);
-        let five = cx.from_i64(5);
-        assert_eq!(f(cx.mul(per_ct, five)), cost, "the marker's basis IS the placer's lot");
-        assert_eq!(cost + profit, 5.0, "and the pair still sums to the $1/ct payoff");
+        // EVERY record prices to ITS OWN legs, through the function the placer
+        // actually calls.
+        let expect = [("0.044000", "0.920000"), ("0.034000", "0.940000")];
+        for (r, (ek, ep)) in recs.iter().zip(expect) {
+            let ts = r.get("ts").and_then(|v| v.as_f64()).expect("ts");
+            let k = crate::naked_act::lot_at(
+                &mut cx, &fees, &recs, rel, ts, Venue::Kalshi, "K", Held::LongYes,
+            )
+            .expect("the placer prices the Kalshi lot");
+            let p = crate::naked_act::lot_at(
+                &mut cx, &fees, &recs, rel, ts, Venue::PolymarketUs, "P", Held::ShortYes,
+            )
+            .expect("...and the PM-US lot");
+            assert_eq!((k.cost_per_ct.as_str(), p.cost_per_ct.as_str()), (ek, ep));
+
+            let (cost, profit) = derived_basis(&mut cx, &fees, r).expect("a basis");
+            let kc = q(&mut cx, &k.cost_per_ct).expect("k");
+            let pc = q(&mut cx, &p.cost_per_ct).expect("p");
+            let per_ct = cx.add(kc, pc);
+            let five = cx.from_i64(5);
+            assert_eq!(f(cx.mul(per_ct, five)), cost, "the marker's basis IS the placer's lot");
+            assert_eq!(cost + profit, 5.0, "and the pair still sums to the $1/ct payoff");
+        }
+
+        // ...AND THE COMPOSITE MATCHES NEITHER. This is the number the placer
+        // used to price against, kept here so the regression has a witness on
+        // the marking side too.
+        let wk = crate::naked_act::worst_lot(
+            &mut cx, &fees, &recs, rel, Venue::Kalshi, "K", Held::LongYes,
+        )
+        .expect("a dearest Kalshi leg");
+        let wp = crate::naked_act::worst_lot(
+            &mut cx, &fees, &recs, rel, Venue::PolymarketUs, "P", Held::ShortYes,
+        )
+        .expect("a dearest PM-US leg");
+        assert_ne!(wk.open_ts, wp.open_ts, "the dearest legs are on different records");
+        let (wkc, wpc) = (q(&mut cx, &wk.cost_per_ct).unwrap(), q(&mut cx, &wp.cost_per_ct).unwrap());
+        let composite = f(cx.add(wkc, wpc));
+        for r in &recs {
+            let (cost, _) = derived_basis(&mut cx, &fees, r).expect("a basis");
+            assert_ne!(composite, cost / 5.0, "the composite is not any real basket's basis");
+        }
     }
 
     /// The ONE live record the side-vocabulary fix moves:

@@ -21,8 +21,9 @@
 //!   1. `unwind::select` picks candidates against the hurdle in force;
 //!   2. [`Debounce`] holds each one for [`DEBOUNCE_S`] of CONTINUOUS selection
 //!      across at least [`DEBOUNCE_SCANS`] scans;
-//!   3. the basis comes from `data/exec/trades.jsonl` — `naked_act::worst_lot`
-//!      on BOTH legs, the dearest still-open lot of each;
+//!   3. the basis comes from `data/exec/trades.jsonl` — `naked_act::lot_at` on
+//!      BOTH legs of the ONE record `select` named, addressed by its
+//!      `opened_ts`;
 //!   4. [`exit_limit`] solves for the lowest legal Kalshi ask at which selling
 //!      that lot AND buying its PM-US YES back still locks [`MIN_LOCK`] a
 //!      contract net of both legs' fees;
@@ -37,16 +38,25 @@
 //!
 //!   * **AGGREGATE N BASKETS BEHIND ONE ASK, AND SPLIT A PARTIAL FILL BACK
 //!     ACROSS N `closes_ts`.** NOT DONE, AND NOT NEEDED, because the trade was
-//!     narrowed until the problem stopped existing. `worst_lot` already answers
-//!     "which lot" with the DEAREST one, and the exit is sized to THAT LOT
-//!     ALONE. One exit therefore names exactly one `closes_ts` and no split can
-//!     arise. The cost is that a ticker carrying six lots takes six passes to
-//!     empty rather than one; the benefit is that the hardest correctness
-//!     requirement in that header is structurally absent rather than
-//!     implemented. Pricing against the dearest lot is also the only
-//!     attribution-safe choice — contracts are fungible, and an exit that pays
-//!     against the dearest pays against every other one — which is
-//!     `worst_lot`'s own argument, in the other direction.
+//!     narrowed until the problem stopped existing. `unwind::select` already
+//!     answers "which lot" — it names the basket by `(rel_id, opened_ts)` — and
+//!     the exit is sized to THAT LOT ALONE. One exit therefore names exactly one
+//!     `closes_ts` and no split can arise. The cost is that a ticker carrying
+//!     six lots takes six passes to empty rather than one; the benefit is that
+//!     the hardest correctness requirement in that header is structurally
+//!     absent rather than implemented.
+//!
+//!     THIS USED TO SAY the lot was `worst_lot`'s dearest, and that pricing
+//!     against the dearest was "the only attribution-safe choice — contracts are
+//!     fungible, and an exit that pays against the dearest pays against every
+//!     other one". The first half was true of the code and the second half is
+//!     true of a ONE-LEGGED question, which this is not. `worst_lot` called once
+//!     per leg pairs the dearest Kalshi record with the dearest PM-US record,
+//!     and on a ticker with several lots those are DIFFERENT records: the
+//!     composite is dearer than any basket we ever traded and can exceed the $1
+//!     the pair pays, at which point no legal ask exits it. That is not
+//!     conservative, it is unsatisfiable, and it is what held
+//!     `maker_exit_closed` at 0. See `naked_act::lot_at`.
 //!   * **RECORD THAT AN EXIT IS OUTSTANDING.** [`Resting`], and it is the reason
 //!     `select` re-choosing the same basket next scan cannot rest a second ask:
 //!     [`Live::target`] refuses while anything is outstanding at all. The cap is
@@ -87,12 +97,16 @@
 //!         landed. **THIS MODULE CAN NOW EXIT A BASKET THIS ENGINE OPENED**,
 //!         and the previous sentence here said the opposite.
 //!         Two things bound what that opened. The basis those rows carry is
-//!         `naked_act::worst_lot`'s own arithmetic — the same number [`decide`]
-//!         re-derives before resting anything, so a row this module accepts and
-//!         a lot it prices cannot disagree. And an INVERTED engine basket
+//!         per-RECORD arithmetic, and `decide` re-derives it off the same record
+//!         through `naked_act::lot_at`, so a row this module accepts and a lot
+//!         it prices cannot disagree. (They could and did while `decide` used
+//!         `worst_lot`: marks priced the selected record and `decide` priced the
+//!         dearest leg of each venue, 0.9263 against 1.0023 on
+//!         `xvus-time-poty-26-artificialintelligence`.) And an INVERTED engine
+//!         basket
 //!         (Kalshi `side:"ask"`) publishes `maker_exit_ct: null`, which
 //!         `unwind::consider` refuses as `NotPriceable` before it is ever a
-//!         candidate; `worst_lot` would refuse its direction here in any case.
+//!         candidate; `lot_at` would refuse its direction here in any case.
 //!
 //! # THE DEBOUNCE IS SIZED ON THE TAPE, NOT ON A GUESS
 //!
@@ -179,7 +193,7 @@
 //! nothing in this process can tell us when that is true.
 
 use crate::ledger;
-use crate::naked_act::{ceil_to_tick, worst_lot, Held};
+use crate::naked_act::{ceil_to_tick, lot_at, Held};
 pub use crate::naked_act::MIN_LOCK;
 use arb_core::fees::{FeeSchedule, Role};
 use arb_core::clock::now_s as wall_now;
@@ -827,6 +841,68 @@ fn rung_step(
     Err(format!("{} is outside every rung of the tick ladder", cx.emit_6dp(x)))
 }
 
+/// The price to actually REST at: the floor, lifted clear of the bid.
+///
+/// # Why the floor is not already the answer
+///
+/// [`exit_limit`] answers "what is the least this lot may be sold for", and for
+/// the life of this module that number went to the venue unmodified. It is a
+/// quote only when it happens to land above the bid. When it landed at or below
+/// one, [`decide`] REFUSED — it read an ask under the bid as "a take dressed as
+/// a maker order", which is true of the ORDER and false of the SITUATION. A
+/// floor below the bid means the book is bidding MORE than this lot needs.
+/// That is the best case an exit can be handed, and it was the one case the
+/// module walked away from: 131 times on 2026-08-20, against a
+/// `KXBTCMAXY-26DEC31-149999.99` floor of 0.0200 into a bid of 0.0300.
+///
+/// The invariant behind the refusal is kept, because it is a real one:
+/// post-only rejects an ask at or below the bid, and an ask that crossed would
+/// trade at a price nothing here decided to take. The answer to "our price is
+/// too low to rest" is to RAISE it. One rung above the bid is post-only-safe by
+/// construction, and being above the floor it locks strictly more than
+/// [`MIN_LOCK`].
+///
+/// # Why one rung above the bid and not somewhere near the ask
+///
+/// `bid + 1` is the lowest offer the book can hold, so it is already in front
+/// of every resting ask. There is nothing to gain by pricing dearer and a fill
+/// to lose. Where the floor is ABOVE the bid this returns the floor unchanged
+/// and the ask may well sit outside the market — that is the honest answer to a
+/// lot the book will not pay for yet, and [`MAX_RESTING_S`] bounds what it
+/// costs to be wrong about it.
+fn rest_price(
+    cx: &mut Cx,
+    ladder: &[(String, String, String)],
+    floor: D,
+    yes_bid: Option<&str>,
+) -> Result<D, String> {
+    // No bid at all is not a bid of zero — `gateway::Quote::yes_bid` carries
+    // that distinction precisely so this does not have to guess. Nothing to
+    // clear, so the floor stands.
+    let Some(bid) = yes_bid.and_then(|b| cx.parse(b)) else { return Ok(floor) };
+    if cx.cmp(floor, bid) == Ordering::Greater {
+        return Ok(floor);
+    }
+    let (_, step) = rung_step(cx, ladder, bid)?;
+    let up = cx.add(bid, step);
+    let Some(p) = ceil_to_tick(cx, ladder, up) else {
+        return Err(format!(
+            "the book is bid {} and the venue's ladder has no rung above it, so this exit \
+             has no post-only price",
+            cx.emit_6dp(bid)
+        ));
+    };
+    if cx.cmp(p, cx.one) != Ordering::Less {
+        return Err(format!(
+            "the book is bid {} and the only post-only price above it is {} — at or above \
+             $1, which is not a price this pair can pay",
+            cx.emit_6dp(bid),
+            cx.emit_6dp(p)
+        ));
+    }
+    Ok(p)
+}
+
 /// The price a PM-US close may pay AT MOST, given what the Kalshi leg actually
 /// sold for. The fill-time re-price (`unwind` §5's fourth bullet).
 ///
@@ -999,11 +1075,33 @@ pub fn decide(
     // THE BASIS, BOTH LEGS, FROM OUR OWN LEDGER. Never PM-US `costPerShare`,
     // which is `baseCost/|net|` — a residual that blows up as net -> 0, which is
     // exactly the regime an exit reads it in. `naked_act` carries the incident.
-    let k_lot = worst_lot(cx, fees, records, &cand.rel_id, Venue::Kalshi, &cand.market_id, Held::LongYes)
-        .map_err(|e| refuse(format!("Kalshi leg: {e}")))?;
-    let pm_lot =
-        worst_lot(cx, fees, records, &cand.rel_id, Venue::PolymarketUs, pm_market, Held::ShortYes)
-            .map_err(|e| refuse(format!("PM-US leg: {e}")))?;
+    // ...AND FROM THE LOT `select` ACTUALLY CHOSE. `cand.opened_ts` is half of
+    // the `(rel_id, opened_ts)` key this module already debounces and books
+    // against; `lot_at` carries why reading the two legs off THAT record rather
+    // than off the dearest of all of them is the difference between an exit
+    // that rests inside the book and one that never fills.
+    let k_lot = lot_at(
+        cx,
+        fees,
+        records,
+        &cand.rel_id,
+        cand.opened_ts,
+        Venue::Kalshi,
+        &cand.market_id,
+        Held::LongYes,
+    )
+    .map_err(|e| refuse(format!("Kalshi leg: {e}")))?;
+    let pm_lot = lot_at(
+        cx,
+        fees,
+        records,
+        &cand.rel_id,
+        cand.opened_ts,
+        Venue::PolymarketUs,
+        pm_market,
+        Held::ShortYes,
+    )
+    .map_err(|e| refuse(format!("PM-US leg: {e}")))?;
     let qty = k_lot.qty.min(pm_lot.qty).min(cand.qty).min(MAX_CLIP);
     if qty < 1 {
         return Err(refuse(format!(
@@ -1022,23 +1120,9 @@ pub fn decide(
     // the smallest instalment the grid can express on it.
     let tick = cx.parse_exact(TICK);
     let pm_close = cx.add(pm_ask_d, tick);
-    let limit = exit_limit(cx, fees, &quote.ladder, k_basis, pm_basis, pm_close, qty)
+    let floor = exit_limit(cx, fees, &quote.ladder, k_basis, pm_basis, pm_close, qty)
         .map_err(refuse)?;
-    // A resting ASK at or below the best BID is not a maker order, it is a take
-    // dressed as one: post-only would reject it, and if it did not it would
-    // cross into the book at a price this module never decided to take. Refuse.
-    if let Some(bid) = quote.yes_bid.as_deref().and_then(|b| cx.parse(b)) {
-        if cx.cmp(limit, bid) != Ordering::Greater {
-            return Err(refuse(format!(
-                "the profit floor for {} is {} and the book is bid {bid_s} — resting there \
-                 would CROSS, which is the take this module exists not to do (unwind_apr on \
-                 these lots is deeply negative). Waiting for a book that comes to us.",
-                cand.market_id,
-                cx.emit_6dp(limit),
-                bid_s = quote.yes_bid.as_deref().unwrap_or("?"),
-            )));
-        }
-    }
+    let limit = rest_price(cx, &quote.ladder, floor, quote.yes_bid.as_deref()).map_err(refuse)?;
     let limit = cx.quantize_4dp(limit);
     Ok(Order {
         rel_id: cand.rel_id.clone(),
@@ -1156,6 +1240,18 @@ pub struct Live {
     /// judge whether the slot is contested — and consumed by [`cycle`], which
     /// owns the wire. See [`MAX_RESTING_S`].
     pub rotate: Option<String>,
+    /// The market just rotated out of the single [`MAX_RESTING`] slot, held for
+    /// exactly the ONE selection that follows.
+    ///
+    /// A rotation that hands the slot straight back to the market it took it
+    /// from has bought that market's own queue position at full price, which is
+    /// the loss [`MAX_RESTING_S`] says it is not willing to pay. `target` orders
+    /// candidates by `select`'s ordering and takes the first, and the market
+    /// that has been resting longest is very often still first — so on
+    /// 2026-08-20 `KXTIME-26-AI` was rotated out at 11:46 and rested again,
+    /// same price, at 11:50. Skipping it for one selection is what makes a
+    /// rotation a HAND-OVER rather than a re-place.
+    rotated_out: Option<String>,
     /// Markets where a place or a cancel DID NOT COMPLETE, so an ask of ours may
     /// be resting under an id nothing in this process can address.
     ///
@@ -1184,6 +1280,7 @@ impl Live {
             resting: None,
             pending: None,
             rotate: None,
+            rotated_out: None,
             unaddressable: BTreeSet::new(),
             cx,
             fees,
@@ -1265,16 +1362,27 @@ impl Live {
             // DIFFERENT market. Rotating for the sake of the exit's own candidate
             // would just buy back its own queue position at full price.
             let age = r.since.elapsed().as_secs_f64();
-            let waiting = admitted.iter().filter(|e| e.market_id != r.order.market).count();
+            // ...AND THE SOMEBODY ELSE HAS TO BE ABLE TO USE IT. A candidate on
+            // a market the venue has halted cannot take the slot, so counting it
+            // as a waiter buys a cancel and hands the slot back — which is how
+            // `KXFRENCHPRES-27-BRET`, halted, cost `KXTIME-26-AI` its queue
+            // position twice on 2026-08-20 before the park took hold.
+            let waiting = admitted
+                .iter()
+                .filter(|e| e.market_id != r.order.market && !self.is_parked(&e.market_id))
+                .count();
+            let incumbent = r.order.market.clone();
             self.rotate = (age > MAX_RESTING_S && waiting > 0).then(|| {
                 format!(
-                    "{} has held the only exit slot for {age:.0}s (limit {MAX_RESTING_S:.0}s) \
-                     with {waiting} other held candidate(s) waiting on it — pulling so the \
-                     next cycle can re-decide against a fresh book. If it is still the best \
-                     exit it will be chosen again and re-priced.",
-                    r.order.market
+                    "{incumbent} has held the only exit slot for {age:.0}s (limit \
+                     {MAX_RESTING_S:.0}s) with {waiting} other held candidate(s) waiting on \
+                     it — pulling so one of them can have it. {incumbent} is skipped for the \
+                     next selection only; it comes back round on the one after."
                 )
             });
+            if self.rotate.is_some() {
+                self.rotated_out = Some(incumbent);
+            }
             return Err(format!(
                 "an exit is already resting ({} of {} in-scope candidate(s) held) — \
                  MAX_RESTING is {MAX_RESTING}, so nothing else may rest until it fills or is \
@@ -1283,20 +1391,36 @@ impl Live {
                 exits.len()
             ));
         }
-        let Some(e) = admitted.into_iter().next() else {
+        if admitted.is_empty() {
             return Err(format!(
                 "{} candidate(s), none held for {DEBOUNCE_S:.0}s across {DEBOUNCE_SCANS} \
                  scans — 60% of every excursion above the floor on the live tape is one \
                  sample long",
                 exits.len()
             ));
-        };
-        if self.is_parked(&e.market_id) {
+        }
+        // Parked markets are filtered rather than tripped over. The old code
+        // took the first admitted candidate and THEN refused if it was halted,
+        // which let one halted market shadow every live one behind it.
+        let live: Vec<&crate::unwind::Exit> =
+            admitted.iter().copied().filter(|e| !self.is_parked(&e.market_id)).collect();
+        if live.is_empty() {
+            let halted: Vec<&str> = admitted.iter().map(|e| e.market_id.as_str()).collect();
             return Err(format!(
-                "{} is halted at the venue; not re-sending into it",
-                e.market_id
+                "all {} held candidate(s) are on markets halted at the venue ({}); not \
+                 re-sending into them",
+                admitted.len(),
+                halted.join(", ")
             ));
         }
+        // THE HAND-OVER, consumed whether or not it changes the pick: it is a
+        // one-selection courtesy, not a ban. If the rotated-out market is the
+        // only thing left it is chosen again — there was nobody to hand to, and
+        // an empty slot is worse than a re-bought queue position.
+        let e = match self.rotated_out.take() {
+            Some(m) => live.iter().copied().find(|e| e.market_id != m).unwrap_or(live[0]),
+            None => live[0],
+        };
         Ok(e)
     }
 
@@ -3036,8 +3160,8 @@ mod tests {
             Instant::now(),
         )
         .expect_err("no open lot");
-        assert!(e.contains("unaccounted for"), "{e}");
-        assert!(e.contains("none will be invented"), "{e}");
+        assert!(e.contains("no open ledger record for r1 opened at 1"), "{e}");
+        assert!(e.contains("No other lot is substituted"), "{e}");
 
         // ...and a PM leg pointing the other way (an inverted basket, 9 of them
         // in the live file) is not this trade either.
@@ -3090,21 +3214,172 @@ mod tests {
         assert!(e.contains("giving it"), "{e}");
     }
 
-    /// AN ASK AT OR UNDER THE BID IS THE TAKE, AND THE TAKE IS THE TRADE THIS
-    /// MODULE EXISTS NOT TO MAKE. Post-only would reject it; if it did not it
-    /// would cross into a book at a price nothing here decided to take.
+    /// THE EXIT IS PRICED OFF THE LOT `select` CHOSE, NOT THE DEAREST LEG OF
+    /// EACH VENUE.
+    ///
+    /// The live shape, from `xvus-time-poty-26-artificialintelligence` on
+    /// 2026-08-20: three open lots on one ticker, where the dearest KALSHI leg
+    /// and the dearest PM-US leg are on DIFFERENT records. Kalshi fees ceil to
+    /// the cent on the leg TOTAL, so the per-contract basis depends on the
+    /// lot's size as well as its price:
+    ///
+    /// ```text
+    ///   ts 1.0  5x  kalshi 0.10 maker -> 0.1020   pm 0.104 -> 0.896  = 0.9980
+    ///   ts 2.0  5x  kalshi 0.10 taker -> 0.1080   pm 0.12  -> 0.880  = 0.9880
+    ///   ts 3.0  4x  kalshi 0.10 taker -> 0.1075   pm 0.18  -> 0.820  = 0.9275  <- chosen
+    /// ```
+    ///
+    /// `worst_lot` per leg composes the 0.1080 with the 0.896 — a basket nobody
+    /// traded, and one dearer than the dollar the pair pays. It still produces
+    /// a LEGAL price, which is what made this survivable enough to ship and
+    /// invisible enough to run for a month: `exit_limit` answers 0.08, and this
+    /// fixture reproduces the live number to the cent. Against a book offering
+    /// 0.05 that ask is three rungs behind the entire queue. The lot actually
+    /// selected wants 0.04. `maker_exit_closed` was 0 for the life of the
+    /// deployment.
     #[tokio::test]
-    async fn an_exit_that_would_cross_the_book_is_refused_rather_than_crossed() {
+    async fn the_exit_is_priced_off_the_selected_lot_and_not_a_composite_of_the_dearest_legs() {
+        // The function this no longer uses, imported HERE and nowhere else:
+        // the test's job is to show what it would have priced.
+        use crate::naked_act::worst_lot;
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let lot = |ts: f64, qty: i64, pm_yes: &str, k_role: &str| {
+            v(&format!(
+                r#"{{"ts":{ts},"relationship_id":"r1","status":"open","qty":{qty},"legs":[
+                     {{"venue":"polymarket_us","market_id":"p-a","side":"no","role":"maker",
+                       "qty":{qty},"yes_price":"{pm_yes}"}},
+                     {{"venue":"kalshi","market_id":"K-a","side":"yes","role":"{k_role}",
+                       "qty":{qty},"yes_price":"0.10"}}]}}"#
+            ))
+        };
+        let recs = vec![
+            lot(1.0, 5, "0.104", "maker"),
+            lot(2.0, 5, "0.12", "taker"),
+            lot(3.0, 4, "0.18", "taker"),
+        ];
+
+        // FIRST, the composite this used to price against is unexitable. Not a
+        // hard exit — an IMPOSSIBLE one, which is the tell.
+        let k = worst_lot(&mut cx, &fees, &recs, "r1", Venue::Kalshi, "K-a", Held::LongYes)
+            .expect("a dearest kalshi leg exists");
+        let pm = worst_lot(&mut cx, &fees, &recs, "r1", Venue::PolymarketUs, "p-a", Held::ShortYes)
+            .expect("a dearest pm leg exists");
+        assert_eq!((k.open_ts, pm.open_ts), (2.0, 1.0), "different records, which is the bug");
+        let (kb, pb) = (cx.parse(&k.cost_per_ct).unwrap(), cx.parse(&pm.cost_per_ct).unwrap());
+        let composite = cx.add(kb, pb);
+        assert_eq!(
+            cx.cmp(composite, cx.one),
+            Ordering::Greater,
+            "the composite is {} — the point is that it exceeds the $1 the pair pays, which \
+             no real basket here does",
+            cx.emit_6dp(composite)
+        );
+        let pm_close = cx.parse_exact("0.06");
+        let composite_floor = exit_limit(&mut cx, &fees, &penny(), kb, pb, pm_close, 4)
+            .expect("legal, which is exactly why nobody caught it");
+        assert_eq!(
+            cx.emit_6dp(composite_floor),
+            "0.080000",
+            "the live mispricing, to the cent — an ask three rungs behind a 0.05 offer"
+        );
+
+        // NOW the real one. `cand(4, 3.0)` names the 0.9275 lot; against a
+        // PM-US ask of 0.05 its floor is the bottom rung, and the Kalshi bid of
+        // 0.03 lifts it to 0.04 — at the front of a book offering 0.05.
+        let o = decide(
+            &mut cx, &fees, &recs, &cand(4, 3.0), "p-a",
+            &quote(Some("0.0300"), Some("0.0500")), &view("0.05"), Instant::now(),
+        )
+        .expect("the selected lot is exitable");
+        assert_eq!(o.closes_ts, 3.0, "the record select named, not the dearest: {o:?}");
+        assert_eq!(o.k_basis, "0.107500");
+        assert_eq!(o.pm_basis, "0.820000");
+        assert_eq!(o.qty, 4);
+        assert_eq!(o.limit, "0.0400", "at the touch, not three ticks above the offer");
+    }
+
+    /// EVERY LOT ON THE TICKER GETS ITS OWN PRICE.
+    ///
+    /// The corollary, and the reason a six-lot ticker empties in six passes
+    /// rather than never: the dearer lots are dearer to exit, and they say so
+    /// individually instead of all inheriting the worst one's floor.
+    #[tokio::test]
+    async fn each_lot_on_one_ticker_prices_to_its_own_basis() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        // Two lots differing ONLY in what the PM leg cost.
+        let recs = vec![open_basket(1.0, 5, "0.10", "0.19"), open_basket(2.0, 5, "0.30", "0.19")];
+        let px = |cx: &mut Cx, ts: f64| {
+            decide(
+                cx, &fees, &recs, &cand(5, ts), "p-a",
+                &quote(Some("0.0100"), Some("0.9500")), &view("0.20"), Instant::now(),
+            )
+            .map(|o| o.limit)
+        };
+        let dear = px(&mut cx, 1.0).expect("the 0.90 pm basis lot");
+        let cheap = px(&mut cx, 2.0).expect("the 0.70 pm basis lot");
+        assert_ne!(dear, cheap, "one floor for two different baskets is the bug");
+        assert!(
+            cx.parse(&dear).unwrap() > cx.parse(&cheap).unwrap(),
+            "the lot that cost more needs more: dear {dear}, cheap {cheap}"
+        );
+    }
+
+    /// A FLOOR AT OR UNDER THE BID MEANS THE BOOK IS PAYING MORE THAN THE LOT
+    /// NEEDS, WHICH IS THE BEST CASE AN EXIT CAN BE HANDED.
+    ///
+    /// This used to be `an_exit_that_would_cross_the_book_is_refused_rather_
+    /// than_crossed`, and it asserted the refusal. The rule it pinned — "an ask
+    /// at or under the bid is a take dressed as a maker order" — is true of the
+    /// ORDER and says nothing about the SITUATION; see [`rest_price`]. The
+    /// invariant survives in
+    /// [`the_lift_clears_the_bid_strictly_so_post_only_cannot_reject_it`].
+    #[tokio::test]
+    async fn a_floor_under_the_bid_is_lifted_over_it_rather_than_walked_away_from() {
         let _g = allow_all().await;
         let (mut cx, fees) = ready();
         let recs = vec![open_basket(1.0, 34, "0.22", "0.19")];
-        // Bid at 0.90 is far above any floor this basket produces.
-        let e = decide(
+        // Bid at 0.90 is far above any floor this basket produces: the book is
+        // offering seventy cents more than the lot needs.
+        let o = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a",
             &quote(Some("0.9000"), Some("0.9500")), &view("0.20"), Instant::now(),
         )
-        .expect_err("that is a take");
-        assert!(e.contains("CROSS"), "{e}");
+        .expect("a bid above the floor is the best case, not a refusal");
+        assert_eq!(o.limit, "0.9100", "one rung above the bid, not the floor: {o:?}");
+    }
+
+    /// ...AND IT IS STILL A MAKER ORDER. The invariant the old refusal was
+    /// protecting is the one that survives: post-only rejects an ask at or
+    /// below the bid, so the lift has to clear it STRICTLY. This pins the
+    /// boundary the `!=  Ordering::Greater` comparison used to guard.
+    #[test]
+    fn the_lift_clears_the_bid_strictly_so_post_only_cannot_reject_it() {
+        let (mut cx, _fees) = ready();
+        let ladder = vec![("0.0000".into(), "1.0000".into(), "0.0100".into())];
+        // Floor exactly ON the bid is the case post-only rejects.
+        let floor = cx.parse_exact("0.3000");
+        let p = rest_price(&mut cx, &ladder, floor, Some("0.3000")).expect("liftable");
+        assert_eq!(cx.emit_6dp(p), "0.310000", "an ask AT the bid is not a maker order");
+    }
+
+    /// A FLOOR ABOVE THE BID IS THE FLOOR, UNCHANGED.
+    ///
+    /// [`rest_price`] lifts, it does not chase: where the book is not yet
+    /// paying what the lot needs, the honest ask is the one the lot needs, even
+    /// when that sits outside the market.
+    #[test]
+    fn a_floor_above_the_bid_is_left_exactly_where_it_is() {
+        let (mut cx, _fees) = ready();
+        let ladder = vec![("0.0000".into(), "1.0000".into(), "0.0100".into())];
+        let floor = cx.parse_exact("0.0800");
+        let p = rest_price(&mut cx, &ladder, floor, Some("0.0300")).expect("no lift needed");
+        assert_eq!(cx.emit_6dp(p), "0.080000");
+        // ...and a market with NO bid at all is not a market bidding zero.
+        let floor = cx.parse_exact("0.0800");
+        let p = rest_price(&mut cx, &ladder, floor, None).expect("no bid, no lift");
+        assert_eq!(cx.emit_6dp(p), "0.080000");
     }
 
     /// A MARKET THE VENUE IS NOT TRADING TAKES NO ORDER, whatever the marks
@@ -3591,7 +3866,63 @@ mod tests {
         }
         let reason = l.rotate.take().expect("the slot has been held too long");
         assert!(reason.contains("held the only exit slot"), "{reason}");
-        assert!(reason.contains("re-decide against a fresh book"), "{reason}");
+        assert!(reason.contains("so one of them can have it"), "{reason}");
+
+        // AND THE SLOT ACTUALLY CHANGES HANDS. Rotating and then handing the
+        // slot straight back is the pure loss `MAX_RESTING_S` says it will not
+        // pay: on 2026-08-20 `KXTIME-26-AI` was rotated out at 11:46 and rested
+        // again, same price, at 11:50, because `target` takes the first
+        // admitted candidate and the incumbent was still first.
+        l.resting = None;
+        let next = l.target(&c, t0 + 4.0 * DEBOUNCE_S, 0).expect("somebody takes the slot");
+        assert_eq!(next.market_id, "K-b", "the rotated-out market must not win it straight back");
+
+        // ...for ONE selection. It is a hand-over, not a ban.
+        let after = l.target(&c, t0 + 5.0 * DEBOUNCE_S, 0).expect("still a candidate");
+        assert_eq!(after.market_id, "K-a", "the courtesy is spent; normal ordering resumes");
+    }
+
+    /// A HAND-OVER WITH NOBODY TO HAND TO KEEPS THE INCUMBENT.
+    ///
+    /// An empty slot is worse than a re-bought queue position, so the skip
+    /// applies only while something else can actually use it.
+    #[test]
+    fn a_rotated_out_market_is_chosen_again_when_it_is_the_only_one_left() {
+        let mut l = Live::new(true, "/dev/null".into());
+        let c = [cand(10, 1.0)];
+        let t0 = 1_000_000.0;
+        for i in 0..4 {
+            let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 0);
+        }
+        l.rotated_out = Some("K-a".into());
+        let e = l.target(&c, t0 + 4.0 * DEBOUNCE_S, 0).expect("the only candidate");
+        assert_eq!(e.market_id, "K-a");
+    }
+
+    /// A HALTED MARKET DOES NOT SHADOW THE LIVE ONES BEHIND IT.
+    ///
+    /// `target` used to take the first admitted candidate and THEN refuse if it
+    /// was parked, which spent the whole cycle on a market that could not take
+    /// an order — 32 of them on 2026-08-20, all `KXFRENCHPRES-27-BRET`.
+    #[test]
+    fn a_parked_market_at_the_head_of_the_queue_is_skipped_not_fatal() {
+        let mut l = Live::new(true, "/dev/null".into());
+        let mut other = cand(10, 2.0);
+        other.market_id = "K-b".into();
+        let c = [cand(10, 1.0), other];
+        let t0 = 1_000_000.0;
+        for i in 0..4 {
+            let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 0);
+        }
+        l.park("K-a");
+        let e = l.target(&c, t0 + 4.0 * DEBOUNCE_S, 0).expect("K-b is live and admitted");
+        assert_eq!(e.market_id, "K-b");
+
+        // ...and when EVERY held candidate is halted, the refusal says so.
+        l.park("K-b");
+        let why = l.target(&c, t0 + 5.0 * DEBOUNCE_S, 0).expect_err("nothing can take an order");
+        assert!(why.contains("halted at the venue"), "{why}");
+        assert!(why.contains("K-a") && why.contains("K-b"), "it names them: {why}");
     }
 
     /// ...BUT NOT WHEN IT IS THE ONLY CANDIDATE.
