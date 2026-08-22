@@ -938,13 +938,49 @@ impl RiskView {
         *self.checked.lock().expect("checked")
     }
 
-    fn config(&self) -> ConfigIn {
+    /// The caps `arb_core::risk` actually gates on, over a book of `book`
+    /// contracts.
+    ///
+    /// THE CEILING HAS TO REACH THE GATE, and for one release it did not.
+    /// [`Self::global_cap_usd`] went NAV-derived while this method went on
+    /// handing `arb_core::risk` the hand-typed strings, so the HURDLE floated
+    /// on live NAV ($874) while the REFUSAL still fired at $490 — visible live
+    /// as `class cap: 481+25 > 490.0` against a hurdle of 9.97%/yr. One
+    /// definition of the ceiling, used by both, or they drift.
+    ///
+    /// `per_class_cap` MOVES WITH the global fraction, and that preserves the
+    /// operator's intent rather than overriding it: `config/exec.yaml` sets it
+    /// to 0.50 *because* that equals `GLOBAL_CAP`, so that "the class dimension
+    /// stops being a separate constraint". Leaving it at 0.50 while the global
+    /// fraction went to [`TARGET_DEPLOY`] would re-introduce exactly the
+    /// separate constraint that file deliberately removed — class would bind
+    /// first, at 0.50 x NAV.
+    ///
+    /// `per_rel_cap` does NOT move. It is an absolute 150 contracts, not a
+    /// fraction of anything, and it is the concentration limit that should not
+    /// grow just because the account did.
+    fn config_over_book(&self, book: f64) -> ConfigIn {
+        // A damaged `exec.yaml` keeps its $0 bankroll: `live_cash` must not
+        // quietly undo the degenerate caps `Caps::corrupt` forces.
+        let live = if self.caps_corrupt.is_some() { None } else { self.live_cash() };
+        let (bankroll, per_class, global) = match live {
+            Some(cash) => (
+                format!("{:.6}", cash + book),
+                TARGET_DEPLOY.to_string(),
+                TARGET_DEPLOY.to_string(),
+            ),
+            None => (
+                self.bankroll.clone(),
+                self.per_class_cap.clone(),
+                GLOBAL_CAP.to_string(),
+            ),
+        };
         ConfigIn {
-            bankroll: self.bankroll.clone(),
+            bankroll,
             tail_fraction: TAIL_FRACTION.into(),
             per_rel_cap: Some(PER_REL_CAP.into()),
-            per_class_cap: self.per_class_cap.clone(),
-            global_cap: GLOBAL_CAP.into(),
+            per_class_cap: per_class,
+            global_cap: global,
             overflow_min_apr: OVERFLOW_MIN_APR.into(),
             overflow_frac: OVERFLOW_FRAC.into(),
             default_topic_budget: self.default_topic_budget.clone(),
@@ -1033,6 +1069,11 @@ impl RiskGate for RiskView {
         let mut by_class = e.by_class.clone();
         let mut by_topic = e.by_topic.clone();
         drop(e);
+        // NAV's book term is what is actually OPEN. Reservations are capital
+        // COMMITTED, not deployed, so folding them in would shrink the ceiling
+        // every time a quote rests — `utilization` excludes them for the same
+        // reason. Taken before the fold below, which mutates `by_rel`.
+        let book: f64 = by_rel.values().sum();
         // Capital already committed by quotes that are RESTING. Without this
         // the gate is a pure read and every resting quote in the process spends
         // the same headroom — see the module header.
@@ -1057,7 +1098,7 @@ impl RiskGate for RiskView {
             m.iter().map(|(k, v)| (k.clone(), v.to_string())).collect()
         };
         let inp = Input {
-            config: self.config(),
+            config: self.config_over_book(book),
             rel: RelIn {
                 id: rel.id.clone(),
                 rtype: rel.rtype.as_str().to_string(),
@@ -2434,5 +2475,76 @@ mod tests {
         v.set_live_balances(vec![("kalshi".to_string(), "5000".to_string())]).unwrap();
         assert_eq!(v.global_cap_usd(), 0.0);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// Both venues, live: a basket spends on both legs, so a one-venue live
+    /// reading is a cash REFUSAL fixture and would mask what these test.
+    fn live_both(v: &RiskView, each: &str) {
+        v.set_live_balances(vec![
+            ("kalshi".to_string(), each.to_string()),
+            ("polymarket_us".to_string(), each.to_string()),
+        ])
+        .expect("a real reading");
+    }
+
+    /// THE REGRESSION THIS FIXES. `global_cap_usd` went NAV-derived while
+    /// `check` went on gating against the hand-typed strings, so the hurdle
+    /// floated on $874 of NAV while the refusal still fired at $490. Live it
+    /// read `class cap: 481+25 > 490.0` under a 9.97%/yr hurdle. The ceiling
+    /// the gate enforces and the one the hurdle divides by are ONE number.
+    ///
+    /// The book is spread over three relationships because 400 contracts on
+    /// ONE would breach the 150 per-rel cap first, and the test would pass
+    /// while proving nothing about the global ceiling.
+    #[test]
+    fn the_nav_ceiling_reaches_the_gate_not_only_the_hurdle() {
+        let v = view_topics_low("/nonexistent/topics.yaml", &["r1", "r2", "r3", "r4"]);
+        for (r, q) in [("r2", 140.0), ("r3", 140.0), ("r4", 120.0)] {
+            v.record_open(r, "cross-venue-equivalent", q);
+        }
+        live_both(&v, "300");
+        // NAV = 600 cash + 400 book; 0.85 x 1000 = 850.
+        assert!((v.global_cap_usd() - 850.0).abs() < 0.01, "{}", v.global_cap_usd());
+        // 400 + 25 is far under 850. Under the old $490 ceiling, with
+        // reservations folded in, this is exactly where the live engine refused.
+        let d = v.check(&rel("r1"), Venue::Kalshi, 25, None);
+        assert!(d.allowed, "the gate is still on the old ceiling: {:?}", d.reasons);
+    }
+
+    /// `exec.yaml` sets `per_class_cap` to 0.50 *because* that equals
+    /// `GLOBAL_CAP`, so the class dimension stops being a separate constraint.
+    /// Raising only the global fraction would put class back in the way at
+    /// 0.50 x NAV, refusing before the global cap ever spoke.
+    #[test]
+    fn the_class_dimension_stays_inert_under_the_nav_ceiling() {
+        let v = view_topics_low("/nonexistent/topics.yaml", &["r1", "r2", "r3", "r4", "r5"]);
+        for r in ["r2", "r3", "r4", "r5"] {
+            v.record_open(r, "cross-venue-equivalent", 130.0);
+        }
+        live_both(&v, "300");
+        // NAV = 600 + 520 = 1120 -> global 952. A class cap left at 0.50 would
+        // be 560, and 520 + 25 would breach it.
+        let d = v.check(&rel("r1"), Venue::Kalshi, 25, None);
+        assert!(
+            !d.reasons.iter().any(|r| r.contains("class cap")),
+            "class must not bind before global: {:?}",
+            d.reasons
+        );
+        assert!(d.allowed, "{:?}", d.reasons);
+    }
+
+    /// The per-relationship cap is an absolute 150 contracts, not a fraction of
+    /// anything. A bigger account must not widen a CONCENTRATION limit.
+    #[test]
+    fn the_per_relationship_cap_does_not_grow_with_nav() {
+        let v = view_topics_low("/nonexistent/topics.yaml", &["r1"]);
+        v.record_open("r1", "cross-venue-equivalent", 140.0);
+        live_both(&v, "9000");
+        let d = v.check(&rel("r1"), Venue::Kalshi, 25, None);
+        assert!(
+            d.reasons.iter().any(|r| r.contains("per-relationship tail cap")),
+            "150 is absolute however rich we get: {:?}",
+            d.reasons
+        );
     }
 }
