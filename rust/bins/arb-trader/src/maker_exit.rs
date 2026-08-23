@@ -375,6 +375,38 @@ const VANISHED_MIN_AGE_S: f64 = CYCLE_S as f64;
 /// tick plus a cancel round trip. See the module header for why a bounded wait
 /// rather than a proof is tolerable HERE and was not tolerable for the Python's
 /// IOC.
+/// How many SELECTIONS a rotation's hand-over survives before the incumbent may
+/// take the slot back.
+///
+/// **IT USED TO BE ONE, AND ONE CAN NEVER SUCCEED.** [`Live::target`] consumed
+/// `rotated_out` on the selection that read it — "a one-selection courtesy" —
+/// but the cycle that first selects a market STRUCTURALLY CANNOT PLACE on it:
+/// [`decide`] refuses everything whose entry quote has not been yielded yet,
+/// and the yield is only requested by that same cycle. So the courtesy was
+/// always spent by a guaranteed refusal, and the incumbent — which `select`
+/// very often still orders first — reclaimed the slot on the very next cycle.
+///
+/// Seen end to end on 2026-08-23, with `KXNOBELPEACE-26-DJT` holding the only
+/// slot against 20 other eligible rows worth about $144:
+///
+/// ```text
+///   05:00:49  ROTATING - DJT pulled so one of 7 waiting can have it
+///   05:01:49  NO - xvus-btcmax-...-150k: quoter not yet told to yield  <- spent
+///   05:02:49  NO - xvus-nobel-peace-26-donaldtrump: ...                <- reclaimed
+///   05:03:50  RESTED 5x tac-nobel-peace-...-dontru                     <- incumbent
+/// ```
+///
+/// THREE, because the handshake costs two — one cycle to ask, one to place,
+/// since [`CYCLE_S`] is 60 and [`SUPPRESS_SETTLE_S`] is 30 — and one spare buys
+/// the challenger a single bad cycle (a halted market, an unreadable quote)
+/// without handing the slot back.
+///
+/// BOUNDED, and that is the other half. A challenger that can never be priced
+/// would otherwise lock the incumbent out for ever, which is a worse starvation
+/// than the one this fixes: an empty slot earns nothing at all, while the
+/// incumbent's ask at least pays if somebody lifts it.
+pub const HANDOVER_CYCLES: u32 = 3;
+
 pub const SUPPRESS_SETTLE_S: f64 = 30.0;
 
 /// The price increment both legs quote in, for the tick THROUGH the PM ask.
@@ -1715,9 +1747,15 @@ pub struct Live {
     /// candidates by `select`'s ordering and takes the first, and the market
     /// that has been resting longest is very often still first — so on
     /// 2026-08-20 `KXTIME-26-AI` was rotated out at 11:46 and rested again,
-    /// same price, at 11:50. Skipping it for one selection is what makes a
-    /// rotation a HAND-OVER rather than a re-place.
+    /// same price, at 11:50. Skipping it until somebody else has actually
+    /// RESTED is what makes a rotation a HAND-OVER rather than a re-place —
+    /// skipping it for one SELECTION, which is what this used to do, never
+    /// could. See [`HANDOVER_CYCLES`].
     rotated_out: Option<String>,
+    /// Selections the current hand-over has survived. Cleared with
+    /// `rotated_out`, which happens when an exit RESTS or when this reaches
+    /// [`HANDOVER_CYCLES`] — never merely because a selection read it.
+    handover_age: u32,
     /// Markets where a place or a cancel DID NOT COMPLETE, so an ask of ours may
     /// be resting under an id nothing in this process can address.
     ///
@@ -1747,6 +1785,7 @@ impl Live {
             pending: None,
             rotate: None,
             rotated_out: None,
+            handover_age: 0,
             unaddressable: BTreeSet::new(),
             cx,
             fees,
@@ -1848,6 +1887,7 @@ impl Live {
             });
             if self.rotate.is_some() {
                 self.rotated_out = Some(incumbent);
+                self.handover_age = 0;
             }
             return Err(format!(
                 "an exit is already resting ({} of {} in-scope candidate(s) held) — \
@@ -1879,11 +1919,23 @@ impl Live {
                 halted.join(", ")
             ));
         }
-        // THE HAND-OVER, consumed whether or not it changes the pick: it is a
-        // one-selection courtesy, not a ban. If the rotated-out market is the
-        // only thing left it is chosen again — there was nobody to hand to, and
-        // an empty slot is worse than a re-bought queue position.
-        let e = match self.rotated_out.take() {
+        // THE HAND-OVER, which survives until somebody else actually RESTS or
+        // [`HANDOVER_CYCLES`] selections have gone by — NOT until the first
+        // selection reads it. Reading it is not evidence that it worked: the
+        // cycle that first picks a market always refuses, because it is the
+        // cycle that asks for the entry quote to be yielded. See the constant.
+        //
+        // If the rotated-out market is the only thing left it is chosen again —
+        // there was nobody to hand to, and an empty slot is worse than a
+        // re-bought queue position. That was true before and is unchanged.
+        if self.rotated_out.is_some() {
+            self.handover_age += 1;
+            if self.handover_age > HANDOVER_CYCLES {
+                self.rotated_out = None;
+                self.handover_age = 0;
+            }
+        }
+        let e = match self.rotated_out.as_deref() {
             Some(m) => live.iter().copied().find(|e| e.market_id != m).unwrap_or(live[0]),
             None => live[0],
         };
@@ -2283,6 +2335,11 @@ async fn place(
                 order.shape.tag(),
                 order.lock_ct
             );
+            // THE HAND-OVER IS DISCHARGED BY THIS, and only by this. Something
+            // other than the rotated-out market has the slot, which is the
+            // whole thing the rotation was asking for.
+            live.rotated_out = None;
+            live.handover_age = 0;
             live.resting = Some(Resting {
                 order,
                 venue_order_id: id,
@@ -4875,14 +4932,96 @@ mod tests {
         let next = l.target(&c, t0 + 4.0 * DEBOUNCE_S, 0).expect("somebody takes the slot");
         assert_eq!(next.market_id, "K-b", "the rotated-out market must not win it straight back");
 
-        // ...for ONE selection. It is a hand-over, not a ban.
+        // ...and it KEEPS it across the cycles that cannot place.
+        //
+        // RETRACTED. This used to read `assert_eq!(after.market_id, "K-a", "the
+        // courtesy is spent; normal ordering resumes")` — one selection and the
+        // incumbent was back. That pinned the bug rather than the behaviour: the
+        // selection above is the one that ASKS for the entry quote to be
+        // yielded, `decide` refuses it for exactly that reason, and so the
+        // courtesy was always spent without anything having rested. `K-a` then
+        // took the slot straight back, which is the loss the two comments above
+        // both say this must not pay. See [`HANDOVER_CYCLES`] and
+        // [`the_hand_over_survives_the_cycles_that_cannot_place`].
         let after = l.target(&c, t0 + 5.0 * DEBOUNCE_S, 0).expect("still a candidate");
-        assert_eq!(after.market_id, "K-a", "the courtesy is spent; normal ordering resumes");
+        assert_eq!(after.market_id, "K-b", "nothing rested, so the claim still stands");
     }
 
     /// A HAND-OVER WITH NOBODY TO HAND TO KEEPS THE INCUMBENT.
     ///
     /// An empty slot is worse than a re-bought queue position, so the skip
+    /// THE HAND-OVER MUST SURVIVE THE REFUSAL THAT ALWAYS FOLLOWS IT.
+    ///
+    /// `rotated_out` used to be consumed by the selection that read it. That can
+    /// never work, because the cycle which first picks a market is the cycle
+    /// that ASKS for its entry quote to be yielded, and `decide` refuses
+    /// everything whose quote has not been yielded yet. So the courtesy was
+    /// always spent on a guaranteed refusal and the incumbent — still first in
+    /// `select`'s order — took the slot straight back.
+    ///
+    /// This replays the live sequence of 2026-08-23, where `KXNOBELPEACE-26-DJT`
+    /// held the only slot against 20 other eligible rows worth about $144:
+    /// rotate, then TWO selections in which nothing manages to rest, and the
+    /// challenger must still hold the claim on the second one.
+    #[test]
+    fn the_hand_over_survives_the_cycles_that_cannot_place() {
+        let mut l = Live::new(true, "/dev/null".into());
+        let mut other = cand(10, 2.0);
+        other.market_id = "K-b".into();
+        // `K-a` sorts first, which is why it was the incumbent and why it would
+        // reclaim the slot the moment the hand-over lapsed.
+        let c = [cand(10, 1.0), other];
+        let t0 = 1_000_000.0;
+        l.resting = Some(stale_resting_exit(5, MAX_RESTING_S + 1.0));
+        for i in 0..4 {
+            let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 0);
+        }
+        assert!(l.rotate.take().is_some(), "the slot has been held too long");
+        l.resting = None;
+
+        // Cycle 1 after the pull: the challenger is picked. In the live process
+        // this is the cycle that asks for the yield and is refused.
+        let e = l.target(&c, t0 + 5.0 * DEBOUNCE_S, 0).expect("a candidate");
+        assert_eq!(e.market_id, "K-b", "the slot changes hands");
+        // Cycle 2: NOTHING RESTED, so the claim still stands. This is the
+        // assertion that fails against the old one-shot rule — it returned
+        // "K-a" here and the incumbent was back.
+        let e = l.target(&c, t0 + 6.0 * DEBOUNCE_S, 0).expect("a candidate");
+        assert_eq!(
+            e.market_id, "K-b",
+            "the incumbent must not reclaim the slot on the cycle after a refusal"
+        );
+    }
+
+    /// ...BUT IT IS BOUNDED, or a challenger that can never be priced locks the
+    /// incumbent out for ever — a worse starvation than the one above, because
+    /// an empty slot earns nothing at all while the incumbent's ask at least
+    /// pays if somebody lifts it.
+    #[test]
+    fn a_hand_over_nobody_takes_up_lapses_after_its_budget() {
+        let mut l = Live::new(true, "/dev/null".into());
+        let mut other = cand(10, 2.0);
+        other.market_id = "K-b".into();
+        let c = [cand(10, 1.0), other];
+        let t0 = 1_000_000.0;
+        l.resting = Some(stale_resting_exit(5, MAX_RESTING_S + 1.0));
+        for i in 0..4 {
+            let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 0);
+        }
+        assert!(l.rotate.take().is_some());
+        l.resting = None;
+
+        for i in 0..HANDOVER_CYCLES {
+            let e = l.target(&c, t0 + (5.0 + f64::from(i)) * DEBOUNCE_S, 0).expect("a candidate");
+            assert_eq!(e.market_id, "K-b", "still the challenger's claim on selection {i}");
+        }
+        let e = l
+            .target(&c, t0 + (5.0 + f64::from(HANDOVER_CYCLES)) * DEBOUNCE_S, 0)
+            .expect("a candidate");
+        assert_eq!(e.market_id, "K-a", "the claim lapses and the incumbent may have it back");
+        assert!(l.rotated_out.is_none(), "and the claim is cleared, not merely ignored");
+    }
+
     /// applies only while something else can actually use it.
     #[test]
     fn a_rotated_out_market_is_chosen_again_when_it_is_the_only_one_left() {
