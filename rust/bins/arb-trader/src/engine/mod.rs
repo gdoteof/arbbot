@@ -538,7 +538,7 @@ struct Engine {
     /// When each Kalshi ask was FIRST yielded to `crate::maker_exit`. Not
     /// re-stamped while the request stands, because the reader's settle window
     /// measures how long the quoter has been out of the side.
-    maker_exit_suppressed: std::collections::BTreeMap<String, std::time::Instant>,
+    maker_exit_suppressed: std::collections::BTreeMap<(String, String), std::time::Instant>,
     unwind_seen: Option<UnwindReport>,
     /// Why the last scan refused to decide, when it did. Same shape and same
     /// reason as `tox_reason`: a subsystem that has gone quiet must be able to
@@ -1336,9 +1336,20 @@ impl Engine {
         let asked = crate::maker_exit::suppress_requests();
         // Base + asked, never asked alone: `set_suppress` replaces the whole
         // set and the operator's `--suppress` declaration must survive.
+        //
+        // THE SIDE COMES FROM THE REQUEST and is no longer assumed to be `Ask`.
+        // It was, for as long as the only exit shape rested a Kalshi ask; a
+        // `Shape::RestPmUs` exit rests a PM-US BID, and hardcoding `Ask` here
+        // would yield a quote it does not collide with while leaving the one it
+        // does collide with live.
         let mut want = self.cfg.suppress.clone();
-        for m in &asked {
-            want.insert((m.clone(), BookSide::Ask));
+        for (m, side) in &asked {
+            // The request carries the wire spelling; `BookSide` is what the
+            // quoter's set is keyed on. An unparseable side is dropped rather
+            // than defaulted — defaulting it to `Ask` is precisely the bug this
+            // whole key change exists to remove.
+            let Some(s) = BookSide::parse(side) else { continue };
+            want.insert((m.clone(), s));
         }
         for q in quoters.iter_mut() {
             q.set_suppress(want.clone());
@@ -1347,9 +1358,9 @@ impl Engine {
         // FIRST installed, not most recently confirmed: the settle window the
         // reader applies is "how long has the quoter been out of this side",
         // and re-stamping it every tick would make that window never elapse.
-        self.maker_exit_suppressed.retain(|m, _| asked.contains(m));
-        for m in &asked {
-            self.maker_exit_suppressed.entry(m.clone()).or_insert(now);
+        self.maker_exit_suppressed.retain(|k, _| asked.contains(k));
+        for k in &asked {
+            self.maker_exit_suppressed.entry(k.clone()).or_insert(now);
         }
         // PM-US top-of-book ASK for every market this engine holds a book for.
         // The engine's book is the ONLY PM-US price read in this process —
@@ -1359,10 +1370,25 @@ impl Engine {
         for (market, ask) in self.books.pm_us_asks() {
             pm_ask.insert(market, ask);
         }
+        // ...and the BID side, for the shape that rests there rather than
+        // crossing there. Same book, same tick, one more read.
+        let mut pm_bid = std::collections::BTreeMap::new();
+        for (market, bid) in self.books.pm_us_bids() {
+            pm_bid.insert(market, bid);
+        }
+        // ...and the Kalshi bid, which is the price `Shape::RestPmUs` SELLS
+        // into. Same reason as `pm_ask` for the other shape: a leg that cannot
+        // be valued makes the exit a one-legged trade with a number on it.
+        let mut k_bid = std::collections::BTreeMap::new();
+        for (market, bid) in self.books.kalshi_bids() {
+            k_bid.insert(market, bid);
+        }
         crate::maker_exit::publish_view(crate::maker_exit::EngineView {
             apr_bar: self.apr_bar,
             global_cap_usd: self.cfg.risk.as_ref().map_or(0.0, |r| r.global_cap_usd()),
             pm_ask,
+            pm_bid,
+            k_bid,
             suppressed_at: self.maker_exit_suppressed.clone(),
         });
     }
@@ -4382,7 +4408,9 @@ mod maker_exit_seam_tests {
         let (mut quoters, _) = quoter_and_books();
         let books = books_where_the_kalshi_ask_pays();
         let mut eng = test_engine(cfg);
-        crate::maker_exit::request_suppress(["K".to_string()].into_iter().collect());
+        crate::maker_exit::request_suppress(
+            [("K".to_string(), "ask".to_string())].into_iter().collect(),
+        );
         eng.maker_exit_tick(&mut quoters);
         assert!(
             !quotes_kalshi_ask(&mut quoters, &books),
@@ -4391,8 +4419,9 @@ mod maker_exit_seam_tests {
         // ...and the operator's own declaration survived the install, which
         // `set_suppress`'s replace-wholesale semantics make easy to lose.
         let v = crate::maker_exit::engine_view().expect("published");
-        assert!(v.suppressed_at.contains_key("K"));
-        let first = v.suppressed_at["K"];
+        assert!(v.suppressed_at.contains_key(&("K".to_string(), "ask".to_string())));
+        let key = ("K".to_string(), "ask".to_string());
+        let first = v.suppressed_at[&key];
 
         // A SECOND tick must not re-stamp it: the reader's settle window
         // measures how long the quoter has been OUT of the side, and a stamp
@@ -4400,7 +4429,7 @@ mod maker_exit_seam_tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         eng.maker_exit_tick(&mut quoters);
         let v = crate::maker_exit::engine_view().expect("published");
-        assert_eq!(v.suppressed_at["K"], first, "the install instant must not move");
+        assert_eq!(v.suppressed_at[&key], first, "the install instant must not move");
 
         // ...and withdrawing the request releases it, so the settle clock
         // restarts rather than crediting an exit with a side it gave back.

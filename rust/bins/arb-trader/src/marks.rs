@@ -201,6 +201,19 @@ pub struct Row {
     pub reverse_signal: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maker_exit_ct: Option<Option<f64>>,
+    /// The two single-maker shapes priced separately, so the number above is
+    /// legible as a CHOICE rather than a fact. `rest-kalshi` sells the Kalshi
+    /// YES passively and crosses PM-US; `rest-pmus` bids for the PM-US YES
+    /// passively and crosses Kalshi. `maker_exit_ct` is the better of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maker_exit_ct_rest_kalshi: Option<Option<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maker_exit_ct_rest_pmus: Option<Option<f64>>,
+    /// Which shape `maker_exit_ct` came from: `"rest-kalshi"` or `"rest-pmus"`.
+    /// Absent when neither could be priced, for the same reason the two numbers
+    /// above are: an unpriced row says nothing rather than saying zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maker_exit_shape: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maker_exit_eligible: Option<bool>,
 }
@@ -353,6 +366,17 @@ fn exit_fees_usd(cx: &mut Cx, fees: &FeeSchedule, k_yes: D, p_yes: D, qty: D) ->
 fn maker_exit_fees_usd(cx: &mut Cx, fees: &FeeSchedule, k_yes: D, p_yes: D, qty: D) -> D {
     let k = leg_fee(cx, fees, Venue::Kalshi, Role::Maker, k_yes, qty, "default", None);
     let p = leg_fee(cx, fees, Venue::PolymarketUs, Role::Taker, p_yes, qty, "default", None);
+    cx.add(k, p)
+}
+
+/// The same total for the MIRROR shape: the PM-US bid rests (PM charges makers
+/// nothing) and the Kalshi leg crosses as a TAKER (0.07, four times its maker
+/// coefficient). Gross of fees the two shapes differ by
+/// `kalshi_spread - pmus_spread`; this is the term that tilts the tie, and it
+/// tilts it toward PM-US by `0.0075 * p * (1 - p)`.
+fn mirror_exit_fees_usd(cx: &mut Cx, fees: &FeeSchedule, k_yes: D, p_yes: D, qty: D) -> D {
+    let k = leg_fee(cx, fees, Venue::Kalshi, Role::Taker, k_yes, qty, "default", None);
+    let p = leg_fee(cx, fees, Venue::PolymarketUs, Role::Maker, p_yes, qty, "default", None);
     cx.add(k, p)
 }
 
@@ -581,6 +605,9 @@ pub fn compute_row(
         reverse_edge_c: None,
         reverse_signal: false,
         maker_exit_ct: None,
+        maker_exit_ct_rest_kalshi: None,
+        maker_exit_ct_rest_pmus: None,
+        maker_exit_shape: None,
         maker_exit_eligible: None,
     };
 
@@ -697,32 +724,103 @@ pub fn compute_row(
     // From here on the two fields are PRESENT (as null/false) whatever happens,
     // because the Python sets them on every priced row.
     row.maker_exit_ct = Some(None);
+    row.maker_exit_ct_rest_kalshi = Some(None);
+    row.maker_exit_ct_rest_pmus = Some(None);
     row.maker_exit_eligible = Some(false);
     let (Some(ka), Some(pa)) = (k_ask, p_ask) else { return row };
     if inverted || cx.cmp(qty, zero) == Ordering::Equal {
         return row;
     }
     let tick = cx.parse_exact(TICK);
-    let k_exit_px = cx.sub(ka, tick);
-    let p_close_px = cx.add(pa, tick);
-    // Divergence 2: an out-of-band price is refused, not fed to a fee curve that
-    // has no domain check.
     let one = cx.one;
-    if cx.cmp(k_exit_px, zero) == Ordering::Less || cx.cmp(p_close_px, one) == Ordering::Greater {
-        return row;
-    }
+    let basis = cx.div(cost, qty);
+
+    // ------------------------------------------------ shape A: rest on Kalshi ---
     // Net of BOTH legs' fees (card b83b0449): the Kalshi ask rests as a MAKER
     // (0.0175 coef — Kalshi charges makers, unlike PM) and the PM NO close pays
     // TAKER. That is 1.2-1.9c/ct, so the fee-free version of this number called
     // exits "profitable" at 0.5c/ct that were net losers, and a placer would
     // rest real orders off this flag.
-    let mx_fee_total = maker_exit_fees_usd(cx, fees, k_exit_px, p_close_px, qty);
-    let mx_fees = cx.div(mx_fee_total, qty);
-    let basis = cx.div(cost, qty);
-    let p_no = cx.one_minus(p_close_px);
-    let mut mx = cx.add(k_exit_px, p_no);
-    mx = cx.sub(mx, basis);
-    mx = cx.sub(mx, mx_fees);
+    let k_exit_px = cx.sub(ka, tick);
+    let p_close_px = cx.add(pa, tick);
+    // Divergence 2: an out-of-band price is refused, not fed to a fee curve that
+    // has no domain check.
+    let mx_a = if cx.cmp(k_exit_px, zero) == Ordering::Less
+        || cx.cmp(p_close_px, one) == Ordering::Greater
+    {
+        None
+    } else {
+        let t = maker_exit_fees_usd(cx, fees, k_exit_px, p_close_px, qty);
+        let fee = cx.div(t, qty);
+        let p_no = cx.one_minus(p_close_px);
+        let mut v = cx.add(k_exit_px, p_no);
+        v = cx.sub(v, basis);
+        v = cx.sub(v, fee);
+        Some(v)
+    };
+
+    // ------------------------------------------------- shape B: rest on PM-US ---
+    // THE MIRROR, and the reason it is here: gross of fees the two differ by
+    // exactly `kalshi_spread - pmus_spread`, so pricing only the first one
+    // silently commits every exit to whichever venue happens to be tighter.
+    // On the eleven pairs this engine holds that is the WRONG venue ten times
+    // — Kalshi 1-3c against PM-US 2-9c — and on `KXFRENCHPRES-27-FHOL` shape A
+    // has no profitable price at all while shape B has one four samples in five.
+    //
+    // The bid rests one tick inside the PM-US bid but strictly under its ask
+    // (post-only), and the Kalshi leg is SOLD one tick under its bid, which is
+    // conservative in the same direction A's `p_ask + tick` is.
+    //
+    // A CROSSED BOOK PRICES NOTHING HERE. Shape A never read a bid, so it never
+    // had to ask; shape B sells into the Kalshi bid and rests against the PM-US
+    // one, and a venue quoting an ask at or under its own bid is quoting
+    // garbage — usually a stale side. Refusing is confined to this arm on
+    // purpose, so shape A's number stays bit-identical to what it has always
+    // been.
+    let crossed = match (k_bid, p_bid) {
+        (Some(kb), Some(pb)) => {
+            cx.cmp(ka, kb) != Ordering::Greater || cx.cmp(pa, pb) != Ordering::Greater
+        }
+        _ => true,
+    };
+    let mx_b = match (k_bid, p_bid) {
+        (Some(kb), Some(pb)) if !crossed => {
+            let k_take_px = cx.sub(kb, tick);
+            let inside = cx.add(pb, tick);
+            let under_ask = cx.sub(pa, tick);
+            let p_rest_px =
+                if cx.cmp(inside, under_ask) == Ordering::Less { inside } else { under_ask };
+            if !cx.is_pos(k_take_px)
+                || !cx.is_pos(p_rest_px)
+                || cx.cmp(p_rest_px, one) == Ordering::Greater
+            {
+                None
+            } else {
+                let t = mirror_exit_fees_usd(cx, fees, k_take_px, p_rest_px, qty);
+                let fee = cx.div(t, qty);
+                let p_no = cx.one_minus(p_rest_px);
+                let mut v = cx.add(k_take_px, p_no);
+                v = cx.sub(v, basis);
+                v = cx.sub(v, fee);
+                Some(v)
+            }
+        }
+        _ => None,
+    };
+
+    row.maker_exit_ct_rest_kalshi = Some(mx_a.map(|v| round_to(f(v), 4)));
+    row.maker_exit_ct_rest_pmus = Some(mx_b.map(|v| round_to(f(v), 4)));
+    // THE BETTER SHAPE IS THE NUMBER. Ties go to rest-kalshi, matching
+    // `maker_exit::decide` — the two must agree about which exit they are
+    // talking about, or the selector admits a candidate the placer prices
+    // differently, which is the class of bug #79 and #80 both were.
+    let (mx, shape) = match (mx_a, mx_b) {
+        (Some(a), Some(b)) if cx.cmp(b, a) == Ordering::Greater => (b, "rest-pmus"),
+        (Some(a), _) => (a, "rest-kalshi"),
+        (None, Some(b)) => (b, "rest-pmus"),
+        (None, None) => return row,
+    };
+    row.maker_exit_shape = Some(shape.to_string());
     row.maker_exit_ct = Some(Some(round_to(f(mx), 4)));
     // Eligibility keys on the MAKER exit's own economics (Geoff 2026-07-24: the
     // taker mark held positions whose passive exit already locked profit): the
@@ -1110,13 +1208,26 @@ mod tests {
     }
 
     /// **THE SCHEMA.** The key list, in order, of a row and of `totals` — this
-    /// file's whole contract with three other processes. Compared against the
-    /// keys of a row taken verbatim out of the live `data/exec/marks.json`, so
-    /// a renamed, dropped, added or reordered field fails here rather than in
-    /// the dashboard.
+    /// file's whole contract with its other readers. Compared against the keys
+    /// of a row taken verbatim out of the live `data/exec/marks.json`, so a
+    /// renamed, dropped or reordered field fails here rather than in the
+    /// dashboard.
+    ///
+    /// THREE FIELDS WERE ADDED, DELIBERATELY, and this test is where that is
+    /// recorded. `maker_exit_ct_rest_kalshi`, `maker_exit_ct_rest_pmus` and
+    /// `maker_exit_shape` make `maker_exit_ct` legible as a CHOICE between the
+    /// two single-maker exit shapes rather than a fact about one of them. The
+    /// name of this test used to say "the python writer": that parity is no
+    /// longer the contract, because `mark_positions.py` does not write this
+    /// file any more and is not run at all (no timer invokes it; the armed
+    /// engine writes it in-process through `--marks-out`). The Rust writer is
+    /// the sole writer, additive changes are its to make, and the fixture below
+    /// is now a row of ITS shape. Readers that do not know the new keys ignore
+    /// them; the three that read named fields are unaffected.
     #[test]
-    fn the_schema_matches_the_python_writer_field_for_field() {
-        // Off data/exec/marks.json, 2026-07-31T18:09:16Z.
+    fn the_schema_is_the_row_this_writer_emits_field_for_field() {
+        // Off data/exec/marks.json, 2026-07-31T18:09:16Z, plus the three
+        // shape-contest fields this writer now adds.
         let live = r#"{
         "relationship_id": "xvus-time-poty-26-zohranmamdani","ts": 1784646759.465,
         "title": "Mamdani is TIME Person of the Year 2026","kalshi_ticker": "KXTIME-26-ZOH",
@@ -1126,9 +1237,11 @@ mod tests {
         "converged_pct": -286.788961038961,"forward_hold_apr": 33.2,
         "natural_hold_apr": 7.3,"unwind_apr": -293.0,"unwind_signal": false,
         "unwind_hard": false,"reverse_edge_c": -8.0,"reverse_signal": false,
-        "maker_exit_ct": -0.0793,"maker_exit_eligible": false}"#;
+        "maker_exit_ct": -0.0793,"maker_exit_ct_rest_kalshi": -0.0793,
+        "maker_exit_ct_rest_pmus": -0.0611,"maker_exit_shape": "rest-kalshi",
+        "maker_exit_eligible": false}"#;
         let want = keys_in_order(live, 1);
-        assert_eq!(want.len(), 21, "the live row has 21 fields");
+        assert_eq!(want.len(), 24, "the row has 24 fields: 21 plus the shape contest's 3");
         assert!(v(live).is_object(), "and the literal above is real JSON");
 
         let mut cx = Cx::default();
@@ -1140,14 +1253,16 @@ mod tests {
         let got = keys_in_order(&serde_json::to_string(&row).expect("ser"), 1);
         assert_eq!(got, want, "a priced row's keys, in order");
 
-        // ...and the unpriced row, where the Python sets NEITHER maker_exit
-        // field, so they must be ABSENT rather than null.
+        // ...and the unpriced row, which sets NO maker_exit field at all, so
+        // every one of the five must be ABSENT rather than null. The shape
+        // contest added three of them and they obey the same rule: a row with
+        // no book does not get to claim a shape.
         let dark = compute_row(&mut cx, &fees, &kuleba(), None, None, None, None, now);
         let dark_keys = keys_in_order(&serde_json::to_string(&dark).expect("ser"), 1);
         assert_eq!(
             dark_keys,
-            want[..want.len() - 2].to_vec(),
-            "an unpriced row omits maker_exit_ct and maker_exit_eligible entirely"
+            want[..want.len() - 5].to_vec(),
+            "an unpriced row omits all five maker_exit fields entirely"
         );
 
         let marked = build(&mut cx, &fees, vec![kuleba()], &BookBuilder::new(), now);
@@ -1584,19 +1699,34 @@ mod tests {
         let mut cx = Cx::default();
         let fees = FeeSchedule::new(&mut cx);
         let now = at("2026-07-31", 18, 24, 49);
-        // A Kalshi ask AT zero: one tick inside it is -0.01.
+        // A Kalshi ask AT zero: one tick inside it is -0.01. The ask is also
+        // UNDER the bid, so the book is crossed and the mirror shape — which
+        // would otherwise sell into that bid — refuses on its own guard.
+        // Neither shape prices, so the row is refused by name.
         let (kb, ka, pb, pa) =
             (q(&mut cx, "0.05"), q(&mut cx, "0.00"), q(&mut cx, "0.08"), q(&mut cx, "0.09"));
         let row = compute_row(&mut cx, &fees, &kuleba(), kb, ka, pb, pa, now);
         assert!(row.liq_value_usd.is_some(), "the LIQUIDATION side is still priceable");
         assert_eq!(row.maker_exit_ct, Some(None), "but the maker exit is refused, by name");
+        assert_eq!(row.maker_exit_ct_rest_kalshi, Some(None), "out of band");
+        assert_eq!(row.maker_exit_ct_rest_pmus, Some(None), "crossed book");
         assert_eq!(row.maker_exit_eligible, Some(false));
 
-        // ...and the same at the other end: a PM ask at 1.00 closes at 1.01.
+        // ...and the other end is NOT the same case, which is the point of the
+        // mirror. A PM ask at 1.00 makes shape A close at 1.01 — off the top of
+        // the grid, refused — while shape B does not close there at all: it
+        // RESTS a bid one tick inside 0.08 and sells the Kalshi leg into its
+        // bid. A dear offer is exactly the book a passive buyer wants, and
+        // under the single old shape this row reported nothing at all.
         let pa1 = q(&mut cx, "1.00");
         let ka1 = q(&mut cx, "0.08");
         let row = compute_row(&mut cx, &fees, &kuleba(), kb, ka1, pb, pa1, now);
-        assert_eq!(row.maker_exit_ct, Some(None));
+        assert_eq!(row.maker_exit_ct_rest_kalshi, Some(None), "shape A is still refused");
+        assert!(
+            row.maker_exit_ct_rest_pmus.expect("present").is_some(),
+            "and shape B prices it: {row:?}"
+        );
+        assert_eq!(row.maker_exit_shape.as_deref(), Some("rest-pmus"));
     }
 
     /// A partial unwind reduces the basket rather than dropping it, and scales
