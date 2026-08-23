@@ -1577,11 +1577,14 @@ fn spawn_maker_exit(
         // that is not going to happen.
         maker_exit::arm_standoff();
         eprintln!(
-            "[maker-exit] *** ARMED *** — it will REST a post-only Kalshi ask that flattens \
-             ONE lot of ONE basket at a time, at a price that locks >= {}/ct against a cost \
-             basis taken from {} for BOTH legs, and close the PM-US leg with an IOC re-priced \
-             at fill time. Caps: {} contracts per exit, {} exit resting at once, and a \
-             candidate must hold for {:.0}s across {} scans before anything rests.",
+            "[maker-exit] *** ARMED *** — it will REST a post-only order that flattens ONE lot \
+             of ONE basket at a time, at a price that locks >= {}/ct against a cost basis \
+             taken from {} for BOTH legs, and cross the OTHER leg with an IOC re-priced at \
+             fill time. WHICH LEG RESTS IS DECIDED PER EXIT: both shapes are priced off the \
+             same basis and the better lock wins — a Kalshi ask (crossing PM-US) or a PM-US \
+             bid (crossing Kalshi), whichever venue carries the wider spread. Every log line \
+             names the shape it chose. Caps: {} contracts per exit, {} exit resting at once, \
+             and a candidate must hold for {:.0}s across {} scans before anything rests.",
             maker_exit::MIN_LOCK,
             args.ledger,
             maker_exit::MAX_CLIP,
@@ -1590,14 +1593,18 @@ fn spawn_maker_exit(
             maker_exit::DEBOUNCE_SCANS,
         );
         eprintln!(
-            "[maker-exit] *** IT CAN LEAVE A NAKED LEG. *** Between the Kalshi ask filling and \
-             the PM-US IOC returning we are one-legged, and if that IOC fails we STAY \
-             one-legged with the ledger still calling the basket open. ALARM ON \
-             `maker_exit_unresolved`; it must stay 0. If --positions-recon-act is also armed \
-             the two WILL fight over that leg — it completes a PmShort by buying Kalshi back, \
-             which re-opens what this just exited. ONE naked leg HALTS NEW EXITS while it \
+            "[maker-exit] *** IT CAN LEAVE A NAKED LEG, AND WHICH SIDE DEPENDS ON THE SHAPE. \
+             *** Between the resting order filling and the IOC on the other leg returning we \
+             are one-legged, and if that IOC fails we STAY one-legged with the ledger still \
+             calling the basket open. A `rest-kalshi` exit sells the Kalshi YES and leaves a \
+             PM-US SHORT uncovered; a `rest-pmus` exit buys the PM-US YES back and leaves a \
+             KALSHI LONG uncovered. THOSE ARE OPPOSITE POSITIONS NEEDING OPPOSITE \
+             CORRECTIONS — read the alarm line, which names the one we actually have, rather \
+             than assuming. ALARM ON `maker_exit_unresolved`; it must stay 0. If \
+             --positions-recon-act is also armed the two WILL fight over that leg, in \
+             whichever direction the shape left it. ONE naked leg HALTS NEW EXITS while it \
              lasts — but it no longer waits for you: `maker_exit::heal` runs first on every \
-             60s cycle, re-reads PM-US venue truth, re-sizes to the SHORTFALL (never to the \
+             60s cycle, re-reads THAT VENUE's truth, re-sizes to the SHORTFALL (never to the \
              fill, or an unreadable IOC gets bought twice) and re-prices. It stays \
              profitable-only for 10 cycles and then CROSSES OUT regardless, because at most 5 \
              contracts are ever naked and carrying them to resolution costs more than the \
