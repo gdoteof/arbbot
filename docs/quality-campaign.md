@@ -73,6 +73,37 @@ matters, because the first cut of this fix skipped our price unconditionally and
 took the same tape to 1,212 places by walking `cpc-btc-*-140k:ask` off a
 1,500,238-lot wall it had merely joined. `touch_excl_self` carries that story.
 
+### The gate runs itself, on push
+
+`scripts/hooks/pre-push` runs `scripts/gate.sh` before anything reaches the
+remote, and refuses the push if it does not PASS. Enable it once per clone:
+
+```bash
+git config core.hooksPath scripts/hooks
+```
+
+It is shared across worktrees (the config lives in the common `.git`) and the
+relative path resolves per worktree, so each one gates its own tree.
+
+**Pre-push, not CI and not pre-commit.** Not CI, because stages 5 and 6 replay
+`data/golden/bench-tape-2026-07-28.jsonl` — `data/` is gitignored and
+`data/golden` is 2.1 GB, so the tape exists on this box and nowhere else, and a
+runner could execute only the stages that were never the problem. Not
+pre-commit, because the gate is a release build plus the suite plus two replays;
+paying that per commit teaches everyone to type `--no-verify` by reflex, at
+which point the hook has stopped being a check. Push is the last moment before
+code becomes a PR, and ~26 s warm is not felt there.
+
+**It does not forbid a decision change**, and must not: #82's moved digest was
+correct. It makes you see the change and re-pin deliberately. `git push
+--no-verify` is the escape hatch and using it with a reason is normal.
+
+One inherited footgun it makes more frequent: the gate release-builds into the
+current worktree's `rust/target/`, so pushing from the PRIMARY checkout rebuilds
+the binary `arbbot-trader-m3.service` runs. A running process keeps its inode,
+but the next restart picks up whatever was last built — push from a worktree, or
+rebuild main before restarting.
+
 ### These baselines have gone stale twice, the same way both times
 
 A merged PR changed a decision and did not re-pin. #65 did it (fixed by #70),

@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# Run the central gate before anything reaches the remote.
+#
+# WHY PRE-PUSH AND NOT PRE-COMMIT OR CI.
+#
+#   * Not CI: stages 5 and 6 replay `data/golden/bench-tape-2026-07-28.jsonl`.
+#     `data/` is gitignored and `data/golden` is 2.1 GB, so the tape exists on
+#     this box and nowhere else. A GitHub runner cannot run the only two stages
+#     that can catch a changed decision, which is precisely the check that has
+#     been missed twice.
+#   * Not pre-commit: commits are cheap, local and frequent, and the gate is a
+#     release build plus 1063 tests plus two replays. Paying that per commit
+#     trains people to pass `--no-verify` by reflex, which is how a hook stops
+#     being a check at all.
+#   * Pre-push is the last moment before code becomes a PR somebody merges, and
+#     it is infrequent enough that ~26 s warm is not felt.
+#
+# WHAT IT IS ANSWERING. Twice a merged PR has changed a decision and not
+# re-pinned the digest baselines — #65 (fixed by #70) and #82 (fixed by #88) —
+# leaving the gate red on main for everyone else's changes in between. Both PRs
+# reported a green test count. Neither ran the digests. A test count is not the
+# gate and this is the difference made mechanical.
+#
+# IT DOES NOT SECOND-GUESS A DELIBERATE DECISION CHANGE. A moved digest is
+# sometimes exactly right (#82's adaptive clip was). The hook's job is to make
+# you SEE it and re-pin deliberately, not to forbid it. `git push --no-verify`
+# is the escape hatch and is a normal thing to use with a reason.
+#
+# ONE FOOTGUN, INHERITED. The gate does a release build into the current
+# worktree's `rust/target/`. Pushing from the PRIMARY checkout therefore
+# rebuilds the very binary `arbbot-trader-m3.service` runs. A running process
+# keeps its inode so nothing changes underneath it, but the NEXT restart picks
+# up whatever was last built. Push from a worktree, or rebuild main before
+# restarting.
+set -uo pipefail
+
+# A deletion (`git push origin :branch`) pushes no commits, so there is nothing
+# to gate. The local sha is all zeros in that case.
+zero="0000000000000000000000000000000000000000"
+gate_needed=0
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  [ "$local_sha" = "$zero" ] || gate_needed=1
+done
+if [ "$gate_needed" -eq 0 ]; then
+  exit 0
+fi
+
+root="$(git rev-parse --show-toplevel)"
+gate="$root/scripts/gate.sh"
+if [ ! -x "$gate" ]; then
+  echo "pre-push: $gate is missing or not executable — refusing to push a tree" >&2
+  echo "          whose own gate cannot be run. (--no-verify to override.)" >&2
+  exit 1
+fi
+
+echo "pre-push: running scripts/gate.sh (~26 s warm; --no-verify to skip) ..." >&2
+nice -n 19 bash "$gate"
+rc=$?
+if [ $rc -eq 0 ]; then
+  exit 0
+fi
+
+# 3 is HATCHED: an escape hatch was taken inside the gate, so the digests did
+# not run or did not match. That is not a pass and must not become one here.
+echo >&2
+if [ $rc -eq 3 ]; then
+  echo "pre-push: REFUSED — the gate HATCHED. One or both digest stages did not" >&2
+  echo "          run, so nothing checked whether this changes a decision." >&2
+else
+  echo "pre-push: REFUSED — the gate did not pass." >&2
+fi
+cat >&2 <<'WHY'
+
+If a DIGEST changed, work out which of the two it is before touching anything:
+
+  1. Is it yours? Build a detached worktree at main and replay there.
+       git worktree add --detach /tmp/mainchk $(git rev-parse origin/main)
+       ln -sf $PWD/config/{registry,topics}.yaml /tmp/mainchk/config/
+       (cd /tmp/mainchk && bash scripts/gate.sh)
+     Those two symlinks are load-bearing: both files are gitignored, so a
+     worktree has neither, and an unrelated arb-recorder test fails without
+     them. If main produces YOUR digest, the baseline is stale, the fix is a
+     bisect, and it is not your PR's problem.
+
+  2. If it IS yours and it is INTENDED, re-pin deliberately: say what decision
+     moved and why in the PR body, update BASELINE_SHA / APR_SHA and their
+     counts in scripts/gate.sh, and update the tables in
+     docs/quality-campaign.md. `--out <file>` on both binaries dumps the intent
+     streams so you can show what changed rather than assert it.
+
+  3. If it is NOT intended, that is the gate doing its job.
+
+Overriding: git push --no-verify
+WHY
+exit 1
