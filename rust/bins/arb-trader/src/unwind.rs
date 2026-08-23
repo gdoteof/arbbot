@@ -986,10 +986,16 @@ mod tests {
         assert!(!sel(&firm, 16.0).unwrap().0[0].resolves_estimated);
     }
 
-    /// THE HAND-OFF. A standard basket is long Kalshi YES, so its passive exit
-    /// rests an ASK on the Kalshi market — the side `Quoter::target` already
-    /// returns `None` for when it is suppressed, so the entry quoter cancels out
-    /// and stays out rather than fighting its own unwind for the queue.
+    /// THE HAND-OFF. A standard basket is long Kalshi YES, so ONE of its two
+    /// passive exits rests an ASK on the Kalshi market — the side
+    /// `Quoter::target` already returns `None` for when it is suppressed, so
+    /// the entry quoter cancels out and stays out rather than fighting its own
+    /// unwind for the queue.
+    ///
+    /// It is not the only one. `maker_exit::Shape::RestPmUs` rests a BID on the
+    /// PM-US leg instead and hands off the same way on that venue's bid side;
+    /// which shape wins is a property of the two spreads and is decided per
+    /// exit. What this pins is the Kalshi-side hand-off, which is unchanged.
     ///
     /// AND IT IS NOT UNIQUE PER BASKET (§5): two baskets on one ticker yield
     /// one key, one venue-side ask, and a placer that must aggregate them.

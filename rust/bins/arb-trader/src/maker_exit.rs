@@ -10,13 +10,31 @@
 //!
 //! `unwind_apr` on the france lots is about −111%/yr: crossing the spread to get
 //! out of them is a large realized loss and nothing here will ever do it. This
-//! rests an ASK and only trades if somebody comes to us. Those are different
-//! trades with different signs and the only reason this module can exist is that
-//! they are different.
+//! RESTS and only trades if somebody comes to us. Those are different trades
+//! with different signs and the only reason this module can exist is that they
+//! are different.
+//!
+//! # WHICH LEG RESTS IS A CHOICE, AND IT USED TO BE MADE BY ACCIDENT
+//!
+//! **RETRACTED: "one resting Kalshi ask".** For the whole life of this module
+//! the passive leg was the Kalshi one, always, and the PM-US leg was always
+//! crossed. That was never argued for — it was the first shape written and it
+//! became the only shape. It is wrong on this book more often than it is right.
+//!
+//! An exit assigns each of the two legs a role, so the space is 2x2. Gross of
+//! fees the two single-maker cells differ by exactly
+//! `kalshi_spread - pmus_spread`: you capture the spread on the venue you rest
+//! at and you pay it on the venue you cross. Fees tilt it a further
+//! `0.0075 * p * (1 - p)` toward PM-US, which charges makers NOTHING while
+//! Kalshi charges them 0.0175. **So the rule is "rest where the spread is
+//! wider", and on this book that is overwhelmingly PM-US** — median Kalshi
+//! spread 1-3c against 2-9c on PM-US across the eleven pairs this engine holds.
+//! Resting on Kalshi meant capturing 3c and paying 8c, on every contract, for
+//! as long as this module has existed. [`Shape`] carries the measurement.
 //!
 //! # WHAT THIS DOES, EXACTLY
 //!
-//! One basket, one lot, one resting Kalshi ask, one PM-US close at fill:
+//! One basket, one lot, one resting order, one cross on the other venue:
 //!
 //!   1. `unwind::select` picks candidates against the hurdle in force;
 //!   2. [`Debounce`] holds each one for [`DEBOUNCE_S`] of CONTINUOUS selection
@@ -24,15 +42,26 @@
 //!   3. the basis comes from `data/exec/trades.jsonl` — `naked_act::lot_at` on
 //!      BOTH legs of the ONE record `select` named, addressed by its
 //!      `opened_ts`;
-//!   4. [`exit_limit`] solves for the lowest legal Kalshi ask at which selling
-//!      that lot AND buying its PM-US YES back still locks [`MIN_LOCK`] a
-//!      contract net of both legs' fees;
-//!   5. the entry quoter is asked to yield the Kalshi ask and given
-//!      [`SUPPRESS_SETTLE_S`] to do it;
-//!   6. ONE post-only GTC ask rests, for at most [`MAX_CLIP`] contracts;
-//!   7. on a fill the PM-US leg is closed with an IOC re-priced against the
+//!   4. BOTH shapes are priced off that one basis and the better lock wins
+//!      ([`decide`]). [`exit_limit`] solves for the resting leg when it is the
+//!      Kalshi ask; [`close_limit`] solves for it when it is the PM-US bid.
+//!      They are the same solver run with the other leg pinned, which is why
+//!      the two shapes cannot drift apart;
+//!   5. the entry quoter is asked to yield BOTH sides the winner might need —
+//!      the shape is not known until the books are priced — and given
+//!      [`SUPPRESS_SETTLE_S`] to do it. [`decide`] then checks the one it
+//!      actually picked;
+//!   6. ONE post-only GTC order rests, for at most [`MAX_CLIP`] contracts, on
+//!      whichever venue won;
+//!   7. on a fill the OTHER leg is closed with an IOC re-priced against the
 //!      book AT THAT MOMENT, and one `unwound` record naming that lot's `ts`
 //!      goes in through `ledger::append_basket`.
+//!
+//! Everything below that says "the ask" or "the Kalshi leg" about the RESTING
+//! order is describing [`Shape::RestKalshi`] specifically. The interlocks —
+//! [`MAX_RESTING`], the stand-off, the naked-leg halt — are shape-independent
+//! and unchanged: there is still at most ONE exit outstanding in this process,
+//! of either shape.
 //!
 //! # HOW §5's FIVE PROBLEMS ARE ANSWERED — THREE BY REFUSING TO HAVE THEM
 //!
@@ -353,6 +382,11 @@ pub const SUPPRESS_SETTLE_S: f64 = 30.0;
 /// the venue, not a modelling choice.
 const TICK: &str = "0.01";
 
+/// The wire spellings of the two book sides, which is how [`EngineView::
+/// suppressed_at`] and the suppression request are keyed. See that field.
+const SIDE_ASK: &str = "ask";
+const SIDE_BID: &str = "bid";
+
 /// How stale the engine's published view may be. Three stats ticks.
 ///
 /// FAIL-CLOSED on both "never published" and "too old", for the same reason
@@ -456,9 +490,30 @@ pub struct EngineView {
     /// Absent means the engine holds no book or the side is empty; either way
     /// the close is unpriceable and the exit is refused.
     pub pm_ask: BTreeMap<String, String>,
-    /// Kalshi markets whose ASK the quoters have been told to yield, and the
-    /// instant that was installed. A market absent here has NOT been yielded.
-    pub suppressed_at: BTreeMap<String, Instant>,
+    /// PM-US market -> best YES BID, the price a RESTING close bids against.
+    /// [`Shape::RestPmUs`] needs this the way [`Shape::RestKalshi`] needs
+    /// `pm_ask`: the leg it prices passively is the one it must see both sides
+    /// of, since post-only forbids resting at or through the offer.
+    pub pm_bid: BTreeMap<String, String>,
+    /// Kalshi market -> best YES BID, the price [`Shape::RestPmUs`] sells into
+    /// at fill time. `Shape::RestKalshi` never reads it: that shape gets its
+    /// Kalshi prices from a fresh `market_quote`, because it must also know the
+    /// ladder and the trading status before it may rest there.
+    pub k_bid: BTreeMap<String, String>,
+    /// (market, side) pairs the quoters have been told to yield, and the instant
+    /// that was installed. Absent means NOT yielded. The side is the WIRE
+    /// spelling and not [`arb_core::model::BookSide`], which is deliberately not
+    /// `Ord` (`quoter::cancel_all` sorts by the wire spelling, where
+    /// `"ask" < "bid"`, and a derived `Ord` would reverse it — there is a test
+    /// guarding exactly that). Keying on the spelling keeps this map ordered the
+    /// way the rest of the codebase orders sides, and leaves that guard alone.
+    ///
+    /// THE SIDE IS PART OF THE KEY and was not always. While the only shape
+    /// rested a Kalshi ask, "the market" and "the side to yield" were the same
+    /// fact and the engine hardcoded `BookSide::Ask`. [`Shape::RestPmUs`] rests
+    /// a PM-US BID, and yielding that market's ask would suppress the wrong
+    /// quote while ours collided with the right one.
+    pub suppressed_at: BTreeMap<(String, String), Instant>,
 }
 
 struct Published {
@@ -467,7 +522,7 @@ struct Published {
 }
 
 static VIEW: Mutex<Option<Published>> = Mutex::new(None);
-static SUPPRESS_REQ: Mutex<Option<BTreeSet<String>>> = Mutex::new(None);
+static SUPPRESS_REQ: Mutex<Option<BTreeSet<(String, String)>>> = Mutex::new(None);
 
 /// Publish the engine's view. Called from `Engine::maker_exit_tick` and nowhere
 /// else.
@@ -499,16 +554,16 @@ pub fn engine_view() -> Result<EngineView, String> {
     Ok(p.view.clone())
 }
 
-/// Ask the entry quoters to yield these Kalshi asks. Read by
+/// Ask the entry quoters to yield these (market, side) pairs. Read by
 /// `Engine::maker_exit_tick`.
-pub fn request_suppress(markets: BTreeSet<String>) {
+pub fn request_suppress(markets: BTreeSet<(String, String)>) {
     if let Ok(mut g) = SUPPRESS_REQ.lock() {
         *g = Some(markets);
     }
 }
 
 /// The outstanding suppression request, for the engine.
-pub fn suppress_requests() -> BTreeSet<String> {
+pub fn suppress_requests() -> BTreeSet<(String, String)> {
     SUPPRESS_REQ.lock().ok().and_then(|g| g.clone()).unwrap_or_default()
 }
 
@@ -703,6 +758,87 @@ impl Debounce {
     }
 }
 
+// ---------------------------------------------------------------- the shape ---
+
+/// WHICH LEG RESTS. An exit assigns each of the two legs a role — maker (rest
+/// and wait) or taker (cross and be done) — so the space is 2x2, and this names
+/// the two cells with exactly one resting leg.
+///
+/// # Why the other two cells are not here
+///
+///   * **take/take** is the LIQUIDATION, and it is already priced: it is
+///     `marks`' `liq_value_usd`, `unwind_apr` annualises it, and on this book it
+///     is a large realized loss (the france lots, about -111%/yr). It is not an
+///     exit this module will ever place; the module header's first section is
+///     about precisely that.
+///   * **rest/rest** would capture BOTH spreads and is the most profitable cell
+///     on paper. It is also the only one that is not an exit: it flattens only
+///     if BOTH legs fill, and a one-sided fill is a naked directional position
+///     that nothing cancels. That is a different risk class from anything here
+///     — [`MAX_RESTING`] is 1 for the same reason — so it is priced for the
+///     record by [`quote_shapes`] and never placed.
+///
+/// # Why RestPmUs exists at all, measured rather than assumed
+///
+/// Gross of fees the two single-maker shapes differ by exactly
+/// `kalshi_spread - pmus_spread`: resting captures the spread on the venue you
+/// rest at and crossing pays it on the venue you cross. Fees tilt it a further
+/// 0.0075*p*(1-p) toward PM-US, because PM-US charges makers NOTHING
+/// (`fees.rs`, `Role::Maker => cx.zero()`) while Kalshi charges makers 0.0175.
+/// So the rule is "rest where the spread is wider", and on this book that is
+/// overwhelmingly PM-US.
+///
+/// On the TOB tape for the eleven pairs this engine holds (`data/tob`,
+/// time-matched, forward-filled, dearest lot per pair), median Kalshi spread is
+/// 1-3c against 2-9c on PM-US, and [`Shape::RestPmUs`] wins on ten of eleven.
+/// The two that matter most are the ones the module header calls unexitable:
+///
+/// ```text
+///   KXFRENCHPRES-27-BRET   A eligible 29% of samples -> B 90%   +7.68c/ct
+///   KXFRENCHPRES-27-FHOL   A eligible  0% of samples -> B 81%   +5.41c/ct
+///   KXBTCMAXY-26DEC31-149999.99   A 4% -> B 59%                 +0.49c/ct
+/// ```
+///
+/// FHOL is the case that makes this a correctness fix rather than an
+/// optimisation: under the old single shape there is NO legal Kalshi ask that
+/// exits it at a profit, at any price, ever — `exit_limit` refuses it — while a
+/// PM-US bid at the touch exits it profitably four samples in five.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// Rest a post-only Kalshi ask (sell the YES we hold); on fill, cross the
+    /// PM-US ask to buy the YES back. The original and only shape until now.
+    RestKalshi,
+    /// Rest a post-only PM-US bid (buy back the YES we are short); on fill,
+    /// cross the Kalshi bid to sell the YES we hold.
+    RestPmUs,
+}
+
+impl Shape {
+    /// The fee role each leg pays under this shape. `(kalshi, pmus)`.
+    pub fn roles(self) -> (Role, Role) {
+        match self {
+            Shape::RestKalshi => (Role::Maker, Role::Taker),
+            Shape::RestPmUs => (Role::Taker, Role::Maker),
+        }
+    }
+
+    /// The venue the post-only order rests at.
+    pub fn rest_venue(self) -> Venue {
+        match self {
+            Shape::RestKalshi => Venue::Kalshi,
+            Shape::RestPmUs => Venue::PolymarketUs,
+        }
+    }
+
+    /// Short tag for log lines and the ledger record.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Shape::RestKalshi => "rest-kalshi",
+            Shape::RestPmUs => "rest-pmus",
+        }
+    }
+}
+
 // ---------------------------------------------------------------- the prices ---
 
 /// The lowest legal Kalshi ask at which selling this lot AND buying its PM-US
@@ -740,11 +876,13 @@ pub fn exit_limit(
     pm_basis: D,
     pm_close: D,
     qty: i64,
+    k_role: Role,
+    pm_role: Role,
 ) -> Result<D, String> {
     let lock = cx.parse_exact(MIN_LOCK);
     // What the PM leg gives back, net of the fee to take it.
     let size = cx.from_i64(qty);
-    let pm_fee_total = fees.fee(cx, Venue::PolymarketUs, Role::Taker, pm_close, size, "");
+    let pm_fee_total = fees.fee(cx, Venue::PolymarketUs, pm_role, pm_close, size, "");
     let pm_fee = cx.div(pm_fee_total, size);
     let pm_out = cx.one_minus(pm_close);
     let pm_out = cx.sub(pm_out, pm_fee);
@@ -795,7 +933,7 @@ pub fn exit_limit(
         ));
     };
     for _ in 0..MAX_TICK_WALK {
-        let k_fee_total = fees.fee(cx, Venue::Kalshi, Role::Maker, l, size, "");
+        let k_fee_total = fees.fee(cx, Venue::Kalshi, k_role, l, size, "");
         let k_fee = cx.div(k_fee_total, size);
         let net = cx.sub(l, k_fee);
         if cx.cmp(net, want) != Ordering::Less {
@@ -949,6 +1087,71 @@ fn rest_price(
     Ok(p)
 }
 
+/// The price to actually REST a PM-US BID at: the dearest this lot may bid and
+/// still be a maker. The mirror of [`rest_price`], and every clause is that
+/// function's clause with the inequality turned over.
+///
+/// We are SHORT the PM-US YES and closing it means BUYING the YES back. Buying
+/// passively is a resting bid, so:
+///
+///   * one tick INSIDE the competing bid (`bid + TICK`) puts us in front of the
+///     whole bid queue, exactly as `ask - TICK` fronts the offer queue;
+///   * never AT OR ABOVE the ask — post-only rejects a bid that would cross,
+///     which is [`rest_price`]'s hard floor pointing the other way. Where the
+///     spread is one tick the cap collapses onto the bid and we JOIN it;
+///   * never above `ceiling`, which is [`close_limit`]'s answer and the whole
+///     profit test. Where the ceiling sits BELOW the touch the bid rests under
+///     the market — the honest answer for a lot the book will not sell to us
+///     cheaply enough yet, bounded by [`MAX_RESTING_S`] exactly as the ask is.
+///
+/// PM-US quotes one flat cent ladder (`quantize_down`'s note), so unlike the
+/// Kalshi side there is no tapered rung to be relative to and TICK is the step
+/// everywhere.
+fn rest_price_bid(
+    cx: &mut Cx,
+    ceiling: D,
+    yes_bid: Option<&str>,
+    yes_ask: Option<&str>,
+) -> Result<D, String> {
+    let tick = cx.parse_exact(TICK);
+    let bid = yes_bid.and_then(|b| cx.parse(b));
+    let ask = yes_ask.and_then(|a| cx.parse(a));
+    // One tick in front of the bid queue.
+    let inside = bid.map(|b| cx.add(b, tick));
+    // ...but strictly under the offer, whatever the spread is.
+    let under_ask = ask.and_then(|a| {
+        let d = cx.sub(a, tick);
+        cx.is_pos(d).then_some(d)
+    });
+    let touch = match (inside, under_ask) {
+        (Some(i), Some(u)) => Some(if cx.cmp(i, u) == Ordering::Less { i } else { u }),
+        (x, None) => x,
+        (None, y) => y,
+    };
+    // With no book at all the ceiling stands, exactly as the floor does.
+    let Some(touch) = touch else { return Ok(ceiling) };
+    let p = if cx.cmp(ceiling, touch) == Ordering::Less { ceiling } else { touch };
+    let p = quantize_down(cx, p, tick);
+    if !cx.is_pos(p) {
+        return Err(format!(
+            "the best post-only bid this lot may make is {} — not a price, so this exit has \
+             no passive PM-US price",
+            cx.emit_6dp(p)
+        ));
+    }
+    if let Some(a) = ask {
+        if cx.cmp(p, a) != Ordering::Less {
+            return Err(format!(
+                "the book is offered {} and the best post-only bid the ladder offers is {} — \
+                 not below it, so this exit has no price that is not a take",
+                cx.emit_6dp(a),
+                cx.emit_6dp(p)
+            ));
+        }
+    }
+    Ok(p)
+}
+
 /// The price a PM-US close may pay AT MOST, given what the Kalshi leg actually
 /// sold for. The fill-time re-price (`unwind` §5's fourth bullet).
 ///
@@ -964,6 +1167,7 @@ fn rest_price(
 /// found by walking DOWN from the fee-free bound. A close that cannot be made at
 /// or under this price is REFUSED — and refusing here means staying naked, which
 /// is why the caller alarms rather than shrugs.
+#[allow(clippy::too_many_arguments)]
 pub fn close_limit(
     cx: &mut Cx,
     fees: &FeeSchedule,
@@ -971,10 +1175,12 @@ pub fn close_limit(
     k_basis: D,
     pm_basis: D,
     qty: i64,
+    k_role: Role,
+    pm_role: Role,
 ) -> Result<D, String> {
     let lock = cx.parse_exact(MIN_LOCK);
     let size = cx.from_i64(qty);
-    let k_fee_total = fees.fee(cx, Venue::Kalshi, Role::Maker, k_fill, size, "");
+    let k_fee_total = fees.fee(cx, Venue::Kalshi, k_role, k_fill, size, "");
     let k_fee = cx.div(k_fee_total, size);
     let k_out = cx.sub(k_fill, k_fee);
     // 1 − p − fee(p) >= MIN_LOCK + k_basis + pm_basis − k_out
@@ -1003,7 +1209,7 @@ pub fn close_limit(
                 cx.emit_6dp(k_fill)
             ));
         }
-        let fee_total = fees.fee(cx, Venue::PolymarketUs, Role::Taker, p, size, "");
+        let fee_total = fees.fee(cx, Venue::PolymarketUs, pm_role, p, size, "");
         let fee = cx.div(fee_total, size);
         let all_in = cx.add(p, fee);
         if cx.cmp(all_in, ceiling) != Ordering::Greater {
@@ -1028,9 +1234,16 @@ fn quantize_down(cx: &mut Cx, x: D, tick: D) -> D {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Order {
     pub rel_id: String,
-    /// The Kalshi ticker the ask rests on.
+    /// WHICH LEG RESTS. Everything below that reads "the resting leg" or "the
+    /// close leg" resolves through this and not through the venue names.
+    pub shape: Shape,
+    /// The Kalshi ticker. The leg this engine is LONG, whichever shape is in
+    /// force — the resting ask under [`Shape::RestKalshi`], the fill-time IOC
+    /// sell under [`Shape::RestPmUs`].
     pub market: String,
-    /// The PM-US market whose NO is closed when it fills.
+    /// The PM-US market. The leg this engine is SHORT — crossed at fill under
+    /// [`Shape::RestKalshi`], rested as a post-only bid under
+    /// [`Shape::RestPmUs`].
     pub pm_market: String,
     pub qty: i64,
     /// 4dp, the way the wire wants it.
@@ -1040,10 +1253,108 @@ pub struct Order {
     pub closes_ts: f64,
     pub k_basis: String,
     pub pm_basis: String,
-    /// The PM-US ask the exit was PRICED against. Not the price it will close
-    /// at — that is re-derived at fill time by [`close_limit`] — but the number
-    /// the decision rested on, so the log line and the record both name it.
+    /// The OTHER leg's price the exit was priced against — the PM-US ask under
+    /// [`Shape::RestKalshi`], the Kalshi bid under [`Shape::RestPmUs`]. Not the
+    /// price the close will pay (that is re-derived at fill time), but the
+    /// number the decision rested on, so the log line and the record name it.
     pub pm_ask_at_decision: String,
+    /// What this exit locks per contract at the price it rested at, against
+    /// both legs' ledger basis and net of both legs' fees. The number the shape
+    /// contest was decided on, carried so the log line can show its work.
+    pub lock_ct: String,
+    /// The runner-up shape's lock, when it had one. `None` = the other shape
+    /// could not be priced at all, and the log line says why instead.
+    pub runner_up_ct: Option<String>,
+}
+
+impl Order {
+    /// The market the post-only order rests on.
+    pub fn rest_market(&self) -> &str {
+        match self.shape {
+            Shape::RestKalshi => &self.market,
+            Shape::RestPmUs => &self.pm_market,
+        }
+    }
+
+    /// The market the fill-time IOC crosses.
+    pub fn close_market(&self) -> &str {
+        match self.shape {
+            Shape::RestKalshi => &self.pm_market,
+            Shape::RestPmUs => &self.market,
+        }
+    }
+}
+
+/// The sink the resting order lives at, and the one its fill-time close crosses.
+///
+/// Both venues were always both present in this loop — the ask rested on one and
+/// the IOC crossed the other. All this does is stop the assignment being
+/// hardcoded.
+fn sinks<'a>(
+    shape: Shape,
+    kalshi: &'a std::sync::Arc<dyn crate::sink::OrderSink>,
+    pmus: &'a std::sync::Arc<dyn crate::sink::OrderSink>,
+) -> (&'a std::sync::Arc<dyn crate::sink::OrderSink>, &'a std::sync::Arc<dyn crate::sink::OrderSink>)
+{
+    match shape {
+        Shape::RestKalshi => (kalshi, pmus),
+        Shape::RestPmUs => (pmus, kalshi),
+    }
+}
+
+/// The (market, side) pair a resting order occupies, for the suppression set.
+pub fn rest_key(o: &Order) -> (String, String) {
+    match o.shape {
+        Shape::RestKalshi => (o.market.clone(), SIDE_ASK.to_string()),
+        Shape::RestPmUs => (o.pm_market.clone(), SIDE_BID.to_string()),
+    }
+}
+
+/// BOTH sides a candidate might rest, asked for before the shape is known.
+///
+/// The cycle cannot know which shape wins until it has priced both books, and
+/// it may not price them until the quote it would collide with is already
+/// yielded — so it yields both and lets [`decide`] check the one it picked.
+/// The cost is one extra entry quote suppressed for the settle window on a
+/// market we are about to stop quoting anyway; the alternative is a two-cycle
+/// handshake that re-decides in between, which is the race this avoids.
+pub fn candidate_keys(market_id: &str, pm_market: &str) -> Vec<(String, String)> {
+    vec![
+        (market_id.to_string(), SIDE_ASK.to_string()),
+        (pm_market.to_string(), SIDE_BID.to_string()),
+    ]
+}
+
+/// What one contract of this exit locks, net of both legs' fees, against both
+/// legs' ledger basis. The one arithmetic both shapes are scored on.
+///
+/// ```text
+///   k_px - fee(kalshi, k_role, k_px) + (1 - pm_px) - fee(pmus, pm_role, pm_px)
+///     - k_basis - pm_basis
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn lock_per_ct(
+    cx: &mut Cx,
+    fees: &FeeSchedule,
+    shape: Shape,
+    k_px: D,
+    pm_px: D,
+    k_basis: D,
+    pm_basis: D,
+    qty: i64,
+) -> D {
+    let (k_role, pm_role) = shape.roles();
+    let size = cx.from_i64(qty);
+    let kf = fees.fee(cx, Venue::Kalshi, k_role, k_px, size, "");
+    let kf = cx.div(kf, size);
+    let pf = fees.fee(cx, Venue::PolymarketUs, pm_role, pm_px, size, "");
+    let pf = cx.div(pf, size);
+    let out = cx.sub(k_px, kf);
+    let back = cx.one_minus(pm_px);
+    let back = cx.sub(back, pf);
+    let gross = cx.add(out, back);
+    let paid = cx.add(k_basis, pm_basis);
+    cx.sub(gross, paid)
 }
 
 /// Decide the exit for one debounced candidate. Pure.
@@ -1090,24 +1401,6 @@ pub fn decide(
             cand.market_id
         ))
     })?;
-    match view.suppressed_at.get(&cand.market_id) {
-        None => {
-            return Err(refuse(format!(
-                "the entry quoter has not yet been told to yield {}:ask — asked for it this \
-                 cycle; nothing rests until it has (unwind §5, card ed6a5910)",
-                cand.market_id
-            )))
-        }
-        Some(since) if now.saturating_duration_since(*since).as_secs_f64() < SUPPRESS_SETTLE_S => {
-            return Err(refuse(format!(
-                "{}:ask was yielded {:.0}s ago; giving it {SUPPRESS_SETTLE_S:.0}s to cancel \
-                 before resting against it",
-                cand.market_id,
-                now.saturating_duration_since(*since).as_secs_f64()
-            )))
-        }
-        Some(_) => {}
-    }
     let Some(pm_ask) = view.pm_ask.get(pm_market) else {
         return Err(refuse(format!(
             "no PM-US ask for {pm_market} in the engine's book — the close leg is unpriceable, \
@@ -1161,19 +1454,128 @@ pub fn decide(
     let pm_basis = cx
         .parse(&pm_lot.cost_per_ct)
         .ok_or_else(|| refuse(format!("unparseable PM-US basis {}", pm_lot.cost_per_ct)))?;
-    // ONE TICK THROUGH THE ASK, matching `mark_positions.py`'s `p_ask + 0.01`.
-    // It is not a bound on the self-pricing bias — see the module header — it is
-    // the smallest instalment the grid can express on it.
     let tick = cx.parse_exact(TICK);
-    let pm_close = cx.add(pm_ask_d, tick);
-    let floor = exit_limit(cx, fees, &quote.ladder, k_basis, pm_basis, pm_close, qty)
-        .map_err(refuse)?;
-    let limit =
-        rest_price(cx, &quote.ladder, floor, quote.yes_bid.as_deref(), quote.yes_ask.as_deref())
-            .map_err(refuse)?;
-    let limit = cx.quantize_4dp(limit);
+
+    // ------------------------------------------------------ the shape contest ---
+    // Both cells with one resting leg are priced, on the SAME basis and the same
+    // fee schedule, and the better lock wins. Neither is preferred a priori:
+    // gross of fees they differ by `kalshi_spread - pmus_spread`, so which one
+    // pays is a property of the two books at this instant and not of the code.
+
+    // A: rest a Kalshi ask; cross the PM-US ask one tick through, matching
+    // `mark_positions.py`'s `p_ask + 0.01`.
+    let a = (|cx: &mut Cx| -> Result<(D, D), String> {
+        let pm_close = cx.add(pm_ask_d, tick);
+        let floor = exit_limit(
+            cx, fees, &quote.ladder, k_basis, pm_basis, pm_close, qty, Role::Maker, Role::Taker,
+        )?;
+        let limit =
+            rest_price(cx, &quote.ladder, floor, quote.yes_bid.as_deref(), quote.yes_ask.as_deref())?;
+        let limit = cx.quantize_4dp(limit);
+        let lock = lock_per_ct(cx, fees, Shape::RestKalshi, limit, pm_close, k_basis, pm_basis, qty);
+        Ok((limit, lock))
+    })(cx);
+
+    // B: rest a PM-US bid; cross the Kalshi bid one tick under, which is the
+    // mirror of A's tick and conservative in the same direction — a marketable
+    // sell limit one tick under the bid fills AT the bid or better, so pricing
+    // the decision at `bid - TICK` cannot flatter it.
+    let b = (|cx: &mut Cx| -> Result<(D, D), String> {
+        let Some(k_bid) = quote.yes_bid.as_deref().and_then(|x| cx.parse(x)) else {
+            return Err(format!(
+                "{} has no Kalshi bid — the leg this shape SELLS into is unpriceable",
+                cand.market_id
+            ));
+        };
+        let k_take = cx.sub(k_bid, tick);
+        if !cx.is_pos(k_take) {
+            return Err(format!(
+                "the Kalshi bid is {} — one tick under it is not a price to sell at",
+                cx.emit_6dp(k_bid)
+            ));
+        }
+        let ceiling = close_limit(
+            cx, fees, k_take, k_basis, pm_basis, qty, Role::Taker, Role::Maker,
+        )?;
+        let pm_bid = view.pm_bid.get(pm_market).map(String::as_str);
+        let limit = rest_price_bid(cx, ceiling, pm_bid, Some(pm_ask.as_str()))?;
+        let limit = cx.quantize_4dp(limit);
+        let lock = lock_per_ct(cx, fees, Shape::RestPmUs, k_take, limit, k_basis, pm_basis, qty);
+        Ok((limit, lock))
+    })(cx);
+
+    // A shape that cannot clear MIN_LOCK is not a candidate for the contest,
+    // whatever the other one does. Priced-but-unprofitable and unpriceable are
+    // reported differently because they need different people.
+    let lock_floor = cx.parse_exact(MIN_LOCK);
+    let graded = |cx: &mut Cx, r: &Result<(D, D), String>| -> Result<(D, D), String> {
+        match r {
+            Ok((limit, lock)) if cx.cmp(*lock, lock_floor) != Ordering::Less => Ok((*limit, *lock)),
+            Ok((limit, lock)) => Err(format!(
+                "priced at {} but locks only {}/ct, under the {MIN_LOCK} floor",
+                cx.emit_6dp(*limit),
+                cx.emit_6dp(*lock)
+            )),
+            Err(e) => Err(e.clone()),
+        }
+    };
+    let ga = graded(cx, &a);
+    let gb = graded(cx, &b);
+    let (shape, limit, lock, runner_up) = match (&ga, &gb) {
+        (Err(ea), Err(eb)) => {
+            return Err(refuse(format!(
+                "neither exit shape pays on {}. rest-kalshi: {ea}. rest-pmus: {eb}",
+                cand.rel_id
+            )))
+        }
+        (Ok((l, lk)), Err(_)) => (Shape::RestKalshi, *l, *lk, None),
+        (Err(_), Ok((l, lk))) => (Shape::RestPmUs, *l, *lk, None),
+        (Ok((la, ka)), Ok((lb, kb))) => {
+            // Ties go to RestKalshi: it is the shape with the longer live
+            // record, and a tie is not evidence for changing venue.
+            if cx.cmp(*kb, *ka) == Ordering::Greater {
+                (Shape::RestPmUs, *lb, *kb, Some(*ka))
+            } else {
+                (Shape::RestKalshi, *la, *ka, Some(*kb))
+            }
+        }
+    };
+
+    // THE SUPPRESSION GATE, on the side this shape actually rests. The cycle
+    // asks for BOTH sides before deciding — it cannot know which shape will win
+    // until the books are priced — so whichever wins here has already been
+    // yielded for the same settle window.
+    let rest_key = match shape {
+        Shape::RestKalshi => (cand.market_id.clone(), SIDE_ASK.to_string()),
+        Shape::RestPmUs => (pm_market.to_string(), SIDE_BID.to_string()),
+    };
+    match view.suppressed_at.get(&rest_key) {
+        None => {
+            return Err(refuse(format!(
+                "the entry quoter has not yet been told to yield {}:{} — asked for it this \
+                 cycle; nothing rests until it has (unwind §5, card ed6a5910)",
+                rest_key.0, rest_key.1
+            )))
+        }
+        Some(since) if now.saturating_duration_since(*since).as_secs_f64() < SUPPRESS_SETTLE_S => {
+            return Err(refuse(format!(
+                "{}:{} was yielded {:.0}s ago; giving it {SUPPRESS_SETTLE_S:.0}s to cancel \
+                 before resting against it",
+                rest_key.0,
+                rest_key.1,
+                now.saturating_duration_since(*since).as_secs_f64()
+            )))
+        }
+        Some(_) => {}
+    }
+
+    let against = match shape {
+        Shape::RestKalshi => pm_ask.clone(),
+        Shape::RestPmUs => quote.yes_bid.clone().unwrap_or_default(),
+    };
     Ok(Order {
         rel_id: cand.rel_id.clone(),
+        shape,
         market: cand.market_id.clone(),
         pm_market: pm_market.to_string(),
         qty,
@@ -1181,7 +1583,9 @@ pub fn decide(
         closes_ts: k_lot.open_ts,
         k_basis: k_lot.cost_per_ct,
         pm_basis: pm_lot.cost_per_ct,
-        pm_ask_at_decision: pm_ask.clone(),
+        pm_ask_at_decision: against,
+        lock_ct: cx.emit_6dp(lock),
+        runner_up_ct: runner_up.map(|r| cx.emit_6dp(r)),
     })
 }
 
@@ -1200,6 +1604,10 @@ pub fn decide(
 /// `engine::fill::book_basket` says and for the same reason. The prices are the
 /// ones we actually got.
 pub fn close_record(o: &Order, k_fill: &str, pm_fill: &str, filled: i64, ts: f64) -> Value {
+    let (k_role, pm_role) = match o.shape {
+        Shape::RestKalshi => ("maker", "taker"),
+        Shape::RestPmUs => ("taker", "maker"),
+    };
     serde_json::json!({
         "ts": ts,
         "relationship_id": o.rel_id,
@@ -1212,16 +1620,26 @@ pub fn close_record(o: &Order, k_fill: &str, pm_fill: &str, filled: i64, ts: f64
         "fees_pending": true,
         "maker_exit_k_basis": o.k_basis,
         "maker_exit_pm_basis": o.pm_basis,
-        "note": "opportunistic maker exit: a post-only Kalshi ask rested at the price that \
-                 locked a profit against BOTH legs' ledger basis, and the PM-US NO was closed \
-                 with an IOC re-priced against the book at fill time. Sized to ONE open lot, \
-                 so this closes exactly one record. realized_pnl_usd is absent because the \
-                 venue fees arrive on fill reports this process does not read.",
+        "maker_exit_shape": o.shape.tag(),
+        "maker_exit_lock_ct": o.lock_ct,
+        "note": format!(
+            "opportunistic maker exit ({}): a post-only order rested on {} at the price that \
+             locked a profit against BOTH legs' ledger basis, and the other leg was closed \
+             with an IOC re-priced against the book at fill time. Sized to ONE open lot, so \
+             this closes exactly one record. realized_pnl_usd is absent because the venue \
+             fees arrive on fill reports this process does not read.",
+            o.shape.tag(),
+            o.shape.rest_venue().as_str()
+        ),
+        // THE ROLES ARE THE SHAPE'S, not a fixed property of the venue. Under
+        // `rest-kalshi` the Kalshi leg is the maker and PM-US the taker; under
+        // `rest-pmus` it is the other way round, and a record that said
+        // otherwise would misattribute the fees this file exists to account for.
         "legs": [
             {"venue": "kalshi", "market_id": o.market, "side": "yes", "action": "sell",
-             "role": "maker", "qty": filled, "yes_price": k_fill},
+             "role": k_role, "qty": filled, "yes_price": k_fill},
             {"venue": "polymarket_us", "market_id": o.pm_market, "side": "no", "action": "sell",
-             "role": "taker", "qty": filled, "yes_price": pm_fill},
+             "role": pm_role, "qty": filled, "yes_price": pm_fill},
         ],
     })
 }
@@ -1490,18 +1908,32 @@ pub fn client_order_id() -> String {
 /// One line describing what was decided, used by both the shadow and the armed
 /// path so the two can never drift.
 pub fn describe(o: &Order, shadow: bool, held_s: f64) -> String {
+    let (verb, against) = match o.shape {
+        Shape::RestKalshi => ("REST ASK", "pm ask"),
+        Shape::RestPmUs => ("REST BID", "kalshi bid"),
+    };
+    // The runner-up is shown whenever there was one, because "we chose this
+    // venue" is only meaningful next to what the other one offered. A shape
+    // that could not be priced at all says so in the refusal line instead.
+    let versus = match &o.runner_up_ct {
+        Some(r) => format!(", beating the other shape's {r}/ct"),
+        None => " (the other shape could not be priced)".to_string(),
+    };
     format!(
-        "[maker-exit]{} REST ASK {}x {} @ {} (closes the lot opened at ts {}, kalshi basis \
-         {}/ct + pm basis {}/ct, pm ask {} at decision, locks >= {}/ct; held {:.0}s) — id {}",
+        "[maker-exit]{} {verb} {}x {} @ {} on {} [{}] (closes the lot opened at ts {}, kalshi \
+         basis {}/ct + pm basis {}/ct, {against} {} at decision, locks {}/ct{versus}; held \
+         {:.0}s) — id {}",
         if shadow { " SHADOW —" } else { "" },
         o.qty,
-        o.market,
+        o.rest_market(),
         o.limit,
+        o.shape.rest_venue().as_str(),
+        o.shape.tag(),
         o.closes_ts,
         o.k_basis,
         o.pm_basis,
         o.pm_ask_at_decision,
-        MIN_LOCK,
+        o.lock_ct,
         held_s,
         o.rel_id,
     )
@@ -1572,20 +2004,37 @@ fn park(live: &mut Live, o: &Order, qty: i64, since: Instant, why: &str) -> Stri
 
 pub fn alarm_unresolved(o: &Order, filled: i64, why: &str) -> String {
     UNRESOLVED.fetch_add(1, AtomicOrd::Relaxed);
+    // THE SIDE WE ARE NAKED ON IS THE SHAPE'S, and this is the line a human
+    // reads at 3am. Under `rest-kalshi` the Kalshi YES has been SOLD and the
+    // PM-US short is uncovered; under `rest-pmus` the PM-US short has been
+    // BOUGHT BACK and the Kalshi LONG is uncovered. They are opposite
+    // positions, they need opposite corrections, and a message that named the
+    // wrong one would send the reader to hedge the wrong way round.
+    let (done, exposure, recon) = match o.shape {
+        Shape::RestKalshi => (
+            format!("{filled}x {} SOLD on Kalshi and the PM-US close on {} did NOT complete",
+                    o.market, o.pm_market),
+            format!("short {filled} PM-US YES with nothing against it"),
+            "Do NOT also let --positions-recon-act complete it by BUYING KALSHI BACK — that \
+             re-opens what this just exited",
+        ),
+        Shape::RestPmUs => (
+            format!("{filled}x {} BOUGHT BACK on PM-US and the Kalshi sell on {} did NOT \
+                     complete", o.pm_market, o.market),
+            format!("long {filled} Kalshi YES with nothing against it"),
+            "Do NOT also let --positions-recon-act complete it by SELLING PM-US SHORT again — \
+             that re-opens the leg this just closed",
+        ),
+    };
     format!(
-        "[maker-exit] ### NAKED AFTER EXIT ### {filled}x {} SOLD on Kalshi and the PM-US \
-         close on {} did NOT complete ({why}). We are short {} PM-US YES with nothing against \
-         it, and the ledger still says the basket opened at ts {} is OPEN — so no exposure \
-         fold, no cap and no unwind can see this. `heal` HAS IT: from the next 60s cycle it \
-         re-reads PM-US venue truth, sizes the retry to the shortfall and re-prices, \
-         profitable-only for {HEAL_PROFITABLE_CYCLES} cycles and then crossing out regardless. \
-         NO HAND NEEDED unless it is still saying this in ~15 minutes. (Do NOT also let \
-         --positions-recon-act complete it by BUYING KALSHI BACK — that re-opens what this \
-         just exited; it is profitable-only and has acted 0 times to date, so in practice it \
-         will not.) maker_exit_unresolved is now {}.",
-        o.market,
-        o.pm_market,
-        filled,
+        "[maker-exit] ### NAKED AFTER EXIT ### {done} ({why}). We are {exposure}, and the \
+         ledger still says the basket opened at ts {} is OPEN — so no exposure fold, no cap \
+         and no unwind can see this. `heal` HAS IT: from the next 60s cycle it re-reads that \
+         venue's truth, sizes the retry to the shortfall and re-prices, profitable-only for \
+         {HEAL_PROFITABLE_CYCLES} cycles and then crossing out regardless. NO HAND NEEDED \
+         unless it is still saying this in ~15 minutes. ({recon}; it is profitable-only and \
+         has acted 0 times to date, so in practice it will not.) maker_exit_unresolved is now \
+         {}.",
         o.closes_ts,
         unresolved()
     )
@@ -1659,7 +2108,7 @@ async fn cycle(
             // exit that it can no longer value.
             if live.resting.is_some() {
                 out.push(format!("[maker-exit] engine view unusable ({why}) — pulling the ask"));
-                out.extend(pull(live, kalshi).await);
+                out.extend(pull(live, kalshi, pmus).await);
             }
             request_suppress(BTreeSet::new());
             return out;
@@ -1671,7 +2120,7 @@ async fn cycle(
     // candidate, only more so, and while it is outstanding `Live::target`
     // refuses everything anyway.
     if live.pending.is_some() {
-        out.extend(heal(live, &view, pmus).await);
+        out.extend(heal(live, &view, kalshi, pmus).await);
     }
     // MANAGE NEXT. A resting ask is money already at a venue; a new candidate
     // is not, and `MAX_RESTING` means nothing new can rest until this is done.
@@ -1692,7 +2141,7 @@ async fn cycle(
         Err(why) => {
             out.push(format!("[maker-exit] NO SCAN — cannot decide: {why}"));
             // Keep suppressing whatever is resting; select nothing new.
-            request_suppress(live.resting.iter().map(|r| r.order.market.clone()).collect());
+            request_suppress(live.resting.iter().map(|r| rest_key(&r.order)).collect());
             return out;
         }
     };
@@ -1708,18 +2157,17 @@ async fn cycle(
             // every other decision here takes.
             if let Some(reason) = live.rotate.take() {
                 out.push(format!("[maker-exit] ROTATING — {reason}"));
-                out.extend(pull(live, kalshi).await);
+                out.extend(pull(live, kalshi, pmus).await);
             }
-            request_suppress(live.resting.iter().map(|r| r.order.market.clone()).collect());
+            request_suppress(live.resting.iter().map(|r| rest_key(&r.order)).collect());
             return out;
         }
     };
     // THE ENTRY QUOTE COMES OFF FIRST. Published before the decision, so the
     // first cycle that picks a market ASKS and the next one places — which is
     // exactly what `decide`'s settle guard refuses on, by name.
-    let mut want: BTreeSet<String> = live.resting.iter().map(|r| r.order.market.clone()).collect();
-    want.insert(target.market_id.clone());
-    request_suppress(want);
+    let mut want: BTreeSet<(String, String)> =
+        live.resting.iter().map(|r| rest_key(&r.order)).collect();
     // ...and the backstop is stood off the same market in the same breath,
     // BEFORE any wire call. The window this closes is one cycle wide: the
     // publication at the top of this cycle did not know which candidate would be
@@ -1733,8 +2181,16 @@ async fn cycle(
              close leg to price",
             target.rel_id
         )));
+        // Nothing about this target may rest, but whatever IS resting still
+        // must keep its quote yielded.
+        request_suppress(want);
         return out;
     };
+    // BOTH sides this candidate might rest, published before the decision — the
+    // first cycle that picks a market ASKS and the next one places, which is
+    // what `decide`'s settle guard refuses on by name.
+    want.extend(candidate_keys(&target.market_id, &pm));
+    request_suppress(want);
     let market = target.market_id.clone();
     let k = kalshi.clone();
     let quote = match tokio::task::spawn_blocking(move || k.market_quote(&market)).await {
@@ -1775,7 +2231,7 @@ async fn cycle(
     if live.shadow {
         return out;
     }
-    out.extend(place(live, order, kalshi).await);
+    out.extend(place(live, order, kalshi, pmus).await);
     out
 }
 
@@ -1784,12 +2240,19 @@ async fn place(
     live: &mut Live,
     order: Order,
     kalshi: &std::sync::Arc<dyn crate::sink::OrderSink>,
+    pmus: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> Vec<String> {
     use arb_venue::gateway::{PlaceRequest, Side, Tif};
+    let (rest_sink, _) = sinks(order.shape, kalshi, pmus);
     let coid = client_order_id();
     let req = PlaceRequest {
-        market: order.market.clone(),
-        side: Side::Ask,
+        market: order.rest_market().to_string(),
+        // SELLING the YES we hold, or BIDDING for the YES we are short. Both are
+        // the passive side of the leg they act on.
+        side: match order.shape {
+            Shape::RestKalshi => Side::Ask,
+            Shape::RestPmUs => Side::Bid,
+        },
         price: order.limit.clone(),
         qty: order.qty,
         tif: Tif::Gtc,
@@ -1801,7 +2264,7 @@ async fn place(
         post_only: true,
         client_order_id: coid.clone(),
     };
-    let k = kalshi.clone();
+    let k = rest_sink.clone();
     let r = req.clone();
     match tokio::task::spawn_blocking(move || k.place(&r)).await {
         Ok(Ok(id)) => {
@@ -1812,8 +2275,13 @@ async fn place(
             // the one thing that makes it explicable: the venue's own id.
             crate::engine::fill::note_sidecar_order(&id);
             let line = format!(
-                "[maker-exit] RESTED {}x {} @ {} — venue id {id}, client {coid}",
-                order.qty, order.market, order.limit
+                "[maker-exit] RESTED {}x {} @ {} [{}] locking {}/ct — venue id {id}, client \
+                 {coid}",
+                order.qty,
+                order.rest_market(),
+                order.limit,
+                order.shape.tag(),
+                order.lock_ct
             );
             live.resting = Some(Resting {
                 order,
@@ -1824,10 +2292,17 @@ async fn place(
             vec![line]
         }
         Ok(Err(e)) if e.retry() == arb_venue::error::Retry::MarketHalted => {
+            // PARKED BY THE KALSHI TICKER even when it is PM-US that halted,
+            // because that ticker is the candidate identity `Live::target`
+            // filters on — parking the PM slug would key the park on something
+            // the selector never looks up, and the halted candidate would be
+            // chosen again every cycle. The message names the market that
+            // actually halted, which is not always the same string.
             let d = live.park(&order.market);
             vec![refuse(format!(
-                "[maker-exit] {} is HALTED at the venue ({e}) — parked for {}s. No price, size \
-                 or interval answers a halt; only the venue reopening does.",
+                "[maker-exit] {} is HALTED at the venue ({e}) — parking {} for {}s. No price, \
+                 size or interval answers a halt; only the venue reopening does.",
+                order.rest_market(),
                 order.market,
                 d.as_secs()
             ))]
@@ -1919,8 +2394,16 @@ fn is_vanished(e: &arb_venue::VenueError, age_s: f64) -> bool {
 async fn resolve_vanished(
     live: &mut Live,
     r: &Resting,
-    kalshi: &std::sync::Arc<dyn crate::sink::OrderSink>,
+    rest_sink: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> (Vec<String>, Option<i64>) {
+    // The order that vanished is the RESTING one, so every read here addresses
+    // its venue and its market. The sign convention follows the same rule
+    // `close_shortfall` follows and for the same reason: `net_positions` is a
+    // yes-count, so a Kalshi long is POSITIVE and a PM-US short is NEGATIVE,
+    // and "how many did it transact" is `expected - held` in BOTH cases only
+    // once `held` has been read with the right sign.
+    let rest_venue = r.order.shape.rest_venue();
+    let rest_market = r.order.rest_market().to_string();
     let records = match ledger::read(&live.ledger_path) {
         Ok(recs) => recs,
         Err(e) => {
@@ -1942,15 +2425,15 @@ async fn resolve_vanished(
                 .and_then(|v| v.as_array())
                 .is_some_and(|legs| {
                     legs.iter().any(|l| {
-                        l.get("venue").and_then(|v| v.as_str()) == Some(Venue::Kalshi.as_str())
+                        l.get("venue").and_then(|v| v.as_str()) == Some(rest_venue.as_str())
                             && l.get("market_id").and_then(|v| v.as_str())
-                                == Some(r.order.market.as_str())
+                                == Some(rest_market.as_str())
                     })
                 })
         })
         .map(|(_, qty, _)| *qty)
         .sum();
-    let k = kalshi.clone();
+    let k = rest_sink.clone();
     let net = match tokio::task::spawn_blocking(move || k.net_positions()).await {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => {
@@ -1976,7 +2459,14 @@ async fn resolve_vanished(
             )
         }
     };
-    let held = net.get(&r.order.market).copied().unwrap_or(0.0);
+    let signed = net.get(&rest_market).copied().unwrap_or(0.0);
+    let held = match r.order.shape {
+        Shape::RestKalshi => signed,
+        // A PM-US short YES is a NEGATIVE yes-count; the NO contracts we hold
+        // are its magnitude. A position on the wrong side of zero is none of
+        // ours, so it floors rather than counting backwards.
+        Shape::RestPmUs => (-signed).max(0.0),
+    };
     let sold = (expected as f64 - held).round() as i64;
     if sold <= 0 {
         live.resting = None;
@@ -1986,7 +2476,7 @@ async fn resolve_vanished(
                  and venue truth says it sold nothing — we hold {held} there and the ledger's \
                  open lots account for {expected}. Forgetting the order and freeing the slot; \
                  the candidate is re-decided from a fresh book next cycle.",
-                r.order.market,
+                r.order.rest_market(),
                 r.venue_order_id,
                 r.since.elapsed().as_secs_f64(),
             )],
@@ -2013,7 +2503,8 @@ async fn manage(
     pmus: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> Vec<String> {
     let Some(r) = live.resting.clone() else { return Vec::new() };
-    let k = kalshi.clone();
+    let (rest_sink, close_sink) = sinks(r.order.shape, kalshi, pmus);
+    let k = rest_sink.clone();
     let id = r.venue_order_id.clone();
     let mut out: Vec<String> = Vec::new();
     // Set on the one path where the order is known to be OFF the venue already.
@@ -2029,7 +2520,7 @@ async fn manage(
         // Which of the two things "gone" means is settled against venue truth,
         // never assumed.
         Ok(Err(ref e)) if is_vanished(e, r.since.elapsed().as_secs_f64()) => {
-            let (lines, sold) = resolve_vanished(live, &r, kalshi).await;
+            let (lines, sold) = resolve_vanished(live, &r, rest_sink).await;
             out.extend(lines);
             match sold {
                 // It sold on the way out. Fall through to the ordinary close
@@ -2075,7 +2566,7 @@ async fn manage(
                  closing, so nothing else can trade while the PM-US leg is open",
                 r.order.market, r.order.qty
             ));
-            let (lines, unaddressable) = cancel_at_venue(kalshi, &r).await;
+            let (lines, unaddressable) = cancel_at_venue(rest_sink, &r).await;
             out.extend(lines);
             if let Some(m) = unaddressable {
                 live.unaddressable.insert(m);
@@ -2111,7 +2602,7 @@ async fn manage(
                 "the venue reports MORE filled than the exit ordered",
             ));
         }
-        out.extend(close_leg(live, view, &r, settled.min(r.order.qty), pmus).await);
+        out.extend(close_leg(live, view, &r, settled.min(r.order.qty), close_sink).await);
         return out;
     }
     // Unfilled. Does the floor still sit at or below where we are resting? The
@@ -2122,7 +2613,7 @@ async fn manage(
         Ok(()) => out,
         Err(why) => {
             out.push(format!("[maker-exit] PULLING {} — {why}", r.order.market));
-            out.extend(pull(live, kalshi).await);
+            out.extend(pull(live, kalshi, pmus).await);
             out
         }
     }
@@ -2135,34 +2626,72 @@ async fn manage(
 /// not. `Ok` means the ask is at or above it and a fill would still lock
 /// [`MIN_LOCK`].
 fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> Result<(), String> {
-    let Some(pm_ask) = view.pm_ask.get(&o.pm_market) else {
-        return Err(format!(
-            "the PM-US book for {} has gone dark, so the close leg can no longer be valued",
-            o.pm_market
-        ));
-    };
-    let (Some(pm_ask_d), Some(k_basis), Some(pm_basis), Some(resting)) = (
-        cx.parse(pm_ask),
-        cx.parse(&o.k_basis),
-        cx.parse(&o.pm_basis),
-        cx.parse(&o.limit),
-    ) else {
+    let (Some(k_basis), Some(pm_basis), Some(resting)) =
+        (cx.parse(&o.k_basis), cx.parse(&o.pm_basis), cx.parse(&o.limit))
+    else {
         return Err("a price on the resting exit does not parse".into());
     };
     let tick = cx.parse_exact(TICK);
-    let pm_close = cx.add(pm_ask_d, tick);
-    // A one-rung penny ladder is enough to re-derive the floor: we are only
-    // asking whether the floor has passed the price we are already at, and the
-    // real ladder was used to pick that price.
+    // A one-rung penny ladder is enough to re-derive the bound: we are only
+    // asking whether it has passed the price we are already at, and the real
+    // ladder was used to pick that price.
     let ladder = vec![("0.0000".to_string(), "1.0000".to_string(), "0.0100".to_string())];
-    let floor = exit_limit(cx, fees, &ladder, k_basis, pm_basis, pm_close, o.qty)?;
-    if cx.cmp(resting, floor) == Ordering::Less {
-        return Err(format!(
-            "the PM-US ask has moved to {pm_ask}, which puts the profit floor at {} — above \
-             the {} we are resting at, so a fill here would no longer lock {MIN_LOCK}/ct",
-            cx.emit_6dp(floor),
-            o.limit
-        ));
+    match o.shape {
+        // We are RESTING an ask. The bound is a FLOOR and it rises as the PM-US
+        // ask we would cross gets dearer.
+        Shape::RestKalshi => {
+            let Some(pm_ask) = view.pm_ask.get(&o.pm_market) else {
+                return Err(format!(
+                    "the PM-US book for {} has gone dark, so the close leg can no longer be \
+                     valued",
+                    o.pm_market
+                ));
+            };
+            let Some(pm_ask_d) = cx.parse(pm_ask) else {
+                return Err("a price on the resting exit does not parse".into());
+            };
+            let pm_close = cx.add(pm_ask_d, tick);
+            let floor = exit_limit(
+                cx, fees, &ladder, k_basis, pm_basis, pm_close, o.qty, Role::Maker, Role::Taker,
+            )?;
+            if cx.cmp(resting, floor) == Ordering::Less {
+                return Err(format!(
+                    "the PM-US ask has moved to {pm_ask}, which puts the profit floor at {} — \
+                     above the {} we are resting at, so a fill here would no longer lock \
+                     {MIN_LOCK}/ct",
+                    cx.emit_6dp(floor),
+                    o.limit
+                ));
+            }
+        }
+        // We are RESTING a bid. The bound is a CEILING and it falls as the
+        // Kalshi bid we would sell into gets cheaper — the same test with the
+        // inequality turned over, for the same reason.
+        Shape::RestPmUs => {
+            let Some(k_bid) = view.k_bid.get(&o.market) else {
+                return Err(format!(
+                    "the Kalshi book for {} has gone dark, so the close leg can no longer be \
+                     valued",
+                    o.market
+                ));
+            };
+            let Some(k_bid_d) = cx.parse(k_bid) else {
+                return Err("a price on the resting exit does not parse".into());
+            };
+            let k_take = cx.sub(k_bid_d, tick);
+            let ceiling = close_limit(
+                cx, fees, k_take, k_basis, pm_basis, o.qty, Role::Taker, Role::Maker,
+            )?;
+            if cx.cmp(resting, ceiling) == Ordering::Greater {
+                return Err(format!(
+                    "the Kalshi bid has moved to {k_bid}, which puts the profit ceiling at {} \
+                     — below the {} we are bidding, so a fill here would no longer lock \
+                     {MIN_LOCK}/ct",
+                    cx.emit_6dp(ceiling),
+                    o.limit
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -2182,9 +2711,11 @@ fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> 
 async fn pull(
     live: &mut Live,
     kalshi: &std::sync::Arc<dyn crate::sink::OrderSink>,
+    pmus: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> Vec<String> {
     let Some(r) = live.resting.take() else { return Vec::new() };
-    let (out, unaddressable) = cancel_at_venue(kalshi, &r).await;
+    let (rest_sink, _) = sinks(r.order.shape, kalshi, pmus);
+    let (out, unaddressable) = cancel_at_venue(rest_sink, &r).await;
     if let Some(m) = unaddressable {
         live.unaddressable.insert(m);
     }
@@ -2202,14 +2733,17 @@ async fn pull(
 /// already hold the `&mut Live`, and threading one in would give this function a
 /// reason to touch the state it exists to leave alone.
 async fn cancel_at_venue(
-    kalshi: &std::sync::Arc<dyn crate::sink::OrderSink>,
+    rest_sink: &std::sync::Arc<dyn crate::sink::OrderSink>,
     r: &Resting,
 ) -> (Vec<String>, Option<String>) {
     use arb_venue::gateway::{CancelBy, CancelRequest};
-    let k = kalshi.clone();
+    let k = rest_sink.clone();
     let req = CancelRequest {
         by: CancelBy::VenueId(r.venue_order_id.clone()),
-        market_slug: Some(r.order.market.clone()),
+        // PM-US requires the slug in the cancel body (quirk
+        // `pmus-cancel-requires-market-slug`); Kalshi ignores it. Naming the
+        // RESTING market is right for both.
+        market_slug: Some(r.order.rest_market().to_string()),
     };
     match tokio::task::spawn_blocking(move || k.cancel(&req)).await {
         Ok(Ok(())) => (
@@ -2226,15 +2760,15 @@ async fn cancel_at_venue(
                 "[maker-exit] CANCEL FAILED on {} ({e}) — order {} may still be RESTING. It \
                  carries client id {} and the account-wide sweep will reach it at kill or exit; \
                  nothing else will.",
-                r.order.market, r.venue_order_id, r.client_order_id
+                r.order.rest_market(), r.venue_order_id, r.client_order_id
             )],
-            Some(r.order.market.clone()),
+            Some(r.order.rest_market().to_string()),
         ),
         // The cancel may never have been SENT, which is the same hazard as the
         // arm above wearing a different error: an ask that may still be resting.
         Err(e) => (
             vec![format!("[maker-exit] cancel task failed ({e})")],
-            Some(r.order.market.clone()),
+            Some(r.order.rest_market().to_string()),
         ),
     }
 }
@@ -2263,33 +2797,43 @@ async fn cancel_at_venue(
 async fn heal(
     live: &mut Live,
     view: &EngineView,
+    kalshi: &std::sync::Arc<dyn crate::sink::OrderSink>,
     pmus: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> Vec<String> {
     use arb_venue::gateway::{PlaceRequest, Side, Tif};
     let Some(mut p) = live.pending.take() else { return Vec::new() };
     p.attempts += 1;
     let mut out: Vec<String> = Vec::new();
+    // The leg still open is the one the shape did NOT rest, and every venue
+    // call below addresses it. Naming it once keeps the log lines honest about
+    // which account is naked.
+    let (_, close_sink) = sinks(p.order.shape, kalshi, pmus);
+    let open_leg = p.order.close_market().to_string();
+    let open_venue = match p.order.shape {
+        Shape::RestKalshi => Venue::PolymarketUs,
+        Shape::RestPmUs => Venue::Kalshi,
+    };
 
     // 1. VENUE TRUTH FIRST. Without it there is no honest size for the retry,
     //    and a guess here is the naked-long failure `close_shortfall` exists to
     //    prevent. A read that cannot answer holds the state for the next cycle.
-    let s = pmus.clone();
+    let s = close_sink.clone();
     let net = match tokio::task::spawn_blocking(move || s.net_positions()).await {
         Ok(Ok(m)) => m,
         Ok(Err(e)) => {
             out.push(format!(
-                "[maker-exit] HEAL {} — cannot read PM-US positions ({e}), so there is no \
-                 honest size for the retry. Still naked, still latched; trying again next cycle \
-                 (attempt {}).",
-                p.order.pm_market, p.attempts
+                "[maker-exit] HEAL {open_leg} — cannot read {} positions ({e}), so there is \
+                 no honest size for the retry. Still naked, still latched; trying again next \
+                 cycle (attempt {}).",
+                open_venue.as_str(), p.attempts
             ));
             live.pending = Some(p);
             return out;
         }
         Err(e) => {
             out.push(format!(
-                "[maker-exit] HEAL {} — positions task failed ({e}); retrying next cycle",
-                p.order.pm_market
+                "[maker-exit] HEAL {open_leg} — positions task failed ({e}); retrying next \
+                 cycle"
             ));
             live.pending = Some(p);
             return out;
@@ -2299,19 +2843,14 @@ async fn heal(
         Ok(r) => r,
         Err(e) => {
             out.push(format!(
-                "[maker-exit] HEAL {} — the ledger is unreadable ({e}); nothing may be sized \
-                 off it. Still latched; retrying next cycle.",
-                p.order.pm_market
+                "[maker-exit] HEAL {open_leg} — the ledger is unreadable ({e}); nothing may \
+                 be sized off it. Still latched; retrying next cycle."
             ));
             live.pending = Some(p);
             return out;
         }
     };
-    let owed = close_shortfall(
-        &records,
-        &p,
-        net.get(&p.order.pm_market).copied().unwrap_or(0.0),
-    );
+    let owed = close_shortfall(&records, &p, net.get(&open_leg).copied().unwrap_or(0.0));
 
     // 2. NOTHING OWED IS A SUCCESS, NOT A NO-OP. The close completed — most
     //    likely the IOC whose fill we could not read — so the only thing missing
@@ -2319,9 +2858,9 @@ async fn heal(
     if owed <= 0 {
         let ts = arb_core::clock::now_s();
         out.push(format!(
-            "[maker-exit] HEALED {} — venue truth says the close completed after all ({}x owed, \
-             0 outstanding). Booking the unwind and clearing the latch.",
-            p.order.pm_market, p.filled
+            "[maker-exit] HEALED {open_leg} — venue truth says the close completed after all \
+             ({}x owed, 0 outstanding). Booking the unwind and clearing the latch.",
+            p.filled
         ));
         out.push(book(&live.ledger_path, &p.order, &p.order.limit, &p.order.limit, p.filled, ts));
         HEALED.fetch_add(1, AtomicOrd::Relaxed);
@@ -2334,11 +2873,11 @@ async fn heal(
         Ok(l) => l,
         Err(why) if !forced => {
             out.push(format!(
-                "[maker-exit] HEAL {} — {owed} still owed and the close does not pay yet \
-                 ({why}). Attempt {} of {HEAL_PROFITABLE_CYCLES} profitable-only; after that it \
-                 crosses out regardless, because five naked contracts for months costs more \
-                 than the spread does.",
-                p.order.pm_market, p.attempts
+                "[maker-exit] HEAL {open_leg} — {owed} still owed and the close does not pay \
+                 yet ({why}). Attempt {} of {HEAL_PROFITABLE_CYCLES} profitable-only; after \
+                 that it crosses out regardless, because five naked contracts for months costs \
+                 more than the spread does.",
+                p.attempts
             ));
             live.pending = Some(p);
             return out;
@@ -2347,33 +2886,53 @@ async fn heal(
             // Past the window. Take the book's price: the ask, one tick through,
             // so the IOC actually clears rather than reporting "unfilled" at a
             // limit nothing will meet.
-            let Some(ask) = view.pm_ask.get(&p.order.pm_market) else {
+            // The book we must cross is the OPEN leg's, and the direction is
+            // the shape's: buy PM-US YES back through the ask, or sell the
+            // Kalshi YES through the bid. One tick THROUGH either way, so the
+            // IOC actually clears rather than reporting "unfilled" at a limit
+            // nothing will meet.
+            let touch = match p.order.shape {
+                Shape::RestKalshi => view.pm_ask.get(&open_leg),
+                Shape::RestPmUs => view.k_bid.get(&open_leg),
+            };
+            let Some(touch) = touch else {
                 out.push(format!(
-                    "[maker-exit] HEAL {} — {owed} still owed, past the profitable-only window, \
-                     and the PM-US book has gone DARK ({why}). A close cannot be priced against \
-                     no book at any policy. Still latched; retrying next cycle.",
-                    p.order.pm_market
+                    "[maker-exit] HEAL {open_leg} — {owed} still owed, past the \
+                     profitable-only window, and the {} book has gone DARK ({why}). A close \
+                     cannot be priced against no book at any policy. Still latched; retrying \
+                     next cycle.",
+                    open_venue.as_str()
                 ));
                 live.pending = Some(p);
                 return out;
             };
-            let Some(ask_d) = live.cx.parse(ask) else {
+            let Some(touch_d) = live.cx.parse(touch) else {
                 out.push(format!(
-                    "[maker-exit] HEAL {} — the PM-US ask {ask} does not parse; retrying",
-                    p.order.pm_market
+                    "[maker-exit] HEAL {open_leg} — the touch {touch} does not parse; retrying"
                 ));
                 live.pending = Some(p);
                 return out;
             };
             let tick = live.cx.parse_exact(TICK);
-            let through = live.cx.add(ask_d, tick);
+            let through = match p.order.shape {
+                Shape::RestKalshi => live.cx.add(touch_d, tick),
+                Shape::RestPmUs => live.cx.sub(touch_d, tick),
+            };
+            if !live.cx.is_pos(through) {
+                out.push(format!(
+                    "[maker-exit] HEAL {open_leg} — the touch is {touch} and one tick through \
+                     it is not a price. Still latched; retrying next cycle."
+                ));
+                live.pending = Some(p);
+                return out;
+            }
             let through = live.cx.quantize_4dp(through);
             out.push(format!(
-                "[maker-exit] HEAL {} — CROSSING OUT. {owed} contract(s) still owed after {} \
-                 attempts, and the close has not paid at any of them ({why}). Taking the book at \
-                 {} to be FLAT: this realises a loss, and it is the cheaper side of the trade — \
-                 the alternative is carrying {owed} naked contract(s) to resolution.",
-                p.order.pm_market,
+                "[maker-exit] HEAL {open_leg} — CROSSING OUT. {owed} contract(s) still owed \
+                 after {} attempts, and the close has not paid at any of them ({why}). Taking \
+                 the book at {} to be FLAT: this realises a loss, and it is the cheaper side \
+                 of the trade — the alternative is carrying {owed} naked contract(s) to \
+                 resolution.",
                 p.attempts,
                 through.to_standard_notation_string()
             ));
@@ -2384,31 +2943,33 @@ async fn heal(
     // 4. SEND IT, sized to the shortfall and never to `filled`.
     let coid = client_order_id();
     let req = PlaceRequest {
-        market: p.order.pm_market.clone(),
-        side: Side::Bid,
+        market: open_leg.clone(),
+        side: match p.order.shape {
+            Shape::RestKalshi => Side::Bid,
+            Shape::RestPmUs => Side::Ask,
+        },
         price: limit.clone(),
         qty: owed,
         tif: Tif::Ioc,
         post_only: false,
         client_order_id: coid.clone(),
     };
-    let s = pmus.clone();
+    let s = close_sink.clone();
     let rq = req.clone();
     let oid = match tokio::task::spawn_blocking(move || s.place(&rq)).await {
         Ok(Ok(id)) => id,
         Ok(Err(e)) => {
             out.push(format!(
-                "[maker-exit] HEAL {} — PM-US refused the retry ({e}); {owed} still owed, \
-                 retrying next cycle (attempt {})",
-                p.order.pm_market, p.attempts
+                "[maker-exit] HEAL {open_leg} — {} refused the retry ({e}); {owed} still \
+                 owed, retrying next cycle (attempt {})",
+                open_venue.as_str(), p.attempts
             ));
             live.pending = Some(p);
             return out;
         }
         Err(e) => {
             out.push(format!(
-                "[maker-exit] HEAL {} — retry task failed ({e}); retrying next cycle",
-                p.order.pm_market
+                "[maker-exit] HEAL {open_leg} — retry task failed ({e}); retrying next cycle"
             ));
             live.pending = Some(p);
             return out;
@@ -2422,7 +2983,7 @@ async fn heal(
     //    sixty seconds. That is the difference this whole path buys.
     let mut got = 0i64;
     for i in 0..crate::naked_act::FILL_POLLS {
-        let s = pmus.clone();
+        let s = close_sink.clone();
         let id = oid.clone();
         if let Ok(Ok(n)) = tokio::task::spawn_blocking(move || s.filled_qty(&id)).await {
             got = n;
@@ -2437,9 +2998,9 @@ async fn heal(
     if got >= owed {
         let ts = arb_core::clock::now_s();
         out.push(format!(
-            "[maker-exit] HEALED {} — the retry closed the last {owed} contract(s) at {limit} \
-             after {} attempt(s) and {:.0}s naked. Booking the unwind and clearing the latch.",
-            p.order.pm_market,
+            "[maker-exit] HEALED {open_leg} — the retry closed the last {owed} contract(s) at \
+             {limit} after {} attempt(s) and {:.0}s naked. Booking the unwind and clearing the \
+             latch.",
             p.attempts,
             p.since.elapsed().as_secs_f64()
         ));
@@ -2448,9 +3009,8 @@ async fn heal(
         return out;
     }
     out.push(format!(
-        "[maker-exit] HEAL {} — the retry filled {got} of {owed} at {limit}. Still short; the \
-         next cycle re-measures against the venue and finishes it.",
-        p.order.pm_market
+        "[maker-exit] HEAL {open_leg} — the retry filled {got} of {owed} at {limit}. Still \
+         short; the next cycle re-measures against the venue and finishes it."
     ));
     live.pending = Some(p);
     out
@@ -2466,13 +3026,12 @@ async fn heal(
 /// is sized the same way [`resolve_vanished`] sizes the Kalshi side: against a
 /// shortfall the account can be asked about.
 ///
-/// The arithmetic, where the basket is long PM-US NO (short YES) and long Kalshi
-/// YES, and `net_positions` reports PM-US NO as a NEGATIVE yes-count (`recon`
-/// prints exactly that: `pmus tpoyc-2026-popleo -69`):
+/// The arithmetic, on whichever leg the shape left open — the PM-US NO under
+/// `rest-kalshi`, the Kalshi YES under `rest-pmus`:
 ///
 /// ```text
-///   L = NO contracts the ledger's open lots claim on this PM-US market
-///   V = NO contracts the venue says we actually hold   (= -net)
+///   L = contracts the ledger's open lots claim on the OPEN leg's market
+///   V = contracts the venue says we actually hold on it
 ///   already_bought = L - V     (a completed close shows up here, however it
 ///                               completed, and whether or not we could read it)
 ///   still_owed     = filled - already_bought,  clamped to [0, filled]
@@ -2481,23 +3040,35 @@ async fn heal(
 /// `still_owed == 0` means the close DID complete — the unreadable IOC filled
 /// after all — and the only thing left to do is book it.
 fn close_shortfall(records: &[Value], p: &PendingClose, venue_net: f64) -> i64 {
-    let ledger_no: i64 = crate::naked_act::open_lots(records, &p.order.rel_id)
+    // WHICH LEG IS STILL OPEN is the shape's answer, and the sign of "how many
+    // do we hold" flips with it. `net_positions` reports a yes-count: PM-US NO
+    // comes back NEGATIVE (`recon` prints `pmus tpoyc-2026-popleo -69`), a
+    // Kalshi long YES comes back POSITIVE. Everything else about the
+    // measurement is identical, which is why it is one function.
+    let (venue, market) = match p.order.shape {
+        Shape::RestKalshi => (Venue::PolymarketUs, p.order.pm_market.as_str()),
+        Shape::RestPmUs => (Venue::Kalshi, p.order.market.as_str()),
+    };
+    let ledger_qty: i64 = crate::naked_act::open_lots(records, &p.order.rel_id)
         .iter()
         .filter(|(_, _, rec)| {
             rec.get("legs").and_then(|v| v.as_array()).is_some_and(|legs| {
                 legs.iter().any(|l| {
-                    l.get("venue").and_then(|v| v.as_str()) == Some(Venue::PolymarketUs.as_str())
-                        && l.get("market_id").and_then(|v| v.as_str())
-                            == Some(p.order.pm_market.as_str())
+                    l.get("venue").and_then(|v| v.as_str()) == Some(venue.as_str())
+                        && l.get("market_id").and_then(|v| v.as_str()) == Some(market)
                 })
             })
         })
         .map(|(_, qty, _)| *qty)
         .sum();
-    // A long (positive) net means we are not short this market at all, so there
-    // is nothing of ours left to buy back: `held` floors at zero.
-    let held = (-venue_net).round().max(0.0) as i64;
-    let already = (ledger_no - held).max(0);
+    // A position on the WRONG side of zero means there is nothing of ours left
+    // to close on this market, so `held` floors at zero either way.
+    let signed = match p.order.shape {
+        Shape::RestKalshi => -venue_net,
+        Shape::RestPmUs => venue_net,
+    };
+    let held = signed.round().max(0.0) as i64;
+    let already = (ledger_qty - held).max(0);
     (p.filled - already).clamp(0, p.filled)
 }
 
@@ -2508,28 +3079,61 @@ fn price_close(
     filled: i64,
     view: &EngineView,
 ) -> Result<String, String> {
-    let k_fill = cx.parse(&o.limit).ok_or("the fill price does not parse")?;
+    let fill = cx.parse(&o.limit).ok_or("the fill price does not parse")?;
     let k_basis = cx.parse(&o.k_basis).ok_or("the kalshi basis does not parse")?;
     let pm_basis = cx.parse(&o.pm_basis).ok_or("the pm basis does not parse")?;
-    let limit = close_limit(cx, fees, k_fill, k_basis, pm_basis, filled)?;
-    let ask = view
-        .pm_ask
-        .get(&o.pm_market)
-        .ok_or_else(|| format!("no PM-US ask for {} in the engine's book", o.pm_market))?;
-    let ask_d = cx.parse(ask).ok_or("the pm ask does not parse")?;
-    // A limit BELOW the ask cannot fill, and sending one is how a close reports
-    // "unfilled" for a book that was never going to take it. Say what is true.
-    if cx.cmp(ask_d, limit) == Ordering::Greater {
-        return Err(format!(
-            "the PM-US ask is {ask} and the most this close may pay is {} — the book has \
-             moved against the exit since the ask was rested",
-            cx.emit_6dp(limit)
-        ));
+    match o.shape {
+        // The Kalshi ask filled at `fill`; solve for the dearest PM-US YES we
+        // may buy back and still lock MIN_LOCK.
+        Shape::RestKalshi => {
+            let limit = close_limit(
+                cx, fees, fill, k_basis, pm_basis, filled, Role::Maker, Role::Taker,
+            )?;
+            let ask = view
+                .pm_ask
+                .get(&o.pm_market)
+                .ok_or_else(|| format!("no PM-US ask for {} in the engine's book", o.pm_market))?;
+            let ask_d = cx.parse(ask).ok_or("the pm ask does not parse")?;
+            // A limit BELOW the ask cannot fill, and sending one is how a close
+            // reports "unfilled" for a book that was never going to take it.
+            // Say what is true.
+            if cx.cmp(ask_d, limit) == Ordering::Greater {
+                return Err(format!(
+                    "the PM-US ask is {ask} and the most this close may pay is {} — the book \
+                     has moved against the exit since the bid was rested",
+                    cx.emit_6dp(limit)
+                ));
+            }
+            // The limit, not the ask: we send at or above the touch, so the
+            // worst fill is the limit, and the limit is the price the lock was
+            // solved for.
+            Ok(cx.quantize_4dp(limit).to_standard_notation_string())
+        }
+        // The PM-US bid filled at `fill`; solve for the cheapest Kalshi YES we
+        // may sell at and still lock MIN_LOCK. Mirror image, and `exit_limit`
+        // is the same solver run with the other leg pinned.
+        Shape::RestPmUs => {
+            let ladder = vec![("0.0000".to_string(), "1.0000".to_string(), "0.0100".to_string())];
+            let limit = exit_limit(
+                cx, fees, &ladder, k_basis, pm_basis, fill, filled, Role::Taker, Role::Maker,
+            )?;
+            let bid = view
+                .k_bid
+                .get(&o.market)
+                .ok_or_else(|| format!("no Kalshi bid for {} in the engine's book", o.market))?;
+            let bid_d = cx.parse(bid).ok_or("the kalshi bid does not parse")?;
+            // A sell limit ABOVE the bid cannot fill — the same statement as the
+            // arm above with the inequality turned over.
+            if cx.cmp(limit, bid_d) == Ordering::Greater {
+                return Err(format!(
+                    "the Kalshi bid is {bid} and the least this close may accept is {} — the \
+                     book has moved against the exit since the bid was rested",
+                    cx.emit_6dp(limit)
+                ));
+            }
+            Ok(cx.quantize_4dp(limit).to_standard_notation_string())
+        }
     }
-    // The limit, not the ask: we send at or above the touch, so the worst fill
-    // is the limit, and the limit is the price the lock was solved for.
-    let limit = cx.quantize_4dp(limit);
-    Ok(limit.to_standard_notation_string())
 }
 
 /// The Kalshi ask filled. Close the PM-US leg, re-priced against the book AS IT
@@ -2547,7 +3151,7 @@ async fn close_leg(
     view: &EngineView,
     r: &Resting,
     filled: i64,
-    pmus: &std::sync::Arc<dyn crate::sink::OrderSink>,
+    close_sink: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> Vec<String> {
     use arb_venue::gateway::{PlaceRequest, Side, Tif};
     // The exit is spent either way: the contracts are gone from Kalshi. Forget
@@ -2555,12 +3159,13 @@ async fn close_leg(
     // no later cycle can poll it as if it were still working.
     live.resting = None;
     let mut out = vec![format!(
-        "[maker-exit] FILLED {filled}x {} @ {} after {:.0}s resting — closing the PM-US leg \
+        "[maker-exit] FILLED {filled}x {} @ {} [{}] after {:.0}s resting — crossing to close \
          on {}",
-        r.order.market,
+        r.order.rest_market(),
         r.order.limit,
+        r.order.shape.tag(),
         r.since.elapsed().as_secs_f64(),
-        r.order.pm_market
+        r.order.close_market()
     )];
     let limit = match price_close(&mut live.cx, &live.fees, &r.order, filled, view) {
         Ok(p) => p,
@@ -2571,9 +3176,14 @@ async fn close_leg(
     };
     let coid = client_order_id();
     let req = PlaceRequest {
-        market: r.order.pm_market.clone(),
-        // BUYING the YES back is how a short YES is closed.
-        side: Side::Bid,
+        market: r.order.close_market().to_string(),
+        // BUYING the YES back is how a short YES is closed; SELLING it is how a
+        // long one is. Which leg is left to close is exactly what the shape
+        // says, and it is the opposite of the one that just filled.
+        side: match r.order.shape {
+            Shape::RestKalshi => Side::Bid,
+            Shape::RestPmUs => Side::Ask,
+        },
         price: limit.clone(),
         qty: filled,
         tif: Tif::Ioc,
@@ -2582,12 +3192,12 @@ async fn close_leg(
         post_only: false,
         client_order_id: coid.clone(),
     };
-    let p = pmus.clone();
+    let p = close_sink.clone();
     let rq = req.clone();
     let oid = match tokio::task::spawn_blocking(move || p.place(&rq)).await {
         Ok(Ok(id)) => id,
         Ok(Err(e)) => {
-            out.push(park(live, &r.order, filled, r.since, &format!("PM-US refused the close: {e}")));
+            out.push(park(live, &r.order, filled, r.since, &format!("the close was refused: {e}")));
             return out;
         }
         Err(e) => {
@@ -2601,7 +3211,7 @@ async fn close_leg(
     let mut got = 0i64;
     let mut unreadable: Option<String> = None;
     for i in 0..crate::naked_act::FILL_POLLS {
-        let p = pmus.clone();
+        let p = close_sink.clone();
         let id = oid.clone();
         match tokio::task::spawn_blocking(move || p.filled_qty(&id)).await {
             Ok(Ok(n)) => {
@@ -2723,17 +3333,299 @@ mod tests {
 
     /// A view with the market already yielded long enough to place.
     fn view(pm_ask: &str) -> EngineView {
+        // A ONE-TICK PM-US BOOK BY DEFAULT, so `Shape::RestPmUs` has almost no
+        // spread to capture and pays the Kalshi TAKER fee for the privilege:
+        // shape A wins, and every test written before the shape contest keeps
+        // asserting the exit it was written about. `wide_pm_view` is the
+        // opposite case and the contest is pinned against both.
+        let pm_bid = format!("{:.4}", pm_ask.parse::<f64>().unwrap_or(0.20) - 0.01);
+        view_with(pm_ask, &pm_bid, "0.2000")
+    }
+
+    /// A view whose PM-US book is WIDE — the live shape of `KXFRENCHPRES-27-*`,
+    /// where the mirror shape is worth several cents a contract.
+    fn wide_pm_view(pm_ask: &str, pm_bid: &str, k_bid: &str) -> EngineView {
+        view_with(pm_ask, pm_bid, k_bid)
+    }
+
+    fn view_with(pm_ask: &str, pm_bid: &str, k_bid: &str) -> EngineView {
+        let then = Instant::now() - Duration::from_secs_f64(SUPPRESS_SETTLE_S + 1.0);
         EngineView {
             apr_bar: 16.0,
             global_cap_usd: 500.0,
             pm_ask: [("p-a".to_string(), pm_ask.to_string())].into_iter().collect(),
-            suppressed_at: [(
-                "K-a".to_string(),
-                Instant::now() - Duration::from_secs_f64(SUPPRESS_SETTLE_S + 1.0),
-            )]
+            pm_bid: [("p-a".to_string(), pm_bid.to_string())].into_iter().collect(),
+            k_bid: [("K-a".to_string(), k_bid.to_string())].into_iter().collect(),
+            // BOTH sides yielded, which is what `cycle` publishes: it cannot
+            // know which shape will win until it has priced both books.
+            suppressed_at: [
+                (("K-a".to_string(), SIDE_ASK.to_string()), then),
+                (("p-a".to_string(), SIDE_BID.to_string()), then),
+            ]
             .into_iter()
             .collect(),
         }
+    }
+
+    // ---- the shape contest ------------------------------------------------
+
+    /// THE FIX, AS A TEST. A wide PM-US book and a tight Kalshi one is the live
+    /// shape of `KXFRENCHPRES-27-BRET` (Kalshi 3.1c median, PM-US 8.0c), and
+    /// under the single old shape every exit rested on the TIGHT side: we
+    /// captured 3c and paid 8c, on every contract, for as long as the module
+    /// has existed.
+    ///
+    /// Gross of fees the two shapes differ by exactly
+    /// `kalshi_spread - pmus_spread`, so this must now rest the BID on PM-US.
+    #[tokio::test]
+    async fn a_wide_pm_book_rests_the_bid_on_pmus_rather_than_the_ask_on_kalshi() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 5, "0.78", "0.19")];
+        // Kalshi 0.20/0.22 (2c), PM-US 0.16/0.24 (8c).
+        let q = quote(Some("0.20"), Some("0.22"));
+        let vw = wide_pm_view("0.24", "0.16", "0.20");
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now())
+            .expect("the mirror shape pays");
+        assert_eq!(o.shape, Shape::RestPmUs, "the wider spread is PM-US's");
+        assert_eq!(o.rest_market(), "p-a", "and that is where the order rests");
+        assert_eq!(o.close_market(), "K-a", "the Kalshi leg is what gets crossed");
+        // One tick inside the 0.16 bid, and strictly under the 0.24 ask.
+        assert_eq!(o.limit, "0.1700", "one tick in front of the PM-US bid queue: {o:?}");
+        assert!(
+            o.runner_up_ct.is_some(),
+            "shape A was priced too, and the log line must be able to show it: {o:?}"
+        );
+    }
+
+    /// The regression in the other direction, and the reason `view()` is tight
+    /// by default: where Kalshi carries the wider spread the ORIGINAL shape is
+    /// still right, and nothing about this change may quietly move those exits
+    /// onto the other venue.
+    #[tokio::test]
+    async fn a_wide_kalshi_book_still_rests_the_ask_on_kalshi() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 5, "0.78", "0.19")];
+        // Kalshi 0.16/0.24 (8c), PM-US 0.20/0.22 (2c) — the mirror of the above.
+        let q = quote(Some("0.16"), Some("0.24"));
+        let vw = wide_pm_view("0.22", "0.20", "0.16");
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now())
+            .expect("the original shape pays");
+        assert_eq!(o.shape, Shape::RestKalshi, "the wider spread is Kalshi's");
+        assert_eq!(o.rest_market(), "K-a");
+        assert_eq!(o.limit, "0.2300", "one tick inside the Kalshi offer: {o:?}");
+    }
+
+    /// A TIE GOES TO THE INCUMBENT, and it has to, because `marks::compute_row`
+    /// breaks ties the same way. If the two disagreed the selector would admit a
+    /// candidate on one shape's number and the placer would price the other —
+    /// which is exactly the marker/placer split that #79 and #80 were both about.
+    #[tokio::test]
+    async fn an_exact_tie_goes_to_rest_kalshi_the_way_marks_breaks_it() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 5, "0.78", "0.19")];
+        // Identical spreads on both venues: the fee term is all that is left,
+        // and it favours PM-US — so a TRUE tie needs the books symmetric AND is
+        // still broken by fees. What this pins is that `decide` never prefers
+        // the mirror without a strictly better number.
+        let q = quote(Some("0.19"), Some("0.23"));
+        let vw = wide_pm_view("0.23", "0.19", "0.19");
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now())
+            .expect("something pays");
+        let a: f64 = o.lock_ct.parse().expect("lock parses");
+        let b: f64 = o.runner_up_ct.as_ref().expect("both priced").parse().expect("parses");
+        assert!(a >= b, "the chosen shape is never the worse one: {o:?}");
+    }
+
+    /// Neither shape pays: the refusal names BOTH, because "the book did not
+    /// pay" now has two books in it and an operator reading one reason would be
+    /// reading half the answer.
+    #[tokio::test]
+    async fn a_refusal_names_what_each_shape_would_have_done() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        // A lot whose basis (0.70 Kalshi + 0.70 PM NO) is far above anything a
+        // cheap Kalshi book and a DEAR PM-US offer can return on either shape.
+        let recs = vec![open_basket(1.0, 5, "0.30", "0.70")];
+        let q = quote(Some("0.20"), Some("0.22"));
+        let vw = wide_pm_view("0.90", "0.86", "0.20");
+        let why = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now())
+            .expect_err("nothing pays");
+        assert!(why.contains("rest-kalshi:"), "{why}");
+        assert!(why.contains("rest-pmus:"), "{why}");
+    }
+
+    /// The suppression gate follows the SHAPE. A process that has yielded only
+    /// the Kalshi ask may not rest a PM-US bid against a quote of its own that
+    /// is still live — the collision the handshake exists to prevent, pointing
+    /// at the other venue.
+    #[tokio::test]
+    async fn resting_on_pmus_needs_the_pmus_bid_yielded_not_the_kalshi_ask() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 5, "0.78", "0.19")];
+        let q = quote(Some("0.20"), Some("0.22"));
+        let mut vw = wide_pm_view("0.24", "0.16", "0.20");
+        vw.suppressed_at.remove(&("p-a".to_string(), SIDE_BID.to_string()));
+        let why = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now())
+            .expect_err("the bid side was never yielded");
+        assert!(why.contains("p-a:bid"), "it names the side it needs: {why}");
+    }
+
+    // ---- the bid-side rest price ------------------------------------------
+
+    /// One tick in front of the bid queue, the mirror of `rest_price`'s
+    /// `ask - TICK`.
+    #[test]
+    fn a_resting_bid_fronts_the_bid_queue_when_the_spread_allows_it() {
+        let (mut cx, _f) = ready();
+        let ceiling = cx.parse_exact("0.9000");
+        let p = rest_price_bid(&mut cx, ceiling, Some("0.16"), Some("0.24")).expect("priced");
+        assert_eq!(cx.emit_6dp(p), "0.170000");
+    }
+
+    /// A one-tick book has no room in front, so the bid JOINS the touch rather
+    /// than crossing it — post-only would reject a bid at the offer, which is
+    /// `rest_price`'s hard floor with the inequality turned over.
+    #[test]
+    fn a_one_tick_book_joins_the_bid_rather_than_crossing_the_offer() {
+        let (mut cx, _f) = ready();
+        let ceiling = cx.parse_exact("0.9000");
+        let p = rest_price_bid(&mut cx, ceiling, Some("0.20"), Some("0.21")).expect("priced");
+        assert_eq!(cx.emit_6dp(p), "0.200000", "joined the bid, not lifted the offer");
+    }
+
+    /// The profit ceiling BINDS when it sits under the touch: the bid rests
+    /// below the market and waits, which is the honest answer for a lot the
+    /// book will not sell to us cheaply enough yet.
+    #[test]
+    fn a_ceiling_under_the_touch_rests_the_bid_below_the_market() {
+        let (mut cx, _f) = ready();
+        let ceiling = cx.parse_exact("0.1200");
+        let p = rest_price_bid(&mut cx, ceiling, Some("0.16"), Some("0.24")).expect("priced");
+        assert_eq!(cx.emit_6dp(p), "0.120000", "the ceiling wins, not the touch");
+    }
+
+    // ---- the close leg ----------------------------------------------------
+
+    /// The ledger record's ROLES are the shape's, not a fixed property of the
+    /// venue. Getting this wrong misattributes every fee the record accounts
+    /// for — Kalshi maker is 0.0175 and Kalshi taker is 0.07, four times it.
+    #[test]
+    fn the_booked_roles_follow_the_shape_and_not_the_venue() {
+        let mut o = resting_exit(5).order;
+        o.shape = Shape::RestPmUs;
+        let rec = close_record(&o, "0.20", "0.17", 5, 1.0);
+        let legs = rec["legs"].as_array().expect("legs");
+        assert_eq!(legs[0]["venue"], "kalshi");
+        assert_eq!(legs[0]["role"], "taker", "rest-pmus crosses Kalshi: {rec}");
+        assert_eq!(legs[1]["venue"], "polymarket_us");
+        assert_eq!(legs[1]["role"], "maker", "rest-pmus rests on PM-US: {rec}");
+        assert_eq!(rec["maker_exit_shape"], "rest-pmus");
+
+        let a = close_record(&resting_exit(5).order, "0.20", "0.17", 5, 1.0);
+        assert_eq!(a["legs"][0]["role"], "maker", "and the original shape is unchanged");
+        assert_eq!(a["legs"][1]["role"], "taker");
+    }
+
+    // ---- the naked leg, on whichever venue it is on -----------------------
+
+    /// THE SIGN FLIP, PINNED. `close_shortfall` measures the still-open leg
+    /// against venue truth, and which leg that is — and therefore the sign of
+    /// "how many do we hold" — is the shape's answer. `net_positions` reports a
+    /// yes-count: a PM-US short YES comes back NEGATIVE, a Kalshi long YES
+    /// POSITIVE. Reading one with the other's sign would size every retry at
+    /// zero and clear the latch on a leg that is still naked, which is the
+    /// worst failure this module can have.
+    #[test]
+    fn the_shortfall_reads_the_open_leg_with_that_venues_sign() {
+        let recs = vec![open_basket(1.0, 5, "0.22", "0.19")];
+
+        // rest-kalshi: the Kalshi ask sold, the PM-US SHORT is what is left.
+        // The ledger claims 5 NO; the venue still shows -5 (5 short), so
+        // nothing has been bought back and all 5 are owed.
+        let a = pending_for(5, 0);
+        assert_eq!(close_shortfall(&recs, &a, -5.0), 5, "5 short at the venue, 5 owed");
+        assert_eq!(close_shortfall(&recs, &a, 0.0), 0, "flat at the venue: the close landed");
+        assert_eq!(close_shortfall(&recs, &a, -2.0), 2, "partly bought back");
+
+        // rest-pmus: the PM-US bid filled, the Kalshi LONG is what is left. The
+        // same three states, read with the opposite sign.
+        let mut b = pending_for(5, 0);
+        b.order.shape = Shape::RestPmUs;
+        assert_eq!(close_shortfall(&recs, &b, 5.0), 5, "5 long at the venue, 5 still to sell");
+        assert_eq!(close_shortfall(&recs, &b, 0.0), 0, "flat: the sell landed");
+        assert_eq!(close_shortfall(&recs, &b, 2.0), 2, "partly sold");
+        // ...and the WRONG sign must not read as "flat". This is the assertion
+        // that would have failed had the mirror shape reused the PM arithmetic.
+        assert_eq!(close_shortfall(&recs, &b, -5.0), 0, "a short Kalshi net is not ours to sell");
+    }
+
+    /// The profit test inverts with the shape: resting an ask has a FLOOR that
+    /// rises as the close gets dearer, resting a bid has a CEILING that falls
+    /// as the leg we sell into gets cheaper. Same test, inequality turned over.
+    #[test]
+    fn the_still_pays_bound_inverts_with_the_shape() {
+        let (mut cx, fees) = ready();
+        let mut o = resting_exit(5).order;
+        o.shape = Shape::RestPmUs;
+        // We are bidding 0.25 for the PM-US YES and will sell Kalshi into its
+        // bid. A healthy Kalshi bid leaves the ceiling above our bid.
+        o.limit = "0.2500".into();
+        let mut vw = wide_pm_view("0.30", "0.24", "0.60");
+        assert!(still_pays(&mut cx, &fees, &o, &vw).is_ok(), "the ceiling is above our bid");
+        // The Kalshi bid collapses: there is far less coming back on that leg,
+        // so the most we may pay for the PM YES falls under what we are bidding.
+        vw.k_bid.insert("K-a".to_string(), "0.20".to_string());
+        let why = still_pays(&mut cx, &fees, &o, &vw).expect_err("the ceiling has fallen");
+        assert!(why.contains("ceiling"), "and it says which bound moved: {why}");
+        assert!(why.contains("Kalshi bid"), "{why}");
+    }
+
+    /// The fill-time close crosses the OTHER venue, and under `rest-pmus` that
+    /// is a Kalshi SELL priced off `exit_limit` — the same solver as the entry
+    /// bound, run with the PM leg pinned to what it actually filled at.
+    #[test]
+    fn a_rest_pmus_close_prices_a_kalshi_sell_against_the_kalshi_bid() {
+        let (mut cx, fees) = ready();
+        let mut o = resting_exit(5).order;
+        o.shape = Shape::RestPmUs;
+        o.limit = "0.2500".into();
+        let vw = wide_pm_view("0.30", "0.24", "0.60");
+        let px = price_close(&mut cx, &fees, &o, 5, &vw).expect("priced");
+        let px_f: f64 = px.parse().expect("parses");
+        assert!(px_f <= 0.60, "at or under the bid, or the IOC cannot fill: {px}");
+        assert!(px_f > 0.0, "and a real price: {px}");
+
+        // A bid that has collapsed below what the lot needs is a refusal, not a
+        // sale at any price: that is the abandon `unwind` §5 asks for.
+        let mut dark = wide_pm_view("0.30", "0.24", "0.60");
+        dark.k_bid.insert("K-a".to_string(), "0.02".to_string());
+        let why = price_close(&mut cx, &fees, &o, 5, &dark).expect_err("does not pay");
+        assert!(why.contains("Kalshi bid"), "{why}");
+    }
+
+    /// THE 3AM LINE. The naked alarm must name the side we are ACTUALLY naked
+    /// on, and the two shapes leave opposite positions: `rest-kalshi` sells the
+    /// Kalshi YES and leaves a PM-US SHORT uncovered, `rest-pmus` buys the
+    /// PM-US YES back and leaves a Kalshi LONG uncovered. A message that named
+    /// the wrong one would send a human to hedge the wrong way round.
+    #[test]
+    fn the_naked_alarm_names_the_side_the_shape_actually_left_open() {
+        let a = alarm_unresolved(&resting_exit(5).order, 5, "the close was refused");
+        assert!(a.contains("SOLD on Kalshi"), "{a}");
+        assert!(a.contains("short 5 PM-US YES"), "{a}");
+        assert!(a.contains("BUYING KALSHI BACK"), "{a}");
+
+        let mut o = resting_exit(5).order;
+        o.shape = Shape::RestPmUs;
+        let b = alarm_unresolved(&o, 5, "the close was refused");
+        assert!(b.contains("BOUGHT BACK on PM-US"), "{b}");
+        assert!(b.contains("long 5 Kalshi YES"), "{b}");
+        assert!(b.contains("SELLING PM-US SHORT"), "{b}");
+        assert!(!b.contains("short 5 PM-US YES"), "the opposite claim must not survive: {b}");
     }
 
     // ---- the debounce -----------------------------------------------------
@@ -2838,6 +3730,9 @@ mod tests {
                 k_basis: "0.19".into(),
                 pm_basis: "0.78".into(),
                 pm_ask_at_decision: "0.20".into(),
+                shape: Shape::RestKalshi,
+                lock_ct: "0.0100".into(),
+                runner_up_ct: None,
             },
             venue_order_id: "v1".into(),
             client_order_id: "x1".into(),
@@ -2866,6 +3761,9 @@ mod tests {
                 k_basis: "0.19".into(),
                 pm_basis: "0.78".into(),
                 pm_ask_at_decision: "0.20".into(),
+                shape: Shape::RestKalshi,
+                lock_ct: "0.0100".into(),
+                runner_up_ct: None,
             },
             venue_order_id: "v1".into(),
             client_order_id: "x1".into(),
@@ -2951,7 +3849,7 @@ mod tests {
         let l = penny();
         let px = |cx: &mut Cx, k: &str, p: &str, close: &str| {
             let (kb, pb, pc) = (cx.parse_exact(k), cx.parse_exact(p), cx.parse_exact(close));
-            exit_limit(cx, &fees, &l, kb, pb, pc, 5).map(|d| cx.emit_6dp(d))
+            exit_limit(cx, &fees, &l, kb, pb, pc, 5, Role::Maker, Role::Taker).map(|d| cx.emit_6dp(d))
         };
         let base = px(&mut cx, "0.19", "0.78", "0.21").expect("solvable");
         // A DEARER lot needs a dearer exit.
@@ -3008,7 +3906,7 @@ mod tests {
         let (mut cx, fees) = ready();
         let (kb, pb, pc) =
             (cx.parse_exact("0.30"), cx.parse_exact("0.85"), cx.parse_exact("0.95"));
-        let e = exit_limit(&mut cx, &fees, &penny(), kb, pb, pc, 5)
+        let e = exit_limit(&mut cx, &fees, &penny(), kb, pb, pc, 5, Role::Maker, Role::Taker)
             .expect_err("a $1.15 lot whose PM leg is worth 5c cannot be recovered under $1");
         assert!(e.contains("at or above $1"), "{e}");
         assert!(e.contains("cannot be done"), "{e}");
@@ -3018,7 +3916,7 @@ mod tests {
         // a price but an offer to give the contracts away.
         let (kb, pb, pc) =
             (cx.parse_exact("0.05"), cx.parse_exact("0.10"), cx.parse_exact("0.01"));
-        let l = exit_limit(&mut cx, &fees, &penny(), kb, pb, pc, 5).expect("anything pays");
+        let l = exit_limit(&mut cx, &fees, &penny(), kb, pb, pc, 5, Role::Maker, Role::Taker).expect("anything pays");
         assert_eq!(cx.emit_6dp(l), "0.010000", "a floor of $0.00 is not a placeable ask");
     }
 
@@ -3053,7 +3951,7 @@ mod tests {
             let k_basis = cx.parse_exact(&format!("0.{:04}", 1900 + milli));
             let pm_basis = cx.parse_exact("0.78");
             let pm_close = cx.parse_exact("0.21");
-            let Ok(floor) = exit_limit(&mut cx, &fees, &l, k_basis, pm_basis, pm_close, 5) else {
+            let Ok(floor) = exit_limit(&mut cx, &fees, &l, k_basis, pm_basis, pm_close, 5, Role::Maker, Role::Taker) else {
                 continue;
             };
             let net = |cx: &mut Cx, px: D| {
@@ -3106,7 +4004,7 @@ mod tests {
         let l = penny();
         let (kb, pb, pc) =
             (cx.parse_exact("0.19"), cx.parse_exact("0.78"), cx.parse_exact("0.21"));
-        let limit = exit_limit(&mut cx, &fees, &l, kb, pb, pc, 5).expect("solvable");
+        let limit = exit_limit(&mut cx, &fees, &l, kb, pb, pc, 5, Role::Maker, Role::Taker).expect("solvable");
         let size = cx.from_i64(5);
         let maker = fees.fee(&mut cx, Venue::Kalshi, Role::Maker, limit, size, "");
         let taker = fees.fee(&mut cx, Venue::Kalshi, Role::Taker, limit, size, "");
@@ -3128,12 +4026,12 @@ mod tests {
         let (mut cx, fees) = ready();
         let (kb, pb) = (cx.parse_exact("0.19"), cx.parse_exact("0.78"));
         let good = cx.parse_exact("0.25");
-        let p = close_limit(&mut cx, &fees, good, kb, pb, 5).expect("a 0.25 fill closes");
+        let p = close_limit(&mut cx, &fees, good, kb, pb, 5, Role::Maker, Role::Taker).expect("a 0.25 fill closes");
         let p_s = cx.emit_6dp(p);
 
         // A BETTER Kalshi fill tolerates a DEARER close.
         let better = cx.parse_exact("0.30");
-        let p2 = close_limit(&mut cx, &fees, better, kb, pb, 5).expect("still closes");
+        let p2 = close_limit(&mut cx, &fees, better, kb, pb, 5, Role::Maker, Role::Taker).expect("still closes");
         let p2_s = cx.emit_6dp(p2);
         assert!(p2_s > p_s, "a better fill buys more room: {p2_s} vs {p_s}");
 
@@ -3142,14 +4040,14 @@ mod tests {
         // the close has to be found under 4c. The first draft of this test
         // asserted an error there and was wrong about the arithmetic.
         let thin = cx.parse_exact("0.02");
-        let p = close_limit(&mut cx, &fees, thin, kb, pb, 5).expect("still closes, barely");
+        let p = close_limit(&mut cx, &fees, thin, kb, pb, 5, Role::Maker, Role::Taker).expect("still closes, barely");
         let five = cx.parse_exact("0.05");
         assert!(cx.cmp(p, five) == Ordering::Less, "{}", cx.emit_6dp(p));
 
         // What has NO close is a lot that cost more than a dollar and whose
         // Kalshi leg came back small: no positive PM price leaves the lock.
         let (kb2, pb2) = (cx.parse_exact("0.30"), cx.parse_exact("0.85"));
-        let e = close_limit(&mut cx, &fees, thin, kb2, pb2, 5)
+        let e = close_limit(&mut cx, &fees, thin, kb2, pb2, 5, Role::Maker, Role::Taker)
             .expect_err("$1.15 of basis against a 2c fill closes nothing");
         assert!(e.contains("no PM-US price"), "{e}");
     }
@@ -3251,7 +4149,9 @@ mod tests {
         assert!(e.contains("yield"), "{e}");
 
         let just_now = EngineView {
-            suppressed_at: [("K-a".to_string(), Instant::now())].into_iter().collect(),
+            suppressed_at: [(("K-a".to_string(), SIDE_ASK.to_string()), Instant::now())]
+                .into_iter()
+                .collect(),
             ..view("0.20")
         };
         let e = decide(
@@ -3324,7 +4224,7 @@ mod tests {
             cx.emit_6dp(composite)
         );
         let pm_close = cx.parse_exact("0.06");
-        let composite_floor = exit_limit(&mut cx, &fees, &penny(), kb, pb, pm_close, 4)
+        let composite_floor = exit_limit(&mut cx, &fees, &penny(), kb, pb, pm_close, 4, Role::Maker, Role::Taker)
             .expect("legal, which is exactly why nobody caught it");
         assert_eq!(
             cx.emit_6dp(composite_floor),
@@ -3545,6 +4445,9 @@ mod tests {
             k_basis: "0.190000".into(),
             pm_basis: "0.780000".into(),
             pm_ask_at_decision: "0.20".into(),
+            shape: Shape::RestKalshi,
+            lock_ct: "0.0100".into(),
+            runner_up_ct: None,
         };
         let rec = close_record(&o, "0.2100", "0.2000", 3, 99.0);
         assert_eq!(rec["status"], "unwound");
@@ -3584,6 +4487,9 @@ mod tests {
             k_basis: "0.190000".into(),
             pm_basis: "0.780000".into(),
             pm_ask_at_decision: "0.20".into(),
+            shape: Shape::RestKalshi,
+            lock_ct: "0.0100".into(),
+            runner_up_ct: None,
         };
         let before = unresolved();
         let refused_before = refused();
@@ -3720,6 +4626,9 @@ mod tests {
                 k_basis: "0.190000".into(),
                 pm_basis: "0.780000".into(),
                 pm_ask_at_decision: "0.20".into(),
+                shape: Shape::RestKalshi,
+                lock_ct: "0.0100".into(),
+                runner_up_ct: None,
             },
             venue_order_id: "v1".into(),
             client_order_id: "x1".into(),
@@ -4037,6 +4946,14 @@ mod tests {
 
     // ---- the self-heal ----------------------------------------------------
 
+    /// The sink a `rest-kalshi` heal never reaches: that shape's open leg is the
+    /// PM-US one, so the Kalshi sink is present only to satisfy the signature.
+    /// A `FakeVenue` records every call, so if `heal` ever DID touch it the
+    /// tests asserting `calls()` would say so.
+    fn kalshi_stub() -> std::sync::Arc<dyn crate::sink::OrderSink> {
+        FakeVenue::with_fills(&[0])
+    }
+
     fn pending_for(qty: i64, attempts: u32) -> PendingClose {
         PendingClose {
             order: resting_exit(qty).order,
@@ -4086,7 +5003,7 @@ mod tests {
         let mut live = Live::new(false, path.clone());
         live.pending = Some(pending_for(5, 0));
         let healed_before = healed();
-        let out = heal(&mut live, &view("0.20"), &pm).await.join("\n");
+        let out = heal(&mut live, &view("0.20"), &kalshi_stub(), &pm).await.join("\n");
 
         assert!(live.pending.is_none(), "the latch is cleared: {out}");
         assert_eq!(healed(), healed_before + 1);
@@ -4112,7 +5029,7 @@ mod tests {
 
         let mut live = Live::new(false, ledger_scratch("heal-blind"));
         live.pending = Some(pending_for(5, 0));
-        let out = heal(&mut live, &view("0.20"), &pm).await.join("\n");
+        let out = heal(&mut live, &view("0.20"), &kalshi_stub(), &pm).await.join("\n");
 
         assert!(live.pending.is_some(), "still latched: {out}");
         assert!(out.contains("no honest size"), "{out}");
@@ -4131,7 +5048,7 @@ mod tests {
         let mut live = Live::new(false, path.clone());
         live.pending = Some(pending_for(5, 0));
         // A PM-US ask of 0.60 puts the close far above what the basis allows.
-        let out = heal(&mut live, &view("0.60"), &pm).await.join("\n");
+        let out = heal(&mut live, &view("0.60"), &kalshi_stub(), &pm).await.join("\n");
 
         assert!(live.pending.is_some(), "still owed, still latched: {out}");
         assert!(out.contains("does not pay yet"), "{out}");
@@ -4157,7 +5074,7 @@ mod tests {
         let path = ledger_with_open("heal-cross", 5);
         let mut live = Live::new(false, path.clone());
         live.pending = Some(pending_for(5, HEAL_PROFITABLE_CYCLES));
-        let out = heal(&mut live, &view("0.60"), &pm).await.join("\n");
+        let out = heal(&mut live, &view("0.60"), &kalshi_stub(), &pm).await.join("\n");
 
         assert!(out.contains("CROSSING OUT"), "{out}");
         assert!(out.contains("realises a loss"), "and it says so plainly: {out}");
@@ -4183,7 +5100,7 @@ mod tests {
         let path = ledger_with_open("heal-partial", 5);
         let mut live = Live::new(false, path.clone());
         live.pending = Some(pending_for(5, HEAL_PROFITABLE_CYCLES));
-        let out = heal(&mut live, &view("0.60"), &pm).await.join("\n");
+        let out = heal(&mut live, &view("0.60"), &kalshi_stub(), &pm).await.join("\n");
 
         assert!(out.contains("filled 2 of 5"), "{out}");
         assert!(live.pending.is_some(), "not flat, so not cleared: {out}");
@@ -4215,7 +5132,7 @@ mod tests {
         live.pending = Some(pending_for(5, 0));
         let before = unresolved();
         let out_before = outstanding();
-        heal(&mut live, &view("0.20"), &pm).await;
+        heal(&mut live, &view("0.20"), &kalshi_stub(), &pm).await;
 
         assert_eq!(unresolved(), before, "the incident count is a RATCHET and does not fall");
         assert_eq!(outstanding(), out_before.saturating_sub(1), "but the LATCH clears");
@@ -4438,7 +5355,7 @@ mod tests {
             Some(arb_venue::VenueError::Transport("timed out".into()));
         let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
         let mut live = Live::new(false, "/dev/null".into());
-        let out = place(&mut live, resting_exit(5).order, &k).await.join("\n");
+        let out = place(&mut live, resting_exit(5).order, &k, &kalshi_stub()).await.join("\n");
         assert!(out.contains("PLACE DID NOT COMPLETE"), "{out}");
         assert!(live.resting.is_none(), "nothing addressable means nothing remembered");
         publish_working(live.working_set(None));

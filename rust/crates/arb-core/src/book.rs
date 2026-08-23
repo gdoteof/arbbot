@@ -127,6 +127,26 @@ impl BookBuilder {
             .collect()
     }
 
+    /// The bid side of the same read. A maker exit that RESTS on PM-US prices
+    /// against this; one that crosses PM-US prices against `pm_us_asks`.
+    pub fn pm_us_bids(&self) -> Vec<(String, String)> {
+        self.books
+            .iter()
+            .filter(|((v, _), _)| *v == Venue::PolymarketUs)
+            .filter_map(|((_, m), b)| b.bids.first().map(|l| (m.clone(), l.price.clone())))
+            .collect()
+    }
+
+    /// Kalshi best YES bid per market. The price a maker exit that CROSSES
+    /// Kalshi sells into, the mirror of `pm_us_asks` for the other shape.
+    pub fn kalshi_bids(&self) -> Vec<(String, String)> {
+        self.books
+            .iter()
+            .filter(|((v, _), _)| *v == Venue::Kalshi)
+            .filter_map(|((_, m), b)| b.bids.first().map(|l| (m.clone(), l.price.clone())))
+            .collect()
+    }
+
     pub fn remove(&mut self, venue: Venue, market_id: &str) {
         self.books.remove(&(venue, market_id.to_owned()));
     }
