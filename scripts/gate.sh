@@ -30,29 +30,46 @@
 set -uo pipefail
 PRIMARY=/home/geoff/claude/arbbot
 ROOT="$(git rev-parse --show-toplevel)"
-# Re-pinned 2026-08-14 by the queue-aware `touch_excl_self` fix: a resting quote
-# no longer treats size that JOINED its own level behind it as competition to
-# step over. One decision on this tape moves, and it is the defect itself —
-# KXFRENCHPRES-27-FHOL:bid, resting 0.06, where a 99-lot joiner lands on our
-# level at ts 1785243864.950475. The old rule netted our 5 out, read the
-# remaining 94 as competition and repriced to 0.07, forfeiting the priority it
-# already had; the new one holds. (37ms later a genuinely foreign 1.05 appears
-# at 0.07 — a level we do NOT hold — and it steps over that to 0.08, which is
-# the unchanged rule doing its job.) 31692/182/131 -> 31691/181/130: one place
-# and one cancel fewer, no other line of the intent stream altered.
+# Re-pinned 2026-08-23 for #82's ADAPTIVE CLIP, which moved BOTH stages and
+# re-pinned NEITHER. This is the second time a merged PR has left these stale
+# (#65 was the first, fixed by #70), and for the days between #82 and this every
+# gate run on main was red for somebody else's change.
 #
-# Stage 6 does NOT move (still 38978b34, 31485/15/6): the APR hurdle refuses
-# this quote long before the queue question arises, so its pin below is
-# untouched.
-BASELINE_SHA=b84e60792b258266c3b7546563f3ae6cbd96c088a719934b4f892ccee080081b
-# Re-pinned 2026-08-14 (authorized by Geoff). #65 dated the DECEMBER btc150k
-# rung — a deliberate resolve-dating change, and resolve dates are the APR
-# hold-length input stage 6 exists to exercise — and did not re-pin this.
-# Verified stale rather than flaky before touching it: three binaries (the
-# Jul-31 build the armed unit is running, an unmodified ac4df9b, and PR #69's)
-# replay this tape to the SAME 38978b34 digest and the same 31485/15/6 counts,
-# while stage 5 still matches its baseline byte-for-byte on all three.
-APR_SHA=38978b34171e4ec8b52102d71282014f1c96d5640ad77739e0e5926a614d37c9
+# BISECTED, not guessed. Building each commit's release binary and replaying
+# this tape directly:
+#
+#   a5708ae (#74, where these were last pinned)  b84e6079 31691/181/130  MATCH
+#   9bb01b0 (#78)                                b84e6079 31691/181/130  MATCH
+#   2a4917c (#79)                                b84e6079 31691/181/130  MATCH
+#   9304766 (#80)                                b84e6079 31691/181/130  MATCH
+#   2e5a736 (#81)                                b84e6079 31691/181/130  MATCH
+#   ec1203e (#82)                                214d4e94 31703/187/136  MOVED
+#   1170a2f (#83) .. 10d1314 (#87)               214d4e94 31703/187/136  same
+#
+# THE CHANGE IS #82'S WHOLE PURPOSE, verified in the intent stream rather than
+# inferred from the commit title. `--out` on both binaries, clip size by count:
+#
+#   #81  {5: 181}                    — a flat 5 on every one of the 181 places
+#   #82  {3:2, 5:1, 8:2, 10:2, 12:4, 16:3, 19:1, 20:3, 21:1, 22:1, 23:1, 25:166}
+#
+# which is exactly "`hedge_has_depth` was a binary gate — refuse the side unless
+# the hedge leg's touch holds the flat clip of 5, and rest exactly 5 however
+# deep that touch is" being replaced by a clip sized to that depth. Six more
+# places and six more cancels follow from sides that used to be refused for want
+# of depth for a flat 5.
+#
+# Nothing in #84-#87 moves either stage: the maker exit is off in bench
+# (`maker_exit_view: !bench && ...`), so it cannot reach a replay decision.
+BASELINE_SHA=214d4e94ebc19a4a33fe3af218016d9300313ab46246d7def66d3201a755722d
+# Re-pinned 2026-08-23 by the same #82 bisect as the baseline above: this stage
+# moved with it, 38978b34/31485/15/6 -> 02c9a582/31487/16/7. One extra place and
+# one extra cancel, from the same adaptive clip — the hurdle refuses all but a
+# handful of these quotes either way, which is why the delta here is two intents
+# against stage 5's twelve.
+#
+# (Previously re-pinned 2026-08-14, authorized by Geoff, for #65's dating of the
+# DECEMBER btc150k rung, which that PR also did not re-pin.)
+APR_SHA=02c9a5829910430e77678d73517cc0a5f6e79567a2ac03a84364a1091faa8bea
 fail=0
 skip_digest=0
 allow_change=0
@@ -443,7 +460,7 @@ elif [ "$skip_digest" = 1 ]; then
   suffix=" (DIGESTS SKIPPED)"
 else
 echo "--- 5/6 real-tape digest ---"
-  digest_stage DIGEST "$BASELINE_SHA" "31691 / 181 / 130"
+  digest_stage DIGEST "$BASELINE_SHA" "31703 / 187 / 136"
 
 # --- 6/6 The SAME tape with the maker APR hurdle turned on.
 #
@@ -457,14 +474,14 @@ echo "--- 5/6 real-tape digest ---"
 # This run pins the hurdle explicitly (an explicit --min-apr wins over the risk
 # view, which is how bench pins it at all) with a fixed as-of date, because the
 # hold length is measured from TODAY and an unpinned asof re-digests daily. It
-# cuts 31691 intents to 31485 and 181 places to 15 — i.e. 166 of the 181 maker
+# cuts 31703 intents to 31487 and 187 places to 16 — i.e. 171 of the 187 maker
 # quotes stage 5 blesses are locking capital under 12%/yr, and only this stage
 # can see that. (152 of 182 before #65 dated the btc150k rung: dating a rung
 # changes its hold length, its APR, and therefore which quotes clear the bar.
 # 167 of 182 until the queue-aware `touch_excl_self` fix held one of stage 5's
 # places instead of repricing it; the 15 that clear the bar are unaffected.)
 echo "--- 6/6 real-tape digest, APR hurdle on ---"
-  digest_stage "APR-DIGEST" "$APR_SHA" "31485 / 15 / 6" --min-apr 12 --apr-asof 2026-07-28
+  digest_stage "APR-DIGEST" "$APR_SHA" "31487 / 16 / 7" --min-apr 12 --apr-asof 2026-07-28
 fi
 
 # A hatched run says HATCHED, not PASS, and exits 3. Both halves matter, and the

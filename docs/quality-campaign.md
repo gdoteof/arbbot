@@ -57,10 +57,10 @@ The `sha256` field of that summary line MUST equal the baseline:
 
 | field | baseline | where it came from |
 |---|---|---|
-| `sha256` | `b84e60792b258266c3b7546563f3ae6cbd96c088a719934b4f892ccee080081b` | re-pinned 2026-08-14 by the queue-aware `touch_excl_self` fix (was `f4141b53…`: main @ b900470, re-measured 2026-07-29 @ 70952c0) |
-| `intents` | 31691 | same |
-| `would_place` | 181 | same |
-| `would_cancel` | 130 | same |
+| `sha256` | `214d4e94ebc19a4a33fe3af218016d9300313ab46246d7def66d3201a755722d` | re-pinned 2026-08-23 for #82's adaptive clip (was `b84e6079…`, re-pinned 2026-08-14 by `touch_excl_self`; before that `f4141b53…`) |
+| `intents` | 31703 | same |
+| `would_place` | 187 | same |
+| `would_cancel` | 136 | same |
 | `book_events` | 675950 | property of the tape; identical in both gates |
 | wall time | ~4 s | 2026-07-29, production box, `nice -n 19` |
 
@@ -72,6 +72,26 @@ joiner behind it. Nothing else in the intent stream differs — and the directio
 matters, because the first cut of this fix skipped our price unconditionally and
 took the same tape to 1,212 places by walking `cpc-btc-*-140k:ask` off a
 1,500,238-lot wall it had merely joined. `touch_excl_self` carries that story.
+
+### These baselines have gone stale twice, the same way both times
+
+A merged PR changed a decision and did not re-pin. #65 did it (fixed by #70),
+and #82 did it again — its ADAPTIVE CLIP replaced a flat clip of 5 with one
+sized to the hedge leg's depth, which is precisely a decision change, and both
+stages moved with it. Until 2026-08-23 nobody re-pinned, so every gate run on
+main in between was red for somebody else's change. The failure mode is not
+subtle and it is not the author's carelessness alone: **a red gate that is red
+for a reason unrelated to your diff trains everyone to read past it**, which is
+the only way this gate can actually fail.
+
+If you are staring at a changed digest, before touching anything below: build a
+DETACHED worktree at main and replay there. `git worktree add --detach <dir>
+<sha>` (main itself cannot be checked out twice), and symlink `config/
+registry.yaml` and `config/topics.yaml` in — they are gitignored, so a worktree
+has neither and `arb-recorder`'s `live_registry_carries_the_france_pmus_legs`
+fails without them for reasons that have nothing to do with you. If main
+produces your digest, the baseline is stale and the fix is a bisect, not a
+change to your PR.
 
 `sha256` is a rolling hash of every intent line the engine emits, in order. It
 is not a checksum of the summary: two runs that place the same orders at the
@@ -86,10 +106,10 @@ when a refactor changes what the engine decides rather than whether it crashes.
 
 | field | baseline | where it came from |
 |---|---|---|
-| `sha256` | `2d330021a685bdeb1c385cccd93d6f2fec201eb0bbcdc973d45e607126a8a214` | recorded during #22; reproduced 2026-07-29 @ 70952c0 before pinning |
-| `intents` | 31500 | same |
-| `would_place` | 30 | same |
-| `would_cancel` | 19 | recorded by #22; reproduced 2026-07-29 @ 70952c0 |
+| `sha256` | `02c9a5829910430e77678d73517cc0a5f6e79567a2ac03a84364a1091faa8bea` | re-pinned 2026-08-23 for #82's adaptive clip (was `38978b34…`, re-pinned 2026-08-14 for #65; before that `2d330021…` from #22) |
+| `intents` | 31487 | same |
+| `would_place` | 16 | same |
+| `would_cancel` | 7 | same |
 | `book_events` | 675950 | property of the tape; identical in both gates |
 
 Gate 5 runs with no `--min-apr`, and in bench there is no risk view for the bar
@@ -100,12 +120,12 @@ ask one — are never entered at all. The entire APR
 path is unreached for the whole of gate 5, and a PR that mis-sizes the bar,
 breaks `resolve::years_to` or deletes the hurdle comparison outright leaves gate
 5 byte-identical. Gate 6 is the only stage that can see it. The cost of the
-difference is worth reading: 152 of the 182 maker quotes gate 5 blesses are
+difference is worth reading: 171 of the 187 maker quotes gate 5 blesses are
 locking capital under 12%/yr.
 
 `--apr-asof` is pinned because the hold length is measured from TODAY, so an
 unpinned as-of re-digests daily. Measured 2026-07-29, `--apr-asof 2026-07-28` and
-`2026-07-29` produce the identical `2d330021…` with the same 31500 / 30 / 19 —
+`2026-07-29` produced the identical digest of the day with the same counts —
 but **not because the margins are unchanged, and reading it that way is a trap.**
 
 `resolve::years_to` is `days.max(1) as f64 / 365.25`, so one day moves `yrs` for
