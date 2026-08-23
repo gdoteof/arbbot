@@ -2412,7 +2412,7 @@ async fn resolve_vanished(
                     "[maker-exit] {} has vanished from the venue (404) but the ledger is \
                      unreadable ({e}), so what we SHOULD hold there cannot be established — \
                      holding the slot rather than assuming it never filled",
-                    r.order.market
+                    r.order.rest_market()
                 )],
                 None,
             )
@@ -2443,7 +2443,7 @@ async fn resolve_vanished(
                      that would say whether it sold first also failed ({e}) — holding the slot. \
                      This is the one case that still stalls the recycler, and it stalls it \
                      SAFELY: no fill is being assumed away.",
-                    r.order.market
+                    r.order.rest_market()
                 )],
                 None,
             )
@@ -2453,7 +2453,7 @@ async fn resolve_vanished(
                 vec![format!(
                     "[maker-exit] {} has vanished (404) and the positions task failed ({e}) — \
                      holding the slot",
-                    r.order.market
+                    r.order.rest_market()
                 )],
                 None,
             )
@@ -2486,10 +2486,19 @@ async fn resolve_vanished(
     let sold = sold.min(r.order.qty);
     (
         vec![format!(
-            "[maker-exit] {} has vanished from the venue (404) and venue truth says it SOLD \
-             first: we hold {held} on Kalshi against {expected} open in the ledger, a shortfall \
-             of {sold}. Closing the PM-US leg for that many now.",
-            r.order.market
+            "[maker-exit] {} has vanished from the venue (404) and venue truth says it {} \
+             first: we hold {held} there against {expected} open in the ledger, a shortfall \
+             of {sold}. Crossing the other leg on {} for that many now.",
+            r.order.rest_market(),
+            // A resting ASK that goes means contracts SOLD; a resting BID that
+            // goes means contracts BOUGHT. Same shortfall arithmetic, opposite
+            // trade, and a reader reconciling this against the venue needs the
+            // right verb.
+            match r.order.shape {
+                Shape::RestKalshi => "SOLD",
+                Shape::RestPmUs => "BOUGHT",
+            },
+            r.order.close_market()
         )],
         Some(sold),
     )
@@ -2542,7 +2551,7 @@ async fn manage(
             return vec![format!(
                 "[maker-exit] could not read the fill state of {} ({e}) — leaving it resting \
                  and asking again next cycle",
-                r.order.market
+                r.order.rest_market()
             )];
         }
         Err(e) => return vec![format!("[maker-exit] fill-read task failed ({e})")],
@@ -2563,8 +2572,8 @@ async fn manage(
         } else {
             out.push(format!(
                 "[maker-exit] {} filled {filled} of {} — cancelling the remainder before \
-                 closing, so nothing else can trade while the PM-US leg is open",
-                r.order.market, r.order.qty
+                 closing, so nothing else can trade while the other leg is open",
+                r.order.rest_market(), r.order.qty
             ));
             let (lines, unaddressable) = cancel_at_venue(rest_sink, &r).await;
             out.extend(lines);
@@ -2574,7 +2583,15 @@ async fn manage(
             // ...and the count is RE-READ after the cancel. Anything that traded
             // between the poll and the cancel is ours too, and closing less than
             // we sold is precisely the naked leg this path exists to avoid.
-            let k = kalshi.clone();
+            //
+            // THROUGH THE REST SINK, which is the only venue that has ever heard
+            // of this order id. This read was hardcoded to `kalshi` while that
+            // was the only venue an exit could rest on; under `Shape::RestPmUs`
+            // the id is a PM-US one, asking Kalshi about it errors, and the
+            // error falls through to the lower bound below — so a fill that
+            // raced the cancel would go naked and unbooked, which is the exact
+            // failure this re-read exists to prevent.
+            let k = rest_sink.clone();
             let id = r.venue_order_id.clone();
             match tokio::task::spawn_blocking(move || k.filled_qty(&id)).await {
                 Ok(Ok(n)) => n.max(filled),
@@ -2586,7 +2603,7 @@ async fn manage(
                         "[maker-exit] could not re-read {} after the cancel — closing the \
                          {filled} we know traded. If the cancel raced a further fill, the \
                          difference is naked and unbooked; CHECK BY HAND.",
-                        r.order.market
+                        r.order.rest_market()
                     ));
                     filled
                 }
@@ -2749,7 +2766,7 @@ async fn cancel_at_venue(
         Ok(Ok(())) => (
             vec![format!(
                 "[maker-exit] pulled {} ({}) after {:.0}s resting",
-                r.order.market,
+                r.order.rest_market(),
                 r.venue_order_id,
                 r.since.elapsed().as_secs_f64()
             )],
@@ -5203,6 +5220,71 @@ mod tests {
         assert_eq!(recs[0]["status"], "unwound");
         assert_eq!(recs[0]["qty"], 3);
         assert_eq!(recs[0]["closes_ts"], 1.0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// THE MIRROR OF THE TEST ABOVE, AND IT CAUGHT A REAL BUG. Every venue
+    /// call a `rest-pmus` exit makes about its RESTING order must go to PM-US,
+    /// because PM-US is the only venue that has ever heard of that order id.
+    ///
+    /// The post-cancel re-read was hardcoded to the Kalshi sink — correct while
+    /// Kalshi was the only venue an exit could rest on, and silently wrong the
+    /// moment it was not. It does not fail loudly: `filled_qty` on a foreign id
+    /// errors, the error falls through to "use the pre-cancel lower bound", and
+    /// a fill that raced the cancel is closed short. That is a naked leg
+    /// arrived at through the code path whose entire purpose is preventing one,
+    /// and no type could catch it because both sinks are `dyn OrderSink`.
+    ///
+    /// Asserting on which FakeVenue was called is the only thing that can.
+    #[tokio::test]
+    async fn a_rest_pmus_partial_fill_re_reads_pmus_and_never_touches_kalshi() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        // The PM-US bid is the RESTING leg: 2 filled on the first read, 3 by the
+        // time the cancel lands. Kalshi is the CLOSE leg and takes the IOC.
+        let pmus = FakeVenue::with_fills(&[2, 3]);
+        let kalshi = FakeVenue::with_fills(&[3]);
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
+        let p: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let path = ledger_scratch("partial-pmus");
+        let mut live = Live::new(false, path.clone());
+        let mut r = resting_exit(5);
+        r.order.shape = Shape::RestPmUs;
+        // A PM-US bid at 0.25, closing by selling Kalshi into its bid.
+        r.order.limit = "0.2500".into();
+        live.resting = Some(r);
+        let out = manage(&mut live, &wide_pm_view("0.30", "0.24", "0.60"), &k, &p).await.join("\n");
+
+        // THE RESTING LEG: read, cancel, read again — all three on PM-US.
+        let ps = pmus.calls();
+        let cancel_at =
+            ps.iter().position(|c| c == "cancel").unwrap_or_else(|| panic!("no cancel: {ps:?}"));
+        assert_eq!(cancel_at, 1, "the cancel follows the FIRST read: {ps:?}");
+        assert_eq!(ps.len(), 3, "and a SECOND read follows the cancel: {ps:?}");
+        assert_eq!(ps[2], "filled_qty -> 3", "the re-read went to PM-US: {ps:?}");
+
+        // THE CLOSE LEG: Kalshi sees the IOC and NOTHING before it. A
+        // `filled_qty` here would be this bug: the id is not Kalshi's.
+        let ks = kalshi.calls();
+        assert!(
+            ks.first().is_some_and(|c| c.starts_with("place K-a 3x")),
+            "Kalshi's first call must be the close IOC for the RE-READ count, not a read of a \
+             PM-US order id: {ks:?}"
+        );
+        assert!(
+            !ks.iter().any(|c| c.starts_with("filled_qty")
+                && ks.iter().position(|x| x == c) < ks.iter().position(|x| x.starts_with("place"))),
+            "nothing may be read on Kalshi before the close: {ks:?}"
+        );
+
+        assert!(live.resting.is_none(), "a spent exit must not be polled next cycle");
+        assert!(out.contains("cancelling the remainder"), "{out}");
+
+        let recs = crate::ledger::read(&path).expect("clean ledger");
+        assert_eq!(recs.len(), 1, "{recs:?}");
+        assert_eq!(recs[0]["status"], "unwound");
+        assert_eq!(recs[0]["qty"], 3, "booked the re-read count, not the pre-cancel one");
+        assert_eq!(recs[0]["maker_exit_shape"], "rest-pmus");
         let _ = std::fs::remove_file(&path);
     }
 
