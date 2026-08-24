@@ -405,6 +405,13 @@ const VANISHED_MIN_AGE_S: f64 = CYCLE_S as f64;
 /// would otherwise lock the incumbent out for ever, which is a worse starvation
 /// than the one this fixes: an empty slot earns nothing at all, while the
 /// incumbent's ask at least pays if somebody lifts it.
+///
+/// WHAT THE BUDGET BUYS BACK IS ONE NAME, not the lap. `Live::served` is a
+/// queue of everyone who has already had the slot, and reaching this budget
+/// pops its FRONT — the market excluded longest becomes eligible again while
+/// the rest are still owed a turn. Clearing the whole lap here would restore
+/// the two-name swap this exists to break, and it would do it precisely when
+/// the book is hardest to price, which is when the queue matters most.
 pub const HANDOVER_CYCLES: u32 = 3;
 
 pub const SUPPRESS_SETTLE_S: f64 = 30.0;
@@ -1738,8 +1745,9 @@ pub struct Live {
     /// judge whether the slot is contested — and consumed by [`cycle`], which
     /// owns the wire. See [`MAX_RESTING_S`].
     pub rotate: Option<String>,
-    /// The market just rotated out of the single [`MAX_RESTING`] slot, held for
-    /// exactly the ONE selection that follows.
+    /// Markets that have ALREADY HELD the single [`MAX_RESTING`] slot during the
+    /// current rotation, oldest first. Selection skips them, so the slot goes
+    /// round the held set instead of back to whoever `select` ranks first.
     ///
     /// A rotation that hands the slot straight back to the market it took it
     /// from has bought that market's own queue position at full price, which is
@@ -1747,14 +1755,29 @@ pub struct Live {
     /// candidates by `select`'s ordering and takes the first, and the market
     /// that has been resting longest is very often still first — so on
     /// 2026-08-20 `KXTIME-26-AI` was rotated out at 11:46 and rested again,
-    /// same price, at 11:50. Skipping it until somebody else has actually
-    /// RESTED is what makes a rotation a HAND-OVER rather than a re-place —
-    /// skipping it for one SELECTION, which is what this used to do, never
-    /// could. See [`HANDOVER_CYCLES`].
-    rotated_out: Option<String>,
-    /// Selections the current hand-over has survived. Cleared with
-    /// `rotated_out`, which happens when an exit RESTS or when this reaches
-    /// [`HANDOVER_CYCLES`] — never merely because a selection read it.
+    /// same price, at 11:50.
+    ///
+    /// **EXCLUDING ONLY THE INCUMBENT IS NOT A ROTATION**, which is what this
+    /// was and why it is now a list. One name is enough to stop an immediate
+    /// re-place and not enough to reach the third candidate: `select`'s
+    /// ordering is stable, so excluding the incumbent hands the slot to the
+    /// same runner-up every time and the two of them trade it for ever. Live
+    /// over the 27 h to 2026-08-24 20:00 that is exactly what happened — 31
+    /// exits placed, 0 filled, the slot ping-ponging between
+    /// `tac-nobel-peace-…-dontru`, `cpc-btc-…-150k` and `tpoyc-2026-ai` while
+    /// the rotation's own log line reported "6 other held candidate(s)
+    /// waiting", then "8 other". Those never got a turn, and the topics they
+    /// would have freed (`time-poty-26` at 185/185) are the ones refusing every
+    /// new basket.
+    ///
+    /// Cleared when every live candidate has had the slot — a completed lap,
+    /// after which the whole set is eligible again. See [`HANDOVER_CYCLES`] for
+    /// the bound that keeps a candidate nobody can price from locking the rest
+    /// out.
+    served: Vec<String>,
+    /// Selections since anything last RESTED, while a lap is in progress.
+    /// Reaching [`HANDOVER_CYCLES`] re-admits the longest-excluded market
+    /// rather than clearing the lap — never merely because a selection read it.
     handover_age: u32,
     /// Markets where a place or a cancel DID NOT COMPLETE, so an ask of ours may
     /// be resting under an id nothing in this process can address.
@@ -1784,7 +1807,7 @@ impl Live {
             resting: None,
             pending: None,
             rotate: None,
-            rotated_out: None,
+            served: Vec::new(),
             handover_age: 0,
             unaddressable: BTreeSet::new(),
             cx,
@@ -1881,12 +1904,15 @@ impl Live {
                 format!(
                     "{incumbent} has held the only exit slot for {age:.0}s (limit \
                      {MAX_RESTING_S:.0}s) with {waiting} other held candidate(s) waiting on \
-                     it — pulling so one of them can have it. {incumbent} is skipped for the \
-                     next selection only; it comes back round on the one after."
+                     it — pulling so one of them can have it. {incumbent} is skipped until \
+                     every other held candidate has had the slot; it comes back round on the \
+                     lap after."
                 )
             });
             if self.rotate.is_some() {
-                self.rotated_out = Some(incumbent);
+                if !self.served.contains(&incumbent) {
+                    self.served.push(incumbent);
+                }
                 self.handover_age = 0;
             }
             return Err(format!(
@@ -1925,19 +1951,39 @@ impl Live {
         // cycle that first picks a market always refuses, because it is the
         // cycle that asks for the entry quote to be yielded. See the constant.
         //
-        // If the rotated-out market is the only thing left it is chosen again —
-        // there was nobody to hand to, and an empty slot is worse than a
-        // re-bought queue position. That was true before and is unchanged.
-        if self.rotated_out.is_some() {
+        // BOUNDED, because a challenger nobody can ever price would otherwise
+        // hold the slot empty for good, and an empty slot earns nothing at all
+        // while the incumbent's ask at least pays if somebody lifts it. The
+        // budget re-admits the LONGEST-EXCLUDED market rather than abandoning
+        // the lap: one name comes back, the rest of the queue is still owed a
+        // turn.
+        if !self.served.is_empty() {
             self.handover_age += 1;
             if self.handover_age > HANDOVER_CYCLES {
-                self.rotated_out = None;
+                self.served.remove(0);
                 self.handover_age = 0;
             }
         }
-        let e = match self.rotated_out.as_deref() {
-            Some(m) => live.iter().copied().find(|e| e.market_id != m).unwrap_or(live[0]),
-            None => live[0],
+        // A LAP, not a swap. The first candidate that has not yet held the slot
+        // this lap takes it; when every live one has, the lap is complete and
+        // the whole set becomes eligible again.
+        //
+        // If everything live has already been served — including the case where
+        // the rotated-out market is the only candidate at all — the lap resets
+        // and `live[0]` is chosen again. There was nobody to hand to, and an
+        // empty slot is worse than a re-bought queue position. That was true
+        // before and is unchanged.
+        let unserved = live
+            .iter()
+            .copied()
+            .find(|e| !self.served.contains(&e.market_id));
+        let e = match unserved {
+            Some(e) => e,
+            None => {
+                self.served.clear();
+                self.handover_age = 0;
+                live[0]
+            }
         };
         Ok(e)
     }
@@ -2338,7 +2384,12 @@ async fn place(
             // THE HAND-OVER IS DISCHARGED BY THIS, and only by this. Something
             // other than the rotated-out market has the slot, which is the
             // whole thing the rotation was asking for.
-            live.rotated_out = None;
+            //
+            // `served` is NOT cleared here: it is the lap, and a rest is one
+            // market taking its turn WITHIN the lap rather than the end of it.
+            // Clearing on every rest is what made this a two-name swap — the
+            // set never grew past the incumbent, so the third candidate was
+            // never reached. Only a completed lap clears it (`target`).
             live.handover_age = 0;
             live.resting = Some(Resting {
                 order,
@@ -4718,6 +4769,15 @@ mod tests {
         r
     }
 
+    /// A stale resting exit on a NAMED market, so a test can make each candidate
+    /// the incumbent in turn. `resting_exit` is fixed to `K-a`, which is enough
+    /// for the one-hand-over tests and not enough to walk a lap.
+    fn stale_resting_exit_on(market: &str, qty: i64, age_s: f64) -> Resting {
+        let mut r = stale_resting_exit(qty, age_s);
+        r.order.market = market.into();
+        r
+    }
+
     /// Write one open basket to a scratch ledger so `resolve_vanished` has an
     /// expected quantity to compare venue truth against.
     fn ledger_with_open(tag: &str, qty: i64) -> String {
@@ -4947,9 +5007,6 @@ mod tests {
         assert_eq!(after.market_id, "K-b", "nothing rested, so the claim still stands");
     }
 
-    /// A HAND-OVER WITH NOBODY TO HAND TO KEEPS THE INCUMBENT.
-    ///
-    /// An empty slot is worse than a re-bought queue position, so the skip
     /// THE HAND-OVER MUST SURVIVE THE REFUSAL THAT ALWAYS FOLLOWS IT.
     ///
     /// `rotated_out` used to be consumed by the selection that read it. That can
@@ -5019,9 +5076,12 @@ mod tests {
             .target(&c, t0 + (5.0 + f64::from(HANDOVER_CYCLES)) * DEBOUNCE_S, 0)
             .expect("a candidate");
         assert_eq!(e.market_id, "K-a", "the claim lapses and the incumbent may have it back");
-        assert!(l.rotated_out.is_none(), "and the claim is cleared, not merely ignored");
+        assert!(l.served.is_empty(), "and the claim is cleared, not merely ignored");
     }
 
+    /// A HAND-OVER WITH NOBODY TO HAND TO KEEPS THE INCUMBENT.
+    ///
+    /// An empty slot is worse than a re-bought queue position, so the skip
     /// applies only while something else can actually use it.
     #[test]
     fn a_rotated_out_market_is_chosen_again_when_it_is_the_only_one_left() {
@@ -5031,9 +5091,59 @@ mod tests {
         for i in 0..4 {
             let _ = l.target(&c, t0 + f64::from(i) * DEBOUNCE_S, 0);
         }
-        l.rotated_out = Some("K-a".into());
+        l.served = vec!["K-a".into()];
         let e = l.target(&c, t0 + 4.0 * DEBOUNCE_S, 0).expect("the only candidate");
         assert_eq!(e.market_id, "K-a");
+        assert!(l.served.is_empty(), "the lap completed rather than leaving the slot empty");
+    }
+
+    /// THE SLOT GOES ROUND THE WHOLE HELD SET, NOT BETWEEN THE TOP TWO.
+    ///
+    /// Excluding only the incumbent is not a rotation. `select`'s ordering is
+    /// stable, so the runner-up wins every hand-over and the pair trade the slot
+    /// for ever while everything behind them waits — live over the 27 h to
+    /// 2026-08-24 20:00 that was 31 exits placed, 0 filled, three names sharing
+    /// the slot and the log itself reporting "8 other held candidate(s)
+    /// waiting".
+    ///
+    /// Three candidates, each rotated out in turn: the third must get the slot
+    /// before the first sees it again, and the lap must then reset.
+    #[test]
+    fn the_slot_laps_the_held_set_before_repeating() {
+        let mut l = Live::new(true, "/dev/null".into());
+        let mut b = cand(10, 2.0);
+        b.market_id = "K-b".into();
+        let mut d = cand(10, 3.0);
+        d.market_id = "K-c".into();
+        // `K-a` sorts first, so it is the incumbent and the one that would
+        // reclaim the slot on every hand-over under the old one-name rule.
+        let c = [cand(10, 1.0), b, d];
+        let t0 = 1_000_000.0;
+        // Warm the debounce: nothing is a candidate until it has been held for
+        // DEBOUNCE_SCANS scans, and `waiting` counts only admitted rows.
+        let mut tick = 0.0f64;
+        l.resting = Some(stale_resting_exit_on("K-a", 5, MAX_RESTING_S + 1.0));
+        for _ in 0..4 {
+            let _ = l.target(&c, t0 + tick * DEBOUNCE_S, 0);
+            tick += 1.0;
+        }
+        let mut seen = Vec::new();
+        for holder in ["K-a", "K-b", "K-c"] {
+            // Whoever holds the slot has held it too long; rotate them out.
+            l.resting = Some(stale_resting_exit_on(holder, 5, MAX_RESTING_S + 1.0));
+            let _ = l.target(&c, t0 + tick * DEBOUNCE_S, 0);
+            tick += 1.0;
+            assert!(l.rotate.take().is_some(), "{holder} has held the slot too long");
+            l.resting = None;
+            let e = l.target(&c, t0 + tick * DEBOUNCE_S, 0).expect("a candidate");
+            tick += 1.0;
+            seen.push(e.market_id.clone());
+        }
+        assert_eq!(
+            seen,
+            vec!["K-b".to_string(), "K-c".to_string(), "K-a".to_string()],
+            "every held candidate takes a turn before the first repeats"
+        );
     }
 
     /// A HALTED MARKET DOES NOT SHADOW THE LIVE ONES BEHIND IT.
