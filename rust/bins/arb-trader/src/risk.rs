@@ -1146,7 +1146,15 @@ impl RiskGate for RiskView {
         } else {
             c.1 += 1;
         }
-        RiskVerdict { allowed: d.allowed, reasons: d.reasons }
+        // Contracts, floored: the gate counts a prediction-market basket as
+        // ~$1, and a fractional contract is not orderable. Floor rather than
+        // round so the resize can never ask for more room than the topic has.
+        let topic_headroom = d
+            .topic_headroom
+            .as_deref()
+            .and_then(|h| h.parse::<f64>().ok())
+            .map(|h| h.floor().max(0.0) as i64);
+        RiskVerdict { allowed: d.allowed, reasons: d.reasons, topic_headroom }
     }
 
     fn release(&self, rel_id: &str, market_id: &str, side: BookSide) {

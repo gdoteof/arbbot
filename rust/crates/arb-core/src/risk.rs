@@ -164,6 +164,22 @@ pub struct Decision {
     pub allowed: bool,
     pub max_notional: String,
     pub reasons: Vec<String>,
+    /// Contracts still under this relationship's TOPIC budget, or `None` when
+    /// no topic budget applies to it.
+    ///
+    /// SEPARATE FROM [`Decision::max_notional`], which is the per-relationship
+    /// tail-cap headroom and only that — a Python-parity output that 34 of the
+    /// 38 fixture cases pin by value. Widening it to mean "the largest notional
+    /// that would pass" would be the better name for the better number and
+    /// would rewrite all of them at once, in the gate that refuses live money.
+    /// This is additive instead, and says exactly which cap it measures.
+    ///
+    /// WHY THE TOPIC AND NOT EVERY CAP. Over the 27 h to 2026-08-24 20:00 the
+    /// armed engine refused 61,610 quotes and every single one was a topic
+    /// budget; not one came from the class cap, the global cap, the tail cap or
+    /// a venue balance. A headroom for the caps that were never the constraint
+    /// is a number nobody would read.
+    pub topic_headroom: Option<String>,
 }
 
 // ---------- helpers ----------
@@ -251,6 +267,7 @@ pub fn check_order(inp: &Input) -> Decision {
         return Decision {
             allowed: false,
             max_notional: "0".to_string(),
+            topic_headroom: None,
             reasons: vec!["kill switch active".to_string()],
         };
     }
@@ -337,9 +354,18 @@ pub fn check_order(inp: &Input) -> Decision {
     // --- topic budget + gate ---
     let topic = topic_of(&inp.rel.id, &inp.config.topics);
     let (budget, gate) = topic_budget(&inp.config, &topic);
+    let mut topic_headroom: Option<String> = None;
     if let Some(budget_s) = budget {
         let budget_d = cx.parse(&budget_s);
         let open_topic = lookup(&mut cx, &inp.exposure.by_topic, &topic, zero);
+        // Clamped at zero: a topic already over its budget has no room, and a
+        // negative headroom read as a size would be an order in reverse.
+        let room = cx.sub(budget_d, open_topic);
+        topic_headroom = Some(if cx.cmp(room, zero) == Ordering::Less {
+            s(zero)
+        } else {
+            s(room)
+        });
         let topic_sum = cx.add(open_topic, notional);
         if cx.cmp(topic_sum, budget_d) == Ordering::Greater {
             // overflow bar = min(weakest deployed fwd APR, overflow_min_apr);
@@ -417,6 +443,7 @@ pub fn check_order(inp: &Input) -> Decision {
         allowed: reasons.is_empty(),
         max_notional,
         reasons,
+        topic_headroom,
     }
 }
 

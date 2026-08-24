@@ -96,6 +96,11 @@ pub struct RiskVerdict {
     pub allowed: bool,
     /// Human-readable cap breaches, surfaced verbatim in the `skip` intent.
     pub reasons: Vec<String>,
+    /// Contracts still under this relationship's TOPIC budget, or `None` when
+    /// no topic budget applies. Carried through from `arb_core::risk::Decision`
+    /// so a refused quote can be re-priced at what the topic WILL take instead
+    /// of being dropped. See the resize in [`Quoter::on_book`].
+    pub topic_headroom: Option<i64>,
 }
 
 pub struct Toxgate {
@@ -716,8 +721,8 @@ impl Quoter {
                     }
                 }
                 // `target` is Some only on the `clip.and_then` arm above.
-                let clip = clip.unwrap_or(self.clip);
-                let Some(target) = target else {
+                let mut clip = clip.unwrap_or(self.clip);
+                let Some(mut target) = target else {
                     if let Some(curq) = self.resting.remove(&key) {
                         // RELEASE. This is the ordinary way a quote goes away —
                         // the book moved, the hedge thinned, the side went
@@ -822,7 +827,7 @@ impl Quoter {
                 // the duration measures. A cancel is a REDUCTION of exposure,
                 // which no cap has an interest in refusing.
                 if let Some(gate) = &self.risk {
-                    let v = gate.check(
+                    let mut v = gate.check(
                         &self.rel,
                         self.rel.legs[i].venue,
                         clip,
@@ -830,6 +835,56 @@ impl Quoter {
                         // the capital until it fills or comes off.
                         Some((&leg_market, side)),
                     );
+                    // A TOPIC WITH ROOM FOR LESS THAN A CLIP IS A THROTTLE, NOT
+                    // A CLIFF — and until now it was a cliff. `config/topics.yaml`
+                    // states the invariant in its own header ("EVERY BUDGET
+                    // CLEARS `deployed + 2 * clip`... a headroom smaller than one
+                    // clip does not slow a topic down, it FREEZES it") and then
+                    // asks a human to maintain it by hand, which is not
+                    // maintainable: the 2026-08-19 re-size satisfied it, the
+                    // fills of 2026-08-20..23 spent the slack, and by 08-24
+                    // `nobel-peace-26` was frozen at 189/196 — refused 3,564
+                    // times for a clip of 25 against 7 contracts of room it
+                    // would gladly have taken.
+                    //
+                    // So the CODE clamps instead. Re-priced, not merely
+                    // re-checked: "SIZE BEFORE PRICE, because the price depends
+                    // on the size" holds here too, and resting a 7-lot order at
+                    // the price computed for 25 would quote a size we never
+                    // priced.
+                    //
+                    // SIZING DOWN CANNOT TURN A REFUSAL INTO AN UNSAFE ALLOW:
+                    // the second call is the SAME full check — every cap, the
+                    // balances, the kill switch — just at a smaller notional.
+                    // Only a check that ALLOWS reserves, and at most one of
+                    // these two ever does.
+                    //
+                    // Only when nothing is resting on this slot. A quote already
+                    // on the book that the caps have turned against is the
+                    // refuse-then-pull case below, which is about withdrawing
+                    // exposure rather than placing less of it.
+                    if !v.allowed && !self.resting.contains_key(&key) {
+                        if let Some(room) = v.topic_headroom {
+                            let smaller = room.min(clip);
+                            if smaller >= MIN_CLIP && smaller < clip {
+                                if let Some(t) =
+                                    self.target(cx, fees, books, i, side, smaller)
+                                {
+                                    let v2 = gate.check(
+                                        &self.rel,
+                                        self.rel.legs[i].venue,
+                                        smaller,
+                                        Some((&leg_market, side)),
+                                    );
+                                    if v2.allowed {
+                                        clip = smaller;
+                                        target = t;
+                                        v = v2;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if !v.allowed {
                         intents.push(Intent::Skip(intent::Skip { skip: v.reasons, ts: now }));
                         let since = *self.refused_since.entry(key).or_insert(now);
@@ -1303,6 +1358,10 @@ mod risk_gate_tests {
             RiskVerdict {
                 allowed: allow,
                 reasons: if allow { vec![] } else { vec!["per-relationship tail cap".into()] },
+                // This stub refuses on the TAIL cap, which the resize does not
+                // read: `None` is "no topic budget applies", so the existing
+                // tests keep asserting the plain refuse-and-pull behaviour.
+                topic_headroom: None,
             }
         }
 
@@ -1535,6 +1594,91 @@ mod risk_gate_tests {
     // is about giving it back: a reservation that leaks is a cap that ratchets
     // shut and silently stops all trading, which is worse than the overshoot it
     // exists to bound.
+
+    /// A gate with a TOPIC BUDGET: it refuses anything larger than `room` and
+    /// reports `room` as the headroom, which is the shape `config/topics.yaml`
+    /// produces once a topic has been partly filled.
+    struct Budgeted {
+        room: i64,
+        placed: std::sync::Mutex<Vec<i64>>,
+    }
+
+    impl Budgeted {
+        fn new(room: i64) -> std::sync::Arc<Budgeted> {
+            std::sync::Arc::new(Budgeted { room, placed: std::sync::Mutex::new(Vec::new()) })
+        }
+        /// The notionals the gate ALLOWED, in order — so a test can prove the
+        /// reservation was taken once, at the resized clip and not the original.
+        fn allowed(&self) -> Vec<i64> {
+            self.placed.lock().expect("placed").clone()
+        }
+    }
+
+    impl RiskGate for Budgeted {
+        fn check(
+            &self,
+            _rel: &Rel,
+            _venue: Venue,
+            notional: i64,
+            _rests_on: Option<(&str, BookSide)>,
+        ) -> RiskVerdict {
+            if notional <= self.room {
+                self.placed.lock().expect("placed").push(notional);
+                RiskVerdict { allowed: true, reasons: vec![], topic_headroom: Some(self.room) }
+            } else {
+                RiskVerdict {
+                    allowed: false,
+                    reasons: vec![format!("topic budget [t]: 189+{notional} > 196")],
+                    topic_headroom: Some(self.room),
+                }
+            }
+        }
+
+        fn release(&self, _rel_id: &str, _market_id: &str, _side: BookSide) {}
+    }
+
+    /// A TOPIC WITH ROOM FOR LESS THAN A CLIP IS A THROTTLE, NOT A CLIFF.
+    ///
+    /// `config/topics.yaml` states the invariant in its own header — "EVERY
+    /// BUDGET CLEARS `deployed + 2 * clip`... a headroom smaller than one clip
+    /// does not slow a topic down, it FREEZES it" — and then asks a human to
+    /// maintain it. That is not maintainable: the 2026-08-19 re-size satisfied
+    /// it, the fills of 08-20..23 spent the slack, and by 08-24 `nobel-peace-26`
+    /// sat at 189/196 refusing a clip of 25 against 7 contracts of room it would
+    /// gladly have taken — 3,564 times in 27 h.
+    ///
+    /// The hedge here is 500 deep, so the clip wants MAX_CLIP; the topic has 7.
+    #[test]
+    fn a_topic_with_room_for_less_than_a_clip_quotes_what_fits() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let gate = Budgeted::new(7);
+        q.set_risk(Some(gate.clone()));
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+
+        let p = place_on(&intents, "P").expect("the topic has room for 7, so 7 rests");
+        assert_eq!(p.count, 7, "sized to the budget, not to the hedge");
+        assert_eq!(gate.allowed(), vec![7], "reserved once, at the size it rested");
+    }
+
+    /// ...BUT NOT BELOW `MIN_CLIP`. A topic with room for one contract is a
+    /// topic that is full for practical purposes, and quoting a dust clip pays
+    /// the same two round trips for a fraction of the edge.
+    #[test]
+    fn a_topic_with_less_room_than_min_clip_still_refuses() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let gate = Budgeted::new(MIN_CLIP - 1);
+        q.set_risk(Some(gate.clone()));
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+
+        assert!(!any_place(&intents), "{intents:?}");
+        assert!(gate.allowed().is_empty(), "and nothing was reserved");
+    }
 
     /// RELEASE ON CANCEL. The book stops funding the quote, the quoter pulls
     /// it, and the capital it was holding goes back — reserved and released
