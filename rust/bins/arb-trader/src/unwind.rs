@@ -344,6 +344,19 @@ pub struct Exit {
     pub fwd_apr: f64,
     /// Per-contract profit the maker exit locks, net of both legs' fees.
     pub exit_ct: f64,
+    /// Per-contract profit CROSSING both legs would lock, estimated from the
+    /// liquidation mark: `mark_pnl_usd / qty` less the two conservative ticks
+    /// `maker_exit`'s cross prices with (a tick under the Kalshi bid, a tick
+    /// through the PM-US ask).
+    ///
+    /// AN ORDERING SIGNAL, NOT A DECISION. `maker_exit::decide` re-prices the
+    /// cross against a live quote and grades it itself; this only has to be good
+    /// enough to answer "would this one convert NOW, or sit?" — because those
+    /// two candidates are worth wildly different amounts of the ONE exit slot.
+    /// A candidate that crosses is done inside a cycle; one that can only rest
+    /// holds the slot for `MAX_RESTING_S` and, on this book, converts at
+    /// approximately zero.
+    pub cross_ct: f64,
     /// Whether THIS process could act on it: the relationship is inside the
     /// `--rel-prefix` scope this engine loaded quoters for. See §1 — this read
     /// `false` for every candidate when the armed process ran three families,
@@ -550,6 +563,15 @@ fn consider(
     if exit_ct < MIN_EXIT_CT {
         return Err(Skip::ExitUnprofitable { exit_ct, qty });
     }
+    // The liquidation mark IS the cross, at the touch: `marks` prices it by
+    // selling the Kalshi YES at its bid and buying the PM-US YES at its ask,
+    // charging BOTH takers — the same two legs, the same two roles. Subtracting
+    // the two conservative ticks `maker_exit` crosses with turns it into that
+    // module's own number without this file having to know its pricing.
+    let cross_ct = p
+        .get("mark_pnl_usd")
+        .and_then(serde_json::Value::as_f64)
+        .map_or(f64::NEG_INFINITY, |m| m / qty as f64 - 2.0 * TICK_CT);
     Ok(Exit {
         rel_id: rel_id.to_string(),
         market_id: market_id.to_string(),
@@ -557,6 +579,7 @@ fn consider(
         qty,
         fwd_apr,
         exit_ct,
+        cross_ct,
         // `main.rs:387`'s rule, exactly: no prefixes means the process loaded
         // every relationship in the registry, so it owns them all.
         actionable: owned.is_empty() || owned.iter().any(|x| rel_id.starts_with(x.as_str())),
@@ -625,12 +648,32 @@ pub fn select(
             Err(s) => skips.push(s),
         }
     }
-    // Deepest lock first: an operator reading one line of this wants the
-    // basket that frees the most capital, and a stable order makes two ticks
-    // comparable. `total_cmp` because a NaN APR must not scramble the rest.
-    // This is a DISPLAY order and it is not stable under ties — see
+    // CAN IT CONVERT NOW, THEN deepest lock first.
+    //
+    // The old order was `(qty desc, fwd_apr asc)` alone, and it predates the
+    // cross entirely: it cannot tell a candidate that executes inside one cycle
+    // from one that will hold the single `MAX_RESTING` slot for an hour and
+    // convert at approximately zero. On the live book of 2026-08-25 that put
+    // FIVE rest-only lots at the head of the queue — `KXNOBELPEACE-26-DJT`
+    // resting behind 6,551 lots at the touch — while `KXTIME-26-POP` at +0.0240
+    // and `KXBRPRES-26-FBOL` at +0.0545 waited behind them for a slot that turns
+    // over once an hour. The slot is the scarce resource; spending it on the
+    // candidate that cannot use it is the whole of what this fixes.
+    //
+    // Only the GROUPING is new. Within each group the old comparator is
+    // untouched, so nothing about the relative order of two rest-only candidates
+    // — or of two crossable ones — has moved.
+    //
+    // `cross_ct` is an estimate off the marks mark; `maker_exit::decide` still
+    // re-prices against a live quote and grades the cross itself. Being wrong
+    // here costs an ordering, not a trade.
+    //
+    // Still a DISPLAY order and still not stable under ties — see
     // [`identity_set`] for the thing that must be.
-    exits.sort_by(|a, b| b.qty.cmp(&a.qty).then(a.fwd_apr.total_cmp(&b.fwd_apr)));
+    exits.sort_by(|a, b| {
+        let (ca, cb) = (a.cross_ct >= MIN_EXIT_CT, b.cross_ct >= MIN_EXIT_CT);
+        cb.cmp(&ca).then(b.qty.cmp(&a.qty)).then(a.fwd_apr.total_cmp(&b.fwd_apr))
+    });
     Ok((exits, skips))
 }
 
@@ -690,7 +733,63 @@ mod tests {
         )
     }
 
-    /// `select` with a real cap and no ownership scope.
+    /// `pos`, plus the liquidation mark `cross_ct` is derived from. The plain
+    /// `pos` omits it deliberately: every test written before the cross gets
+    /// `NEG_INFINITY`, is therefore not crossable, and keeps asserting the order
+    /// it was written about.
+    fn pos_mark(
+        rel: &str,
+        qty: i64,
+        resolves: &str,
+        fwd: &str,
+        mx: &str,
+        mark: &str,
+    ) -> String {
+        format!(
+            r#"{{"relationship_id":"{rel}","ts":1784646659.716,"kalshi_ticker":"KX-{rel}",
+                 "qty":{qty},"cost_usd":10.0,"locked_profit_usd":1.0,
+                 "resolves_by":"{resolves}","resolves_estimated":true,
+                 "forward_hold_apr":{fwd},"maker_exit_ct":{mx},"mark_pnl_usd":{mark}}}"#
+        )
+    }
+
+    /// **A CANDIDATE THAT CAN CONVERT NOW OUTRANKS A BIGGER ONE THAT CANNOT.**
+    ///
+    /// There is ONE exit slot. A crossable candidate is done inside a cycle; a
+    /// rest-only one holds the slot for `MAX_RESTING_S` and, on this book,
+    /// converts at approximately zero — our ask sat behind 6,551 lots at the
+    /// touch on `dontru` and 711 on `popleo`. Ordering by size alone spends the
+    /// scarce resource on the candidate that cannot use it, which is exactly
+    /// what the live book did on 2026-08-25: five rest-only lots at the head of
+    /// the queue while `KXTIME-26-POP` at +0.0240 and `KXBRPRES-26-FBOL` at
+    /// +0.0545 waited an hour each for a turn.
+    ///
+    /// `big` is twice the size and would sort first under the old comparator.
+    #[test]
+    fn a_crossable_candidate_outranks_a_bigger_one_that_can_only_rest() {
+        let big = pos_mark("big", 10, "2027-01-01", "5.0", "0.05", "0.10");
+        let quick = pos_mark("quick", 5, "2027-01-01", "5.0", "0.05", "0.50");
+        let m = marks(&format!("{big},{quick}"));
+        let (exits, _) = sel(&m, 16.0).expect("both are candidates");
+        assert_eq!(exits.len(), 2);
+        assert_eq!(exits[0].rel_id, "quick", "the one that converts now goes first");
+        assert!(exits[0].cross_ct >= MIN_EXIT_CT, "and it really is crossable: {:?}", exits[0]);
+        assert!(exits[1].cross_ct < MIN_EXIT_CT, "while the bigger one is rest-only");
+    }
+
+    /// ...AND WITHIN A GROUP NOTHING MOVED. Two rest-only candidates still order
+    /// by `(qty desc, fwd_apr asc)`, which is the comparator every test written
+    /// before the cross depends on.
+    #[test]
+    fn two_rest_only_candidates_keep_the_old_order() {
+        let small = pos_mark("small", 5, "2027-01-01", "5.0", "0.05", "0.10");
+        let big = pos_mark("big", 10, "2027-01-01", "5.0", "0.05", "0.10");
+        let m = marks(&format!("{small},{big}"));
+        let (exits, _) = sel(&m, 16.0).expect("both are candidates");
+        assert_eq!(exits[0].rel_id, "big", "neither crosses, so size still leads");
+    }
+
+    /// `select` with a real cap and no ownership scope.    /// `select` with a real cap and no ownership scope.
     fn sel(m: &str, hurdle: f64) -> Result<(Vec<Exit>, Vec<Skip>), String> {
         select(m, hurdle, CAP, &[], NOW)
     }
