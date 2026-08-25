@@ -3846,6 +3846,9 @@ mod tests {
             qty,
             fwd_apr: 11.0,
             exit_ct: 0.03,
+            // Not crossable by default: the cross is opt-in and every test written
+            // before it keeps asserting the resting exit it was written about.
+            cross_ct: f64::NEG_INFINITY,
             actionable: true,
             near_floor: false,
             resolves_estimated: true,
