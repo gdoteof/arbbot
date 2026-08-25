@@ -271,7 +271,52 @@ use std::time::{Duration, Instant};
 /// a basket going +0.0312 -> −0.0721 in ONE writer period. Nothing sized in
 /// wall-clock can survive that; what the debounce buys is that the 60% which
 /// never had a second sample never reach a venue.
-pub const DEBOUNCE_S: f64 = 900.0;
+///
+/// # RE-DERIVED 2026-08-25: 900 s -> 120 s, BECAUSE THE WRITER IT WAS SIZED
+/// # AGAINST NO LONGER EXISTS
+///
+/// Every number above was measured on `marks_history.jsonl`, written by
+/// `arbbot-marks.timer` at a MEDIAN PERIOD OF 120.4 s. That timer was retired on
+/// 2026-07-31 and marks moved in-process: `data/exec/marks.json` is now rewritten
+/// **about once a second** (sampled live on 2026-08-25 — a fresh `generated_at`
+/// on every 400 ms poll).
+///
+/// THAT IS THE WHOLE OF WHY 900 WAS THE NUMBER, and it was never about the
+/// market. [`Debounce::admit`] requires BOTH a wall-clock age and
+/// [`DEBOUNCE_SCANS`] observations, and it is called once per [`CYCLE_S`] — 60 s.
+/// Against a 120 s writer, three 60 s scans could read THE SAME FILE three times
+/// and count as three samples while being one; the wall-clock term existed to
+/// force them across enough writer periods to be independent. Against a 1 s
+/// writer every scan is already an independent sample, so the term is doing
+/// nothing the scan count does not already do.
+///
+/// THE MINIMUM THAT PRESERVES THE PROTECTION EXACTLY:
+///
+/// ```text
+///   (DEBOUNCE_SCANS - 1) * CYCLE_S  =  2 * 60  =  120 s
+/// ```
+///
+/// which is the time three independent scans take anyway, so the two conditions
+/// now bind together and neither is slack. Below this the wall-clock term stops
+/// binding at all and the scan count alone decides; above it we are waiting for
+/// no measured reason. It is also, exactly, ONE 120-SECOND WINDOW — the unit the
+/// failure mode is stated in: a value that existed for one sample cannot survive
+/// being asked for again one whole window later.
+///
+/// WHAT THIS COSTS, STATED PLAINLY. The 27%/33%/55% survival figures were
+/// durations measured in 120 s samples, so a 120 s bar admits excursions a 900 s
+/// bar refused — more candidates, and some of them will die before an ask on
+/// them fills. Two things carry that which did not exist when 900 was chosen:
+/// [`still_pays`] pulls a resting exit the book has moved away from, and a CROSS
+/// ([`Order::cross`]) does not care at all, because it fills or dies in the same
+/// second and has nothing left to be wrong about.
+///
+/// **THE 60% FIGURE CANNOT BE RE-MEASURED AT THE NEW RESOLUTION**, and this does
+/// not pretend otherwise: `marks_history.jsonl` stopped on 2026-07-31, so there
+/// is no 1 s-resolution history to re-derive an excursion distribution from.
+/// What is re-derived here is the SIZING RULE, which was a property of the
+/// writer and the cycle, not of the book.
+pub const DEBOUNCE_S: f64 = (DEBOUNCE_SCANS as f64 - 1.0) * CYCLE_S as f64;
 
 /// ...and across at least this many DISTINCT scans.
 ///
@@ -4266,12 +4311,17 @@ mod tests {
     fn neither_the_clock_nor_the_scan_count_is_sufficient_alone() {
         let c = [cand(10, 1.0)];
 
-        // enough scans, not enough time: three scans a minute apart.
+        // Enough scans, not enough time. This needs a burst FASTER than
+        // `CYCLE_S`, because `DEBOUNCE_S` is now exactly the time
+        // `DEBOUNCE_SCANS` scans take at the normal cadence — so at 60 s apart
+        // the two conditions land together and neither can be shown alone. A
+        // burst is the case the clock still guards on its own: scans arriving
+        // inside one window are not independent samples however many there are.
         let mut d = Debounce::default();
         for i in 0..8 {
             assert!(
-                d.admit(&c, 1_000_000.0 + f64::from(i) * 60.0).is_empty(),
-                "8 scans over 420s is under DEBOUNCE_S ({DEBOUNCE_S})"
+                d.admit(&c, 1_000_000.0 + f64::from(i) * 10.0).is_empty(),
+                "8 scans over 70s is under DEBOUNCE_S ({DEBOUNCE_S})"
             );
         }
 
@@ -4856,7 +4906,39 @@ mod tests {
         assert_eq!(o.limit, "0.0400", "at the touch, not three ticks above the offer");
     }
 
-    /// **OWNING AT 0.95 AND SELLING AT 0.96 IS NOT AN EXIT, IT IS A FEE.**
+    /// THE DEBOUNCE IS EXACTLY AS LONG AS ITS OWN SCAN COUNT TAKES.
+    ///
+    /// Both halves of [`Debounce::admit`] must bind together or one of them is
+    /// decoration. `DEBOUNCE_S` below `(DEBOUNCE_SCANS - 1) * CYCLE_S` is never
+    /// reached before the scans are, and above it we wait for no measured
+    /// reason — the 900 s it used to be was compensating for a 120 s marks
+    /// writer that was retired on 2026-07-31.
+    ///
+    /// Pinned as an identity so that moving `CYCLE_S` or `DEBOUNCE_SCANS` moves
+    /// this with them instead of silently unbalancing the pair.
+    #[test]
+    fn the_debounce_is_the_time_its_scans_take() {
+        assert_eq!(DEBOUNCE_S, (DEBOUNCE_SCANS as f64 - 1.0) * CYCLE_S as f64);
+        assert_eq!(DEBOUNCE_S, 120.0, "two minutes, and the reason is in the constant's doc");
+    }
+
+    /// A SINGLE-SAMPLE SPIKE STILL CANNOT REACH A VENUE, which is the whole of
+    /// what the debounce is for. One observation is not enough however long the
+    /// clock says, and two is not enough either.
+    #[test]
+    fn one_sample_is_never_admitted_however_old_the_clock() {
+        let mut d = Debounce::default();
+        let e = [cand(5, 1.0)];
+        let t0 = 1_000_000.0;
+        // Seen once, then asked again an hour later: still one scan of a value
+        // that may have existed for a single write.
+        assert!(d.admit(&e, t0).is_empty(), "first sighting is never enough");
+        assert!(d.admit(&e, t0 + 3600.0).is_empty(), "nor is the second, however stale");
+        let out = d.admit(&e, t0 + 3600.0 + CYCLE_S as f64);
+        assert_eq!(out.len(), 1, "three independent scans past the window admit it");
+    }
+
+    /// **OWNING AT 0.95 AND SELLING AT 0.96 IS NOT AN EXIT, IT IS A FEE.**    /// **OWNING AT 0.95 AND SELLING AT 0.96 IS NOT AN EXIT, IT IS A FEE.**
     ///
     /// The floor `decide` grades on used to be `MIN_LOCK` (0.005) while the
     /// selector that admitted the lot used `MIN_EXIT_CT` (0.02) — four times
