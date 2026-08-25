@@ -293,6 +293,34 @@ pub const DEBOUNCE_SCANS: u32 = 3;
 /// empties — in seven passes, each re-decided from scratch against a fresh book.
 pub const MAX_CLIP: i64 = 5;
 
+/// The profit floor a maker exit must clear to be OPENED or KEPT, per contract,
+/// net of both legs' fees and against both legs' ledger basis.
+///
+/// **THE SAME NUMBER THE SELECTOR ADMITTED THE LOT UNDER.** `unwind::consider`
+/// refuses anything under `MIN_EXIT_CT` (0.02) as not worth doing, and this is
+/// the decision that acts on what it admitted, so the two must be one floor.
+///
+/// IT USED TO BE `MIN_LOCK` (0.005), and that was a borrowed constant doing the
+/// wrong job: it is ported verbatim from `hedge_naked_legs.py` and was chosen
+/// for a leg that is ALREADY NAKED and needs out — a case where half a cent
+/// beats carrying direction for months. Nothing about it was ever an answer to
+/// "should we exit a hedged position at all".
+///
+/// The gap was reachable rather than theoretical. `consider` screens on the
+/// MARKS snapshot, which `select` will price off at up to 900 s old, while
+/// `decide` re-prices against the book NOW — so a lot admitted at 2c could go
+/// out at 0.6c on a book that had moved. That is precisely the case of owning
+/// at 0.95 and selling at 0.96: refused by the screen, allowed by the floor.
+///
+/// **NOT USED BY `price_close`, DELIBERATELY.** That prices the SECOND leg,
+/// after the first has already filled, and a refusal there does not decline a
+/// trade — it strands a naked leg. `risk.rs` states the governing invariant for
+/// the symmetric case: "never consult this for a HEDGE. Refusing a hedge leaves
+/// the first leg naked, which is strictly worse than being a little over
+/// budget." Completing a close is the same trade with the same asymmetry, so it
+/// keeps `MIN_LOCK` and `heal` keeps its cross-out.
+const EXIT_FLOOR: &str = crate::unwind::MIN_EXIT_CT_S;
+
 /// Exits resting at once, across the whole process. ONE.
 ///
 /// This is the answer to `unwind` §5's "a naive placer rests a SECOND ask", and
@@ -917,8 +945,9 @@ pub fn exit_limit(
     qty: i64,
     k_role: Role,
     pm_role: Role,
+    floor: &str,
 ) -> Result<D, String> {
-    let lock = cx.parse_exact(MIN_LOCK);
+    let lock = cx.parse_exact(floor);
     // What the PM leg gives back, net of the fee to take it.
     let size = cx.from_i64(qty);
     let pm_fee_total = fees.fee(cx, Venue::PolymarketUs, pm_role, pm_close, size, "");
@@ -1216,8 +1245,9 @@ pub fn close_limit(
     qty: i64,
     k_role: Role,
     pm_role: Role,
+    floor: &str,
 ) -> Result<D, String> {
-    let lock = cx.parse_exact(MIN_LOCK);
+    let lock = cx.parse_exact(floor);
     let size = cx.from_i64(qty);
     let k_fee_total = fees.fee(cx, Venue::Kalshi, k_role, k_fill, size, "");
     let k_fee = cx.div(k_fee_total, size);
@@ -1572,6 +1602,7 @@ pub fn decide(
         let pm_close = cx.add(pm_ask_d, tick);
         let floor = exit_limit(
             cx, fees, &quote.ladder, k_basis, pm_basis, pm_close, qty, Role::Maker, Role::Taker,
+            EXIT_FLOOR,
         )?;
         let limit =
             rest_price(cx, &quote.ladder, floor, quote.yes_bid.as_deref(), quote.yes_ask.as_deref())?;
@@ -1600,7 +1631,7 @@ pub fn decide(
             ));
         }
         let ceiling = close_limit(
-            cx, fees, k_take, k_basis, pm_basis, qty, Role::Taker, Role::Maker,
+            cx, fees, k_take, k_basis, pm_basis, qty, Role::Taker, Role::Maker, EXIT_FLOOR,
         )?;
         let pm_bid = view.pm_bid.get(pm_market).map(String::as_str);
         let limit = rest_price_bid(cx, ceiling, pm_bid, Some(pm_ask.as_str()))?;
@@ -1613,14 +1644,36 @@ pub fn decide(
     // A shape that cannot clear MIN_LOCK is not a candidate for the contest,
     // whatever the other one does. Priced-but-unprofitable and unpriceable are
     // reported differently because they need different people.
-    let lock_floor = cx.parse_exact(MIN_LOCK);
+    // THE SAME FLOOR THE SELECTOR USED, on the price we are actually about to
+    // send. This used to be `MIN_LOCK` (0.005), which is ported verbatim from
+    // `hedge_naked_legs.py` and was chosen for a leg that is ALREADY NAKED and
+    // needs out — a case where half a cent beats carrying direction for months.
+    // It was never chosen for "should we exit a hedged position at all", and it
+    // is four times looser than `MIN_EXIT_CT`, the floor `unwind::consider` had
+    // to clear to admit this lot in the first place.
+    //
+    // The gap was reachable, not theoretical: `consider` screens on the MARKS
+    // snapshot and `select` will price off one up to 900 s old, while this
+    // re-prices against the book NOW. A lot admitted at 2c could therefore go
+    // out at 0.6c on a book that had moved — the exact case of owning at 0.95
+    // and selling at 0.96, which the 2c screen refuses and the 0.5c floor let
+    // through.
+    //
+    // `MIN_EXIT_CT` is a NOISE floor, not a profit target, and its own doc says
+    // why two ticks: the exit prices against a snapshot and the Kalshi fee term
+    // steps by a whole tick at qty=1, so anything clearing by less than that is
+    // measurement error. That reasoning is about the arithmetic, not about when
+    // it runs, so it applies here exactly as it does there.
+    let lock_floor = cx.parse_exact(crate::unwind::MIN_EXIT_CT_S);
     let graded = |cx: &mut Cx, r: &Result<(D, D), String>| -> Result<(D, D), String> {
         match r {
             Ok((limit, lock)) if cx.cmp(*lock, lock_floor) != Ordering::Less => Ok((*limit, *lock)),
             Ok((limit, lock)) => Err(format!(
-                "priced at {} but locks only {}/ct, under the {MIN_LOCK} floor",
+                "priced at {} but locks only {}/ct, under the {}/ct floor the selector \
+                 admitted it under",
                 cx.emit_6dp(*limit),
-                cx.emit_6dp(*lock)
+                cx.emit_6dp(*lock),
+                crate::unwind::MIN_EXIT_CT_S
             )),
             Err(e) => Err(e.clone()),
         }
@@ -3085,12 +3138,13 @@ fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> 
             let pm_close = cx.add(pm_ask_d, tick);
             let floor = exit_limit(
                 cx, fees, &ladder, k_basis, pm_basis, pm_close, o.qty, Role::Maker, Role::Taker,
+                EXIT_FLOOR,
             )?;
             if cx.cmp(resting, floor) == Ordering::Less {
                 return Err(format!(
                     "the PM-US ask has moved to {pm_ask}, which puts the profit floor at {} — \
                      above the {} we are resting at, so a fill here would no longer lock \
-                     {MIN_LOCK}/ct",
+                     {EXIT_FLOOR}/ct",
                     cx.emit_6dp(floor),
                     o.limit
                 ));
@@ -3113,6 +3167,7 @@ fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> 
             let k_take = cx.sub(k_bid_d, tick);
             let ceiling = close_limit(
                 cx, fees, k_take, k_basis, pm_basis, o.qty, Role::Taker, Role::Maker,
+                EXIT_FLOOR,
             )?;
             if cx.cmp(resting, ceiling) == Ordering::Greater {
                 return Err(format!(
@@ -3520,6 +3575,7 @@ fn price_close(
         Shape::RestKalshi => {
             let limit = close_limit(
                 cx, fees, fill, k_basis, pm_basis, filled, Role::Maker, Role::Taker,
+                MIN_LOCK,
             )?;
             let ask = view
                 .pm_ask
@@ -3548,6 +3604,7 @@ fn price_close(
             let ladder = vec![("0.0000".to_string(), "1.0000".to_string(), "0.0100".to_string())];
             let limit = exit_limit(
                 cx, fees, &ladder, k_basis, pm_basis, fill, filled, Role::Taker, Role::Maker,
+                MIN_LOCK,
             )?;
             let bid = view
                 .k_bid
@@ -4394,7 +4451,7 @@ mod tests {
         let l = penny();
         let px = |cx: &mut Cx, k: &str, p: &str, close: &str| {
             let (kb, pb, pc) = (cx.parse_exact(k), cx.parse_exact(p), cx.parse_exact(close));
-            exit_limit(cx, &fees, &l, kb, pb, pc, 5, Role::Maker, Role::Taker).map(|d| cx.emit_6dp(d))
+            exit_limit(cx, &fees, &l, kb, pb, pc, 5, Role::Maker, Role::Taker, MIN_LOCK).map(|d| cx.emit_6dp(d))
         };
         let base = px(&mut cx, "0.19", "0.78", "0.21").expect("solvable");
         // A DEARER lot needs a dearer exit.
@@ -4451,7 +4508,7 @@ mod tests {
         let (mut cx, fees) = ready();
         let (kb, pb, pc) =
             (cx.parse_exact("0.30"), cx.parse_exact("0.85"), cx.parse_exact("0.95"));
-        let e = exit_limit(&mut cx, &fees, &penny(), kb, pb, pc, 5, Role::Maker, Role::Taker)
+        let e = exit_limit(&mut cx, &fees, &penny(), kb, pb, pc, 5, Role::Maker, Role::Taker, MIN_LOCK)
             .expect_err("a $1.15 lot whose PM leg is worth 5c cannot be recovered under $1");
         assert!(e.contains("at or above $1"), "{e}");
         assert!(e.contains("cannot be done"), "{e}");
@@ -4461,7 +4518,7 @@ mod tests {
         // a price but an offer to give the contracts away.
         let (kb, pb, pc) =
             (cx.parse_exact("0.05"), cx.parse_exact("0.10"), cx.parse_exact("0.01"));
-        let l = exit_limit(&mut cx, &fees, &penny(), kb, pb, pc, 5, Role::Maker, Role::Taker).expect("anything pays");
+        let l = exit_limit(&mut cx, &fees, &penny(), kb, pb, pc, 5, Role::Maker, Role::Taker, MIN_LOCK).expect("anything pays");
         assert_eq!(cx.emit_6dp(l), "0.010000", "a floor of $0.00 is not a placeable ask");
     }
 
@@ -4496,7 +4553,7 @@ mod tests {
             let k_basis = cx.parse_exact(&format!("0.{:04}", 1900 + milli));
             let pm_basis = cx.parse_exact("0.78");
             let pm_close = cx.parse_exact("0.21");
-            let Ok(floor) = exit_limit(&mut cx, &fees, &l, k_basis, pm_basis, pm_close, 5, Role::Maker, Role::Taker) else {
+            let Ok(floor) = exit_limit(&mut cx, &fees, &l, k_basis, pm_basis, pm_close, 5, Role::Maker, Role::Taker, MIN_LOCK) else {
                 continue;
             };
             let net = |cx: &mut Cx, px: D| {
@@ -4549,7 +4606,7 @@ mod tests {
         let l = penny();
         let (kb, pb, pc) =
             (cx.parse_exact("0.19"), cx.parse_exact("0.78"), cx.parse_exact("0.21"));
-        let limit = exit_limit(&mut cx, &fees, &l, kb, pb, pc, 5, Role::Maker, Role::Taker).expect("solvable");
+        let limit = exit_limit(&mut cx, &fees, &l, kb, pb, pc, 5, Role::Maker, Role::Taker, MIN_LOCK).expect("solvable");
         let size = cx.from_i64(5);
         let maker = fees.fee(&mut cx, Venue::Kalshi, Role::Maker, limit, size, "");
         let taker = fees.fee(&mut cx, Venue::Kalshi, Role::Taker, limit, size, "");
@@ -4571,12 +4628,12 @@ mod tests {
         let (mut cx, fees) = ready();
         let (kb, pb) = (cx.parse_exact("0.19"), cx.parse_exact("0.78"));
         let good = cx.parse_exact("0.25");
-        let p = close_limit(&mut cx, &fees, good, kb, pb, 5, Role::Maker, Role::Taker).expect("a 0.25 fill closes");
+        let p = close_limit(&mut cx, &fees, good, kb, pb, 5, Role::Maker, Role::Taker, MIN_LOCK).expect("a 0.25 fill closes");
         let p_s = cx.emit_6dp(p);
 
         // A BETTER Kalshi fill tolerates a DEARER close.
         let better = cx.parse_exact("0.30");
-        let p2 = close_limit(&mut cx, &fees, better, kb, pb, 5, Role::Maker, Role::Taker).expect("still closes");
+        let p2 = close_limit(&mut cx, &fees, better, kb, pb, 5, Role::Maker, Role::Taker, MIN_LOCK).expect("still closes");
         let p2_s = cx.emit_6dp(p2);
         assert!(p2_s > p_s, "a better fill buys more room: {p2_s} vs {p_s}");
 
@@ -4585,14 +4642,14 @@ mod tests {
         // the close has to be found under 4c. The first draft of this test
         // asserted an error there and was wrong about the arithmetic.
         let thin = cx.parse_exact("0.02");
-        let p = close_limit(&mut cx, &fees, thin, kb, pb, 5, Role::Maker, Role::Taker).expect("still closes, barely");
+        let p = close_limit(&mut cx, &fees, thin, kb, pb, 5, Role::Maker, Role::Taker, MIN_LOCK).expect("still closes, barely");
         let five = cx.parse_exact("0.05");
         assert!(cx.cmp(p, five) == Ordering::Less, "{}", cx.emit_6dp(p));
 
         // What has NO close is a lot that cost more than a dollar and whose
         // Kalshi leg came back small: no positive PM price leaves the lock.
         let (kb2, pb2) = (cx.parse_exact("0.30"), cx.parse_exact("0.85"));
-        let e = close_limit(&mut cx, &fees, thin, kb2, pb2, 5, Role::Maker, Role::Taker)
+        let e = close_limit(&mut cx, &fees, thin, kb2, pb2, 5, Role::Maker, Role::Taker, MIN_LOCK)
             .expect_err("$1.15 of basis against a 2c fill closes nothing");
         assert!(e.contains("no PM-US price"), "{e}");
     }
@@ -4774,7 +4831,8 @@ mod tests {
             cx.emit_6dp(composite)
         );
         let pm_close = cx.parse_exact("0.06");
-        let composite_floor = exit_limit(&mut cx, &fees, &penny(), kb, pb, pm_close, 4, Role::Maker, Role::Taker)
+        let composite_floor =
+            exit_limit(&mut cx, &fees, &penny(), kb, pb, pm_close, 4, Role::Maker, Role::Taker, MIN_LOCK)
             .expect("legal, which is exactly why nobody caught it");
         assert_eq!(
             cx.emit_6dp(composite_floor),
@@ -4798,7 +4856,60 @@ mod tests {
         assert_eq!(o.limit, "0.0400", "at the touch, not three ticks above the offer");
     }
 
-    /// EVERY LOT ON THE TICKER GETS ITS OWN PRICE.
+    /// **OWNING AT 0.95 AND SELLING AT 0.96 IS NOT AN EXIT, IT IS A FEE.**
+    ///
+    /// The floor `decide` grades on used to be `MIN_LOCK` (0.005) while the
+    /// selector that admitted the lot used `MIN_EXIT_CT` (0.02) — four times
+    /// tighter. The gap was reachable, not theoretical: `consider` screens on a
+    /// MARKS snapshot `select` will price off at up to 900 s old, and `decide`
+    /// re-prices against the book NOW, so a lot admitted at 2c could go out at
+    /// 0.6c on a book that had moved.
+    ///
+    /// This is that case with real numbers, and the answer is better than a
+    /// refusal: THE SOLVER ASKS A HIGHER PRICE. The dear lot (PM leg cost 0.90,
+    /// Kalshi 0.194) used to rest at 0.3300 for a lock of 0.012046/ct —
+    /// comfortably over the old floor, comfortably under the one the selector
+    /// used. Aiming the same solver at the same floor the selector used walks it
+    /// one rung further up the ladder: 0.3400, locking 0.022046/ct.
+    ///
+    /// So the fix does not forgo the exit, it prices it. A refusal happens only
+    /// when NO rung on the ladder reaches the floor — which is the honest answer
+    /// in that case, because a price that does not exist cannot be rested at.
+    #[tokio::test]
+    async fn a_lock_between_the_two_floors_is_re_priced_not_taken() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 5, "0.10", "0.19")];
+        let o = decide(
+            &mut cx,
+            &fees,
+            &recs,
+            &cand(5, 1.0),
+            "p-a",
+            &quote(Some("0.0100"), Some("0.1000")),
+            &view("0.20"),
+            Instant::now(),
+            false,
+        )
+        .expect("the ladder has a rung that clears the selection floor");
+        assert_eq!(o.limit, "0.3400", "one rung above the 0.3300 the old floor settled for: {o:?}");
+        let lock: f64 = o.lock_ct.parse().expect("a decimal");
+        assert!(
+            lock >= 0.02,
+            "and it clears the floor the selector admitted this lot under: {}",
+            o.lock_ct
+        );
+    }
+
+    /// The floor `decide` grades on IS the floor `unwind::consider` admits on.
+    /// Two constants would drift, and the drift is invisible: the selector would
+    /// go on admitting lots the wire then refuses, or worse, the other way.
+    #[test]
+    fn the_exit_floor_is_the_selection_floor() {
+        assert_eq!(EXIT_FLOOR, crate::unwind::MIN_EXIT_CT_S);
+    }
+
+    /// EVERY LOT ON THE TICKER GETS ITS OWN PRICE.    /// EVERY LOT ON THE TICKER GETS ITS OWN PRICE.
     ///
     /// The corollary, and the reason a six-lot ticker empties in six passes
     /// rather than never: the dearer lots are dearer to exit, and they say so
