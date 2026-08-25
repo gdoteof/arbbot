@@ -1880,10 +1880,47 @@ pub fn decide(
 /// fill reports this process does not read, so `fees_pending` says what
 /// `engine::fill::book_basket` says and for the same reason. The prices are the
 /// ones we actually got.
-pub fn close_record(o: &Order, k_fill: &str, pm_fill: &str, filled: i64, ts: f64) -> Value {
-    let (k_role, pm_role) = match o.shape {
-        Shape::RestKalshi => ("maker", "taker"),
-        Shape::RestPmUs => ("taker", "maker"),
+/// The two fills mapped onto the venues that paid them. ONE PLACE, so the
+/// ledger record and the log line that announces it cannot disagree about which
+/// leg cost what — they did, and nothing caught it.
+///
+/// Callers hold these by ROLE: the leg the shape rested, and the leg closed by
+/// IOC afterwards. Under `rest-kalshi` that is already (kalshi, pmus); under
+/// `rest-pmus` it is reversed, and writing them straight onto the legs swapped
+/// the two prices on every record of the shape the contest picks most often.
+///
+/// ON A CROSS THE "RESTING" LEG DID NOT REST — it went out as an IOC at
+/// [`Cross::limit`], which is the price it actually paid. Callers pass
+/// `Order::limit` because that is what a rest would have used, and on a cross
+/// that price was never sent to anyone.
+fn fills_by_venue<'a>(o: &'a Order, rest_fill: &'a str, close_fill: &'a str) -> (&'a str, &'a str) {
+    let rest_fill = o.cross.as_ref().map_or(rest_fill, |c| c.limit.as_str());
+    match o.shape {
+        Shape::RestKalshi => (rest_fill, close_fill),
+        Shape::RestPmUs => (close_fill, rest_fill),
+    }
+}
+
+pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, ts: f64) -> Value {
+    // BY LEG ROLE, THEN MAPPED TO VENUES BY THE SHAPE. These used to be named
+    // `k_fill`/`pm_fill` and written straight onto the Kalshi and PM-US legs,
+    // while all three callers passed them as (the leg that RESTED, the leg that
+    // CLOSED). Under `rest-kalshi` those coincide and the record was right;
+    // under `rest-pmus` they are reversed and EVERY RECORD HAD ITS TWO PRICES
+    // SWAPPED.
+    //
+    // Caught on 2026-08-25 against the log that placed it: the 08-23 exit rested
+    // a PM-US bid `@ 0.0200 on polymarket_us`, and its record carries 0.0200 on
+    // the KALSHI leg. `rest-pmus` is the shape the contest picks most often, so
+    // this is most of the unwound records in `data/exec/trades.jsonl`.
+    let (k_fill, pm_fill) = fills_by_venue(o, rest_fill, close_fill);
+    // A CROSS PAYS TAKER ON BOTH LEGS. The shape still says which leg went
+    // first, but neither rested, so neither is a maker — and the comment below
+    // is exactly why that matters.
+    let (k_role, pm_role) = match (o.cross.is_some(), o.shape) {
+        (true, _) => ("taker", "taker"),
+        (false, Shape::RestKalshi) => ("maker", "taker"),
+        (false, Shape::RestPmUs) => ("taker", "maker"),
     };
     serde_json::json!({
         "ts": ts,
@@ -1898,16 +1935,37 @@ pub fn close_record(o: &Order, k_fill: &str, pm_fill: &str, filled: i64, ts: f64
         "maker_exit_k_basis": o.k_basis,
         "maker_exit_pm_basis": o.pm_basis,
         "maker_exit_shape": o.shape.tag(),
-        "maker_exit_lock_ct": o.lock_ct,
-        "note": format!(
-            "opportunistic maker exit ({}): a post-only order rested on {} at the price that \
-             locked a profit against BOTH legs' ledger basis, and the other leg was closed \
-             with an IOC re-priced against the book at fill time. Sized to ONE open lot, so \
-             this closes exactly one record. realized_pnl_usd is absent because the venue \
-             fees arrive on fill reports this process does not read.",
-            o.shape.tag(),
-            o.shape.rest_venue().as_str()
-        ),
+        // The lock that was actually TAKEN. A cross pays the spread and both
+        // takers' fees to convert now, so it locks strictly less than the rest
+        // it replaced — recording the rested figure would book a profit this
+        // trade did not make.
+        "maker_exit_lock_ct": o.cross.as_ref().map_or(&o.lock_ct, |c| &c.lock_ct),
+        "note": match &o.cross {
+            Some(c) => format!(
+                "opportunistic maker exit ({}): BOTH legs were CROSSED — an IOC on {} at {} \
+                 rather than a post-only order rested there — because crossing still locked \
+                 {}/ct against BOTH legs' ledger basis, net of both takers' fees, where \
+                 resting would have locked {}/ct and waited. The difference is the spread and \
+                 the taker fees, and it is what was paid to convert now instead of joining a \
+                 queue. Sized to ONE open lot, so this closes exactly one record. \
+                 realized_pnl_usd is absent because the venue fees arrive on fill reports this \
+                 process does not read.",
+                o.shape.tag(),
+                o.shape.rest_venue().as_str(),
+                c.limit,
+                c.lock_ct,
+                o.lock_ct
+            ),
+            None => format!(
+                "opportunistic maker exit ({}): a post-only order rested on {} at the price \
+                 that locked a profit against BOTH legs' ledger basis, and the other leg was \
+                 closed with an IOC re-priced against the book at fill time. Sized to ONE open \
+                 lot, so this closes exactly one record. realized_pnl_usd is absent because \
+                 the venue fees arrive on fill reports this process does not read.",
+                o.shape.tag(),
+                o.shape.rest_venue().as_str()
+            ),
+        },
         // THE ROLES ARE THE SHAPE'S, not a fixed property of the venue. Under
         // `rest-kalshi` the Kalshi leg is the maker and PM-US the taker; under
         // `rest-pmus` it is the other way round, and a record that said
@@ -2281,8 +2339,14 @@ pub fn describe(o: &Order, shadow: bool, held_s: f64) -> String {
 
 /// Book a filled-and-closed exit. Through `append_basket`, never a raw append:
 /// the single-author rule is what caught the 2026-07-30 double-book.
-pub fn book(path: &str, o: &Order, k_fill: &str, pm_fill: &str, filled: i64, ts: f64) -> String {
-    let rec = close_record(o, k_fill, pm_fill, filled, ts);
+/// `rest_fill` is the price of the leg the shape RESTED (or, on a cross, would
+/// have); `close_fill` the leg closed by IOC afterwards. Named by ROLE because
+/// that is how every caller has them — mapping them onto venues is
+/// [`close_record`]'s job and getting it wrong there swapped the two prices on
+/// every `rest-pmus` record until 2026-08-25.
+pub fn book(path: &str, o: &Order, rest_fill: &str, close_fill: &str, filled: i64, ts: f64) -> String {
+    let rec = close_record(o, rest_fill, close_fill, filled, ts);
+    let (k_fill, pm_fill) = fills_by_venue(o, rest_fill, close_fill);
     match ledger::append_basket(path, rec) {
         Ok(ledger::Booking::Booked) => {
             CLOSED.fetch_add(1, AtomicOrd::Relaxed);
@@ -4178,7 +4242,62 @@ mod tests {
         assert_eq!(a["legs"][1]["role"], "taker");
     }
 
-    // ---- the naked leg, on whichever venue it is on -----------------------
+    /// **THE PRICES GO TO THE VENUES THAT PAID THEM.**
+    ///
+    /// The test above pins the ROLES and never looks at the numbers, which is
+    /// exactly why the swap survived: callers hold the two fills as (the leg
+    /// that RESTED, the leg CLOSED by IOC), and writing them straight onto
+    /// (kalshi, pmus) is only right for one of the two shapes.
+    ///
+    /// Caught on 2026-08-25 against the log that placed it — the 08-23 exit
+    /// rested a PM-US bid `@ 0.0200 on polymarket_us`, and its record carried
+    /// 0.0200 on the KALSHI leg. `rest-pmus` is the shape the contest picks most
+    /// often, so this was most of the unwound records in the ledger.
+    #[test]
+    fn a_rest_pmus_record_puts_each_price_on_the_venue_that_paid_it() {
+        let mut o = resting_exit(5).order;
+        o.shape = Shape::RestPmUs;
+        // (rested = the PM-US bid @ 0.20, closed = the Kalshi IOC @ 0.17)
+        let rec = close_record(&o, "0.20", "0.17", 5, 1.0);
+        assert_eq!(rec["legs"][0]["venue"], "kalshi");
+        assert_eq!(rec["legs"][0]["yes_price"], "0.17", "the Kalshi IOC's price: {rec}");
+        assert_eq!(rec["legs"][1]["venue"], "polymarket_us");
+        assert_eq!(rec["legs"][1]["yes_price"], "0.20", "the PM-US rest's price: {rec}");
+
+        // `rest-kalshi` is the case where role order and venue order coincide.
+        // It was always right and must stay byte-for-byte unchanged.
+        let a = close_record(&resting_exit(5).order, "0.20", "0.17", 5, 1.0);
+        assert_eq!(a["legs"][0]["yes_price"], "0.20", "kalshi rested at 0.20: {a}");
+        assert_eq!(a["legs"][1]["yes_price"], "0.17", "pmus closed at 0.17: {a}");
+    }
+
+    /// A CROSS PAID TAKER ON BOTH LEGS, AT THE PRICE IT ACTUALLY CROSSED.
+    ///
+    /// `Order::limit` is what a rest WOULD have used and on a cross was never
+    /// sent to anyone; `Cross::limit` is what the IOC paid. Booking the former
+    /// records a trade at a price no venue saw, and `maker_exit_lock_ct` from
+    /// the rest books a profit the cross did not make — it locks strictly less,
+    /// and the difference is the spread and both takers' fees.
+    #[test]
+    fn a_crossed_record_books_both_takers_and_the_price_it_crossed_at() {
+        let mut o = resting_exit(5).order;
+        o.shape = Shape::RestPmUs;
+        o.cross = Some(Cross { limit: "0.2200".into(), lock_ct: "0.025704".into() });
+        let rec = close_record(&o, "0.20", "0.17", 5, 1.0);
+        assert_eq!(rec["legs"][0]["role"], "taker");
+        assert_eq!(rec["legs"][1]["role"], "taker", "neither leg rested: {rec}");
+        assert_eq!(
+            rec["legs"][1]["yes_price"], "0.2200",
+            "the price the IOC actually paid, not the rest's 0.20: {rec}"
+        );
+        assert_eq!(rec["maker_exit_lock_ct"], "0.025704", "the lock actually taken: {rec}");
+        assert!(
+            rec["note"].as_str().expect("a note").contains("CROSSED"),
+            "and the note describes what happened: {rec}"
+        );
+    }
+
+    // ---- the naked leg, on whichever venue it is on -----------------------    // ---- the naked leg, on whichever venue it is on -----------------------
 
     /// THE SIGN FLIP, PINNED. `close_shortfall` measures the still-open leg
     /// against venue truth, and which leg that is — and therefore the sign of
