@@ -1386,6 +1386,29 @@ pub fn rest_key(o: &Order) -> (String, String) {
     }
 }
 
+/// The sides a CROSS takes, which are the OPPOSITE of the ones it might rest.
+///
+/// **A CROSS THAT HITS OUR OWN QUOTE IS CANCELLED, NOT FILLED.** Kalshi's
+/// `self_trade_prevention_type: taker_at_cross` answers a taker that would
+/// cross our own resting order by cancelling THE TAKER — the same rule
+/// `naked_act` refuses under, and the reason it names a working maker exit as a
+/// blocker. The entry quoter rests on both sides across this book (live on
+/// 2026-08-24: `kalshi KXTIME-26-POP bid`, `polymarket_us …-flabol bid`,
+/// `kalshi KXBRPRES-26-FBOL ask`), and its whole job is to sit AT the touch —
+/// which is exactly the price a cross lifts.
+///
+/// So a cross needs the opposite side yielded for the same reason a rest needs
+/// its own, and it would otherwise fail SILENTLY and SAFELY: the taker comes
+/// back unfilled and reads as "the book moved", on precisely the markets we
+/// quote, which is all of them. Ineffective rather than dangerous, and
+/// invisible either way.
+pub fn cross_keys(market_id: &str, pm_market: &str) -> Vec<(String, String)> {
+    vec![
+        (market_id.to_string(), SIDE_BID.to_string()),
+        (pm_market.to_string(), SIDE_ASK.to_string()),
+    ]
+}
+
 /// BOTH sides a candidate might rest, asked for before the shape is known.
 ///
 /// The cycle cannot know which shape wins until it has priced both books, and
@@ -1676,6 +1699,24 @@ pub fn decide(
     // spread to reach a trade the selector had rejected.
     let cross = take_ok
         .then(|| {
+            // THE SIDE A CROSS LIFTS MUST BE YIELDED TOO, and it is the opposite
+            // of the one checked above: `taker_at_cross` cancels a taker that
+            // would hit our own resting quote, so an unyielded side does not
+            // make the cross wrong, it makes it a no-op that reads as "the book
+            // moved". Same settle window as the rest guard, for the same reason.
+            let lift = match shape {
+                Shape::RestKalshi => (cand.market_id.clone(), SIDE_BID.to_string()),
+                Shape::RestPmUs => (pm_market.to_string(), SIDE_ASK.to_string()),
+            };
+            match view.suppressed_at.get(&lift) {
+                Some(since)
+                    if now.saturating_duration_since(*since).as_secs_f64()
+                        >= SUPPRESS_SETTLE_S => {}
+                // Not yielded, or not yet settled: rest this cycle rather than
+                // send a taker into our own book. The candidate comes back round
+                // and crosses then, by which time the yield has landed.
+                _ => return None,
+            }
             let k_bid = quote.yes_bid.as_deref().and_then(|x| cx.parse(x))?;
             let k_take = cx.sub(k_bid, tick);
             if !cx.is_pos(k_take) {
@@ -2391,6 +2432,13 @@ async fn cycle(
     // first cycle that picks a market ASKS and the next one places, which is
     // what `decide`'s settle guard refuses on by name.
     want.extend(candidate_keys(&target.market_id, &pm));
+    // ...and, when a cross is possible, the two sides it would LIFT. Asked for
+    // unconditionally under the flag rather than after pricing, because the
+    // shape — and so which side a cross would hit — is not known until the
+    // books are read, which is the same reason `candidate_keys` yields both.
+    if live.take_ok {
+        want.extend(cross_keys(&target.market_id, &pm));
+    }
     request_suppress(want);
     let market = target.market_id.clone();
     let k = kalshi.clone();
@@ -3740,11 +3788,16 @@ mod tests {
             pm_ask: [("p-a".to_string(), pm_ask.to_string())].into_iter().collect(),
             pm_bid: [("p-a".to_string(), pm_bid.to_string())].into_iter().collect(),
             k_bid: [("K-a".to_string(), k_bid.to_string())].into_iter().collect(),
-            // BOTH sides yielded, which is what `cycle` publishes: it cannot
-            // know which shape will win until it has priced both books.
+            // ALL FOUR sides yielded, which is what `cycle` publishes once
+            // `--maker-exit-take` is on: it cannot know which shape will win
+            // until it has priced both books, nor whether the winner will rest
+            // or cross. The two REST sides are `candidate_keys`, the two LIFT
+            // sides `cross_keys`.
             suppressed_at: [
                 (("K-a".to_string(), SIDE_ASK.to_string()), then),
                 (("p-a".to_string(), SIDE_BID.to_string()), then),
+                (("K-a".to_string(), SIDE_BID.to_string()), then),
+                (("p-a".to_string(), SIDE_ASK.to_string()), then),
             ]
             .into_iter()
             .collect(),
@@ -3834,7 +3887,37 @@ mod tests {
         assert!(crossed >= 0.02, "and still clears the 0.02 selection floor: {c:?}");
     }
 
-    /// ...AND IS REFUSED WHEN IT DOES NOT. The same books against a basis that
+    /// **A CROSS INTO OUR OWN QUOTE IS CANCELLED, NOT FILLED**, so the side it
+    /// LIFTS has to be yielded exactly as the side it would rest on does.
+    ///
+    /// `self_trade_prevention_type: taker_at_cross` answers a taker that would
+    /// cross our own resting order by cancelling THE TAKER. The entry quoter
+    /// sits at the touch by design, and the touch is what a cross lifts — so
+    /// without this the cross would come back unfilled and read as "the book
+    /// moved", silently, on exactly the markets we quote. Ineffective rather
+    /// than dangerous, which is why it needs a test rather than an alarm.
+    ///
+    /// Shape A wins here, so the lift side is the KALSHI BID; the view yields
+    /// everything except that.
+    #[tokio::test]
+    async fn a_cross_whose_lift_side_is_not_yielded_rests_instead() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 5, "0.57", "0.43")];
+        let q = quote(Some("0.16"), Some("0.24"));
+        let mut vw = wide_pm_view("0.22", "0.20", "0.16");
+        vw.suppressed_at.remove(&("K-a".to_string(), SIDE_BID.to_string()));
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true)
+            .expect("the resting shape still pays");
+        assert_eq!(o.shape, Shape::RestKalshi);
+        assert!(
+            o.cross.is_none(),
+            "the bid we would sell into is still ours to cancel, so this rests: {o:?}"
+        );
+        assert_eq!(o.limit, "0.2300", "and rests where it always did: {o:?}");
+    }
+
+    /// ...AND IS REFUSED WHEN IT DOES NOT.    /// ...AND IS REFUSED WHEN IT DOES NOT. The same books against a basis that
     /// leaves only a thin lock: resting still pays, crossing does not, and the
     /// exit rests exactly as it always did.
     ///
