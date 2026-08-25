@@ -316,6 +316,15 @@ const TICK_CT: f64 = 0.01;
 /// [`Exit::near_floor`]: noise even by the weak reading above.
 const MIN_EXIT_CT: f64 = 2.0 * TICK_CT;
 
+/// [`MIN_EXIT_CT`] as an exact-decimal literal, for the callers that compare in
+/// the decimal context rather than in `f64` — `maker_exit`'s cross test, which
+/// must hold a cross to the same floor `consider` admitted the lot under.
+///
+/// Two spellings of one number, so `min_exit_ct_spellings_agree` pins them
+/// together: a floor that drifted between the selector and the thing it gates
+/// would spend the spread to reach a trade the selector had already refused.
+pub const MIN_EXIT_CT_S: &str = "0.02";
+
 /// A basket that should be quoted out of: holding it is worse than redeploying
 /// its capital, and the passive exit is profitable today.
 #[derive(Debug, Clone, PartialEq)]
@@ -643,6 +652,16 @@ pub fn identity_set(exits: &[Exit]) -> Vec<(String, u64)> {
 
 #[cfg(test)]
 mod tests {
+    /// The two spellings of the exit floor are one number.
+    #[test]
+    fn min_exit_ct_spellings_agree() {
+        assert_eq!(
+            super::MIN_EXIT_CT_S.parse::<f64>().expect("a decimal literal"),
+            super::MIN_EXIT_CT,
+            "MIN_EXIT_CT_S must be MIN_EXIT_CT, or the selector and the cross gate disagree"
+        );
+    }
+
     use super::*;
 
     /// 2026-07-29T20:15:04Z, the live marks file's own `generated_at`.

@@ -200,6 +200,10 @@ struct Args {
     /// `Engine::maker_exit_tick`, and a silent engine makes every decision here
     /// refuse.
     maker_exit: bool,
+    /// `--maker-exit-take`: let an exit CROSS both legs when crossing still
+    /// clears the selection floor, instead of resting one and waiting for a
+    /// queue it cannot reach the front of. Off unless asked for.
+    maker_exit_take: bool,
     /// Decide and LOG, never place (`maker_exit::Live::shadow`). Wins over
     /// `--maker-exit` when both are given — same rule, same reason, same
     /// function as `--positions-recon-act-shadow`.
@@ -286,6 +290,7 @@ fn default_args() -> Args {
         positions_recon_act: false,
         positions_recon_act_shadow: false,
         maker_exit: false,
+        maker_exit_take: false,
         maker_exit_shadow: false,
     }
 }
@@ -377,6 +382,7 @@ fn parse_args() -> Args {
             "--positions-recon-act" => a.positions_recon_act = true,
             "--positions-recon-act-shadow" => a.positions_recon_act_shadow = true,
             "--maker-exit" => a.maker_exit = true,
+            "--maker-exit-take" => a.maker_exit_take = true,
             "--maker-exit-shadow" => a.maker_exit_shadow = true,
             other => {
                 eprintln!("unknown arg: {other}");
@@ -1614,7 +1620,11 @@ fn spawn_maker_exit(
         );
     }
     tokio::spawn(maker_exit::exit_loop(
-        maker_exit::Live::new(shadow, args.ledger.clone()),
+        {
+            let mut l = maker_exit::Live::new(shadow, args.ledger.clone());
+            l.take_ok = args.maker_exit_take;
+            l
+        },
         maker_exit::Cfg {
             marks_path: args.marks.clone(),
             rel_prefixes: args.rel_prefixes.clone(),
