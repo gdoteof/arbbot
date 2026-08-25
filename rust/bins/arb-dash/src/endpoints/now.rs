@@ -613,8 +613,25 @@ pub fn json(a: &Args) -> String {
     });
 
     // ---- what actually got booked ----------------------------------------
+    //
+    // A CORRECTION IS METADATA ABOUT A BASKET, NOT A BASKET. It carries a
+    // `relationship_id` and a `ts` and nothing else this panel reads — no qty,
+    // no strategy, no title — so listing one renders a blank row, and because
+    // it is written LATER than the record it corrects it sorts to the top and
+    // pushes real fills off the end.
+    //
+    // `ledger::apply_corrections` has always dropped them; this panel read the
+    // raw tail and did not. Seen 2026-08-25: ten corrections appended in one
+    // pass filled all eight slots, and the `/now` tab showed no fills at all on
+    // the night the exit path first started closing.
+    //
+    // Filtered rather than APPLIED, deliberately: applying needs the whole file
+    // (a correction may name a record older than the tail), and this endpoint
+    // is a tail by construction. `/api/trades` is the one that folds them in,
+    // and it already does.
     let booked: Vec<Value> = tail_json(&a.ledger_path, LEDGER_TAIL)
         .into_iter()
+        .filter(is_booked_basket)
         .rev()
         .take(8)
         .map(|r| {
@@ -683,9 +700,42 @@ pub fn json(a: &Args) -> String {
     serde_json::to_string(&Value::Object(out)).unwrap_or_else(|_| "{}".into())
 }
 
+/// Is this ledger record a basket the engine booked, or bookkeeping about one?
+///
+/// See the `booked` panel for why this exists. Pulled out as a named predicate
+/// so it can be tested: the panel itself needs an `App` and a ledger on disk.
+fn is_booked_basket(r: &Value) -> bool {
+    r.get("status").and_then(Value::as_str) != Some("correction")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CORRECTION IS NOT A FILL, and the `/now` tab showed nothing else for
+    /// the eight slots it has on 2026-08-25 — ten corrections appended in one
+    /// pass, each newer than the record it corrects, on the night the exit path
+    /// first started closing baskets.
+    #[test]
+    fn a_correction_is_not_something_the_engine_booked() {
+        let corr = serde_json::json!({
+            "ts": 1787632310.3, "status": "correction",
+            "relationship_id": "xvus-time-poty-26-popeleoxiv",
+            "corrects_ts": 1787631074.9, "fields": {"legs": []}
+        });
+        assert!(!is_booked_basket(&corr), "it carries a rel_id and nothing else this panel reads");
+
+        for status in ["open", "unwound", "settled"] {
+            let rec = serde_json::json!({
+                "ts": 1787631074.9, "status": status, "qty": 5,
+                "relationship_id": "xvus-time-poty-26-popeleoxiv", "strategy": "maker-exit"
+            });
+            assert!(is_booked_basket(&rec), "{status} is a basket");
+        }
+        // A record with no status at all is still a basket: the panel has
+        // always shown those, and silence here would hide them.
+        assert!(is_booked_basket(&serde_json::json!({"ts": 1.0, "qty": 5})));
+    }
 
     /// The four gates that actually fire on this book, parsed from the exact
     /// strings `arb_core::risk::gate` builds. These literals are the contract:
