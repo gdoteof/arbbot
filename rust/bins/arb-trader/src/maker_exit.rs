@@ -1269,7 +1269,22 @@ fn quantize_down(cx: &mut Cx, x: D, tick: D) -> D {
 
 // -------------------------------------------------------------- the decision ---
 
-/// One exit, priced and ready to rest.
+/// CROSS BOTH LEGS NOW instead of resting one and waiting. See [`Order::cross`]
+/// for why, and for the arithmetic that decides when it is worth the spread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cross {
+    /// Marketable limit for the leg that would otherwise have rested. The other
+    /// leg is re-priced by `price_close` at fill time, exactly as it is after a
+    /// resting fill.
+    pub limit: String,
+    /// What crossing BOTH legs locks per contract, net of BOTH takers' fees.
+    /// Always less than [`Order::lock_ct`] — that difference is the spread and
+    /// the taker fees, and it is the price of not waiting.
+    pub lock_ct: String,
+}
+
+/// One exit, priced and ready to rest — or, when [`Order::cross`] is set, to
+/// cross.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Order {
     pub rel_id: String,
@@ -1301,6 +1316,28 @@ pub struct Order {
     /// both legs' ledger basis and net of both legs' fees. The number the shape
     /// contest was decided on, carried so the log line can show its work.
     pub lock_ct: String,
+    /// CROSS THIS EXIT INSTEAD OF RESTING IT: the marketable limit for the leg
+    /// that would otherwise rest, and the lock crossing still leaves.
+    ///
+    /// `None` is every exit that has ever been sent — rest a post-only GTC and
+    /// wait. `Some` only when `--maker-exit-take` is on AND crossing both legs
+    /// still clears [`crate::unwind::MIN_EXIT_CT`] net of BOTH takers' fees.
+    ///
+    /// WHY IT EXISTS. Resting was not slow, it was ineffective: over the 27 h to
+    /// 2026-08-24 the module rested 34 exits and closed NONE, because a 5-lot
+    /// passive order joins a queue it cannot get to the front of. Measured on
+    /// the live book that day: our `tpoyc-2026-popleo` bid sat THIRD price level
+    /// down behind ~711 lots, and our `dontru` bid was at the touch behind
+    /// 6,551 lots at the same price. An hour of that is not a fair run at the
+    /// queue; it is a coin that never lands.
+    ///
+    /// The price of certainty is the spread plus the taker fee, and the floor is
+    /// what decides whether it is worth paying. On `dontru` that day: 1.00c of
+    /// spread and 0.175c of PM-US taker fee (`0.06 * p * (1-p)`, quadratic, so
+    /// nearly free at a 3c price) took the lock from 3.4c to ~2.2c — still over
+    /// the 2c floor. On `popleo` the same arithmetic gave 0.6c and it is
+    /// correctly refused. This is a per-candidate test, never a mode.
+    pub cross: Option<Cross>,
     /// The runner-up shape's lock, when it had one. `None` = the other shape
     /// could not be priced at all, and the log line says why instead.
     pub runner_up_ct: Option<String>,
@@ -1365,7 +1402,12 @@ pub fn candidate_keys(market_id: &str, pm_market: &str) -> Vec<(String, String)>
 }
 
 /// What one contract of this exit locks, net of both legs' fees, against both
-/// legs' ledger basis. The one arithmetic both shapes are scored on.
+/// legs' ledger basis. The one arithmetic every shape is scored on.
+///
+/// TAKES THE ROLES RATHER THAN A [`Shape`] because the CROSS has neither a
+/// resting leg nor a shape to name it: both legs pay taker. Passing
+/// `shape.roles()` is what the two resting shapes do, so nothing about them
+/// changed.
 ///
 /// ```text
 ///   k_px - fee(kalshi, k_role, k_px) + (1 - pm_px) - fee(pmus, pm_role, pm_px)
@@ -1375,14 +1417,13 @@ pub fn candidate_keys(market_id: &str, pm_market: &str) -> Vec<(String, String)>
 pub fn lock_per_ct(
     cx: &mut Cx,
     fees: &FeeSchedule,
-    shape: Shape,
+    (k_role, pm_role): (Role, Role),
     k_px: D,
     pm_px: D,
     k_basis: D,
     pm_basis: D,
     qty: i64,
 ) -> D {
-    let (k_role, pm_role) = shape.roles();
     let size = cx.from_i64(qty);
     let kf = fees.fee(cx, Venue::Kalshi, k_role, k_px, size, "");
     let kf = cx.div(kf, size);
@@ -1411,6 +1452,7 @@ pub fn decide(
     quote: &Quote,
     view: &EngineView,
     now: Instant,
+    take_ok: bool,
 ) -> Result<Order, String> {
     if !cand.actionable {
         return Err(refuse(format!(
@@ -1511,7 +1553,8 @@ pub fn decide(
         let limit =
             rest_price(cx, &quote.ladder, floor, quote.yes_bid.as_deref(), quote.yes_ask.as_deref())?;
         let limit = cx.quantize_4dp(limit);
-        let lock = lock_per_ct(cx, fees, Shape::RestKalshi, limit, pm_close, k_basis, pm_basis, qty);
+        let lock =
+            lock_per_ct(cx, fees, Shape::RestKalshi.roles(), limit, pm_close, k_basis, pm_basis, qty);
         Ok((limit, lock))
     })(cx);
 
@@ -1539,7 +1582,8 @@ pub fn decide(
         let pm_bid = view.pm_bid.get(pm_market).map(String::as_str);
         let limit = rest_price_bid(cx, ceiling, pm_bid, Some(pm_ask.as_str()))?;
         let limit = cx.quantize_4dp(limit);
-        let lock = lock_per_ct(cx, fees, Shape::RestPmUs, k_take, limit, k_basis, pm_basis, qty);
+        let lock =
+            lock_per_ct(cx, fees, Shape::RestPmUs.roles(), k_take, limit, k_basis, pm_basis, qty);
         Ok((limit, lock))
     })(cx);
 
@@ -1612,6 +1656,60 @@ pub fn decide(
         Shape::RestKalshi => pm_ask.clone(),
         Shape::RestPmUs => quote.yes_bid.clone().unwrap_or_default(),
     };
+
+    // ------------------------------------------------------------- the cross ---
+    // CROSSING IS ONE ECONOMIC ACTION AND SO ONE NUMBER, whichever shape won the
+    // contest above: sell the Kalshi YES into its bid, buy the PM-US YES at its
+    // ask, both taker. The shape still decides which leg goes FIRST — that is
+    // `rest_market`/`close_market` and the sides `place` and `close_leg` read —
+    // but it does not change what crossing pays, so this is computed once.
+    //
+    // Priced with the SAME conservative ticks the resting shapes use: a tick
+    // UNDER the Kalshi bid (a marketable sell fills at the bid or better, so
+    // this cannot flatter it) and a tick THROUGH the PM-US ask. Crossing is
+    // therefore scored against prices at least as bad as the ones it will get.
+    //
+    // AGAINST `MIN_EXIT_CT`, NOT `MIN_LOCK`. The placement floor is 0.005 and
+    // the selection floor is 0.02, and paying the spread has to clear the harder
+    // one: `unwind::consider` already refused this lot at anything under 0.02 as
+    // not worth doing, and a cross that dropped below it would be spending the
+    // spread to reach a trade the selector had rejected.
+    let cross = take_ok
+        .then(|| {
+            let k_bid = quote.yes_bid.as_deref().and_then(|x| cx.parse(x))?;
+            let k_take = cx.sub(k_bid, tick);
+            if !cx.is_pos(k_take) {
+                return None;
+            }
+            let pm_take = cx.add(pm_ask_d, tick);
+            let lock = lock_per_ct(
+                cx,
+                fees,
+                (Role::Taker, Role::Taker),
+                k_take,
+                pm_take,
+                k_basis,
+                pm_basis,
+                qty,
+            );
+            let floor = cx.parse_exact(crate::unwind::MIN_EXIT_CT_S);
+            if cx.cmp(lock, floor) == Ordering::Less {
+                return None;
+            }
+            // The leg that would have rested is the one crossed FIRST, at its
+            // marketable price; the other is closed by `close_leg` exactly as it
+            // is after a resting fill, re-priced against the book at that moment.
+            let first = match shape {
+                Shape::RestKalshi => k_take,
+                Shape::RestPmUs => pm_take,
+            };
+            Some(Cross {
+                limit: cx.quantize_4dp(first).to_standard_notation_string(),
+                lock_ct: cx.emit_6dp(lock),
+            })
+        })
+        .flatten();
+
     Ok(Order {
         rel_id: cand.rel_id.clone(),
         shape,
@@ -1624,6 +1722,7 @@ pub fn decide(
         pm_basis: pm_lot.cost_per_ct,
         pm_ask_at_decision: against,
         lock_ct: cx.emit_6dp(lock),
+        cross,
         runner_up_ct: runner_up.map(|r| cx.emit_6dp(r)),
     })
 }
@@ -1733,6 +1832,9 @@ pub struct Live {
     /// the naked-leg completer it RESTS rather than crossing, so the first live
     /// one is also the first time anyone sees what price it picks.
     pub shadow: bool,
+    /// `--maker-exit-take`: may an exit CROSS both legs when doing so still
+    /// clears the selection floor? Off unless asked for. See [`Order::cross`].
+    pub take_ok: bool,
     pub ledger_path: String,
     pub debounce: Debounce,
     pub resting: Option<Resting>,
@@ -1802,6 +1904,7 @@ impl Live {
         let fees = FeeSchedule::new(&mut cx);
         Live {
             shadow,
+            take_ok: false,
             ledger_path,
             debounce: Debounce::default(),
             resting: None,
@@ -2314,8 +2417,17 @@ async fn cycle(
             return out;
         }
     };
-    let decided =
-        decide(&mut live.cx, &live.fees, &records, &target, &pm, &quote, &view, Instant::now());
+    let decided = decide(
+        &mut live.cx,
+        &live.fees,
+        &records,
+        &target,
+        &pm,
+        &quote,
+        &view,
+        Instant::now(),
+        live.take_ok,
+    );
     let order = match decided {
         Ok(o) => o,
         Err(why) => {
@@ -2329,18 +2441,165 @@ async fn cycle(
     if live.shadow {
         return out;
     }
-    out.extend(place(live, order, kalshi, pmus).await);
+    out.extend(place(live, order, &view, kalshi, pmus).await);
     out
 }
 
-/// Rest ONE post-only GTC ask.
-async fn place(
+/// CROSS BOTH LEGS. The first leg is sent marketable instead of rested; if it
+/// fills, [`close_leg`] closes the other one exactly as it does after a resting
+/// fill, re-priced against the book at that moment.
+///
+/// **THE FAILURE MODE IS THE ONE THIS MODULE ALREADY HAS.** Between the first
+/// leg filling and the second one returning we are one-legged, which is true of
+/// a resting exit too — the difference is only that we chose the moment. So
+/// nothing new guards it: `close_leg` parks a shortfall, `heal` works it off,
+/// and `maker_exit_unresolved` still ratchets.
+///
+/// A first leg that does NOT fill leaves the slot free and NOTHING resting,
+/// which is the whole point of an IOC here: the alternative — a marketable GTC —
+/// would rest at a price we chose for crossing, which is the one price we never
+/// want to sit at.
+async fn cross(
     live: &mut Live,
     order: Order,
+    view: &EngineView,
     kalshi: &std::sync::Arc<dyn crate::sink::OrderSink>,
     pmus: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> Vec<String> {
     use arb_venue::gateway::{PlaceRequest, Side, Tif};
+    let plan = order.cross.clone().expect("cross() is only called with a cross plan");
+    let (first_sink, close_sink) = sinks(order.shape, kalshi, pmus);
+    let coid = client_order_id();
+    let req = PlaceRequest {
+        market: order.rest_market().to_string(),
+        // The same side the rest would have taken — selling the YES we hold, or
+        // bidding for the YES we are short. Only the PRICE and the TIF differ.
+        side: match order.shape {
+            Shape::RestKalshi => Side::Ask,
+            Shape::RestPmUs => Side::Bid,
+        },
+        price: plan.limit.clone(),
+        qty: order.qty,
+        tif: Tif::Ioc,
+        // NOT post-only, and that is the entire difference from `place`. A
+        // post-only order priced to cross is REJECTED by the venue, which is
+        // exactly what makes it safe to rest and exactly what makes it useless
+        // here.
+        post_only: false,
+        client_order_id: coid.clone(),
+    };
+    let mut out = vec![format!(
+        "[maker-exit] CROSS {} {}x {} @ {} [{}] locking {}/ct crossed (vs {}/ct rested, which is \
+         the spread and both takers' fees) — id {coid}",
+        match order.shape {
+            Shape::RestKalshi => "SELL",
+            Shape::RestPmUs => "BUY",
+        },
+        order.qty,
+        order.rest_market(),
+        plan.limit,
+        order.shape.tag(),
+        plan.lock_ct,
+        order.lock_ct,
+    )];
+    let sk = first_sink.clone();
+    let rq = req.clone();
+    let oid = match tokio::task::spawn_blocking(move || sk.place(&rq)).await {
+        Ok(Ok(id)) => id,
+        Ok(Err(e)) => {
+            out.push(format!("[maker-exit] the cross was refused: {e}"));
+            return out;
+        }
+        Err(e) => {
+            out.push(format!("[maker-exit] cross task failed: {e}"));
+            return out;
+        }
+    };
+    PLACED.fetch_add(1, AtomicOrd::Relaxed);
+    // Same reason as `place`: this never went through `Engine::dispatch`, so the
+    // account-wide fill feed would otherwise see money nothing can explain.
+    crate::engine::fill::note_sidecar_order(&oid);
+
+    let mut filled = 0i64;
+    let mut unreadable: Option<String> = None;
+    for i in 0..crate::naked_act::FILL_POLLS {
+        let sk = first_sink.clone();
+        let id = oid.clone();
+        match tokio::task::spawn_blocking(move || sk.filled_qty(&id)).await {
+            Ok(Ok(n)) => {
+                filled = n;
+                unreadable = None;
+                if filled >= 1 {
+                    break;
+                }
+            }
+            Ok(Err(e)) => unreadable = Some(e.to_string()),
+            Err(e) => unreadable = Some(format!("fill-read task failed: {e}")),
+        }
+        if i + 1 < crate::naked_act::FILL_POLLS {
+            tokio::time::sleep(crate::naked_act::FILL_POLL_GAP).await;
+        }
+    }
+    if let Some(e) = unreadable {
+        // AN ACCEPTED IOC WE CANNOT READ IS NOT A NON-FILL. It may have taken
+        // contracts. `resolve_vanished` owns exactly this shape of doubt for the
+        // resting path; here the order is already terminal at the venue, so the
+        // honest move is to say so loudly and let the positions reconciler find
+        // it rather than to assume either way and act on the assumption.
+        out.push(format!(
+            "[maker-exit] the cross IOC {oid} (client {coid}) was ACCEPTED and its fill could \
+             not be read: {e} — NOT closing the other leg, because closing against a fill we \
+             cannot see is how one naked leg becomes two. `--positions-recon` reads venue truth \
+             every cycle and will surface it."
+        ));
+        UNRESOLVED.fetch_add(1, AtomicOrd::Relaxed);
+        return out;
+    }
+    if filled < 1 {
+        out.push(
+            "[maker-exit] the cross IOC did not fill — the book moved between the decision and \
+             the wire. Nothing rests and the slot is free; the candidate comes back round on \
+             the next scan."
+                .to_string(),
+        );
+        return out;
+    }
+    if filled < order.qty {
+        out.push(format!(
+            "[maker-exit] the cross filled {filled} of {} — the close below is sized to the \
+             FILL, not the order, so the unfilled remainder was never opened and needs nothing.",
+            order.qty
+        ));
+    }
+    // From here it is indistinguishable from a resting fill, so it uses the same
+    // code: `close_leg` prices the other leg against the book NOW, sends the
+    // IOC, parks a shortfall and writes the `unwound` record.
+    // `close_leg` takes the fill it must cover as an argument and clears
+    // `live.resting` itself, so this never goes into `live` — there is nothing
+    // resting to forget, which is the one thing a cross has that a rest does not.
+    let r = Resting {
+        order,
+        venue_order_id: oid,
+        client_order_id: coid,
+        since: Instant::now(),
+    };
+    out.extend(close_leg(live, view, &r, filled, close_sink).await);
+    out
+}
+
+/// Rest ONE post-only GTC ask — or cross, when [`Order::cross`] says the spread
+/// is worth paying.
+async fn place(
+    live: &mut Live,
+    order: Order,
+    view: &EngineView,
+    kalshi: &std::sync::Arc<dyn crate::sink::OrderSink>,
+    pmus: &std::sync::Arc<dyn crate::sink::OrderSink>,
+) -> Vec<String> {
+    use arb_venue::gateway::{PlaceRequest, Side, Tif};
+    if order.cross.is_some() {
+        return cross(live, order, view, kalshi, pmus).await;
+    }
     let (rest_sink, _) = sinks(order.shape, kalshi, pmus);
     let coid = client_order_id();
     let req = PlaceRequest {
@@ -3510,7 +3769,7 @@ mod tests {
         // Kalshi 0.20/0.22 (2c), PM-US 0.16/0.24 (8c).
         let q = quote(Some("0.20"), Some("0.22"));
         let vw = wide_pm_view("0.24", "0.16", "0.20");
-        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now())
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false)
             .expect("the mirror shape pays");
         assert_eq!(o.shape, Shape::RestPmUs, "the wider spread is PM-US's");
         assert_eq!(o.rest_market(), "p-a", "and that is where the order rests");
@@ -3521,6 +3780,82 @@ mod tests {
             o.runner_up_ct.is_some(),
             "shape A was priced too, and the log line must be able to show it: {o:?}"
         );
+    }
+
+    /// **THE CROSS IS OFF UNLESS ASKED FOR.** `--maker-exit-take` defaults false,
+    /// and on a book where crossing would comfortably pay, `take_ok: false` must
+    /// still plan a resting exit and nothing else.
+    #[tokio::test]
+    async fn without_the_flag_a_cross_is_never_planned() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        // The same basis the "clears" test below uses, so this proves the FLAG
+        // and not the arithmetic: identical books, identical lot, cross planned
+        // there and not here.
+        let recs = vec![open_basket(1.0, 5, "0.57", "0.43")];
+        let q = quote(Some("0.16"), Some("0.24"));
+        let vw = wide_pm_view("0.22", "0.20", "0.16");
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false)
+            .expect("the resting shape pays");
+        assert!(o.cross.is_none(), "the flag is off, so nothing crosses: {o:?}");
+    }
+
+    /// **CROSSING PAYS WHEN IT STILL CLEARS THE SELECTION FLOOR.**
+    ///
+    /// Resting was not slow, it was ineffective: 34 exits rested and none closed
+    /// over the 27 h to 2026-08-24, because a 5-lot passive order joins a queue
+    /// it cannot reach the front of — measured that day, ours sat behind 711
+    /// lots on `popleo` and 6,551 on `dontru`.
+    ///
+    /// Kalshi 0.16/0.24 is the wide book, so shape A wins and the leg that would
+    /// have rested is the Kalshi ask. Crossing it means SELLING into the bid, a
+    /// tick under: 0.15.
+    #[tokio::test]
+    async fn a_cross_that_clears_the_selection_floor_is_planned() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        // Basis 0.434 + 0.430 = 0.864. Against 0.15 sold and 0.23 bought that
+        // leaves ~0.035/ct after both takers' fees (~0.021 of the 0.056 gross) —
+        // just OVER the floor. The refusal below moves ONLY the Kalshi basis, by
+        // three cents, so the two bracket the boundary from either side.
+        let recs = vec![open_basket(1.0, 5, "0.57", "0.43")];
+        let q = quote(Some("0.16"), Some("0.24"));
+        let vw = wide_pm_view("0.22", "0.20", "0.16");
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true)
+            .expect("the resting shape pays");
+        assert_eq!(o.shape, Shape::RestKalshi, "the wider spread is Kalshi's");
+        let c = o.cross.as_ref().expect("crossing clears the floor here: {o:?}");
+        assert_eq!(c.limit, "0.1500", "a tick under the 0.16 bid we sell into: {o:?}");
+        // The whole trade-off, asserted rather than described: crossing locks
+        // strictly less than resting, and that difference is what buys certainty.
+        let crossed: f64 = c.lock_ct.parse().expect("a decimal");
+        let rested: f64 = o.lock_ct.parse().expect("a decimal");
+        assert!(crossed < rested, "crossing pays the spread: {c:?} vs {}", o.lock_ct);
+        assert!(crossed >= 0.02, "and still clears the 0.02 selection floor: {c:?}");
+    }
+
+    /// ...AND IS REFUSED WHEN IT DOES NOT. The same books against a basis that
+    /// leaves only a thin lock: resting still pays, crossing does not, and the
+    /// exit rests exactly as it always did.
+    ///
+    /// Against `MIN_EXIT_CT` (0.02) and not `MIN_LOCK` (0.005) on purpose:
+    /// `unwind::consider` already refused this lot at anything under 0.02, so a
+    /// cross that dropped below it would spend the spread to reach a trade the
+    /// selector had rejected.
+    #[tokio::test]
+    async fn a_cross_that_falls_under_the_selection_floor_is_refused() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        // The other side of the bracket: only the Kalshi basis moves, 0.43 ->
+        // 0.46. Resting still clears MIN_LOCK comfortably; crossing drops to
+        // ~0.005/ct, under the 0.02 selection floor, and is refused.
+        let recs = vec![open_basket(1.0, 5, "0.57", "0.46")];
+        let q = quote(Some("0.16"), Some("0.24"));
+        let vw = wide_pm_view("0.22", "0.20", "0.16");
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true)
+            .expect("the resting shape still pays");
+        assert!(o.cross.is_none(), "crossing does not clear the floor, so it rests: {o:?}");
+        assert_eq!(o.limit, "0.2300", "and rests where it always did: {o:?}");
     }
 
     /// The regression in the other direction, and the reason `view()` is tight
@@ -3535,7 +3870,7 @@ mod tests {
         // Kalshi 0.16/0.24 (8c), PM-US 0.20/0.22 (2c) — the mirror of the above.
         let q = quote(Some("0.16"), Some("0.24"));
         let vw = wide_pm_view("0.22", "0.20", "0.16");
-        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now())
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false)
             .expect("the original shape pays");
         assert_eq!(o.shape, Shape::RestKalshi, "the wider spread is Kalshi's");
         assert_eq!(o.rest_market(), "K-a");
@@ -3557,7 +3892,7 @@ mod tests {
         // the mirror without a strictly better number.
         let q = quote(Some("0.19"), Some("0.23"));
         let vw = wide_pm_view("0.23", "0.19", "0.19");
-        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now())
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false)
             .expect("something pays");
         let a: f64 = o.lock_ct.parse().expect("lock parses");
         let b: f64 = o.runner_up_ct.as_ref().expect("both priced").parse().expect("parses");
@@ -3576,7 +3911,7 @@ mod tests {
         let recs = vec![open_basket(1.0, 5, "0.30", "0.70")];
         let q = quote(Some("0.20"), Some("0.22"));
         let vw = wide_pm_view("0.90", "0.86", "0.20");
-        let why = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now())
+        let why = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false)
             .expect_err("nothing pays");
         assert!(why.contains("rest-kalshi:"), "{why}");
         assert!(why.contains("rest-pmus:"), "{why}");
@@ -3594,7 +3929,7 @@ mod tests {
         let q = quote(Some("0.20"), Some("0.22"));
         let mut vw = wide_pm_view("0.24", "0.16", "0.20");
         vw.suppressed_at.remove(&("p-a".to_string(), SIDE_BID.to_string()));
-        let why = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now())
+        let why = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false)
             .expect_err("the bid side was never yielded");
         assert!(why.contains("p-a:bid"), "it names the side it needs: {why}");
     }
@@ -3857,7 +4192,8 @@ mod tests {
                 pm_ask_at_decision: "0.20".into(),
                 shape: Shape::RestKalshi,
                 lock_ct: "0.0100".into(),
-                runner_up_ct: None,
+                cross: None,
+        runner_up_ct: None,
             },
             venue_order_id: "v1".into(),
             client_order_id: "x1".into(),
@@ -3888,7 +4224,8 @@ mod tests {
                 pm_ask_at_decision: "0.20".into(),
                 shape: Shape::RestKalshi,
                 lock_ct: "0.0100".into(),
-                runner_up_ct: None,
+                cross: None,
+        runner_up_ct: None,
             },
             venue_order_id: "v1".into(),
             client_order_id: "x1".into(),
@@ -4194,6 +4531,7 @@ mod tests {
             &quote(Some("0.10"), Some("0.30")),
             &view("0.20"),
             Instant::now(),
+            false,
         )
         .expect("a priced exit");
         assert_eq!(o.qty, MAX_CLIP, "capped at the clip, not the 34-lot");
@@ -4229,6 +4567,7 @@ mod tests {
             &quote(Some("0.10"), Some("0.30")),
             &view("0.20"),
             Instant::now(),
+            false,
         )
         .expect_err("no open lot");
         assert!(e.contains("no open ledger record for r1 opened at 1"), "{e}");
@@ -4252,6 +4591,7 @@ mod tests {
             &quote(Some("0.10"), Some("0.30")),
             &view("0.20"),
             Instant::now(),
+            false,
         )
         .expect_err("an inverted basket has no PM short to close");
         assert!(e.contains("PM-US leg"), "the refusal names the side: {e}");
@@ -4269,6 +4609,7 @@ mod tests {
         let e = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a",
             &quote(Some("0.10"), Some("0.30")), &never, Instant::now(),
+            false,
         )
         .expect_err("the quoter has not been told");
         assert!(e.contains("yield"), "{e}");
@@ -4282,6 +4623,7 @@ mod tests {
         let e = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a",
             &quote(Some("0.10"), Some("0.30")), &just_now, Instant::now(),
+            false,
         )
         .expect_err("told, but not yet settled");
         assert!(e.contains("giving it"), "{e}");
@@ -4363,6 +4705,7 @@ mod tests {
         let o = decide(
             &mut cx, &fees, &recs, &cand(4, 3.0), "p-a",
             &quote(Some("0.0300"), Some("0.0500")), &view("0.05"), Instant::now(),
+            false,
         )
         .expect("the selected lot is exitable");
         assert_eq!(o.closes_ts, 3.0, "the record select named, not the dearest: {o:?}");
@@ -4389,6 +4732,7 @@ mod tests {
             decide(
                 cx, &fees, &recs, &cand(5, ts), "p-a",
                 &quote(Some("0.0100"), Some("0.1000")), &view("0.20"), Instant::now(),
+                false,
             )
             .map(|o| o.limit)
         };
@@ -4421,6 +4765,7 @@ mod tests {
         let o = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a",
             &quote(Some("0.9000"), Some("0.9500")), &view("0.20"), Instant::now(),
+            false,
         )
         .expect("a bid above the floor is the best case, not a refusal");
         assert_eq!(o.limit, "0.9400", "one rung inside the 0.95 offer, not the floor: {o:?}");
@@ -4491,6 +4836,7 @@ mod tests {
         q.status = "finalized".into();
         let e = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a", &q, &view("0.20"), Instant::now(),
+            false,
         )
         .expect_err("a finalized market takes no order");
         assert!(e.contains("not `active`"), "{e}");
@@ -4510,6 +4856,7 @@ mod tests {
         let e = decide(
             &mut cx, &fees, &recs, &c, "p-a",
             &quote(Some("0.10"), Some("0.30")), &view("0.20"), Instant::now(),
+            false,
         )
         .expect_err("not ours");
         assert!(e.contains("--rel-prefix"), "{e}");
@@ -4527,6 +4874,7 @@ mod tests {
         let e = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a",
             &quote(Some("0.10"), Some("0.30")), &dark, Instant::now(),
+            false,
         )
         .expect_err("no PM ask");
         assert!(e.contains("unpriceable"), "{e}");
@@ -4572,7 +4920,8 @@ mod tests {
             pm_ask_at_decision: "0.20".into(),
             shape: Shape::RestKalshi,
             lock_ct: "0.0100".into(),
-            runner_up_ct: None,
+            cross: None,
+        runner_up_ct: None,
         };
         let rec = close_record(&o, "0.2100", "0.2000", 3, 99.0);
         assert_eq!(rec["status"], "unwound");
@@ -4614,7 +4963,8 @@ mod tests {
             pm_ask_at_decision: "0.20".into(),
             shape: Shape::RestKalshi,
             lock_ct: "0.0100".into(),
-            runner_up_ct: None,
+            cross: None,
+        runner_up_ct: None,
         };
         let before = unresolved();
         let refused_before = refused();
@@ -4753,7 +5103,8 @@ mod tests {
                 pm_ask_at_decision: "0.20".into(),
                 shape: Shape::RestKalshi,
                 lock_ct: "0.0100".into(),
-                runner_up_ct: None,
+                cross: None,
+        runner_up_ct: None,
             },
             venue_order_id: "v1".into(),
             client_order_id: "x1".into(),
@@ -5623,6 +5974,7 @@ mod tests {
         let e = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a",
             &quote(Some("0.10"), Some("0.30")), &view("0.20"), Instant::now(),
+            false,
         )
         .expect_err("the engine owes a hedge on this market");
         assert!(e.contains("double hedge"), "the registry's own words: {e}");
@@ -5686,7 +6038,10 @@ mod tests {
             Some(arb_venue::VenueError::Transport("timed out".into()));
         let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
         let mut live = Live::new(false, "/dev/null".into());
-        let out = place(&mut live, resting_exit(5).order, &k, &kalshi_stub()).await.join("\n");
+        let out =
+            place(&mut live, resting_exit(5).order, &view("0.20"), &k, &kalshi_stub())
+                .await
+                .join("\n");
         assert!(out.contains("PLACE DID NOT COMPLETE"), "{out}");
         assert!(live.resting.is_none(), "nothing addressable means nothing remembered");
         publish_working(live.working_set(None));
