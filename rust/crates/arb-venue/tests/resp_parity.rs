@@ -259,3 +259,58 @@ fn pmus_missing_id_is_typed_error() {
         other => panic!("expected MissingField, got {other:?}"),
     }
 }
+
+// ------------------------------------- the money fields, against a real payload ---
+
+/// THE LINK THE UNIT TESTS CANNOT COVER: that `KalshiOrder` actually
+/// DESERIALIZES the fill-cost fields out of a real venue response.
+///
+/// `maker_exit::fill_price` is pinned against these numbers already, but it is
+/// handed a `FilledCost` built in the test. If the wire names were wrong —
+/// changed, or never right — `filled_cost()` would read absent money as "0",
+/// price the fill at 1.0000, fail its own guard and fall back to the limit. The
+/// whole of PR #101 would become a silent no-op, and every symptom of that is
+/// identical to "the venue did not answer".
+///
+/// So this drives the real captured body: the 16:19:32Z close on KXTIME-26-POP,
+/// sent at a limit of 0.1200 and filled by Kalshi at the touch. 3.9208 on 5
+/// contracts is 0.7842 of NO, so 0.2158 of YES received — 9.6c better than the
+/// limit, which is exactly the money the ledger was throwing away.
+#[test]
+fn a_real_filled_order_carries_its_money_fields() {
+    // Through `kalshi_order_envelope`, which is what `order_status_at` calls on
+    // the live GET — so this drives the same parse the money path does.
+    let raw = include_str!("fixtures/venue/kalshi_order_filled.json");
+    let order = arb_venue::resp::kalshi_order_envelope(raw)
+        .expect("a real single-order GET body parses")
+        .order;
+
+    assert_eq!(order.filled_qty(), 5);
+    let fc = order.filled_cost().expect("a filled order has a cost — if this is None the \
+                                         wire names moved and #101 is a silent no-op");
+    assert_eq!(fc.qty, "5.00");
+    assert_eq!(fc.taker_cost_usd, "3.920800", "the field #101 exists to read");
+    assert_eq!(fc.maker_cost_usd, "0.000000");
+    assert_eq!(fc.taker_fees_usd, "0.059300");
+    assert!(fc.complement, "action=sell side=yes: the notional is the NO side");
+
+    // ...and the arithmetic the trader does on it, restated here so both halves
+    // of the conversion are pinned in one place against one real row. The
+    // trader works in decimal and quantizes to 4dp, so 0.21584 becomes the
+    // 0.2158 `maker_exit::fill_price` is pinned to — either way it is nowhere
+    // near the 0.1200 limit this order was sent at.
+    let per_ct = 3.920800_f64 / 5.0;
+    let yes = 1.0 - per_ct;
+    assert!((yes - 0.21584).abs() < 1e-9, "0.21584 YES received, got {yes}");
+    assert!(yes > 0.1200, "and better than the limit, which is the whole point");
+}
+
+/// A CREATE RESPONSE HAS NO FILL DATA, and must answer `None` rather than a
+/// zero-cost fill. Reading absent money as $0.00 would price a sell at 1.0000
+/// and a buy at 0.0000 — both of which are "free money" shaped.
+#[test]
+fn an_order_with_no_money_fields_reports_no_cost() {
+    let create = r#"{"order_id":"x","client_order_id":"m1","fill_count":"0.00"}"#;
+    let o = arb_venue::resp::kalshi_created_order(create).expect("a create response parses");
+    assert_eq!(o.filled_cost(), None, "nothing filled, so there is no price");
+}
