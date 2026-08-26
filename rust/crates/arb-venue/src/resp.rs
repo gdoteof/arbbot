@@ -53,6 +53,49 @@ pub struct KalshiOrder {
     /// but whose create response we failed to read.
     #[serde(default)]
     pub client_order_id: Option<String>,
+    /// WHAT IT ACTUALLY TRADED, in dollars. Present on a GET, absent on a
+    /// create. Read [`FilledCost`] for why a limit is not this number.
+    #[serde(default)]
+    pub taker_fill_cost_dollars: Option<String>,
+    #[serde(default)]
+    pub maker_fill_cost_dollars: Option<String>,
+    #[serde(default)]
+    pub taker_fees_dollars: Option<String>,
+    #[serde(default)]
+    pub maker_fees_dollars: Option<String>,
+}
+
+/// What an order actually TRADED, as opposed to the limit it was sent with.
+///
+/// THESE ARE DIFFERENT NUMBERS AND THE DIFFERENCE IS THE EDGE. A marketable
+/// limit is a floor, not a prediction: it says "do not fill me worse than
+/// this", and a CLOB fills it at the touch when the touch is better. The
+/// maker-exit booked its own limit as the fill price on every close, and across
+/// 30 of them that understated Kalshi proceeds by $9.71 — enough to report
+/// +$8.58 of realized profit as a $0.91 loss and retire a working strategy.
+///
+/// Strings, per the module contract. The caller owns the arithmetic: in this
+/// repo that caller has a decimal arena and this crate deliberately does not
+/// depend on `arb-core`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilledCost {
+    pub qty: String,
+    /// Dollars for the side the order ended up LONG. Both legs of one order,
+    /// unsummed — adding two money strings is the caller's job, not serde's.
+    pub taker_cost_usd: String,
+    pub maker_cost_usd: String,
+    pub taker_fees_usd: String,
+    pub maker_fees_usd: String,
+    /// The cost is quoted on the NO side, so the YES price is its complement.
+    ///
+    /// SELLING A YES IS BUYING ITS NO, and Kalshi reports the notional of what
+    /// you ended up holding either way. Verified live against this account's
+    /// own order history, both directions: a `buy`/`yes` gives `cost/qty` equal
+    /// to the YES price paid (0.3600 on a 0.3600 limit), and a `sell`/`yes`
+    /// gives `cost/qty` equal to `1 - the YES price received` (0.7842 on a fill
+    /// at 0.2158). Getting this backwards would invert every recorded exit
+    /// price, which is the same class of error as PR #97.
+    pub complement: bool,
 }
 
 impl KalshiOrder {
@@ -96,6 +139,37 @@ impl KalshiOrder {
         let raw = self.fill_count_fp.as_deref().or(self.fill_count.as_deref())?;
         let n = raw.trim().parse::<f64>().ok()?;
         (n >= 0.0 && n.is_finite()).then_some(n as i64)
+    }
+
+    /// The money this order actually traded. `None` when the venue did not say
+    /// — a create response, or an order that has not traded — which leaves the
+    /// caller on whatever it knew before rather than on a zero.
+    ///
+    /// `action` and `side` decide [`FilledCost::complement`] and BOTH must be
+    /// readable: an order whose direction we cannot name is one whose price we
+    /// cannot orient, and orienting it wrong inverts it.
+    pub fn filled_cost(&self) -> Option<FilledCost> {
+        let qty = self.fill_count_fp.as_deref().or(self.fill_count.as_deref())?;
+        if qty.trim().parse::<f64>().ok()? <= 0.0 {
+            return None;
+        }
+        let (action, side) = (self.action.as_deref()?, self.side.as_deref()?);
+        let complement = match (action, side) {
+            ("buy", "yes") => false,
+            ("sell", "yes") => true,
+            // `no`-side orders are not placed by this repo and their
+            // orientation is therefore unverified. Refusing is what keeps an
+            // unverified convention out of the ledger.
+            _ => return None,
+        };
+        Some(FilledCost {
+            qty: qty.to_string(),
+            taker_cost_usd: self.taker_fill_cost_dollars.clone().unwrap_or_else(|| "0".into()),
+            maker_cost_usd: self.maker_fill_cost_dollars.clone().unwrap_or_else(|| "0".into()),
+            taker_fees_usd: self.taker_fees_dollars.clone().unwrap_or_else(|| "0".into()),
+            maker_fees_usd: self.maker_fees_dollars.clone().unwrap_or_else(|| "0".into()),
+            complement,
+        })
     }
 }
 
@@ -441,6 +515,23 @@ impl PmOrder {
     pub fn try_filled_qty(&self) -> Option<i64> {
         self.cum_quantity.filter(|n| *n >= 0)
     }
+}
+
+/// What a venue says an order actually traded at, in the shape THAT venue
+/// reports it.
+///
+/// The two genuinely differ and neither is converted here. Kalshi reports a
+/// notional and leaves the division to the reader; PM-US reports an average
+/// price outright. Normalising them would need decimal arithmetic, and this
+/// crate has no `arb-core` dependency on purpose — so the trader, which owns
+/// the arena, does it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderFill {
+    /// Kalshi: the notional of the side the order ended up long.
+    Notional(FilledCost),
+    /// PM-US: an average price, already in the YES convention this repo sends
+    /// (`pmus_order_body` puts one `price` on the wire for both intents).
+    Average { qty: i64, avg_px: String },
 }
 
 /// `{"order": {...}}` or a bare order — the get_order path unwraps `order` if

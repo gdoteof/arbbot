@@ -307,6 +307,17 @@ pub trait OrderSink: Send + Sync {
     fn filled_qty(&self, _order_id: &str) -> Result<i64, VenueError> {
         Err(VenueError::NotWired)
     }
+    /// What that order actually traded AT — see
+    /// [`arb_venue::gateway::VenueGateway::order_fill`].
+    ///
+    /// The default answers `Ok(None)`, NOT an error, and that is the opposite
+    /// of `filled_qty` above for a reason its doc already gives: not knowing
+    /// the price is inert, because the caller falls back to the limit it sent
+    /// and is no worse off than before this method existed. Not knowing the
+    /// COUNT is an affirmative claim that authorises another order.
+    fn order_fill(&self, _order_id: &str) -> Result<Option<arb_venue::resp::OrderFill>, VenueError> {
+        Ok(None)
+    }
     /// Venue truth for POSITIONS: market id -> signed contract count, over the
     /// whole account. Where `fills_since` is history for a window and
     /// `filled_qty` is one order, this is the standing state — the only read
@@ -380,6 +391,9 @@ where
     }
     fn filled_qty(&self, order_id: &str) -> Result<i64, VenueError> {
         VenueGateway::order_filled_qty(self, order_id)
+    }
+    fn order_fill(&self, order_id: &str) -> Result<Option<arb_venue::resp::OrderFill>, VenueError> {
+        VenueGateway::order_fill(self, order_id)
     }
     fn net_positions(&self) -> Result<std::collections::BTreeMap<String, f64>, VenueError> {
         VenueGateway::net_positions(self)
