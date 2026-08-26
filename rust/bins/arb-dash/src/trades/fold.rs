@@ -27,6 +27,14 @@ fn key_of(rel: Option<&str>, ts: Option<f64>) -> Option<Key> {
 /// fold could not reconcile. The counters are reported, never absorbed.
 pub struct Ledger {
     pub records: Vec<serde_json::Value>,
+    /// The records a `correction` actually amended, by `(relationship_id, ts)`.
+    ///
+    /// The fold DROPS corrections once applied, so after it runs an amended
+    /// record is indistinguishable from one that was written correctly — and
+    /// something has to be able to tell the difference. `pricing` uses this to
+    /// check that the ten records PR #97 broke were reached by the migration
+    /// that repairs them, rather than assuming either way.
+    amended: HashSet<Key>,
     unwound_qty: HashMap<Key, f64>,
     unusable: HashSet<Key>,
     pub unparsed: u64,
@@ -54,7 +62,7 @@ impl Ledger {
             }
         }
 
-        let (corrections, corrections_applied, corrections_unmatched) =
+        let (corrections, corrections_applied, corrections_unmatched, amended) =
             apply_corrections(&mut records);
         let superseded = records.iter().filter(|r| status_of(r) == "superseded").count() as u64;
         records.retain(|r| status_of(r) != "superseded");
@@ -62,6 +70,7 @@ impl Ledger {
 
         Ledger {
             records,
+            amended,
             unwound_qty,
             unusable,
             unparsed,
@@ -76,6 +85,11 @@ impl Ledger {
     /// An unwind that names nothing it can reduce is reported, not matched.
     pub fn unusable_unwinds(&self) -> usize {
         self.unusable.len()
+    }
+
+    /// Did a `correction` amend this record? See [`Ledger::amended`].
+    pub fn was_amended(&self, rel_id: &str, ts: f64) -> bool {
+        key_of(Some(rel_id), Some(ts)).is_some_and(|k| self.amended.contains(&k))
     }
 
     /// Steps 2 and 3 of the fold, applied to ONE record: how much of this
@@ -151,8 +165,11 @@ pub struct Remainder {
 /// nameless correction is applied only when exactly one record carries that ts —
 /// an ambiguous retraction is dropped and reported rather than guessed.
 ///
-/// Returns `(corrections seen, records amended, corrections that reached nothing)`.
-fn apply_corrections(records: &mut Vec<serde_json::Value>) -> (u64, u64, u64) {
+/// Returns `(corrections seen, records amended, corrections that reached
+/// nothing, the keys of the records amended)`.
+fn apply_corrections(
+    records: &mut Vec<serde_json::Value>,
+) -> (u64, u64, u64, HashSet<Key>) {
     // (target ts bits, relationship_id IF the correction named one, fields).
     // A Vec, not a map: file order is the precedence order, and three
     // corrections target one fedcut record on disk where last-wins is correct.
@@ -170,7 +187,7 @@ fn apply_corrections(records: &mut Vec<serde_json::Value>) -> (u64, u64, u64) {
     }
     records.retain(|r| status_of(r) != "correction");
     if fixes.is_empty() {
-        return (corrections, 0, corrections);
+        return (corrections, 0, corrections, HashSet::new());
     }
     let mut per_ts: HashMap<u64, usize> = HashMap::new();
     for r in records.iter() {
@@ -181,6 +198,7 @@ fn apply_corrections(records: &mut Vec<serde_json::Value>) -> (u64, u64, u64) {
 
     let mut used = vec![false; fixes.len()];
     let mut amended = 0u64;
+    let mut amended_keys: HashSet<Key> = HashSet::new();
     for r in records.iter_mut() {
         // Read everything needed off `r` first so nothing borrows it when it is
         // mutated below.
@@ -208,10 +226,16 @@ fn apply_corrections(records: &mut Vec<serde_json::Value>) -> (u64, u64, u64) {
         }
         if hit {
             amended += 1;
+            // Read back off `r`, not off the pre-merge `rel`: a correction may
+            // replace any top-level field, and the key must name the record as
+            // it now stands.
+            if let Some(k) = key_of(rel_of(r), num(r.get("ts"))) {
+                amended_keys.insert(k);
+            }
         }
     }
     let unmatched = corrections - used.iter().filter(|u| **u).count() as u64;
-    (corrections, amended, unmatched)
+    (corrections, amended, unmatched, amended_keys)
 }
 
 /// Step 2 of the fold: unwound quantity per `open` record, keyed by the
