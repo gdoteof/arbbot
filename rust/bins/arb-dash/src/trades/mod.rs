@@ -39,11 +39,30 @@
 //! otherwise is what turned 9 naked legs into "+$26.92 locked" and promoted a
 //! naked Kalshi punt to the top of the strategy board.
 //!
-//! For a CLOSED record the ledger already knows the answer and this file must
-//! not re-derive it: `realized_pnl_usd` (or `profit_usd`) is bank truth,
-//! including the naked settlements that paid $0.00. Deriving instead from an
-//! assumed $1.00 payoff is how a $2.16 realised LOSS displayed as +$4.00.
-//! A closed record carrying neither field cannot be priced and says so.
+//! For a CLOSED record that HAS the answer the ledger's answer wins and this
+//! file must not re-derive it: `realized_pnl_usd` (or `profit_usd`) is bank
+//! truth, including the naked settlements that paid $0.00. Deriving instead
+//! from an assumed $1.00 payoff is how a $2.16 realised LOSS displayed as
+//! +$4.00.
+//!
+//! A CLOSED RECORD CARRYING NEITHER IS STILL A ROUND TRIP. The engine books
+//! `fees_pending` and never reads fill reports, so not one of its 24
+//! maker-exit closes — every unwind the flywheel has made — carries a realized
+//! P&L, and all 24 read `unknown`. But the ledger holds both halves: the exit
+//! says what it sold, and the `open` record its `closes_ts` names says what
+//! that cost to put on. Proceeds, less that basis, less the exit's fees, IS
+//! the P&L, and `entry` is the join that finds it. Such a row is marked
+//! `derived:exit_vs_entry` and counted apart from the banked ones, because a
+//! number this file computed and a number the venue settled must never be
+//! presented alike.
+//!
+//! The same join gives a realized rate. An APR on an OPEN position runs from
+//! today to resolution; a closed one earned its return over the time the
+//! capital was actually out, entry to exit, which for a maker exit is hours.
+//! The two are different measurements and live in different fields
+//! (`apr_pct`, `realized_apr_pct`) so that neither can leak into the other's
+//! total — a six-minute turn's four-figure rate reported as the yield on the
+//! open book would be this file's next incident.
 //!
 //! Where a number cannot be established it is `null` with a reason. A
 //! plausible-looking dollar amount in a column of dollars is worse than a
@@ -53,11 +72,13 @@
 //! they carry an APR-to-hold; `realized` and `unwound` are history, and
 //! `correction` is a compensating adjustment, not a new position.
 //!
-//! The work splits four ways, and every one of them is a place a wrong answer
+//! The work splits five ways, and every one of them is a place a wrong answer
 //! has already cost money: `fold` decides what is still on, `legs` decides
-//! what each leg did, `pricing` turns that into dollars or into a stated
-//! refusal, and `totals` adds up only what may be added up.
+//! what each leg did, `entry` joins an exit to the record it retired,
+//! `pricing` turns that into dollars or into a stated refusal, and `totals`
+//! adds up only what may be added up.
 
+mod entry;
 mod fold;
 mod legs;
 mod pricing;
@@ -68,6 +89,7 @@ mod tests;
 
 use arb_core::resolve::{resolve_date, today_iso, years_between};
 
+use entry::{Entries, RoundTrip};
 use fold::Ledger;
 use legs::{Legs, Modeller, Splits};
 use pricing::Priced;
@@ -110,6 +132,14 @@ struct Trade {
     resolves: Option<String>,
     resolves_estimated: bool,
     apr: Option<f64>,
+    /// The round trip this row closed, where it closed one. `None` on every
+    /// open position and on any exit whose entry this ledger cannot find.
+    round_trip: Option<RoundTrip>,
+    /// What the closed capital actually earned, annualized over the time it
+    /// was out. Kept in its OWN field rather than folded into `apr`: that one
+    /// is an APR-to-hold on committed capital and feeds the blended headline,
+    /// and mixing a six-minute realized turn into it would wreck both.
+    realized_apr: Option<f64>,
     legs: Vec<serde_json::Value>,
 }
 
@@ -136,6 +166,20 @@ impl Trade {
             "resolves_by": self.resolves,
             "resolves_estimated": self.resolves_estimated,
             "apr_pct": self.apr,
+            // The round trip. `entry_cost_usd` is the capital this exit gave
+            // back at the basis it went out at; `exit_proceeds_usd` is what the
+            // legs collected, present only on a clean whole flatten.
+            // `held_days` travels WITH `realized_apr_pct` and is not optional
+            // decoration: annualizing a two-cent gain on a six-minute hold is
+            // an honest number that reads as a wild one without it.
+            "entry_ts": self.round_trip.as_ref().map(|r| r.entry_ts),
+            "entry_cost_usd": self.priced.entry_cost,
+            "exit_proceeds_usd": self.priced.exit_proceeds,
+            "held_days": self.round_trip.as_ref().map(|r| r.held_days),
+            "realized_apr_pct": self.realized_apr,
+            // A realized P&L is only as settled as BOTH ends of the round trip.
+            "round_trip_fees_settled":
+                self.round_trip.as_ref().map(|r| r.fees_settled && self.fees_settled),
             "legs": self.legs,
         })
     }
@@ -151,7 +195,51 @@ pub fn build(ledger_text: &str, fee_category: &str, now_s: f64) -> serde_json::V
     let mut splits = Splits::default();
     let mut totals = Totals::default();
 
-    for rec in &ledger.records {
+    // PASS 1 reads every record's legs, because pricing an EXIT needs the
+    // ENTRY it retired and the entry is a different record — often thousands of
+    // lines earlier in the file. `Legs::read` also accumulates the make/take
+    // split, so it must run exactly once per record: the read is cached here
+    // and pass 2 consumes it rather than re-reading.
+    let read: Vec<Legs> = ledger
+        .records
+        .iter()
+        .map(|rec| {
+            let qty = num(rec.get("qty")).filter(|q| q.is_finite()).unwrap_or(0.0);
+            let empty = vec![];
+            let raw = rec.get("legs").and_then(|v| v.as_array()).unwrap_or(&empty);
+            Legs::read(&mut modeller, raw, qty, fee_category, &mut splits)
+        })
+        .collect();
+
+    // The entry basis of every open record, keyed the way an unwind's
+    // `closes_ts` names it. Built from pass 1 so the cost is the same all-in
+    // figure the open row itself displays.
+    let mut entries = Entries::default();
+    for (rec, l) in ledger.records.iter().zip(read.iter()) {
+        if status_of(rec) != "open" {
+            continue;
+        }
+        let qty = num(rec.get("qty")).filter(|q| q.is_finite()).unwrap_or(0.0);
+        let hedged = pricing::hedged(l, qty);
+        // ALL-IN, both ways. `cost_usd` already has the fees inside it; a cost
+        // derived from leg prices does not, so the modelled fees are added.
+        // Subtracting an ex-fee basis from gross proceeds would report every
+        // close as more profitable than it was, by exactly the entry fee.
+        let cost = match num(rec.get("cost_usd")) {
+            Some(c) => Some(c),
+            None if hedged => Some(l.derived_cost + l.fees),
+            None => None,
+        };
+        entries.insert(rel_of(rec).unwrap_or(""), num(rec.get("ts")).unwrap_or(0.0), qty, cost, l);
+    }
+
+    // Records this view refuses to price because their two leg prices are on
+    // the wrong venues. Counted and reported, never absorbed: an un-run
+    // migration is a thing a human has to go and do.
+    let mut swapped_legs = 0u64;
+
+    // PASS 2 prices.
+    for (rec, legs) in ledger.records.iter().zip(read) {
         let ledger_status = status_of(rec).to_string();
         let rel_id = rel_of(rec).unwrap_or("").to_string();
         // `as_i64()` here read every float qty ("qty": 5.0) as 0 and dropped 45
@@ -167,13 +255,15 @@ pub fn build(ledger_text: &str, fee_category: &str, now_s: f64) -> serde_json::V
             .and_then(|v| v.as_str())
             .unwrap_or("make-take")
             .to_string();
-        let empty = vec![];
-        let raw_legs = rec.get("legs").and_then(|v| v.as_array()).unwrap_or(&empty);
 
-        let legs = Legs::read(&mut modeller, raw_legs, qty_booked, fee_category, &mut splits);
+        if pricing::legs_are_swapped(rec) {
+            swapped_legs += 1;
+        }
         let hedged = pricing::hedged(&legs, qty_booked);
         let rem = ledger.remainder(&rel_id, ts, &ledger_status, qty_booked);
-        let priced = pricing::price(rec, &legs, hedged, qty_booked, &rem);
+        let round_trip =
+            entry::join(&entries, &rel_id, num(rec.get("closes_ts")), ts, qty_booked);
+        let priced = pricing::price(rec, &legs, hedged, qty_booked, &rem, round_trip.as_ref());
 
         let (resolves, resolves_estimated) = match resolve_date(&rel_id) {
             Some((d, est)) => (Some(d.to_string()), est),
@@ -181,6 +271,9 @@ pub fn build(ledger_text: &str, fee_category: &str, now_s: f64) -> serde_json::V
         };
         let years = resolves.as_deref().and_then(|d| years_between(&today, d));
         let apr = pricing::apr(&priced, &rem.status, years);
+        // Realized APR is measured over the time the capital was ACTUALLY out
+        // — entry to exit — not to a resolve date it never reached.
+        let realized_apr = entry::apr(priced.net, round_trip.as_ref());
 
         let trade = Trade {
             ts,
@@ -198,6 +291,8 @@ pub fn build(ledger_text: &str, fee_category: &str, now_s: f64) -> serde_json::V
             resolves,
             resolves_estimated,
             apr,
+            round_trip,
+            realized_apr,
             legs: legs.payload,
         };
         totals.add(&trade);
@@ -226,7 +321,7 @@ pub fn build(ledger_text: &str, fee_category: &str, now_s: f64) -> serde_json::V
 
     serde_json::json!({
         "as_of": today,
-        "totals": totals.headline(rows.len(), blended_apr),
+        "totals": totals.headline(rows.len(), blended_apr, totals.realized_apr()),
         "by_venue_role": splits.to_json(),
         "by_strategy": totals.by_strategy(),
         "fee_note": format!(
@@ -244,6 +339,7 @@ pub fn build(ledger_text: &str, fee_category: &str, now_s: f64) -> serde_json::V
         "orphan_unwinds": ledger.orphan_unwinds,
         "unusable_unwinds": ledger.unusable_unwinds(),
         "unparsed_lines": ledger.unparsed,
+        "swapped_legs": swapped_legs,
         "rows": rows,
     })
 }
