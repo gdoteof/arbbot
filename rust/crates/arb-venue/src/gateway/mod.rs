@@ -235,6 +235,19 @@ pub trait VenueGateway {
     /// sending another order. Implementations settle the not-yet-visible 404
     /// window (see [`Settle::retry_404`]) rather than reporting it as unknown.
     fn order_filled_qty(&self, order_id: &str) -> Result<i64, VenueError>;
+
+    /// What that same order actually traded AT. `order_filled_qty` answers only
+    /// the count, and every caller that needed a price then recorded the LIMIT
+    /// IT SENT — see [`crate::resp::FilledCost`] for what that cost.
+    ///
+    /// `Ok(None)` means the venue did not say, which is INERT: the caller keeps
+    /// whatever it knew before. That is the opposite of `order_filled_qty`'s
+    /// default, and deliberately so — "I do not know the price" leaves a record
+    /// no worse than it is today, while "I do not know the count" is a claim
+    /// that authorises another order.
+    fn order_fill(&self, _order_id: &str) -> Result<Option<crate::resp::OrderFill>, VenueError> {
+        Ok(None)
+    }
     fn order_status(&self, order_id: &str) -> Result<Self::Order, VenueError>;
     /// Cancel every RESTING order THIS STACK owns (kill-switch sweep) — see
     /// [`is_ours`] for what that means and why it is not "this process".

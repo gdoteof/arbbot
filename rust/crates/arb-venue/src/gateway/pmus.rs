@@ -223,6 +223,19 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
         })
     }
 
+    fn order_fill(&self, order_id: &str) -> Result<Option<crate::resp::OrderFill>, VenueError> {
+        let o = self.settle.retry_404("pmus order_fill", order_id, || {
+            self.order_status_at(Priority::Critical, order_id)
+        })?;
+        Ok(match o.fill_state() {
+            resp::PmFillState::Filled { cum_quantity, avg_px } => {
+                Some(crate::resp::OrderFill::Average { qty: cum_quantity, avg_px })
+            }
+            // `avgPx=0-on-create` is a documented quirk, not a $0.00 fill.
+            resp::PmFillState::NoFillData => None,
+        })
+    }
+
     /// POST /v1/order/{id}/cancel, with the marketSlug in the BODY.
     ///
     /// Three things differ from Kalshi and all three are deliberate:

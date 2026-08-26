@@ -229,6 +229,7 @@ use arb_core::clock::now_s as wall_now;
 use arb_core::model::Venue;
 use arb_core::scan::{Cx, D};
 use arb_venue::gateway::Quote;
+use arb_venue::resp::OrderFill;
 use serde_json::Value;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -939,6 +940,14 @@ impl Shape {
         match self {
             Shape::RestKalshi => Venue::Kalshi,
             Shape::RestPmUs => Venue::PolymarketUs,
+        }
+    }
+
+    /// The venue the IOC closes at — the other one.
+    pub fn close_venue(self) -> Venue {
+        match self {
+            Shape::RestKalshi => Venue::PolymarketUs,
+            Shape::RestPmUs => Venue::Kalshi,
         }
     }
 
@@ -1876,10 +1885,25 @@ pub fn decide(
 /// not having it.
 ///
 /// It does NOT claim a realized P&L. Both legs traded here — unlike
-/// `naked_act::close_record`, where only one did — but the venue FEES arrive on
-/// fill reports this process does not read, so `fees_pending` says what
-/// `engine::fill::book_basket` says and for the same reason. The prices are the
-/// ones we actually got.
+/// `naked_act::close_record`, where only one did — but the PM-US FEES are not
+/// on anything this process reads, so `fees_pending` says what
+/// `engine::fill::book_basket` says and for the same reason.
+///
+/// THE PRICES ARE THE ONES WE ACTUALLY GOT, and that sentence sat here being
+/// false for the whole armed life of this module. Callers passed the LIMITS
+/// they had sent. A marketable limit is a floor — "do not fill me worse than
+/// this" — and both venues fill it at the touch when the touch is better, so
+/// the recorded price was systematically worse than the trade. Across 30 closes
+/// it understated Kalshi proceeds by $9.71, which is the difference between
+/// this programme reading as +$8.58 of profit and as a $0.91 loss. Callers now
+/// read `order_fill` from the venue and pass that; see `fill_price` for the two
+/// guards that decide when a venue's number may be believed.
+///
+/// KALSHI'S SETTLED FEE IS DELIBERATELY NOT RECORDED even though the same read
+/// returns it. `trades::legs` marks a record's fees SETTLED when ANY leg
+/// carries one, so a Kalshi-only fee would make the tab claim the whole
+/// record's fees are bank truth while the PM-US half is still modelled. Both or
+/// neither.
 /// The two fills mapped onto the venues that paid them. ONE PLACE, so the
 /// ledger record and the log line that announces it cannot disagree about which
 /// leg cost what — they did, and nothing caught it.
@@ -1889,15 +1913,24 @@ pub fn decide(
 /// `rest-pmus` it is reversed, and writing them straight onto the legs swapped
 /// the two prices on every record of the shape the contest picks most often.
 ///
-/// ON A CROSS THE "RESTING" LEG DID NOT REST — it went out as an IOC at
-/// [`Cross::limit`], which is the price it actually paid. Callers pass
-/// `Order::limit` because that is what a rest would have used, and on a cross
-/// that price was never sent to anyone.
+/// PURELY THE SHAPE'S MAPPING NOW. It used to also swap in [`Cross::limit`] for
+/// the resting leg, because on a cross that leg went out as an IOC and
+/// `Order::limit` was never sent to anyone. Callers ask [`Order::rest_limit`]
+/// for that instead, so this function does one thing; and in any case a LIMIT
+/// is no longer what a caller passes when the venue will tell it the fill.
 fn fills_by_venue<'a>(o: &'a Order, rest_fill: &'a str, close_fill: &'a str) -> (&'a str, &'a str) {
-    let rest_fill = o.cross.as_ref().map_or(rest_fill, |c| c.limit.as_str());
     match o.shape {
         Shape::RestKalshi => (rest_fill, close_fill),
         Shape::RestPmUs => (close_fill, rest_fill),
+    }
+}
+
+impl Order {
+    /// The price the RESTING leg was actually sent at. On a cross it never
+    /// rested: it went out as an IOC at [`Cross::limit`], and `Order::limit` is
+    /// the price a rest WOULD have used and was sent to nobody.
+    pub fn rest_limit(&self) -> &str {
+        self.cross.as_ref().map_or(self.limit.as_str(), |c| c.limit.as_str())
     }
 }
 
@@ -1947,9 +1980,11 @@ pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, t
                  {}/ct against BOTH legs' ledger basis, net of both takers' fees, where \
                  resting would have locked {}/ct and waited. The difference is the spread and \
                  the taker fees, and it is what was paid to convert now instead of joining a \
-                 queue. Sized to ONE open lot, so this closes exactly one record. \
-                 realized_pnl_usd is absent because the venue fees arrive on fill reports this \
-                 process does not read.",
+                 queue. Sized to ONE open lot, so this closes exactly one record. The leg \
+                 prices are the venues' OWN fills, not the limits sent — an IOC fills at the \
+                 touch when the touch is better, and the difference is real money. \
+                 realized_pnl_usd is still absent: PM-US fees are not on anything this process \
+                 reads, and half-settled fees would read as fully settled downstream.",
                 o.shape.tag(),
                 o.shape.rest_venue().as_str(),
                 c.limit,
@@ -1960,8 +1995,11 @@ pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, t
                 "opportunistic maker exit ({}): a post-only order rested on {} at the price \
                  that locked a profit against BOTH legs' ledger basis, and the other leg was \
                  closed with an IOC re-priced against the book at fill time. Sized to ONE open \
-                 lot, so this closes exactly one record. realized_pnl_usd is absent because \
-                 the venue fees arrive on fill reports this process does not read.",
+                 lot, so this closes exactly one record. The leg prices are the venues' OWN \
+                 fills, not the limits sent — an IOC fills at the touch when the touch is \
+                 better, and the difference is real money. realized_pnl_usd is still absent: \
+                 PM-US fees are not on anything this process reads, and half-settled fees would \
+                 read as fully settled downstream.",
                 o.shape.tag(),
                 o.shape.rest_venue().as_str()
             ),
@@ -1977,6 +2015,112 @@ pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, t
              "role": pm_role, "qty": filled, "yes_price": pm_fill},
         ],
     })
+}
+
+
+// ------------------------------------------------------ what it actually got ---
+
+/// Which way a leg's price runs for the venue it is on, for the guard below.
+/// The KALSHI leg of an exit always SELLS the YES; the PM-US leg always BUYS it
+/// back (buying the YES against a NO long is how PM-US flattens one — there is
+/// no sell intent on that wire). So this is a property of the VENUE, not of
+/// which leg the shape happened to rest.
+fn sells_yes(v: Venue) -> bool {
+    matches!(v, Venue::Kalshi)
+}
+
+/// The price a leg ACTUALLY filled at, YES-side — or `None`, meaning "keep the
+/// limit", which is what every booking path here did unconditionally until now.
+///
+/// A LIMIT IS A FLOOR, NOT A PREDICTION. It says "do not fill me worse than
+/// this"; a CLOB fills it at the touch when the touch is better, and both
+/// venues do. Booking the limit understated Kalshi proceeds by $9.71 across 30
+/// closes — enough to report +$8.58 of realized profit as a $0.91 loss, and to
+/// retire a strategy that was working.
+///
+/// GUARDED, and the guard is the whole reason this may be trusted into the
+/// ledger. A fill can never be WORSE than the limit that authorised it: a buy
+/// cannot pay more, a sell cannot receive less. A number that says otherwise is
+/// not a windfall, it is a conversion this file got wrong — an inverted
+/// complement, a `no`-side quote, a units change — and the ledger is where the
+/// basis of every FUTURE exit is folded from, so a wrong price there is not one
+/// bad row. It refuses to the limit, which is exactly today's behaviour.
+fn fill_price(cx: &mut Cx, f: &OrderFill, limit: &str, selling: bool) -> Option<String> {
+    let px = match f {
+        OrderFill::Notional(fc) => {
+            let qty = cx.parse(&fc.qty)?;
+            if !cx.is_pos(qty) {
+                return None;
+            }
+            let (t, m) = (cx.parse(&fc.taker_cost_usd)?, cx.parse(&fc.maker_cost_usd)?);
+            let cost = cx.add(t, m);
+            let per = cx.div(cost, qty);
+            // Kalshi quotes the notional of the side the order ended up LONG,
+            // and selling a YES is buying its NO.
+            if fc.complement {
+                cx.one_minus(per)
+            } else {
+                per
+            }
+        }
+        OrderFill::Average { avg_px, .. } => cx.parse(avg_px)?,
+    };
+    // A price outside (0, 1) is not a probability and cannot be a fill.
+    let one = cx.parse_exact("1");
+    if !cx.is_pos(px) || cx.cmp(px, one) != Ordering::Less {
+        return None;
+    }
+    let lim = cx.parse(limit)?;
+    let ok = if selling {
+        cx.cmp(px, lim) != Ordering::Less
+    } else {
+        cx.cmp(px, lim) != Ordering::Greater
+    };
+    ok.then(|| cx.quantize_4dp(px).to_standard_notation_string())
+}
+
+/// What the two legs together claim, bounded by what a flattened basket can
+/// possibly pay.
+///
+/// THE SECOND HALF OF THE GUARD, and the half that catches an inverted read.
+/// `fill_price`'s "never worse than its limit" is one-sided: a sell read with
+/// the complement the wrong way round comes out BETTER than its limit and sails
+/// through. But the two legs of an exit close ONE hedged basket, and a hedged
+/// basket pays exactly $1.00 a contract — so `k + (1 - pm)`, the gross proceeds
+/// of flattening it, has to land near a dollar whatever the prices were.
+///
+/// The band is deliberately loose. This is a bound on NONSENSE, not a re-pricing
+/// and not an edge check: a genuinely bad exit is still recorded, because
+/// recording bad news correctly is the entire point of this change. An inverted
+/// leg misses by 50c or more and every real close on disk sits inside 0.95-1.05.
+fn plausible_pair(cx: &mut Cx, k_px: &str, pm_px: &str) -> bool {
+    let (Some(k), Some(pm)) = (cx.parse(k_px), cx.parse(pm_px)) else { return false };
+    let back = cx.one_minus(pm);
+    let gross = cx.add(k, back);
+    let (lo, hi) = (cx.parse_exact("0.5"), cx.parse_exact("1.5"));
+    cx.cmp(gross, lo) == Ordering::Greater && cx.cmp(gross, hi) == Ordering::Less
+}
+
+/// Ask the venue what one order filled at, and fall back to its limit.
+///
+/// Never an error path: a venue that will not answer leaves the record exactly
+/// as good as it was before this existed, and the exit is already spent either
+/// way. Failing the close over a PRICE READ would be strictly worse than
+/// booking the conservative number.
+async fn filled_price_or_limit(
+    cx: &mut Cx,
+    sink: &std::sync::Arc<dyn crate::sink::OrderSink>,
+    order_id: &str,
+    limit: &str,
+    venue: Venue,
+) -> String {
+    let s = sink.clone();
+    let id = order_id.to_string();
+    match tokio::task::spawn_blocking(move || s.order_fill(&id)).await {
+        Ok(Ok(Some(f))) => fill_price(cx, &f, limit, sells_yes(venue))
+            .unwrap_or_else(|| limit.to_string()),
+        _ => limit.to_string(),
+    }
 }
 
 // -------------------------------------------------------------- the resting ask ---
@@ -2793,7 +2937,7 @@ async fn cross(
         client_order_id: coid,
         since: Instant::now(),
     };
-    out.extend(close_leg(live, view, &r, filled, close_sink).await);
+    out.extend(close_leg(live, view, &r, filled, first_sink, close_sink).await);
     out
 }
 
@@ -3196,7 +3340,7 @@ async fn manage(
                 "the venue reports MORE filled than the exit ordered",
             ));
         }
-        out.extend(close_leg(live, view, &r, settled.min(r.order.qty), close_sink).await);
+        out.extend(close_leg(live, view, &r, settled.min(r.order.qty), rest_sink, close_sink).await);
         return out;
     }
     // Unfilled. Does the floor still sit at or below where we are resting? The
@@ -3458,7 +3602,11 @@ async fn heal(
              ({}x owed, 0 outstanding). Booking the unwind and clearing the latch.",
             p.filled
         ));
-        out.push(book(&live.ledger_path, &p.order, &p.order.limit, &p.order.limit, p.filled, ts));
+        // NO PRICE TO READ HERE, and that is the case this arm exists for: the
+        // close completed by an IOC whose fill this process never got back, so
+        // its id buys nothing. The limits are what is known.
+        let rest = p.order.rest_limit().to_string();
+        out.push(book(&live.ledger_path, &p.order, &rest, &rest, p.filled, ts));
         HEALED.fetch_add(1, AtomicOrd::Relaxed);
         return out;
     }
@@ -3600,7 +3748,10 @@ async fn heal(
             p.attempts,
             p.since.elapsed().as_secs_f64()
         ));
-        out.push(book(&live.ledger_path, &p.order, &p.order.limit, &limit, p.filled, ts));
+        let close_px =
+            filled_price_or_limit(&mut live.cx, close_sink, &oid, &limit, p.order.shape.close_venue())
+                .await;
+        out.push(book(&live.ledger_path, &p.order, p.order.rest_limit(), &close_px, p.filled, ts));
         HEALED.fetch_add(1, AtomicOrd::Relaxed);
         return out;
     }
@@ -3749,6 +3900,7 @@ async fn close_leg(
     view: &EngineView,
     r: &Resting,
     filled: i64,
+    rest_sink: &std::sync::Arc<dyn crate::sink::OrderSink>,
     close_sink: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> Vec<String> {
     use arb_venue::gateway::{PlaceRequest, Side, Tif};
@@ -3856,7 +4008,40 @@ async fn close_leg(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
-    out.push(book(&live.ledger_path, &r.order, &r.order.limit, &limit, booked, ts));
+    // WHAT THE VENUES SAY, not what we told them to accept. Both legs are read:
+    // the resting one filled at its own price only when it truly rested, and on
+    // a cross it was an IOC like the other.
+    let rest_px = filled_price_or_limit(
+        &mut live.cx,
+        rest_sink,
+        &r.venue_order_id,
+        r.order.rest_limit(),
+        r.order.shape.rest_venue(),
+    )
+    .await;
+    let close_px =
+        filled_price_or_limit(&mut live.cx, close_sink, &oid, &limit, r.order.shape.close_venue())
+            .await;
+    // BOTH LEGS TOGETHER, against what a flattened basket can pay. Each price
+    // has already cleared its own limit, but that check is one-sided and cannot
+    // see an inverted read — see `plausible_pair`. A pair that fails falls back
+    // to the limits, which is what this path booked before it could read fills
+    // at all, and says so: the ledger is where every future exit's basis comes
+    // from and a wrong price there is not one bad row.
+    let (k_px, pm_px) = fills_by_venue(&r.order, &rest_px, &close_px);
+    let (rest_px, close_px) = if plausible_pair(&mut live.cx, k_px, pm_px) {
+        (rest_px.clone(), close_px.clone())
+    } else {
+        out.push(format!(
+            "[maker-exit] REFUSED the venues' own fill prices for {}: kalshi {k_px} against \
+             pm-us {pm_px} claims {} a contract out of a basket that can only pay $1.00. \
+             Booking the limits instead — this is a price-convention fault, not a bad exit.",
+            r.order.rel_id,
+            "more than $1.50 or less than $0.50"
+        ));
+        (r.order.rest_limit().to_string(), limit.clone())
+    };
+    out.push(book(&live.ledger_path, &r.order, &rest_px, &close_px, booked, ts));
     out
 }
 
@@ -4271,19 +4456,20 @@ mod tests {
         assert_eq!(a["legs"][1]["yes_price"], "0.17", "pmus closed at 0.17: {a}");
     }
 
-    /// A CROSS PAID TAKER ON BOTH LEGS, AT THE PRICE IT ACTUALLY CROSSED.
+    /// A CROSS PAID TAKER ON BOTH LEGS, AND ITS RESTING LEG WAS NEVER RESTED.
     ///
-    /// `Order::limit` is what a rest WOULD have used and on a cross was never
-    /// sent to anyone; `Cross::limit` is what the IOC paid. Booking the former
-    /// records a trade at a price no venue saw, and `maker_exit_lock_ct` from
-    /// the rest books a profit the cross did not make — it locks strictly less,
-    /// and the difference is the spread and both takers' fees.
+    /// `Order::limit` is what a rest WOULD have used and on a cross was sent to
+    /// nobody; `Cross::limit` is what the IOC was sent at. That substitution
+    /// used to live inside `close_record` — it is [`Order::rest_limit`] now, so
+    /// that `close_record` records what it is HANDED and callers can hand it a
+    /// real fill price instead of any limit at all.
     #[test]
     fn a_crossed_record_books_both_takers_and_the_price_it_crossed_at() {
         let mut o = resting_exit(5).order;
         o.shape = Shape::RestPmUs;
         o.cross = Some(Cross { limit: "0.2200".into(), lock_ct: "0.025704".into() });
-        let rec = close_record(&o, "0.20", "0.17", 5, 1.0);
+        assert_eq!(o.rest_limit(), "0.2200", "the IOC's price, not the rest's {}", o.limit);
+        let rec = close_record(&o, o.rest_limit(), "0.17", 5, 1.0);
         assert_eq!(rec["legs"][0]["role"], "taker");
         assert_eq!(rec["legs"][1]["role"], "taker", "neither leg rested: {rec}");
         assert_eq!(
@@ -4295,6 +4481,136 @@ mod tests {
             rec["note"].as_str().expect("a note").contains("CROSSED"),
             "and the note describes what happened: {rec}"
         );
+    }
+
+    /// ...and a leg that TRULY rested keeps its own price, because a post-only
+    /// order fills at the price it rested at and nowhere else.
+    #[test]
+    fn an_uncrossed_rest_limit_is_the_orders_own() {
+        let o = resting_exit(5).order;
+        assert!(o.cross.is_none());
+        assert_eq!(o.rest_limit(), o.limit);
+    }
+
+    // ---- what it actually got, not what it was told to accept -------------
+
+    fn notional(qty: &str, taker: &str, complement: bool) -> OrderFill {
+        OrderFill::Notional(arb_venue::resp::FilledCost {
+            qty: qty.into(),
+            taker_cost_usd: taker.into(),
+            maker_cost_usd: "0".into(),
+            taker_fees_usd: "0".into(),
+            maker_fees_usd: "0".into(),
+            complement,
+        })
+    }
+
+    /// THE ROW THAT PAID FOR THIS CHANGE, verbatim from the account's own order
+    /// history. A sell of 5 KXTIME-26-POP went out at a limit of 0.1200 and
+    /// Kalshi filled it at the touch: `taker_fill_cost_dollars` 3.9208 on 5
+    /// contracts is 0.7842 of NO, so 0.2158 of YES received — 9.6c BETTER than
+    /// the limit. The ledger booked 0.1200.
+    #[test]
+    fn a_sell_is_read_as_the_complement_of_its_notional() {
+        let mut cx = Cx::default();
+        let f = notional("5.00", "3.920800", true);
+        assert_eq!(fill_price(&mut cx, &f, "0.1200", true).as_deref(), Some("0.2158"));
+    }
+
+    /// ...and a BUY is the notional itself. Both directions are pinned because
+    /// getting the orientation backwards inverts every recorded price, which is
+    /// the same class of error as PR #97.
+    #[test]
+    fn a_buy_is_read_as_the_notional_itself() {
+        let mut cx = Cx::default();
+        let f = notional("5.00", "1.800000", false);
+        assert_eq!(fill_price(&mut cx, &f, "0.3600", false).as_deref(), Some("0.3600"));
+    }
+
+    /// A FILL MAY NEVER BE WORSE THAN THE LIMIT THAT AUTHORISED IT. A buy that
+    /// claims to have paid MORE is not a bad fill, it is a conversion this file
+    /// got wrong, and the ledger is where every future exit's basis is folded
+    /// from. It refuses to the limit — exactly the old behaviour.
+    #[test]
+    fn a_price_worse_than_its_own_limit_is_refused() {
+        let mut cx = Cx::default();
+        let dear = notional("5.00", "3.920800", false); // 0.7842 paid...
+        assert_eq!(fill_price(&mut cx, &dear, "0.3600", false), None, "...on a 0.36 limit");
+        let cheap = OrderFill::Average { qty: 5, avg_px: "0.1000".into() };
+        assert_eq!(fill_price(&mut cx, &cheap, "0.2000", true), None, "sold under a 0.20 limit");
+    }
+
+    /// THE GUARD IS ONE-SIDED AND THIS PINS THAT, so nobody reads the one above
+    /// as total. Reading a SELL with the complement the wrong way round makes it
+    /// look BETTER than its limit, not worse, so "never worse than the limit"
+    /// cannot catch it: 3.9208 on 5 read as 0.7842 sails past a 0.1200 sell
+    /// limit. [`plausible_pair`] is the check that does catch it, because it
+    /// looks at what the two legs say TOGETHER.
+    #[test]
+    fn the_limit_guard_alone_cannot_catch_an_inverted_sell() {
+        let mut cx = Cx::default();
+        let inverted = notional("5.00", "3.920800", false);
+        assert_eq!(fill_price(&mut cx, &inverted, "0.1200", true).as_deref(), Some("0.7842"));
+        // ...and here is the thing that stops it reaching the ledger. Sold YES
+        // at 0.7842 while buying the YES back at 0.20 claims $1.58 a contract
+        // out of a pair that can only ever pay $1.00.
+        assert!(!plausible_pair(&mut cx, "0.7842", "0.2000"));
+        assert!(plausible_pair(&mut cx, "0.2158", "0.2000"), "the correct read is fine");
+    }
+
+    /// The pair bound is a BOUND, not a re-pricing: a flattened basket pays
+    /// $1.00 a contract, so what the two legs together claim has to land near
+    /// it. Real closes sit just under; nothing legitimate is near the edges.
+    #[test]
+    fn the_pair_bound_admits_real_closes_and_rejects_nonsense() {
+        let mut cx = Cx::default();
+        for (k, pm) in [("0.2158", "0.2000"), ("0.3600", "0.3300"), ("0.0300", "0.0600")] {
+            assert!(plausible_pair(&mut cx, k, pm), "a real close: {k}/{pm}");
+        }
+        assert!(!plausible_pair(&mut cx, "0.9000", "0.0100"), "1.89/ct is not a flatten");
+        assert!(!plausible_pair(&mut cx, "0.0100", "0.9000"), "0.11/ct is not one either");
+    }
+
+    /// PM-US answers an average price directly, already in the YES convention
+    /// `pmus_order_body` sends. The guard applies to it identically.
+    #[test]
+    fn a_pmus_average_is_taken_as_given_and_still_guarded() {
+        let mut cx = Cx::default();
+        let better = OrderFill::Average { qty: 5, avg_px: "0.1300".into() };
+        assert_eq!(fill_price(&mut cx, &better, "0.1500", false).as_deref(), Some("0.1300"));
+        let worse = OrderFill::Average { qty: 5, avg_px: "0.1900".into() };
+        assert_eq!(fill_price(&mut cx, &worse, "0.1500", false), None);
+    }
+
+    /// A price outside (0, 1) is not a probability and cannot be a fill. Zero
+    /// especially: `avgPx=0-on-create` is a documented PM-US quirk, and booking
+    /// it would record a leg that cost nothing.
+    #[test]
+    fn a_price_outside_the_unit_interval_is_not_a_fill() {
+        let mut cx = Cx::default();
+        for px in ["0", "1", "1.5", "-0.2"] {
+            let f = OrderFill::Average { qty: 5, avg_px: px.into() };
+            assert_eq!(fill_price(&mut cx, &f, "0.9999", false), None, "px {px}");
+        }
+        // ...and a zero quantity cannot be divided by.
+        assert_eq!(fill_price(&mut cx, &notional("0", "1.0", false), "0.5", false), None);
+    }
+
+    /// The KALSHI leg of an exit always SELLS the YES and the PM-US leg always
+    /// BUYS it back — there is no sell intent on the PM-US wire, so flattening a
+    /// NO long there means buying the YES against it. The guard's direction is a
+    /// property of the VENUE, not of which leg the shape rested.
+    #[test]
+    fn the_guards_direction_follows_the_venue_not_the_shape() {
+        assert!(sells_yes(Venue::Kalshi));
+        assert!(!sells_yes(Venue::PolymarketUs));
+        for shape in [Shape::RestKalshi, Shape::RestPmUs] {
+            assert_ne!(shape.rest_venue(), shape.close_venue(), "{shape:?} closes the OTHER leg");
+            assert!(
+                sells_yes(shape.rest_venue()) != sells_yes(shape.close_venue()),
+                "one leg sells and the other buys, whichever rested: {shape:?}"
+            );
+        }
     }
 
     // ---- the naked leg, on whichever venue it is on -----------------------    // ---- the naked leg, on whichever venue it is on -----------------------

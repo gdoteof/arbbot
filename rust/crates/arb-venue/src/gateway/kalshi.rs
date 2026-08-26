@@ -802,6 +802,13 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
         })
     }
 
+    fn order_fill(&self, order_id: &str) -> Result<Option<crate::resp::OrderFill>, VenueError> {
+        let o = self.settle.retry_404("kalshi order_fill", order_id, || {
+            self.order_status_at(Priority::Critical, order_id)
+        })?;
+        Ok(o.filled_cost().map(crate::resp::OrderFill::Notional))
+    }
+
     /// The evidence half of the sweep, scoped to match the cancel half.
     fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
         let listing = self.listing()?;
