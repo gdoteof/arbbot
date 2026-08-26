@@ -1,0 +1,29 @@
+{
+ "_source": "GET /trade-api/v2/portfolio/orders, captured live 2026-08-26. The order behind the 16:19:32Z maker-exit close on KXTIME-26-POP: sent at a limit of 0.1200 and filled by Kalshi at the touch. This is the payload PR #101 exists to read.",
+ "order": {
+  "action": "sell",
+  "book_side": "ask",
+  "client_order_id": "x1787761172640",
+  "created_time": "2026-08-26T16:19:32.669111Z",
+  "exchange_index": 0,
+  "fill_count_fp": "5.00",
+  "initial_count_fp": "5.00",
+  "last_update_time": "2026-08-26T16:19:32.669111Z",
+  "maker_fees_dollars": "0.000000",
+  "maker_fill_cost_dollars": "0.000000",
+  "no_price_dollars": "0.8800",
+  "order_id": "01a03ede-9e20-769e-91db-32a479e30df0",
+  "outcome_side": "no",
+  "remaining_count_fp": "0.00",
+  "self_trade_prevention_type": "taker_at_cross",
+  "side": "yes",
+  "status": "executed",
+  "subaccount_number": 0,
+  "taker_fees_dollars": "0.059300",
+  "taker_fill_cost_dollars": "3.920800",
+  "ticker": "KXTIME-26-POP",
+  "type": "limit",
+  "user_id": "00000000-0000-0000-0000-000000000000",
+  "yes_price_dollars": "0.1200"
+ }
+}
