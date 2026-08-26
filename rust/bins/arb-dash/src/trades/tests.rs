@@ -573,3 +573,292 @@ fn a_record_with_no_status_is_open() {
     assert_eq!(status_of(&serde_json::json!({ "status": 7 })), "open", "not a string either");
     assert_eq!(status_of(&serde_json::json!({ "status": "unwound" })), "unwound");
 }
+
+// ---------------------------------------------------------------- round trips ---
+//
+// Pricing an EXIT needs the ENTRY it retired, which is a different record. Every
+// test below is a way that join has been, or could be, got wrong.
+
+/// The entry the exits below close: 5 contracts at 0.92/ct all-in, engine
+/// shape, so its basis has to be derived from the legs AND the modelled fees
+/// added to it.
+const RT_ENTRY: &str = r#"{"ts":1787700000.0,"relationship_id":"xvus-btcmax-26-31-2026-200k","qty":5,"strategy":"maker-hedge","status":"open","source":"arb-trader","fees_pending":true,"legs":[{"venue":"kalshi","market_id":"KXBTCMAXY-26DEC31-199999.99","side":"bid","role":"maker","qty":5,"yes_price":"0.0400"},{"venue":"polymarket_us","market_id":"cpc-btc-hitprice-high-yr-12-31-2026-200k","side":"ask","role":"maker","qty":5,"yes_price":"0.1200"}]}"#;
+
+/// The close: sells both legs for 0.95/ct, 3.5 days later. `rest-pmus`, but
+/// written AFTER the 2026-08-25 fix, so its prices are on the right venues.
+const RT_EXIT: &str = r#"{"ts":1788002400.0,"relationship_id":"xvus-btcmax-26-31-2026-200k","qty":5,"strategy":"maker-exit","status":"unwound","source":"arb-trader","closes_ts":1787700000.0,"fees_pending":true,"maker_exit_shape":"rest-pmus","maker_exit_k_basis":"0.040000","maker_exit_pm_basis":"0.880000","legs":[{"venue":"kalshi","market_id":"KXBTCMAXY-26DEC31-199999.99","side":"yes","action":"sell","role":"taker","qty":5,"yes_price":"0.0100"},{"venue":"polymarket_us","market_id":"cpc-btc-hitprice-high-yr-12-31-2026-200k","side":"no","action":"sell","role":"taker","qty":5,"yes_price":"0.0600"}]}"#;
+
+fn row_for<'a>(out: &'a serde_json::Value, status: &str) -> &'a serde_json::Value {
+    out["rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .find(|r| r["status"] == status)
+        .unwrap_or_else(|| panic!("no {status} row: {out}"))
+}
+
+/// THE WHOLE POINT. All 24 Rust maker-exit closes on disk — every profitable
+/// unwind the flywheel has made — priced as `net_usd: null` because the engine
+/// books `fees_pending` and never writes `realized_pnl_usd`, and nothing here
+/// looked up what they closed. The exit's proceeds against the entry's basis
+/// IS the answer, and the ledger holds both halves.
+#[test]
+fn an_exit_is_priced_against_the_entry_it_closes() {
+    let led = format!("{RT_ENTRY}\n{RT_EXIT}");
+    let out = build(&led, "default", 1788100000.0);
+    let exit = row_for(&out, "unwound");
+    assert_eq!(exit["net_source"], "derived:exit_vs_entry", "{exit}");
+    // Entry: 0.04 YES + (1 - 0.12) NO = 0.92/ct = $4.60, plus its modelled
+    // maker fees. Exit: 0.01 + (1 - 0.06) = 0.95/ct = $4.75.
+    let entry_cost = exit["entry_cost_usd"].as_f64().expect("entry cost");
+    assert!(entry_cost > 4.60, "entry basis is ALL-IN — fees inside: {entry_cost}");
+    assert!(entry_cost < 4.70, "and only its own fees: {entry_cost}");
+    assert!((exit["exit_proceeds_usd"].as_f64().expect("proceeds") - 4.75).abs() < 1e-9);
+    let net = exit["net_usd"].as_f64().expect("a net");
+    let fees = exit["fees_usd"].as_f64().expect("fees");
+    assert!((net - (4.75 - entry_cost - fees)).abs() < 1e-9, "proceeds - basis - exit fees: {exit}");
+}
+
+/// The entry is `open` on disk and stays that way — the ledger never rewrites a
+/// line. It must not ALSO carry the profit its exit just booked, or the same
+/// $0.09 is counted twice.
+#[test]
+fn the_closed_entry_contributes_nothing_to_the_headline() {
+    let led = format!("{RT_ENTRY}\n{RT_EXIT}");
+    let out = build(&led, "default", 1788100000.0);
+    assert_eq!(row_for(&out, "closed")["net_usd"], serde_json::Value::Null);
+    assert_eq!(totals(&out, "open_net_usd"), 0.0, "the entry is fully closed");
+    assert_eq!(totals(&out, "closed_by_unwind"), 1.0);
+    let exit = row_for(&out, "unwound");
+    assert!((totals(&out, "realized_net_usd") - exit["net_usd"].as_f64().unwrap()).abs() < 1e-9);
+}
+
+/// Realized APR is measured over the time the capital was ACTUALLY out, not to
+/// a resolve date it never reached. This position resolves 2026-12-31 but was
+/// held 3.5 days, and the two give answers ~40x apart.
+#[test]
+fn realized_apr_is_measured_over_the_hold_not_to_resolution() {
+    let led = format!("{RT_ENTRY}\n{RT_EXIT}");
+    let out = build(&led, "default", 1788100000.0);
+    let exit = row_for(&out, "unwound");
+    let days = exit["held_days"].as_f64().expect("held_days");
+    assert!((days - 3.5).abs() < 1e-6, "302400s is 3.5 days: {days}");
+    let (net, cost) = (exit["net_usd"].as_f64().unwrap(), exit["entry_cost_usd"].as_f64().unwrap());
+    let want = net / cost / (3.5 / 365.25) * 100.0;
+    assert!((exit["realized_apr_pct"].as_f64().expect("realized apr") - want).abs() < 1e-6);
+    // APR-to-hold is for capital still committed and must stay off this row.
+    assert_eq!(exit["apr_pct"], serde_json::Value::Null, "a closed row holds nothing");
+}
+
+/// A blank in the APR-to-hold column is the CLAIM that no capital is committed.
+/// Letting a realized rate leak into `blended_apr_pct` would report a
+/// nine-minute turn's four-figure rate as the yield on the open book.
+#[test]
+fn a_realized_rate_never_reaches_the_blended_hold_apr() {
+    let led = format!("{RT_ENTRY}\n{RT_EXIT}\n{ENGINE}");
+    let out = build(&led, "default", 1788100000.0);
+    let blended = out["totals"]["blended_apr_pct"].as_f64().expect("a blended apr");
+    let open = row_for(&out, "open");
+    assert!((blended - open["apr_pct"].as_f64().expect("apr")).abs() < 1e-9,
+            "the only open row is the only contributor: {blended}");
+}
+
+/// `naked-close` on disk: venue-truth reconciliation sold ONE Kalshi leg of a
+/// two-leg basket and says in its own note that the PM-US exit price is not
+/// known. Its $1.45 of proceeds against the basket's full $4.90 basis reads as
+/// a $3.45 LOSS that nobody took.
+#[test]
+fn a_one_legged_exit_is_not_a_flatten() {
+    let one_leg = r#"{"ts":1788002400.0,"relationship_id":"xvus-btcmax-26-31-2026-200k","qty":5,"strategy":"naked-close","status":"unwound","source":"arb-trader","closes_ts":1787700000.0,"pnl_pending":true,"legs":[{"venue":"kalshi","market_id":"KXBTCMAXY-26DEC31-199999.99","side":"yes","action":"sell","role":"taker","qty":5,"yes_price":"0.2900"}]}"#;
+    let out = build(&format!("{RT_ENTRY}\n{one_leg}"), "default", 1788100000.0);
+    let exit = row_for(&out, "unwound");
+    assert_eq!(exit["net_usd"], serde_json::Value::Null, "one leg of two: {exit}");
+    assert_eq!(exit["exit_proceeds_usd"], serde_json::Value::Null);
+    assert!(exit["unpriced_reason"].as_str().expect("a reason").contains("partial flatten"));
+    assert_eq!(totals(&out, "realized_unpriced_trades"), 1.0);
+}
+
+/// `close_via_*` BUYS to close a short — a debit. Reading its price as sale
+/// proceeds would book the cost of closing as income.
+#[test]
+fn buying_to_close_is_not_proceeds() {
+    let via = r#"{"ts":1788002400.0,"relationship_id":"xvus-btcmax-26-31-2026-200k","qty":5,"strategy":"unwind","status":"unwound","closes_ts":1787700000.0,"legs":[{"venue":"kalshi","market_id":"KXBTCMAXY-26DEC31-199999.99","side":"no","action":"close_via_buy_yes","qty":5,"yes_price":"0.1100"},{"venue":"polymarket_us","market_id":"cpc-btc-hitprice-high-yr-12-31-2026-200k","side":"yes","action":"close_via_buy_short","qty":5,"yes_price":"0.0800"}]}"#;
+    let out = build(&format!("{RT_ENTRY}\n{via}"), "default", 1788100000.0);
+    let exit = row_for(&out, "unwound");
+    assert_eq!(exit["net_usd"], serde_json::Value::Null, "{exit}");
+    assert_eq!(exit["exit_proceeds_usd"], serde_json::Value::Null);
+}
+
+/// The ledger's own `realized_pnl_usd` is bank truth and is never re-derived
+/// while it is on the record — but the round trip still supplies the basis and
+/// the holding period the rate is measured over.
+#[test]
+fn a_banked_pnl_still_gets_a_realized_apr() {
+    let banked = RT_EXIT.replace(r#""status":"unwound""#, r#""status":"unwound","realized_pnl_usd":0.25"#);
+    let out = build(&format!("{RT_ENTRY}\n{banked}"), "default", 1788100000.0);
+    let exit = row_for(&out, "unwound");
+    assert_eq!(exit["net_source"], "ledger:realized_pnl");
+    assert_eq!(exit["net_usd"], 0.25);
+    let cost = exit["entry_cost_usd"].as_f64().expect("entry cost");
+    let want = 0.25 / cost / (3.5 / 365.25) * 100.0;
+    assert!((exit["realized_apr_pct"].as_f64().expect("apr") - want).abs() < 1e-6);
+}
+
+/// An exit sized to part of a lot may only be charged its share of the basis.
+/// Charging the whole thing would report a 1-contract close of a 5-contract
+/// basket as a $3.68 loss.
+#[test]
+fn a_partial_exit_is_charged_pro_rata() {
+    let part = RT_EXIT.replace(r#""qty":5,"strategy":"maker-exit""#, r#""qty":1,"strategy":"maker-exit""#)
+        .replace(r#""role":"taker","qty":5"#, r#""role":"taker","qty":1"#);
+    let out = build(&format!("{RT_ENTRY}\n{part}"), "default", 1788100000.0);
+    let exit = row_for(&out, "unwound");
+    let whole = build(&format!("{RT_ENTRY}\n{RT_EXIT}"), "default", 1788100000.0);
+    let five = row_for(&whole, "unwound")["entry_cost_usd"].as_f64().unwrap();
+    assert!((exit["entry_cost_usd"].as_f64().unwrap() - five / 5.0).abs() < 1e-9, "{exit}");
+    // 4 of 5 contracts are still on, and still priced as an open basket.
+    let rest = row_for(&out, "open");
+    assert_eq!(rest["qty"], 4.0);
+    assert!(rest["net_usd"].as_f64().is_some(), "the remainder is still a hedged basket: {rest}");
+}
+
+/// `closes_ts` naming nothing this ledger holds is the difference between a
+/// number and a guess. It must not fall back to some other record's basis.
+#[test]
+fn an_exit_whose_entry_is_missing_is_not_priced() {
+    let out = build(RT_EXIT, "default", 1788100000.0);
+    let exit = row_for(&out, "unwound");
+    assert_eq!(exit["net_usd"], serde_json::Value::Null);
+    assert_eq!(exit["entry_cost_usd"], serde_json::Value::Null);
+    assert_eq!(exit["realized_apr_pct"], serde_json::Value::Null);
+    assert!(exit["unpriced_reason"].as_str().expect("a reason").contains("closes_ts"));
+    assert_eq!(totals(&out, "round_trips"), 0.0);
+}
+
+/// The 10 `rest-pmus` records written before PR #97 carry each leg's price on
+/// the OTHER venue, and the migration that would correct them has not run.
+/// Priced from those legs they are fabricated losses.
+#[test]
+fn a_record_with_its_prices_on_the_wrong_venues_is_refused() {
+    // Both ends moved back before the 2026-08-25 fix — an exit cannot predate
+    // the entry it closes, and a nonsense hold would prove nothing here.
+    let entry = RT_ENTRY.replace("1787700000.0", "1787500000.0");
+    let pre = RT_EXIT.replace("1788002400.0", "1787600000.0").replace("1787700000.0", "1787500000.0");
+    let out = build(&format!("{entry}\n{pre}"), "default", 1788100000.0);
+    let exit = row_for(&out, "unwound");
+    assert_eq!(exit["net_usd"], serde_json::Value::Null, "{exit}");
+    assert_eq!(exit["exit_proceeds_usd"], serde_json::Value::Null);
+    assert!(exit["unpriced_reason"].as_str().expect("a reason").contains("WRONG VENUES"));
+    assert_eq!(out["swapped_legs"], 1, "reported, not absorbed");
+}
+
+/// ...but only that shape. `rest-kalshi` wrote the two fills onto the venues
+/// that paid them even before the fix, because there the roles coincide.
+#[test]
+fn the_shape_the_bug_never_touched_is_still_priced() {
+    let entry = RT_ENTRY.replace("1787700000.0", "1787500000.0");
+    let pre = RT_EXIT
+        .replace("1788002400.0", "1787600000.0")
+        .replace("1787700000.0", "1787500000.0")
+        .replace("rest-pmus", "rest-kalshi");
+    let out = build(&format!("{entry}\n{pre}"), "default", 1788100000.0);
+    assert_eq!(row_for(&out, "unwound")["net_source"], "derived:exit_vs_entry");
+    assert_eq!(out["swapped_legs"], 0);
+}
+
+/// The book's realized rate is money-weighted, not a mean of per-trade APRs. A
+/// $4.60 position held 3.5 days and a $0.92 one turned in an hour do not average
+/// to anything a human should read.
+#[test]
+fn the_realized_rate_is_weighted_by_dollar_years() {
+    let fast_entry = RT_ENTRY.replace("1787700000.0", "1787800000.0").replace(r#""qty":5"#, r#""qty":1"#)
+        .replace(r#""role":"maker","qty":5"#, r#""role":"maker","qty":1"#);
+    let fast_exit = RT_EXIT.replace(r#""ts":1788002400.0"#, r#""ts":1787803600.0"#)
+        .replace("\"closes_ts\":1787700000.0", "\"closes_ts\":1787800000.0")
+        .replace(r#""qty":5"#, r#""qty":1"#).replace(r#""role":"taker","qty":5"#, r#""role":"taker","qty":1"#);
+    let out = build(&format!("{RT_ENTRY}\n{RT_EXIT}\n{fast_entry}\n{fast_exit}"), "default", 1788100000.0);
+    assert_eq!(totals(&out, "round_trips"), 2.0);
+    let rate = totals(&out, "realized_apr_pct");
+    let want = totals(&out, "realized_net_usd") / totals(&out, "realized_dollar_years") * 100.0;
+    assert!((rate - want).abs() < 1e-9, "net over dollar-years: {rate} vs {want}");
+    // The one-hour turn's OWN rate is enormous; the book's is not.
+    let rows = out["rows"].as_array().unwrap();
+    let fastest = rows.iter().filter_map(|r| r["realized_apr_pct"].as_f64())
+        .fold(f64::MIN, f64::max);
+    assert!(fastest > rate * 5.0, "a fast small turn cannot set the book rate: {fastest} vs {rate}");
+}
+
+/// A hold of exactly zero must not divide the rate by nothing — and must not be
+/// floored into one either. It is reported as the zero it is, with no rate.
+#[test]
+fn a_same_instant_round_trip_does_not_divide_by_zero() {
+    let instant = RT_EXIT.replace(r#""ts":1788002400.0"#, r#""ts":1787700000.0"#);
+    let out = build(&format!("{RT_ENTRY}\n{instant}"), "default", 1788100000.0);
+    let exit = row_for(&out, "unwound");
+    assert_eq!(exit["realized_apr_pct"], serde_json::Value::Null, "{exit}");
+    assert_eq!(exit["held_days"], 0.0);
+    assert!(exit["net_usd"].as_f64().is_some_and(f64::is_finite), "the P&L is still real");
+}
+
+/// Four `pmus-maker-probe` pairs on disk were booked one MILLISECOND apart —
+/// the probe wrote an entry and its exit in the same breath, so no capital was
+/// ever really out. Annualized, one of them reads −10,646,155%/yr. The P&L is
+/// real and stays; only the RATE is refused.
+#[test]
+fn a_hold_too_short_to_be_one_gets_no_rate() {
+    let ms = RT_EXIT.replace(r#""ts":1788002400.0"#, r#""ts":1787700000.001"#);
+    let out = build(&format!("{RT_ENTRY}\n{ms}"), "default", 1788100000.0);
+    let exit = row_for(&out, "unwound");
+    assert!(exit["net_usd"].as_f64().is_some(), "the money is real: {exit}");
+    assert_eq!(exit["realized_apr_pct"], serde_json::Value::Null, "1ms is not a period");
+    // The duration is reported TRUE, not floored — a 1ms pair rendered as "1m"
+    // would hide the very thing that makes its rate meaningless.
+    let days = exit["held_days"].as_f64().expect("held_days");
+    assert!(days < 1e-7, "true elapsed, not a floor: {days}");
+    assert_eq!(totals(&out, "round_trips"), 1.0, "it is still a close");
+    assert_eq!(totals(&out, "unrated_round_trips"), 1.0);
+}
+
+/// ...and it must not reach the book's rate from EITHER side. Its loss in the
+/// numerator against nothing in the denominator gives it infinite weight, which
+/// is the opposite of what dollar-year weighting is for.
+#[test]
+fn a_rateless_trip_moves_the_book_rate_not_at_all() {
+    let ms_entry = RT_ENTRY.replace("1787700000.0", "1787800000.0");
+    let ms_exit = RT_EXIT
+        .replace(r#""ts":1788002400.0"#, r#""ts":1787800000.001"#)
+        .replace("\"closes_ts\":1787700000.0", "\"closes_ts\":1787800000.0");
+    let base = build(&format!("{RT_ENTRY}\n{RT_EXIT}"), "default", 1788100000.0);
+    let with = build(
+        &format!("{RT_ENTRY}\n{RT_EXIT}\n{ms_entry}\n{ms_exit}"),
+        "default",
+        1788100000.0,
+    );
+    assert!((totals(&base, "realized_apr_pct") - totals(&with, "realized_apr_pct")).abs() < 1e-9);
+    assert!((totals(&base, "realized_dollar_years") - totals(&with, "realized_dollar_years")).abs() < 1e-12);
+    // ...but its money is still banked.
+    assert!(totals(&with, "realized_net_usd") != totals(&base, "realized_net_usd"));
+}
+
+/// The strategy board carries the realized side so the MIX behind the book's
+/// rate is visible: a strategy turning small capital in minutes shows an
+/// enormous rate on almost no dollar-years, and that is the thing to see.
+#[test]
+fn the_strategy_board_shows_which_strategies_earned_the_rate() {
+    let out = build(&format!("{RT_ENTRY}\n{RT_EXIT}"), "default", 1788100000.0);
+    let row = out["by_strategy"]
+        .as_array()
+        .expect("board")
+        .iter()
+        .find(|s| s["strategy"] == "maker-exit")
+        .expect("the exit's strategy");
+    let exit = row_for(&out, "unwound");
+    assert!((row["realized_net_usd"].as_f64().unwrap() - exit["net_usd"].as_f64().unwrap()).abs() < 1e-9);
+    assert!((row["realized_apr_pct"].as_f64().expect("a rate")
+        - exit["realized_apr_pct"].as_f64().unwrap()).abs() < 1e-6,
+        "one trip, so the strategy's rate IS its rate: {row}");
+    // The entry's own strategy closed nothing and states no rate.
+    let entry = out["by_strategy"].as_array().unwrap().iter()
+        .find(|s| s["strategy"] == "maker-hedge").expect("the entry's strategy");
+    assert_eq!(entry["realized_apr_pct"], serde_json::Value::Null);
+}

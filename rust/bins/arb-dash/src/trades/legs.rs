@@ -65,6 +65,24 @@ fn leg_dir(action: &str, side: &str) -> Leg {
     }
 }
 
+/// Which side a SALE gave up, for the exit legs of an unwind.
+///
+/// `close_via_*` IS NOT A SALE and must never reach here as one. Those legs
+/// BUY to close a short — a debit — and reading their price as proceeds would
+/// book the cost of closing as income. There is one such record on disk and it
+/// carries its own `realized_pnl_usd`, so refusing to read it costs nothing and
+/// guessing at it would cost $0.57.
+fn sold_side(action: &str, side: &str) -> Option<bool> {
+    if action != "sell" {
+        return None;
+    }
+    match side {
+        "yes" | "bid" => Some(true),
+        "no" | "ask" => Some(false),
+        _ => None,
+    }
+}
+
 /// The fee model and the arena it needs. `FeeSchedule::fee` wants a `&mut Cx`
 /// alongside the schedule, so the two travel together for the whole build.
 pub struct Modeller {
@@ -146,6 +164,19 @@ pub struct Legs {
     pub no_qty: f64,
     pub unknown_leg: bool,
     pub short_leg: bool,
+    /// The mirror of `derived_cost` for an EXIT: what the sold legs collected,
+    /// ex-fees. `yes_price` is always quoted on the YES side, so a sold NO
+    /// collects (1 - yes_price).
+    pub proceeds: f64,
+    pub sold_yes_qty: f64,
+    pub sold_no_qty: f64,
+    /// A leg that BOUGHT. An exit record is a clean flatten only if nothing in
+    /// it opened new exposure.
+    pub long_leg: bool,
+    /// A sold leg whose side or price this file could not read — including
+    /// every `close_via_*`. It makes `proceeds` incomplete, so the record
+    /// cannot be priced from its legs.
+    pub short_unreadable: bool,
     pub payload: Vec<serde_json::Value>,
 }
 
@@ -166,6 +197,11 @@ impl Legs {
             no_qty: 0.0,
             unknown_leg: false,
             short_leg: false,
+            proceeds: 0.0,
+            sold_yes_qty: 0.0,
+            sold_no_qty: 0.0,
+            long_leg: false,
+            short_unreadable: false,
             payload: Vec::new(),
         };
         for l in legs {
@@ -201,14 +237,34 @@ impl Legs {
             let dir = leg_dir(&action, &side);
             match (dir, px) {
                 (Leg::LongYes, Some(px)) => {
+                    out.long_leg = true;
                     out.yes_qty += lqty;
                     out.derived_cost += px * lqty;
                 }
                 (Leg::LongNo, Some(px)) => {
+                    out.long_leg = true;
                     out.no_qty += lqty;
                     out.derived_cost += (1.0 - px) * lqty;
                 }
-                (Leg::Short, _) => out.short_leg = true,
+                // A sale still disqualifies the record from being priced as a
+                // long basket — `short_leg` is unchanged and `hedged` still
+                // reads it. What is new is that the sale is also READ, because
+                // an unwind is made of nothing else and its proceeds are the
+                // only thing that says what the exit got.
+                (Leg::Short, _) => {
+                    out.short_leg = true;
+                    match (sold_side(&action, &side), px) {
+                        (Some(true), Some(px)) => {
+                            out.sold_yes_qty += lqty;
+                            out.proceeds += px * lqty;
+                        }
+                        (Some(false), Some(px)) => {
+                            out.sold_no_qty += lqty;
+                            out.proceeds += (1.0 - px) * lqty;
+                        }
+                        _ => out.short_unreadable = true,
+                    }
+                }
                 _ => out.unknown_leg = true,
             }
 

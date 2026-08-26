@@ -1763,10 +1763,13 @@ const DRAW = {
     if(d.error) return fail(f, d.error);
     f.append(tradeTotals(d));
     f.append(venueRolePanel(d));
+    f.append(roundTrips(d));
     f.append(tradeRows(d));
     const t = d.totals || {};
     return `${t.open_trades||0} open &middot; locked <b class="${sign(t.open_net_usd)}">$${money(t.open_net_usd||0)}</b>` +
            ` &middot; ${pctf(t.blended_apr_pct)}/yr to hold` +
+           ` &middot; realized <b class="${sign(t.realized_net_usd)}">$${money(t.realized_net_usd||0)}</b>` +
+           ` at ${pctf(t.realized_apr_pct)}/yr` +
            (t.unpriced_rows ? ` &middot; <b class="warn">${t.unpriced_rows} unpriced</b>` : '');
   },
   '/intents': (f) => {
@@ -1862,6 +1865,31 @@ function rollupHost(day){
 const pctf = (v) => (v===null||v===undefined||!isFinite(v)) ? '&mdash;'
   : (Number(v)>=0?'':'') + Number(v).toFixed(1) + '%';
 
+/* How long the capital was out, in the largest unit that still reads as a
+   duration. This is NOT decoration: it is the denominator of the realized APR
+   beside it, and a three-figure APR means one thing over five weeks and quite
+   another over nine minutes. Never render one without the other. */
+/* Dollar-years span four orders of magnitude on this book — 1.8 for the
+   unwinds, 0.0002 for a probe. A fixed 3dp renders the small end as "0.000",
+   which reads as a divide-by-nothing beside a five-figure rate when it is
+   really a very small but perfectly real denominator. */
+const dyears = (v) => (v===null||v===undefined||!isFinite(v)) ? '&mdash;'
+  : Number(v) >= 0.01 ? Number(v).toFixed(3) : Number(v).toPrecision(2);
+
+const held = (d) => {
+  if (d===null || d===undefined || !isFinite(d)) return '&mdash;';
+  if (d >= 1) return Number(d).toFixed(1) + 'd';
+  const h = d * 24;
+  if (h >= 1) return h.toFixed(1) + 'h';
+  const m = h * 60;
+  if (m >= 1) return m.toFixed(0) + 'm';
+  /* Sub-minute must LOOK sub-minute. Four probe pairs on disk are a
+     millisecond apart; rounding those up to "1m" would hide the very thing
+     that makes their annualized rate meaningless. */
+  const sec = m * 60;
+  return sec >= 1 ? sec.toFixed(0) + 's' : (sec * 1000).toFixed(0) + 'ms';
+};
+
 function tradeTotals(d){
   const t = d.totals || {};
   const kv = (label, val, cls) =>
@@ -1873,11 +1901,20 @@ function tradeTotals(d){
     ${kv('Locked, still open', '$'+money(t.open_net_usd||0), sign(t.open_net_usd))}
     ${kv('APR to hold', pctf(t.blended_apr_pct), sign(t.blended_apr_pct))}
     ${kv('Realized', '$'+money(t.realized_net_usd||0), sign(t.realized_net_usd))}
+    ${t.round_trips ? kv('Realized APR',
+        `${pctf(t.realized_apr_pct)} <span class="sub">on $${money(t.realized_cost_usd||0)} over
+         ${Number(t.realized_dollar_years||0).toFixed(2)} dollar-years, ${t.round_trips} round trip(s)` +
+        (t.unrated_round_trips ? `, ${t.unrated_round_trips} of them held too briefly to annualize
+         and excluded from this rate (their P&amp;L is still in Realized)` : '') + `</span>`,
+        sign(t.realized_apr_pct)) : ''}
     ${kv('Fees &mdash; settled', '$'+money(t.fees_settled_usd||0), 'warn')}
     ${kv('Fees &mdash; modelled', '$'+money(t.fees_modelled_usd||0), 'warn')}
     ${t.open_unpriced_trades ? kv('Naked, NOT in locked',
         `${t.open_unpriced_trades} pos &middot; ${Number(t.open_unpriced_contracts||0).toLocaleString()} ct
          &middot; $${money(t.open_unpriced_cost_usd||0)} at risk`, 'warn') : ''}
+    ${t.realized_derived_trades ? kv('Realized, derived not banked',
+        `${t.realized_derived_trades} record(s) <span class="sub">priced from the exit's own fills
+         against the entry's basis &mdash; fees modelled at both ends</span>`, 'warn') : ''}
     ${t.realized_unpriced_trades ? kv('Closed but unpriceable',
         `${t.realized_unpriced_trades} record(s)`, 'warn') : ''}
     ${t.closed_by_unwind ? kv('Folded out as closed',
@@ -1890,10 +1927,15 @@ function tradeTotals(d){
       directional bet that pays $0.00 or $1.00, so it is shown as
       <b class="warn">unknown</b> and is excluded from Locked and from the APR
       &mdash; its contracts and its capital are still counted above, because
-      those are facts. Closed rows use the ledger's own realized P&amp;L, never a
-      re-derived payoff. Open and realized are kept apart: realized money is
-      back in the account and is not earning this APR. APR is capital-weighted
-      and measured from today to resolution.
+      those are facts. Closed rows use the ledger's own realized P&amp;L wherever
+      the record carries one; where it does not, the close is priced from its own
+      exit fills against the basis of the entry it retired, and is counted in
+      <b>Realized, derived not banked</b>. Open and realized are kept apart:
+      realized money is back in the account and is not earning this APR.
+      <b>APR to hold</b> is capital-weighted and measured from today to
+      resolution; <b>Realized APR</b> is what the closed capital actually earned
+      over the time it was out, weighted by <b>dollar-years</b> so that one fast
+      small turn cannot set the book's rate.
       <br><br>Every figure here comes from the ledger alone. It is <b>not</b>
       reconciled against venue position snapshots, and it is <b>not</b> comparable
       to the Books statement — different populations, and the PM-US side of that
@@ -1918,6 +1960,9 @@ function venueRolePanel(d){
       <td class="num ${sign(s.net_usd)}">$${money(s.net_usd)}</td>
       <td class="num ${s.unpriced?'warn':'dim'}">${Number(s.unpriced||0)}</td>
       <td class="num dim">${Number(s.closed_by_unwind||0)}</td>
+      <td class="num ${s.dollar_years?usdSign(s.realized_net_usd):''}">${s.dollar_years?'$'+money(s.realized_net_usd):'&mdash;'}</td>
+      <td class="num dim">${s.dollar_years?dyears(s.dollar_years):'&mdash;'}</td>
+      <td class="num ${usdSign(s.realized_apr_pct)}">${pctf(s.realized_apr_pct)}</td>
     </tr>`).join('');
   return $(`<section class="wide">
     <h2>Make vs take &middot; by venue</h2>
@@ -1929,14 +1974,101 @@ function venueRolePanel(d){
     <div class="scroll"><table>
       <thead><tr><th>strategy</th><th class="num">trades</th>
         <th class="num">contracts</th><th class="num">net</th>
-        <th class="num">unpriced</th><th class="num">closed</th></tr></thead>
-      <tbody>${strat || '<tr><td colspan="6">none</td></tr>'}</tbody></table></div>
+        <th class="num">unpriced</th><th class="num">closed</th>
+        <th class="num">realized</th><th class="num">$-years</th>
+        <th class="num">realized APR</th></tr></thead>
+      <tbody>${strat || '<tr><td colspan="9">none</td></tr>'}</tbody></table></div>
     <div class="sub" style="margin-top:8px">
       <b>net</b> sums exactly to Locked + Realized above. A trade whose P&amp;L is
       not knowable (<b>unpriced</b>) or is already booked on its unwind row
       (<b>closed</b>) contributes 0 rather than a guess, so a strategy can show
       real activity and no net.
+      <br>The last three columns are the CLOSED side only, and are the mix
+      behind the book's realized rate: <b>realized</b> is what this strategy's
+      round trips ended up making, <b>$-years</b> the capital-time they made it
+      over, and <b>realized APR</b> the one divided by the other. A strategy
+      that turns small capital in minutes shows an enormous rate on almost no
+      dollar-years &mdash; that is the point of reading the two together, and
+      why the book-level rate is weighted by the second column and not the
+      first.
       <br>${esc(d.fee_note||'')}
+    </div>
+  </section>`);
+}
+
+/* --------------------------------------------------------------------------
+   ROUND TRIPS — the closes, with what they ended up making.
+
+   A separate table from Trades because a round trip is a different object: it
+   spans TWO ledger records, and its rate is earned over the time between them
+   rather than to a resolution date it never reached. The Trades table's `APR`
+   column is an APR-to-hold on capital still committed and stays blank here.
+   -------------------------------------------------------------------------- */
+function roundTrips(d){
+  const trips = (d.rows||[]).filter(r => r.entry_ts);
+  const rows = trips.map(r => {
+    const when = (ts) => esc(new Date((ts||0)*1000).toISOString().slice(0,16).replace('T',' '));
+    /* MODELLED at either end is modelled overall. A round trip's P&L is only as
+       settled as both of its legs, and the entry's fees are inside its basis. */
+    const feeMark = r.round_trip_fees_settled ? '' : ' <span class="sub">~</span>';
+    const derived = r.net_source === 'derived:exit_vs_entry'
+      ? ' <span class="badge warn" title="the ledger recorded no realized_pnl_usd for this close &mdash; priced from its own exit fills against the entry basis, with fees modelled at both ends">derived</span>'
+      : '';
+    return `<tr>
+      <td>${when(r.entry_ts)}<div class="sub">exit ${when(r.ts)}</div></td>
+      <td>${esc(r.relationship_id)}</td>
+      <td>${esc(r.strategy)}${derived}</td>
+      <td class="num">${Number(r.qty).toLocaleString()}</td>
+      <td class="num">${usd(r.entry_cost_usd)}</td>
+      <td class="num">${usd(r.exit_proceeds_usd, 'this close did not record a whole, readable flatten of both legs &mdash; see the net column')}</td>
+      <td class="num warn">$${money(r.fees_usd||0)}${feeMark}</td>
+      <td class="num ${usdSign(r.net_usd)}">${usd(r.net_usd, r.unpriced_reason)}</td>
+      <td class="num">${held(r.held_days)}</td>
+      <td class="num ${usdSign(r.realized_apr_pct)}">${pctf(r.realized_apr_pct)}</td>
+    </tr>`;
+  }).join('');
+  const t = d.totals || {};
+  return $(`<section class="wide">
+    <h2>Round trips &middot; ${trips.length} close(s), newest first</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>entered / exited (UTC)</th><th>relationship</th><th>strategy</th>
+        <th class="num">qty</th><th class="num">entry cost</th><th class="num">proceeds</th>
+        <th class="num">exit fees</th><th class="num">net</th><th class="num">held</th>
+        <th class="num">realized APR</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="10">no position has been closed against a known entry yet</td></tr>'}</tbody>
+    </table></div>
+    <div class="sub" style="margin-top:8px">
+      A row appears here only when the ledger still holds the <b>entry</b> the
+      exit retired &mdash; matched on the <code>closes_ts</code> the exit names.
+      <b>entry cost</b> is that entry's all-in basis (its own fees inside),
+      pro-rated to the contracts this exit actually closed, so a partial unwind
+      is charged its share and no more. <b>net</b> is the ledger's own
+      <code>realized_pnl_usd</code> where the record carries one, and otherwise
+      proceeds minus that basis minus the exit's fees &mdash; flagged
+      <b class="warn">derived</b>.
+      <br><br><b>realized APR annualizes a holding period that is often hours</b>,
+      so read it against the <b>held</b> column beside it: a 2c gain turned in
+      nine minutes is a real four-figure rate and not a repeatable one. Nothing
+      is capped, because a cap is a number nobody can audit. What IS refused is a
+      period too short to be one &mdash; a close booked less than a minute after
+      its entry keeps its P&amp;L and shows no rate, because four probe pairs on
+      disk are a <em>millisecond</em> apart and one of those annualizes to
+      &minus;10,646,155%/yr. The book-level rate in the panel above excludes
+      those from both sides of its ratio and is weighted by dollar-years, so
+      neither a fast winner nor a fast loser can set it.
+      ${t.realized_derived_trades ? `<br><br><b class="warn">${t.realized_derived_trades}</b> of these
+        are <b>derived</b>: the engine writes <code>fees_pending</code> and does not read fill
+        reports, so it books no <code>realized_pnl_usd</code>. On a <b>crossed</b> exit the
+        PM-US leg records the IOC's <em>limit</em> rather than its fill, and an IOC can fill
+        better than its limit &mdash; so those nets are, if anything, conservative.` : ''}
+      ${d.swapped_legs ? `<br><br><b class="bad">▲ ${d.swapped_legs} close(s) below show <code>unknown</code>
+        rather than a net.</b> Their two leg prices were written to the WRONG VENUES by the
+        <code>rest-pmus</code> exit writer before it was fixed on 2026-08-25 (PR #97), and the
+        ledger migration that would correct the records already on disk has not been run &mdash;
+        the file is still byte-identical to the backup taken when the fix landed. Transposing
+        the two prices moves their P&amp;L by <code>2 &times; (pm &minus; kalshi) &times; qty</code>,
+        enough to flip most of them between profit and loss, so they are left unpriced rather
+        than shown wrong. Run the migration and they price themselves with no code change.` : ''}
     </div>
   </section>`);
 }
