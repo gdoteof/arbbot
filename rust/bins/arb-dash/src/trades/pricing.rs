@@ -44,39 +44,40 @@ pub fn flattened(l: &Legs, qty: f64) -> bool {
         && l.sold_no_qty >= qty - EPS
 }
 
-/// The exits whose two leg prices are on the WRONG VENUES, and are known to be.
+/// The exits whose two leg prices are on the WRONG VENUES **and have not been
+/// put right**.
 ///
 /// `arb-trader/src/maker_exit.rs::close_record` took its two fills as (the leg
 /// that RESTED, the leg CLOSED by IOC) and wrote them straight onto the Kalshi
 /// and PM-US legs. Under `rest-kalshi` those coincide; under `rest-pmus` they
-/// are reversed, so EVERY `rest-pmus` record written before the fix carries its
+/// are reversed, so every `rest-pmus` record written before the fix carried its
 /// Kalshi price on the PM-US leg and vice versa. PR #97 fixed the writer on
-/// 2026-08-25 and said in as many words that correcting the records already on
-/// disk was a separate migration. That migration has not been run: the ledger
-/// is still byte-identical to the backup taken when #97 landed.
+/// 2026-08-25; ten `correction` records appended ten minutes later transpose
+/// the prices back on the ten records already on disk.
 ///
-/// So these records cannot be priced from their legs, and the difference is not
-/// cosmetic — transposing the two prices moves the derived P&L by
-/// `2 * (pm_px - k_px) * qty`, which on the 11 affected records ranges from 2c
-/// to 38c per contract and flips most of them between profit and loss. They
-/// price as `null` with the reason below rather than as fabricated losses.
+/// SO THE ORDINARY CASE HERE IS `false`, AND CHECKING THE CORRECTION IS THE
+/// WHOLE POINT. The first version of this predicate did not: it refused every
+/// pre-fix `rest-pmus` record on the timestamp alone, on the strength of the
+/// ledger file being byte-identical to the backup taken when #97 landed. That
+/// comparison could not have shown otherwise — the ledger is APPEND-ONLY and a
+/// correction is an appended record, never a rewrite of the one it fixes — so
+/// it suppressed ten closes the migration had already repaired.
 ///
-/// THIS PREDICATE IS A DATED FACT, NOT A HEURISTIC. The boundary is the restart
-/// that put the fixed binary in front of the ledger —
-/// `arbbot-trader-m3.service` at 2026-08-25T00:22:28-04:00, per its journal —
-/// and no exit was written during the restart window: the last affected record
-/// is 00:21:15 and the first correct one 00:28:32. It is deliberately NOT keyed
-/// on the note text, which #97 did not change in a way that separates the two
-/// versions, nor on `lock_ct`, which is a decision-time figure that legitimately
-/// disagrees with a fill.
+/// `fold` applies corrections and then drops them, which leaves an amended
+/// record indistinguishable from one written correctly. `Ledger::was_amended`
+/// exists so this one question can still be asked. What survives is the honest
+/// invariant: a record of the broken shape that NO correction reached is one
+/// whose prices are still transposed, and pricing it from its legs would move
+/// the P&L by `2 * (pm_px - k_px) * qty` — 2c to 38c per contract on the ten,
+/// enough to flip most between profit and loss.
 ///
-/// DELETE THIS, and the reason it emits, the moment the migration appends its
-/// `correction` records. The fold already applies those, so the rows light up
-/// with no other change here.
+/// This self-retires. It fires on nothing today, and it would fire on a
+/// migration that half-ran.
 const SWAP_FIXED_TS: f64 = 1_787_631_748.0;
 
-pub fn legs_are_swapped(rec: &serde_json::Value) -> bool {
-    rec.get("strategy").and_then(|v| v.as_str()) == Some("maker-exit")
+pub fn legs_are_swapped(rec: &serde_json::Value, amended: bool) -> bool {
+    !amended
+        && rec.get("strategy").and_then(|v| v.as_str()) == Some("maker-exit")
         && rec.get("maker_exit_shape").and_then(|v| v.as_str()) == Some("rest-pmus")
         && num(rec.get("ts")).is_some_and(|ts| ts < SWAP_FIXED_TS)
 }
@@ -159,6 +160,7 @@ pub fn price(
     qty_booked: f64,
     rem: &Remainder,
     rt: Option<&RoundTrip>,
+    amended: bool,
 ) -> Priced {
     // The record's own cost is authoritative and ALL-IN (fees inside).
     // Derived cost is ex-fees, so fees must then be subtracted separately.
@@ -181,7 +183,7 @@ pub fn price(
     // never for a record whose two prices are on the wrong venues, where the
     // total is arithmetically fine and attributed to the wrong books.
     let flat_proceeds =
-        (flattened(l, qty_booked) && !legs_are_swapped(rec)).then_some(l.proceeds);
+        (flattened(l, qty_booked) && !legs_are_swapped(rec, amended)).then_some(l.proceeds);
 
     let derived_from = if fees_in_cost { "ledger:cost_usd" } else { "derived:leg_prices" };
     let derive = |c: f64, p: f64| if fees_in_cost { p - c } else { p - c - l.fees };
@@ -228,15 +230,16 @@ pub fn price(
                 // the exit's own fees. Entry fees are already inside
                 // `entry_cost`; exit fees are `l.fees`, modelled where the
                 // engine booked `fees_pending`.
-                _ if legs_are_swapped(rec) => (
+                _ if legs_are_swapped(rec, amended) => (
                     None,
                     None,
                     Some(
                         "this record's two leg prices are on the WRONG VENUES — a `rest-pmus` \
-                             exit written before the 2026-08-25 fix (PR #97), whose ledger \
-                             migration has not been run. Its P&L is recoverable only by \
-                             transposing the two prices, which is the migration's job and not \
-                             this view's"
+                         exit written before the 2026-08-25 fix (PR #97) that NO correction \
+                         record has reached. Ten such records were repaired by an appended \
+                         migration; this one was not, so its P&L is recoverable only by \
+                         transposing the two prices, which is that migration's job and not \
+                         this view's"
                             .to_string(),
                     ),
                 ),

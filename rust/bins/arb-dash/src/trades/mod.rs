@@ -256,14 +256,17 @@ pub fn build(ledger_text: &str, fee_category: &str, now_s: f64) -> serde_json::V
             .unwrap_or("make-take")
             .to_string();
 
-        if pricing::legs_are_swapped(rec) {
+        // A correction may have already transposed this record's prices back;
+        // the fold drops corrections once applied, so only it still knows.
+        let amended = ledger.was_amended(&rel_id, ts);
+        if pricing::legs_are_swapped(rec, amended) {
             swapped_legs += 1;
         }
         let hedged = pricing::hedged(&legs, qty_booked);
         let rem = ledger.remainder(&rel_id, ts, &ledger_status, qty_booked);
         let round_trip =
             entry::join(&entries, &rel_id, num(rec.get("closes_ts")), ts, qty_booked);
-        let priced = pricing::price(rec, &legs, hedged, qty_booked, &rem, round_trip.as_ref());
+        let priced = pricing::price(rec, &legs, hedged, qty_booked, &rem, round_trip.as_ref(), amended);
 
         let (resolves, resolves_estimated) = match resolve_date(&rel_id) {
             Some((d, est)) => (Some(d.to_string()), est),

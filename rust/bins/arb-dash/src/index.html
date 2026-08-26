@@ -2063,12 +2063,12 @@ function roundTrips(d){
         better than its limit &mdash; so those nets are, if anything, conservative.` : ''}
       ${d.swapped_legs ? `<br><br><b class="bad">▲ ${d.swapped_legs} close(s) below show <code>unknown</code>
         rather than a net.</b> Their two leg prices were written to the WRONG VENUES by the
-        <code>rest-pmus</code> exit writer before it was fixed on 2026-08-25 (PR #97), and the
-        ledger migration that would correct the records already on disk has not been run &mdash;
-        the file is still byte-identical to the backup taken when the fix landed. Transposing
-        the two prices moves their P&amp;L by <code>2 &times; (pm &minus; kalshi) &times; qty</code>,
-        enough to flip most of them between profit and loss, so they are left unpriced rather
-        than shown wrong. Run the migration and they price themselves with no code change.` : ''}
+        <code>rest-pmus</code> exit writer before it was fixed on 2026-08-25 (PR #97), and unlike
+        the ten the appended migration repaired, <b>no <code>correction</code> record has reached
+        these</b>. Transposing the two prices moves their P&amp;L by
+        <code>2 &times; (pm &minus; kalshi) &times; qty</code>, enough to flip most of them between
+        profit and loss, so they are left unpriced rather than shown wrong. Append their
+        corrections and they price themselves with no code change.` : ''}
     </div>
   </section>`);
 }

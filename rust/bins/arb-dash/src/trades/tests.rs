@@ -735,9 +735,9 @@ fn an_exit_whose_entry_is_missing_is_not_priced() {
     assert_eq!(totals(&out, "round_trips"), 0.0);
 }
 
-/// The 10 `rest-pmus` records written before PR #97 carry each leg's price on
-/// the OTHER venue, and the migration that would correct them has not run.
-/// Priced from those legs they are fabricated losses.
+/// A record of the shape PR #97 broke that NO correction reached still has its
+/// two leg prices on the wrong venues. Priced from those legs it is a
+/// fabricated loss.
 #[test]
 fn a_record_with_its_prices_on_the_wrong_venues_is_refused() {
     // Both ends moved back before the 2026-08-25 fix — an exit cannot predate
@@ -752,18 +752,37 @@ fn a_record_with_its_prices_on_the_wrong_venues_is_refused() {
     assert_eq!(out["swapped_legs"], 1, "reported, not absorbed");
 }
 
-/// ...but only that shape. `rest-kalshi` wrote the two fills onto the venues
-/// that paid them even before the fix, because there the roles coincide.
+/// ...but ten such records ARE reached, by corrections appended ten minutes
+/// after the fix. THE LEDGER IS APPEND-ONLY: a correction is a new record, never
+/// a rewrite of the one it fixes, so a file that is byte-identical to a
+/// pre-migration backup can be fully migrated. Reading it the other way refused
+/// ten closes that were already correct.
 #[test]
-fn the_shape_the_bug_never_touched_is_still_priced() {
+fn a_corrected_record_is_priced_from_the_prices_the_correction_gave_it() {
     let entry = RT_ENTRY.replace("1787700000.0", "1787500000.0");
-    let pre = RT_EXIT
-        .replace("1788002400.0", "1787600000.0")
-        .replace("1787700000.0", "1787500000.0")
-        .replace("rest-pmus", "rest-kalshi");
-    let out = build(&format!("{entry}\n{pre}"), "default", 1788100000.0);
-    assert_eq!(row_for(&out, "unwound")["net_source"], "derived:exit_vs_entry");
-    assert_eq!(out["swapped_legs"], 0);
+    let pre = RT_EXIT.replace("1788002400.0", "1787600000.0").replace("1787700000.0", "1787500000.0");
+    // The real migration's shape: `fields.legs` replaces the leg array wholesale
+    // with the two prices on the venues that paid them.
+    let fix = r#"{"ts":1787632310.3,"relationship_id":"xvus-btcmax-26-31-2026-200k","status":"correction","corrects_ts":1787600000.0,"note":"PR #97 transposition","fields":{"legs":[{"venue":"kalshi","market_id":"KXBTCMAXY-26DEC31-199999.99","side":"yes","action":"sell","role":"taker","qty":5,"yes_price":"0.0600"},{"venue":"polymarket_us","market_id":"cpc-btc-hitprice-high-yr-12-31-2026-200k","side":"no","action":"sell","role":"taker","qty":5,"yes_price":"0.0100"}]}}"#;
+    let out = build(&format!("{entry}\n{pre}\n{fix}"), "default", 1788100000.0);
+    assert_eq!(out["swapped_legs"], 0, "the migration reached it: {out}");
+    let exit = row_for(&out, "unwound");
+    assert_eq!(exit["net_source"], "derived:exit_vs_entry", "{exit}");
+    // Priced at the CORRECTED prices: 0.06 YES + (1 - 0.01) NO = 1.05/ct.
+    assert!((exit["exit_proceeds_usd"].as_f64().expect("proceeds") - 5.25).abs() < 1e-9);
+    assert!(exit["realized_apr_pct"].as_f64().is_some());
+}
+
+/// ...and a migration that half-runs is caught. One of two broken records
+/// corrected leaves the other still wrong, and the counter says so.
+#[test]
+fn a_half_run_migration_still_reports_what_it_missed() {
+    let entry = RT_ENTRY.replace("1787700000.0", "1787500000.0");
+    let a = RT_EXIT.replace("1788002400.0", "1787600000.0").replace("1787700000.0", "1787500000.0");
+    let b = a.replace("1787600000.0", "1787610000.0");
+    let fix = r#"{"ts":1787632310.3,"relationship_id":"xvus-btcmax-26-31-2026-200k","status":"correction","corrects_ts":1787600000.0,"fields":{"legs":[{"venue":"kalshi","market_id":"KXBTCMAXY-26DEC31-199999.99","side":"yes","action":"sell","role":"taker","qty":5,"yes_price":"0.0600"},{"venue":"polymarket_us","market_id":"cpc-btc-hitprice-high-yr-12-31-2026-200k","side":"no","action":"sell","role":"taker","qty":5,"yes_price":"0.0100"}]}}"#;
+    let out = build(&format!("{entry}\n{a}\n{b}\n{fix}"), "default", 1788100000.0);
+    assert_eq!(out["swapped_legs"], 1, "the one the migration missed: {out}");
 }
 
 /// The book's realized rate is money-weighted, not a mean of per-trade APRs. A
