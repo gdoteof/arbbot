@@ -274,6 +274,13 @@ pub struct Lot {
     /// All-in cost per contract, fees included: the number a completion has to
     /// beat.
     pub cost_per_ct: String,
+    /// The `yes_price` of the leg `cost_per_ct` was read off, verbatim, with its
+    /// `role`. A record that RESTATES this lot has to restate both: a reader
+    /// recovers the basis as `(1 - yes_px) + fee(role)`, so re-emitting the
+    /// derived cost instead — or keeping the price and dropping the role — hands
+    /// back a different number than the one the decision rested on.
+    pub yes_px: String,
+    pub role: String,
     /// Contracts of this record still open, after unwinds.
     pub qty: i64,
 }
@@ -304,7 +311,7 @@ fn leg_cost(
     venue: Venue,
     market: &str,
     held: Held,
-) -> Result<D, LegSkip> {
+) -> Result<(D, String, String), LegSkip> {
     let legs = rec.get("legs").and_then(|v| v.as_array()).ok_or(LegSkip::Absent)?;
     let leg = legs
         .iter()
@@ -317,10 +324,10 @@ fn leg_cost(
     if !held.matches(side) {
         return Err(LegSkip::Direction);
     }
-    let px = str_field(leg, "yes_price")
+    let yes_px = str_field(leg, "yes_price")
         .or_else(|| str_field(leg, "avg_price"))
         .ok_or(LegSkip::Price)?;
-    let px = cx.parse(&px).ok_or(LegSkip::Price)?;
+    let px = cx.parse(&yes_px).ok_or(LegSkip::Price)?;
     // The YES price is what the ledger records on both sides; the COST of a
     // short-yes contract is what is left of the dollar.
     let paid = match held {
@@ -331,23 +338,25 @@ fn leg_cost(
     if leg_qty <= 0.0 {
         return Err(LegSkip::Price);
     }
+    // `None` and the two `maker+taker` legs both read as `taker`: the dearer
+    // schedule, because a fee we guessed low is a basis we beat by less than we
+    // thought. Carried out with the cost so a restating record can name the same
+    // role and be re-priced to the same number.
+    let role = match leg.get("role").and_then(|v| v.as_str()) {
+        Some("maker") => "maker",
+        _ => "taker",
+    };
     let fee_total = match str_field(leg, "fees").and_then(|s| cx.parse(&s)) {
         Some(f) => f,
         None => {
-            let role = match leg.get("role").and_then(|v| v.as_str()) {
-                Some("maker") => Role::Maker,
-                // `None` and the two `maker+taker` legs both land here: the
-                // dearer schedule, because a fee we guessed low is a basis
-                // we beat by less than we thought.
-                _ => Role::Taker,
-            };
+            let r = if role == "maker" { Role::Maker } else { Role::Taker };
             let size = cx.parse(&leg_qty.to_string()).unwrap_or_else(|| cx.zero());
-            fees.fee(cx, venue, role, px, size, "")
+            fees.fee(cx, venue, r, px, size, "")
         }
     };
     let size = cx.parse(&leg_qty.to_string()).unwrap_or_else(|| cx.zero());
     let fee_ct = cx.div(fee_total, size);
-    Ok(cx.add(paid, fee_ct))
+    Ok((cx.add(paid, fee_ct), yes_px, role.to_string()))
 }
 
 /// The ONE still-open lot opened at `open_ts`, priced on one leg.
@@ -415,7 +424,7 @@ pub fn lot_at(
             have.join(", ")
         ));
     };
-    let cost = leg_cost(cx, fees, &rec, qty, venue, market, held).map_err(|e| {
+    let (cost, yes_px, role) = leg_cost(cx, fees, &rec, qty, venue, market, held).map_err(|e| {
         let v = venue.as_str();
         match e {
             LegSkip::Absent => {
@@ -431,7 +440,7 @@ pub fn lot_at(
             ),
         }
     })?;
-    Ok(Lot { open_ts: ts, cost_per_ct: cx.emit_6dp(cost), qty })
+    Ok(Lot { open_ts: ts, cost_per_ct: cx.emit_6dp(cost), yes_px, role, qty })
 }
 
 /// The DEAREST still-open lot for one leg of one relationship — the basis a
@@ -483,7 +492,7 @@ pub fn worst_lot(
     let mut skipped_direction = 0usize;
     let mut skipped_price = 0usize;
     for (open_ts, qty, rec) in open_lots(records, rel) {
-        let cost = match leg_cost(cx, fees, &rec, qty, venue, market, held) {
+        let (cost, yes_px, role) = match leg_cost(cx, fees, &rec, qty, venue, market, held) {
             Ok(c) => c,
             Err(LegSkip::Absent) => continue,
             Err(LegSkip::Direction) => {
@@ -498,6 +507,8 @@ pub fn worst_lot(
         let lot = Lot {
             open_ts,
             cost_per_ct: cx.emit_6dp(cost),
+            yes_px,
+            role,
             qty,
         };
         best = match best {
@@ -828,6 +839,11 @@ pub struct Order {
     /// The ledger cost per contract this was priced against, carried so the log
     /// line and the booked record both name the number the decision rested on.
     pub basis: String,
+    /// The vouching leg's own `yes_price` and `role`, carried so a record that
+    /// RESTATES that leg states it the way every reader prices a leg — see
+    /// [`Lot::yes_px`].
+    pub src_yes_px: String,
+    pub src_role: String,
     /// The open record that vouched for `basis`.
     pub lot_ts: f64,
 }
@@ -920,6 +936,8 @@ pub fn decide(
                 qty,
                 limit: limit.to_standard_notation_string(),
                 basis: lot.cost_per_ct,
+                src_yes_px: lot.yes_px,
+                src_role: lot.role,
                 lot_ts: lot.open_ts,
             })
         }
@@ -964,6 +982,8 @@ pub fn decide(
                 qty,
                 limit: limit.to_standard_notation_string(),
                 basis: lot.cost_per_ct,
+                src_yes_px: lot.yes_px,
+                src_role: lot.role,
                 lot_ts: lot.open_ts,
             })
         }
@@ -979,6 +999,23 @@ pub fn decide(
 /// that carries the venue's own fee is not read here. The PM leg is recorded at
 /// the price the LEDGER vouched for, not at anything the venue said, because
 /// that is the number this trade was actually decided on.
+///
+/// # `yes_price` IS ON THE YES SIDE, INCLUDING ON THE `no` LEG
+///
+/// This wrote `yes_price: o.basis` until 2026-09-01, and `basis` is a SHORT-YES
+/// lot's cost — what is LEFT of the dollar, 0.88 where the leg's YES price is
+/// 0.12. Every reader applies the file's one convention (`trades::legs`,
+/// `marks::leg_cost`, and [`leg_cost`] here) and takes `1 - yes_price` for a
+/// `no` leg, so 0.88 came back as a 0.12 leg: the four `xvus-btcmax-26-31-2026-130k`
+/// baskets of that day priced at $0.22 against a $1.00 payoff and rendered
+/// 1050%/yr on a completion the engine's own gate had sized at half a cent.
+///
+/// So the leg restates the vouching leg VERBATIM — its `yes_price` and its
+/// `role` — rather than the cost derived from it. Both, or neither: a reader
+/// recovers the basis as `(1 - yes_price) + fee(role)`, and PM-US charges takers
+/// `0.06·p·(1-p)` and makers nothing, which at p=0.12 is 0.63c/ct — more than
+/// the 0.5c/ct floor this module trades against. Emitting `1 - basis` under a
+/// `taker` role would therefore have booked a profitable completion as a loss.
 pub fn basket_record(f: &crate::positions::Finding, o: &Order, filled: i64, ts: f64) -> Value {
     serde_json::json!({
         "ts": ts,
@@ -994,8 +1031,8 @@ pub fn basket_record(f: &crate::positions::Finding, o: &Order, filled: i64, ts: 
         "legs": [
             {"venue": "kalshi", "market_id": o.market, "side": "yes", "role": "taker",
              "qty": filled, "yes_price": o.limit},
-            {"venue": "polymarket_us", "market_id": f.pmus, "side": "no", "role": "taker",
-             "qty": filled, "yes_price": o.basis},
+            {"venue": "polymarket_us", "market_id": f.pmus, "side": "no", "role": o.src_role,
+             "qty": filled, "yes_price": o.src_yes_px},
         ],
     })
 }
@@ -1643,6 +1680,8 @@ mod tests {
             qty: 3,
             limit: "0.1900".into(),
             basis: "0.780000".into(),
+            src_yes_px: "0.22".into(),
+            src_role: "maker".into(),
             lot_ts: 1.0,
         };
         let rec = basket_record(&f, &o, 3, 12.0);
@@ -1650,12 +1689,55 @@ mod tests {
         assert_eq!(rec["source"], ledger::SOURCE);
         assert_eq!(rec["qty"], 3);
         assert_eq!(rec["legs"][0]["yes_price"], "0.1900");
-        assert_eq!(rec["legs"][1]["yes_price"], "0.780000", "the LEDGER basis, not a venue read");
+        assert_eq!(rec["naked_hedge_basis"], "0.780000", "the number the decision rested on");
         assert_eq!(
             crate::ledger::open_exposure(vec![rec]).get("r1").copied(),
             Some(3.0),
             "the next restart must seed this exposure"
         );
+    }
+
+    /// THE INVERSION OF 2026-09-01, pinned from the reader's end.
+    ///
+    /// The PM leg is a `no` leg, and `yes_price` on a `no` leg is the YES side —
+    /// so writing the SHORT-YES basis (0.78) there made every reader take
+    /// `1 - 0.78` and price the basket at 0.22 against a $1.00 payoff. The
+    /// assertion that matters is not the literal, it is the ROUND TRIP: read the
+    /// record back with the same `leg_cost` that priced the lot, and get the
+    /// basis the order was sized against.
+    #[test]
+    fn a_completed_baskets_pm_leg_reprices_to_the_basis_it_was_built_from() {
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 5, "0.22", "0.19")];
+        let lot = worst_lot(&mut cx, &fees, &recs, "r1", Venue::PolymarketUs, "p-a", Held::ShortYes)
+            .expect("one open lot");
+        assert_eq!(lot.cost_per_ct, "0.780000");
+
+        let f = finding(Leg::PmShort, 3);
+        let o = Order {
+            market: "K-a".into(),
+            buy: true,
+            qty: 3,
+            limit: "0.1900".into(),
+            basis: lot.cost_per_ct.clone(),
+            src_yes_px: lot.yes_px.clone(),
+            src_role: lot.role.clone(),
+            lot_ts: lot.open_ts,
+        };
+        let rec = basket_record(&f, &o, 3, 12.0);
+        assert_eq!(rec["legs"][1]["yes_price"], "0.22", "the YES side, as the field is named");
+        assert_eq!(rec["legs"][1]["role"], "maker", "and the role that made the fee zero");
+
+        // The round trip: this record now vouches for what its source vouched for.
+        let (cost, _, _) =
+            leg_cost(&mut cx, &fees, &rec, 3, Venue::PolymarketUs, "p-a", Held::ShortYes)
+                .ok()
+                .expect("the restated leg prices");
+        assert_eq!(cx.emit_6dp(cost), lot.cost_per_ct);
+
+        // And the trap the old shape fell into: 1 - 0.78 = 0.22, a basket that
+        // renders as 78c of locked profit on a half-cent completion.
+        assert_ne!(rec["legs"][1]["yes_price"], "0.780000");
     }
 
     /// A Case B record CLOSES the lot it beat, and refuses to state a P&L it
@@ -1669,6 +1751,8 @@ mod tests {
             qty: 2,
             limit: "0.4000".into(),
             basis: "0.200773".into(),
+            src_yes_px: "0.19".into(),
+            src_role: "taker".into(),
             lot_ts: 1.0,
         };
         let rec = close_record(&f, &o, 2, 12.0);
