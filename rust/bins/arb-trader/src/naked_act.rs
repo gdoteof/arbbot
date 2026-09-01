@@ -1016,7 +1016,18 @@ pub fn decide(
 /// `0.06·p·(1-p)` and makers nothing, which at p=0.12 is 0.63c/ct — more than
 /// the 0.5c/ct floor this module trades against. Emitting `1 - basis` under a
 /// `taker` role would therefore have booked a profitable completion as a loss.
-pub fn basket_record(f: &crate::positions::Finding, o: &Order, filled: i64, ts: f64) -> Value {
+///
+/// `k_px` is what Kalshi says the order TRADED at, which is not `o.limit`: a
+/// marketable limit is a ceiling on a buy, and a CLOB fills at the touch when
+/// the touch is better. `positions::place_and_book` reads it and falls back to
+/// the limit when the venue will not say.
+pub fn basket_record(
+    f: &crate::positions::Finding,
+    o: &Order,
+    k_px: &str,
+    filled: i64,
+    ts: f64,
+) -> Value {
     serde_json::json!({
         "ts": ts,
         "relationship_id": f.rel_id,
@@ -1030,7 +1041,7 @@ pub fn basket_record(f: &crate::positions::Finding, o: &Order, filled: i64, ts: 
         "naked_hedge_lot_ts": o.lot_ts,
         "legs": [
             {"venue": "kalshi", "market_id": o.market, "side": "yes", "role": "taker",
-             "qty": filled, "yes_price": o.limit},
+             "qty": filled, "yes_price": k_px},
             {"venue": "polymarket_us", "market_id": f.pmus, "side": "no", "role": o.src_role,
              "qty": filled, "yes_price": o.src_yes_px},
         ],
@@ -1050,7 +1061,13 @@ pub fn basket_record(f: &crate::positions::Finding, o: &Order, filled: i64, ts: 
 /// the same asymmetry from the other end; `engine::fill::book_basket` sets the
 /// precedent for naming the gap in the record rather than filling it with a
 /// guess.
-pub fn close_record(f: &crate::positions::Finding, o: &Order, filled: i64, ts: f64) -> Value {
+pub fn close_record(
+    f: &crate::positions::Finding,
+    o: &Order,
+    k_px: &str,
+    filled: i64,
+    ts: f64,
+) -> Value {
     serde_json::json!({
         "ts": ts,
         "relationship_id": f.rel_id,
@@ -1070,7 +1087,7 @@ pub fn close_record(f: &crate::positions::Finding, o: &Order, filled: i64, ts: f
                  not known to this process. RECONCILE BY HAND.",
         "legs": [
             {"venue": "kalshi", "market_id": o.market, "side": "yes", "action": "sell",
-             "role": "taker", "qty": filled, "yes_price": o.limit},
+             "role": "taker", "qty": filled, "yes_price": k_px},
         ],
     })
 }
@@ -1684,7 +1701,7 @@ mod tests {
             src_role: "maker".into(),
             lot_ts: 1.0,
         };
-        let rec = basket_record(&f, &o, 3, 12.0);
+        let rec = basket_record(&f, &o, "0.1900", 3, 12.0);
         assert_eq!(rec["status"], "open");
         assert_eq!(rec["source"], ledger::SOURCE);
         assert_eq!(rec["qty"], 3);
@@ -1724,7 +1741,7 @@ mod tests {
             src_role: lot.role.clone(),
             lot_ts: lot.open_ts,
         };
-        let rec = basket_record(&f, &o, 3, 12.0);
+        let rec = basket_record(&f, &o, "0.1900", 3, 12.0);
         assert_eq!(rec["legs"][1]["yes_price"], "0.22", "the YES side, as the field is named");
         assert_eq!(rec["legs"][1]["role"], "maker", "and the role that made the fee zero");
 
@@ -1755,8 +1772,12 @@ mod tests {
             src_role: "taker".into(),
             lot_ts: 1.0,
         };
-        let rec = close_record(&f, &o, 2, 12.0);
+        let rec = close_record(&f, &o, "0.4100", 2, 12.0);
         assert_eq!(rec["status"], "unwound");
+        assert_eq!(
+            rec["legs"][0]["yes_price"], "0.4100",
+            "the price Kalshi PAID, not the 0.4000 floor the IOC was sent at"
+        );
         assert_eq!(rec["closes_ts"], 1.0);
         assert_eq!(rec["pnl_pending"], true);
         assert!(rec.get("realized_pnl_usd").is_none(), "it does not know this");
