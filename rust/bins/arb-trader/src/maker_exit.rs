@@ -2025,7 +2025,7 @@ pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, t
 /// back (buying the YES against a NO long is how PM-US flattens one — there is
 /// no sell intent on that wire). So this is a property of the VENUE, not of
 /// which leg the shape happened to rest.
-fn sells_yes(v: Venue) -> bool {
+pub(crate) fn sells_yes(v: Venue) -> bool {
     matches!(v, Venue::Kalshi)
 }
 
@@ -2045,7 +2045,7 @@ fn sells_yes(v: Venue) -> bool {
 /// complement, a `no`-side quote, a units change — and the ledger is where the
 /// basis of every FUTURE exit is folded from, so a wrong price there is not one
 /// bad row. It refuses to the limit, which is exactly today's behaviour.
-fn fill_price(cx: &mut Cx, f: &OrderFill, limit: &str, selling: bool) -> Option<String> {
+pub(crate) fn fill_price(cx: &mut Cx, f: &OrderFill, limit: &str, selling: bool) -> Option<String> {
     let px = match f {
         OrderFill::Notional(fc) => {
             let qty = cx.parse(&fc.qty)?;
@@ -2104,21 +2104,31 @@ fn plausible_pair(cx: &mut Cx, k_px: &str, pm_px: &str) -> bool {
 /// Ask the venue what one order filled at, and fall back to its limit.
 ///
 /// Never an error path: a venue that will not answer leaves the record exactly
-/// as good as it was before this existed, and the exit is already spent either
+/// as good as it was before this existed, and the order is already spent either
 /// way. Failing the close over a PRICE READ would be strictly worse than
 /// booking the conservative number.
-async fn filled_price_or_limit(
+///
+/// `selling` is passed rather than derived from the venue because it is NOT a
+/// property of the venue outside this file. Here every Kalshi leg sells its YES
+/// and every PM-US leg buys one back, which is what [`sells_yes`] encodes — but
+/// `positions::place_and_book` shares this function and goes BOTH ways on
+/// Kalshi: it buys the missing YES to complete a naked PM short, and sells an
+/// excess YES to close one. The guard inside [`fill_price`] is "never worse than
+/// the limit", which inverts with the direction, so a caller that got this wrong
+/// would silently keep its limit on every genuinely better fill.
+pub(crate) async fn filled_price_or_limit(
     cx: &mut Cx,
     sink: &std::sync::Arc<dyn crate::sink::OrderSink>,
     order_id: &str,
     limit: &str,
-    venue: Venue,
+    selling: bool,
 ) -> String {
     let s = sink.clone();
     let id = order_id.to_string();
     match tokio::task::spawn_blocking(move || s.order_fill(&id)).await {
-        Ok(Ok(Some(f))) => fill_price(cx, &f, limit, sells_yes(venue))
-            .unwrap_or_else(|| limit.to_string()),
+        Ok(Ok(Some(f))) => {
+            fill_price(cx, &f, limit, selling).unwrap_or_else(|| limit.to_string())
+        }
         _ => limit.to_string(),
     }
 }
@@ -3749,7 +3759,13 @@ async fn heal(
             p.since.elapsed().as_secs_f64()
         ));
         let close_px =
-            filled_price_or_limit(&mut live.cx, close_sink, &oid, &limit, p.order.shape.close_venue())
+            filled_price_or_limit(
+                &mut live.cx,
+                close_sink,
+                &oid,
+                &limit,
+                sells_yes(p.order.shape.close_venue()),
+            )
                 .await;
         out.push(book(&live.ledger_path, &p.order, p.order.rest_limit(), &close_px, p.filled, ts));
         HEALED.fetch_add(1, AtomicOrd::Relaxed);
@@ -4016,12 +4032,17 @@ async fn close_leg(
         rest_sink,
         &r.venue_order_id,
         r.order.rest_limit(),
-        r.order.shape.rest_venue(),
+        sells_yes(r.order.shape.rest_venue()),
     )
     .await;
-    let close_px =
-        filled_price_or_limit(&mut live.cx, close_sink, &oid, &limit, r.order.shape.close_venue())
-            .await;
+    let close_px = filled_price_or_limit(
+        &mut live.cx,
+        close_sink,
+        &oid,
+        &limit,
+        sells_yes(r.order.shape.close_venue()),
+    )
+    .await;
     // BOTH LEGS TOGETHER, against what a flattened basket can pay. Each price
     // has already cleared its own limit, but that check is one-sided and cannot
     // see an inverted read — see `plausible_pair`. A pair that fails falls back
@@ -4525,6 +4546,37 @@ mod tests {
         let mut cx = Cx::default();
         let f = notional("5.00", "1.800000", false);
         assert_eq!(fill_price(&mut cx, &f, "0.3600", false).as_deref(), Some("0.3600"));
+    }
+
+    /// WHY `filled_price_or_limit` TAKES `selling` INSTEAD OF A VENUE.
+    ///
+    /// Inside this file the direction IS a property of the venue — every Kalshi
+    /// leg of an exit sells its YES — and [`sells_yes`] says so. But
+    /// `positions::place_and_book` shares the helper and goes BOTH ways on
+    /// Kalshi: Case A BUYS the missing YES to complete a naked PM short.
+    ///
+    /// The numbers are the completion of 2026-09-01: an IOC to buy 5
+    /// KXBTCMAXY-26DEC31-129999.99 at a limit of 0.1000, filled at the touch for
+    /// 0.45 on 5 — a cent BETTER. Read as a buy it is booked. Read with
+    /// `sells_yes(Kalshi)`, as a venue-derived direction would have it, "never
+    /// worse than the limit" runs the wrong way, 0.0900 looks like a sell that
+    /// received too little, and the caller silently keeps the limit — the exact
+    /// behaviour this change exists to end, restored invisibly.
+    #[test]
+    fn the_recon_completions_buy_direction_is_not_the_venues() {
+        let mut cx = Cx::default();
+        let f = notional("5.00", "0.450000", false);
+        assert_eq!(
+            fill_price(&mut cx, &f, "0.1000", false).as_deref(),
+            Some("0.0900"),
+            "a BUY that filled a cent better than its limit"
+        );
+        assert!(sells_yes(Venue::Kalshi), "the exit's Kalshi leg really does sell");
+        assert_eq!(
+            fill_price(&mut cx, &f, "0.1000", true),
+            None,
+            "and that direction would refuse it straight back to the limit"
+        );
     }
 
     /// A FILL MAY NEVER BE WORSE THAN THE LIMIT THAT AUTHORISED IT. A buy that

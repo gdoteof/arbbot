@@ -813,14 +813,35 @@ async fn place_and_book(
         ACT_UNRESOLVED.fetch_add(1, Ordering::Relaxed);
     }
     let filled = filled.min(o.qty);
+    // WHAT KALSHI SAYS IT TRADED AT, not what we told it to accept. A marketable
+    // limit is a ceiling on a buy and a floor on a sell, never a prediction, and
+    // this path booked the limit until now — the log line said `at <= 0.1000`
+    // and the ledger recorded 0.1000. That understated a completion's edge, and
+    // understating it is not harmless here: `naked_act::worst_lot` folds these
+    // very records into the basis the NEXT completion has to beat, so a dear
+    // basis makes future profitable orders look unprofitable and refuse.
+    //
+    // `o.buy` decides the direction, NOT the venue: this is the one caller that
+    // goes both ways on Kalshi — Case A buys the missing YES, Case B sells the
+    // excess one — and `fill_price`'s "never worse than its limit" guard inverts
+    // with it. Falls back to `o.limit` when the venue will not answer, which is
+    // exactly this path's behaviour before the read existed.
+    let k_px = crate::maker_exit::filled_price_or_limit(
+        &mut st.cx,
+        kalshi,
+        &oid,
+        &o.limit,
+        !o.buy,
+    )
+    .await;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0);
     let rec = if o.buy {
-        crate::naked_act::basket_record(f, o, filled, ts)
+        crate::naked_act::basket_record(f, o, &k_px, filled, ts)
     } else {
-        crate::naked_act::close_record(f, o, filled, ts)
+        crate::naked_act::close_record(f, o, &k_px, filled, ts)
     };
     // Through `append_basket`, never a raw append: the single-author rule is
     // what caught the 2026-07-30 double-book, and this is precisely the writer
@@ -828,7 +849,22 @@ async fn place_and_book(
     match crate::ledger::append_basket(&st.ledger_path, rec) {
         Ok(crate::ledger::Booking::Booked) => {
             ACTED.fetch_add(1, Ordering::Relaxed);
-            eprintln!("[recon-act] FILLED {}x {} at <= {} — booked", filled, o.market, o.limit);
+            // A price EQUAL to the limit is two different facts — the venue
+            // said so, or the venue would not say and we fell back — and
+            // `filled_price_or_limit` folds them into one string. So the
+            // hedged phrasing survives for that case: it is still everything
+            // this line can honestly claim.
+            if k_px == o.limit {
+                eprintln!(
+                    "[recon-act] FILLED {}x {} at <= {} — booked",
+                    filled, o.market, o.limit
+                );
+            } else {
+                eprintln!(
+                    "[recon-act] FILLED {}x {} @ {} (venue truth; limit was {}) — booked",
+                    filled, o.market, k_px, o.limit
+                );
+            }
         }
         Ok(crate::ledger::Booking::AlreadyBooked) => {
             ACTED.fetch_add(1, Ordering::Relaxed);
