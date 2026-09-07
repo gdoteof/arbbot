@@ -2058,9 +2058,9 @@ function roundTrips(d){
       neither a fast winner nor a fast loser can set it.
       ${t.realized_derived_trades ? `<br><br><b class="warn">${t.realized_derived_trades}</b> of these
         are <b>derived</b>: the engine writes <code>fees_pending</code> and does not read fill
-        reports, so it books no <code>realized_pnl_usd</code>. On a <b>crossed</b> exit the
-        PM-US leg records the IOC's <em>limit</em> rather than its fill, and an IOC can fill
-        better than its limit &mdash; so those nets are, if anything, conservative.` : ''}
+        reports, so it books no <code>realized_pnl_usd</code>. Both leg prices are the venues'
+        own fills (the crossed leg booked its IOC's <em>limit</em> until 2026-08-26, PR #101);
+        PM-US fees are modelled at the category default until settled.` : ''}
       ${d.swapped_legs ? `<br><br><b class="bad">▲ ${d.swapped_legs} close(s) below show <code>unknown</code>
         rather than a net.</b> Their two leg prices were written to the WRONG VENUES by the
         <code>rest-pmus</code> exit writer before it was fixed on 2026-08-25 (PR #97), and unlike

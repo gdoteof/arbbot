@@ -434,7 +434,7 @@ async fn read_net(sink: &Arc<dyn crate::sink::OrderSink>, venue: &str) -> Result
 /// including its comparison: the whole slug -> net map, not a subset and not a
 /// tolerance. A row that appears, moves or vanishes between two reads two
 /// seconds apart is the endpoint dropping rows, not the account trading.
-async fn pmus_consensus(sink: &Arc<dyn crate::sink::OrderSink>) -> Result<NetMap, String> {
+pub(crate) async fn pmus_consensus(sink: &Arc<dyn crate::sink::OrderSink>) -> Result<NetMap, String> {
     let mut prev: Option<NetMap> = None;
     for attempt in 0..CONSENSUS_ATTEMPTS {
         let cur = read_net(sink, "pmus").await?;
