@@ -3117,6 +3117,11 @@ fn is_vanished(e: &arb_venue::VenueError, age_s: f64) -> bool {
 ///     clamped to what the exit ordered, through the ordinary fill path.
 ///   * the read fails — we have learned nothing, so HOLD, exactly as before.
 ///     A `net_positions` that cannot answer is not evidence of no fill.
+///   * the read is IMPOSSIBLE — a shortfall larger than the order, or a PM-US
+///     map with no row for a slug the ledger holds — HOLD. That is the positions
+///     endpoint dropping rows (`pmus-positions-partial-stale-sticky`); on
+///     2026-09-05 it booked two phantom closes before these guards existed.
+///     PM-US is read through `positions::pmus_consensus` for the same reason.
 ///
 /// The comparison is `>=` and not `==` on purpose: another lot on the same ticker
 /// from a relationship this exit does not name would make the venue count larger,
@@ -3164,10 +3169,28 @@ async fn resolve_vanished(
         })
         .map(|(_, qty, _)| *qty)
         .sum();
-    let k = rest_sink.clone();
-    let net = match tokio::task::spawn_blocking(move || k.net_positions()).await {
-        Ok(Ok(m)) => m,
-        Ok(Err(e)) => {
+    // Venue truth, read the way the venue deserves. Kalshi's positions endpoint
+    // answers whole, so one read is one answer. PM-US's does not: it serves
+    // PARTIAL sets during incidents (`pmus-positions-partial-stale-sticky`), and a
+    // slug it dropped reads as ZERO held — which this arithmetic would take for
+    // "everything sold". On 2026-09-05 it did exactly that, twice in four
+    // minutes: 51 held read as 0, and two 5-lot "fills" were booked that never
+    // happened. So the PM-US read is the same consensus read `positions` acts on,
+    // and the guards below refuse the shapes only a dropped row can produce.
+    let read: Result<crate::positions::NetMap, String> = match r.order.shape {
+        Shape::RestKalshi => {
+            let k = rest_sink.clone();
+            match tokio::task::spawn_blocking(move || k.net_positions()).await {
+                Ok(Ok(m)) => Ok(m),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(format!("positions task failed: {e}")),
+            }
+        }
+        Shape::RestPmUs => crate::positions::pmus_consensus(rest_sink).await,
+    };
+    let net = match read {
+        Ok(m) => m,
+        Err(e) => {
             return (
                 vec![format!(
                     "[maker-exit] {} has vanished from the venue (404) and the positions read \
@@ -3179,17 +3202,25 @@ async fn resolve_vanished(
                 None,
             )
         }
-        Err(e) => {
-            return (
-                vec![format!(
-                    "[maker-exit] {} has vanished (404) and the positions task failed ({e}) — \
-                     holding the slot",
-                    r.order.rest_market()
-                )],
-                None,
-            )
-        }
     };
+    // Expected-set completeness, the other half of that quirk's port requirement.
+    // The ledger says we hold this slug; a map without the row is either a
+    // position sold to exactly zero or a row the endpoint dropped, and from here
+    // the two are indistinguishable. Refuse. A real sell-to-zero is a naked leg
+    // recon confirms from its own consensus reads and `naked_act` closes; a
+    // dropped row booked as a fill is money that never moved.
+    if r.order.shape == Shape::RestPmUs && expected > 0 && !net.contains_key(&rest_market) {
+        return (
+            vec![format!(
+                "[maker-exit] {} has vanished from the venue (404) and the ledger has {expected} \
+                 open there, but the PM-US positions map has NO ROW for it — a DEGRADED read \
+                 (partial set, see pmus-positions-partial-stale-sticky), not a sale. Holding \
+                 the slot; recon owns any real discrepancy.",
+                r.order.rest_market()
+            )],
+            None,
+        );
+    }
     let signed = net.get(&rest_market).copied().unwrap_or(0.0);
     let held = match r.order.shape {
         Shape::RestKalshi => signed,
@@ -3214,7 +3245,24 @@ async fn resolve_vanished(
             None,
         );
     }
-    let sold = sold.min(r.order.qty);
+    // A shortfall LARGER than the order is not something the order can explain.
+    // Clamping it to the order size (as this once did) books a fill for the part
+    // that fits and says nothing about the rest — the one thing a 51-versus-0
+    // read must never become is a 5-lot close.
+    if sold > r.order.qty {
+        return (
+            vec![format!(
+                "[maker-exit] {} has vanished from the venue (404) and venue truth says we hold \
+                 {held} there against {expected} open in the ledger — a shortfall of {sold}, MORE \
+                 than the {} this exit ever ordered. This order cannot account for that; a \
+                 positions read that dropped rows can. Holding the slot and booking nothing; \
+                 recon owns any real discrepancy.",
+                r.order.rest_market(),
+                r.order.qty,
+            )],
+            None,
+        );
+    }
     (
         vec![format!(
             "[maker-exit] {} has vanished from the venue (404) and venue truth says it {} \
@@ -6017,6 +6065,109 @@ mod tests {
         assert!(out.contains("holding the slot"), "{out}");
         assert!(out.contains("SAFELY"), "and says the stall is the safe side: {out}");
         assert!(pmus.calls().is_empty(), "nothing closed on a guess");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A resting PM-US bid that has gone stale, for the mirror-shape 404 tests.
+    fn stale_pmus_resting_exit(qty: i64, age_s: f64) -> Resting {
+        let mut r = stale_resting_exit(qty, age_s);
+        r.order.shape = Shape::RestPmUs;
+        r
+    }
+
+    /// **A PM-US MAP WITH NO ROW FOR A SLUG THE LEDGER HOLDS IS A DEGRADED READ,
+    /// NOT A SALE.**
+    ///
+    /// The 2026-09-05 incident, as a test. A rest-pmus exit for 5 of the 51 NO
+    /// contracts the ledger held on one slug 404ed; the positions endpoint
+    /// answered WITHOUT that slug (`pmus-positions-partial-stale-sticky`), a
+    /// missing row read as 0 held, "51 - 0" was clamped to the order's 5, and a
+    /// 5-lot close was booked and its Kalshi leg sold — twice, four minutes
+    /// apart. Recon then found the account long 10 on PM-US against the ledger
+    /// and bought them back. The dashboard shows two profitable round trips that
+    /// never happened.
+    ///
+    /// The quirk's port requirement is consensus AND expected-set completeness:
+    /// the slug we hold has to be IN the map before its count means anything.
+    #[tokio::test(start_paused = true)]
+    async fn a_404_on_a_pmus_exit_whose_positions_map_lacks_the_slug_holds_the_slot() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let kalshi = FakeVenue::with_fills(&[0]);
+        let pmus = FakeVenue::with_fills(&[0]);
+        FakeVenue::refusing(&pmus, FakeVenue::status(404));
+        // Stable across reads (so consensus passes) and missing our slug.
+        FakeVenue::holding(&pmus, "p-other", -3.0);
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
+        let p: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let path = ledger_with_open("vanished-pmus-norow", 51);
+        let mut live = Live::new(false, path.clone());
+        live.resting = Some(stale_pmus_resting_exit(5, VANISHED_MIN_AGE_S + 1.0));
+        let out = manage(&mut live, &view("0.20"), &k, &p).await.join("\n");
+
+        assert!(live.resting.is_some(), "a dropped row is not evidence of a sale: {out}");
+        assert!(out.contains("NO ROW"), "{out}");
+        assert!(out.contains("DEGRADED"), "and names the quirk, not a fill: {out}");
+        assert!(kalshi.calls().is_empty(), "NOTHING crossed on Kalshi: {:?}", kalshi.calls());
+        assert_eq!(crate::ledger::read(&path).unwrap().len(), 1, "no phantom unwind record");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ...AND A SHORTFALL THE ORDER CANNOT EXPLAIN IS REFUSED ON EITHER VENUE.
+    ///
+    /// The second guard, independent of the first: 51 open, 40 held, so 11 gone
+    /// — but this exit only ever asked for 5. Clamping to 5 (what this once did)
+    /// books a fill for the part that fits and says nothing about the other 6.
+    /// Whatever moved 11 contracts, it was not a 5-lot order, so the path books
+    /// nothing and leaves the discrepancy to recon, which reads for itself.
+    #[tokio::test]
+    async fn a_404_whose_shortfall_exceeds_the_order_holds_the_slot() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let kalshi = FakeVenue::with_fills(&[0]);
+        let pmus = FakeVenue::with_fills(&[0]);
+        FakeVenue::refusing(&kalshi, FakeVenue::status(404));
+        FakeVenue::holding(&kalshi, "K-a", 40.0);
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
+        let p: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let path = ledger_with_open("vanished-too-short", 51);
+        let mut live = Live::new(false, path.clone());
+        live.resting = Some(stale_resting_exit(5, VANISHED_MIN_AGE_S + 1.0));
+        let out = manage(&mut live, &view("0.20"), &k, &p).await.join("\n");
+
+        assert!(live.resting.is_some(), "11 gone is not this order's doing: {out}");
+        assert!(out.contains("MORE than the 5"), "{out}");
+        assert!(pmus.calls().is_empty(), "no close leg: {:?}", pmus.calls());
+        assert_eq!(crate::ledger::read(&path).unwrap().len(), 1, "nothing booked");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// PM-US POSITIONS ARE READ BY CONSENSUS HERE, AS EVERYWHERE ELSE THAT ACTS.
+    ///
+    /// One raw read was what this path did before; `positions::pmus_consensus` is
+    /// what recon and the hedger act on, and the same witness deserves the same
+    /// scepticism at every call. Two agreeing reads, then the ordinary verdict.
+    #[tokio::test(start_paused = true)]
+    async fn a_404_on_a_pmus_exit_reads_positions_by_consensus() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let kalshi = FakeVenue::with_fills(&[0]);
+        let pmus = FakeVenue::with_fills(&[0]);
+        FakeVenue::refusing(&pmus, FakeVenue::status(404));
+        // We hold all 5 NO (a -5 yes-count): the bid went unfilled.
+        FakeVenue::holding(&pmus, "p-a", -5.0);
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
+        let p: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+
+        let path = ledger_with_open("vanished-pmus-clean", 5);
+        let mut live = Live::new(false, path.clone());
+        live.resting = Some(stale_pmus_resting_exit(5, VANISHED_MIN_AGE_S + 1.0));
+        let out = manage(&mut live, &view("0.20"), &k, &p).await.join("\n");
+
+        assert!(live.resting.is_none(), "sold nothing, slot freed: {out}");
+        assert!(out.contains("sold nothing"), "{out}");
+        let reads = pmus.calls().iter().filter(|c| *c == "net_positions").count();
+        assert_eq!(reads, 2, "two agreeing reads, not one: {:?}", pmus.calls());
+        assert!(kalshi.calls().is_empty(), "no close leg: {:?}", kalshi.calls());
         let _ = std::fs::remove_file(&path);
     }
 
