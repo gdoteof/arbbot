@@ -94,6 +94,16 @@ use std::sync::Mutex;
 /// `MIN_LOCK` from `hedge_naked_legs.py:38`, ported verbatim.
 pub const MIN_LOCK: &str = "0.005";
 
+/// The `strategy` stamped on a Case A record, and on nothing else.
+///
+/// A free-form grouping key: the dash's `by_strategy` board buckets on it and
+/// nothing branches on its value (`arb-dash/src/trades/totals.rs`). That is
+/// exactly why it must be its own string — these baskets were stamped
+/// `take-take` until 2026-09-09 and so were counted as take-take trades, which
+/// they are not. See [`basket_record`]. `close_record`'s `naked-close` is the
+/// same idea from the other direction, and the pair reads as one family.
+pub const NAKED_HEDGE_STRATEGY: &str = "naked-hedge";
+
 /// Contracts in ONE order this module sends.
 ///
 /// Five, and single digits is the point rather than the number. Everything here
@@ -848,11 +858,67 @@ pub struct Order {
     pub lot_ts: f64,
 }
 
+/// Why no order was placed against a confirmed naked leg — and, load-bearing,
+/// WHICH KIND of "no" it is.
+///
+/// `positions.rs` already draws this distinction once, between
+/// `positions_recon_act_refused` and `positions_recon_act_unresolved`, and says
+/// there why: "the book did not pay" and "we do not know what we own" must never
+/// share a number. This is the same cut one step earlier. Every refusal in
+/// [`decide`] used to be a `String`, so both landed on `act_refused` — a counter
+/// whose own documentation says it is NOT an error count, because declining is
+/// the normal state.
+///
+/// That is how `xvus-fedcut-26-usfed-2026-cut` sat for six days. From
+/// 2026-09-03 the venue held 1 Kalshi YES that no open ledger lot accounted
+/// for; every five minutes the cycle re-derived that fact, printed it as an
+/// ordinary `NO —` line, and incremented a counter that had already reached
+/// four figures of routine declines. Nothing was wrong with the reasoning and
+/// nothing acted on it, because a books-vs-venue disagreement had been filed
+/// under "waiting for a better book". Waiting does not fix it: no book, at any
+/// price, makes the ledger account for a contract it has no record of.
+#[derive(Debug)]
+pub enum Refusal {
+    /// The ordinary case. A guard is holding, or the book does not pay yet.
+    /// Declining is the normal state and this is the normal outcome.
+    Waiting(String),
+    /// The venue holds contracts NO open ledger lot accounts for.
+    ///
+    /// Not a pricing decision and not transient: the books and the account
+    /// disagree about what is owned, which is the one condition on this path
+    /// that a human has to resolve. See [`worst_lot`], which is the only
+    /// producer.
+    Unaccounted(String),
+}
+
+/// Both variants still PRINT as the sentence they always were — the cut is in
+/// what a caller may branch on, not in what an operator reads.
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Waiting(w) | Refusal::Unaccounted(w) => f.write_str(w),
+        }
+    }
+}
+
+/// The interlocks (`inflight_check`, `maker_exit::working_check`) answer with a
+/// bare `String`, and every one of them is contention that the next cycle
+/// re-asks — `Waiting`, never `Unaccounted`. Having the conversion means their
+/// `?` sites need no edit, which is also what keeps this enum from spreading
+/// into modules that have no opinion about it.
+impl From<String> for Refusal {
+    fn from(s: String) -> Self {
+        Refusal::Waiting(s)
+    }
+}
+
 /// Decide what to do about one CONFIRMED finding, given a quote and the ledger.
 ///
-/// Pure. Every refusal is a `String` a human can act on, because at 3am the
-/// difference between "the book is not paying" and "we hold a position our own
-/// books have never heard of" is the whole message.
+/// Pure. Every refusal carries a sentence a human can act on, and a [`Refusal`]
+/// variant a caller can branch on, because at 3am the difference between "the
+/// book is not paying" and "we hold a position our own books have never heard
+/// of" is the whole message — and for six days it was a difference only the
+/// prose carried.
 #[allow(clippy::too_many_arguments)]
 pub fn decide(
     cx: &mut Cx,
@@ -861,23 +927,23 @@ pub fn decide(
     f: &crate::positions::Finding,
     quote: &Quote,
     now: f64,
-) -> Result<Order, String> {
+) -> Result<Order, Refusal> {
     if quote.status != "active" {
-        return Err(format!(
+        return Err(Refusal::Waiting(format!(
             "Kalshi reports {} as `{}`, not `active` — a market that is not trading takes no \
              order, whatever the book says",
             f.kalshi, quote.status
-        ));
+        )));
     }
     let contested = contested_by_other_author(records, &f.rel_id, now);
     if !contested.is_empty() {
-        return Err(format!(
+        return Err(Refusal::Waiting(format!(
             "another writer booked an OPEN basket on {} at ts {contested:?}, inside the {}s \
              contest window (which is arbbot-hedge.timer's own period) — this leg may already \
              have been completed by the timer and the venue read not caught up",
             f.rel_id,
             ledger::CONTEST_WINDOW_S
-        ));
+        )));
     }
     inflight_check(&f.kalshi)?;
     // ...and the same question asked of the OTHER order-owner in this process.
@@ -897,37 +963,41 @@ pub fn decide(
                 Venue::PolymarketUs,
                 &f.pmus,
                 Held::ShortYes,
-            )?;
+            )
+            .map_err(Refusal::Unaccounted)?;
             let qty = f.qty.min(lot.qty).min(MAX_CLIP);
             if qty < 1 {
-                return Err(format!(
+                return Err(Refusal::Waiting(format!(
                     "nothing to buy: naked {} against a vouched lot of {}",
                     f.qty, lot.qty
-                ));
+                )));
             }
             let Some(ask) = quote.yes_ask.as_deref() else {
-                return Err(format!(
+                return Err(Refusal::Waiting(format!(
                     "{} has no ask — the book offers nothing to lift, so there is no hedge to \
                      place (the venue spells this `0.0000`, which the Python reads as a price \
                      of zero)",
                     f.kalshi
-                ));
+                )));
             };
             let Some(ask_d) = cx.parse(ask) else {
-                return Err(format!("{} quoted an unparseable ask {ask:?}", f.kalshi));
+                return Err(Refusal::Waiting(format!(
+                    "{} quoted an unparseable ask {ask:?}",
+                    f.kalshi
+                )));
             };
             let basis = cx
                 .parse(&lot.cost_per_ct)
                 .ok_or_else(|| format!("unparseable ledger basis {}", lot.cost_per_ct))?;
             let limit = buy_limit(cx, fees, &quote.ladder, basis, qty)?;
             if cx.cmp(ask_d, limit) == Ordering::Greater {
-                return Err(format!(
+                return Err(Refusal::Waiting(format!(
                     "ask {ask} is above the profit limit {} (ledger basis {}/ct from the open \
                      record at ts {}) — waiting for a better book, which is the policy",
                     cx.emit_6dp(limit),
                     lot.cost_per_ct,
                     lot.open_ts
-                ));
+                )));
             }
             let limit = cx.quantize_4dp(limit);
             Ok(Order {
@@ -943,37 +1013,41 @@ pub fn decide(
         }
         crate::positions::Leg::KalshiLong => {
             let lot =
-                worst_lot(cx, fees, records, &f.rel_id, Venue::Kalshi, &f.kalshi, Held::LongYes)?;
+                worst_lot(cx, fees, records, &f.rel_id, Venue::Kalshi, &f.kalshi, Held::LongYes)
+                    .map_err(Refusal::Unaccounted)?;
             let qty = f.qty.min(lot.qty).min(MAX_CLIP);
             if qty < 1 {
-                return Err(format!(
+                return Err(Refusal::Waiting(format!(
                     "nothing to sell: excess {} against a vouched lot of {}",
                     f.qty, lot.qty
-                ));
+                )));
             }
             let Some(bid) = quote.yes_bid.as_deref() else {
-                return Err(format!(
+                return Err(Refusal::Waiting(format!(
                     "{} has no bid — nothing is offering to buy these back, so there is no \
                      profitable close to make",
                     f.kalshi
-                ));
+                )));
             };
             let Some(bid_d) = cx.parse(bid) else {
-                return Err(format!("{} quoted an unparseable bid {bid:?}", f.kalshi));
+                return Err(Refusal::Waiting(format!(
+                    "{} quoted an unparseable bid {bid:?}",
+                    f.kalshi
+                )));
             };
             let basis = cx
                 .parse(&lot.cost_per_ct)
                 .ok_or_else(|| format!("unparseable ledger basis {}", lot.cost_per_ct))?;
             let limit = sell_limit(cx, fees, &quote.ladder, basis, qty)?;
             if cx.cmp(bid_d, limit) == Ordering::Less {
-                return Err(format!(
+                return Err(Refusal::Waiting(format!(
                     "bid {bid} is below the profit floor {} (ledger basis {}/ct from the open \
                      record at ts {}) — HOLDING. Selling here would realise a loss to flatten, \
                      and flattening is not the instruction",
                     cx.emit_6dp(limit),
                     lot.cost_per_ct,
                     lot.open_ts
-                ));
+                )));
             }
             let limit = cx.quantize_4dp(limit);
             Ok(Order {
@@ -992,13 +1066,37 @@ pub fn decide(
 
 // ----------------------------------------------------------------- the record ---
 
-/// The ledger record a filled Case A order writes: a NEW complete basket.
+/// The ledger record a filled Case A order writes: a completed basket, of which
+/// ONLY THE KALSHI LEG TRADED.
 ///
 /// Deliberately NOT fee-complete, and it says so with `fees_pending`, exactly as
 /// `engine::fill::book_basket` does and for the same reason — the fill report
 /// that carries the venue's own fee is not read here. The PM leg is recorded at
 /// the price the LEDGER vouched for, not at anything the venue said, because
 /// that is the number this trade was actually decided on.
+///
+/// # THE PM LEG IS ADOPTED, NOT BOUGHT, AND THE RECORD MUST SAY SO
+///
+/// This path exists because PM-US is already short and Kalshi is not yet long:
+/// the completion buys the missing Kalshi side and NOTHING is sent to PM-US. The
+/// PM leg below is a restatement of a short that was at the venue before this
+/// order existed — so `yes_price` on it is a basis carried forward, not a price
+/// anything filled at, at this `ts` or any other.
+///
+/// Until 2026-09-09 the record said `strategy: "take-take"` and carried no note,
+/// which made an adoption indistinguishable from a two-legged purchase. It is
+/// not a cosmetic difference. `xvus-fedcut-26-usfed-2026-cut` on 2026-09-02
+/// booked one of these: 1 Kalshi YES really traded at 0.0660, and beside it went
+/// a PM leg at 0.1300 that no order and no fill ever touched. It landed on the
+/// take-take line of the dash strategy board, and the 2026-09-08 unwind that
+/// closed it priced its P&L partly off that carried-forward number. The outcome
+/// was right — the PM short genuinely had been outside the ledger since
+/// 2026-07-31, and adopting it brought the books level with the venue — but a
+/// right answer reached by recording a purchase that did not happen is a wrong
+/// mechanism, and the next reader cannot tell the two apart.
+///
+/// So: its own `strategy`, a `note` that says which leg traded, and `adopted`
+/// on the leg itself for a reader that parses rather than reads.
 ///
 /// # `yes_price` IS ON THE YES SIDE, INCLUDING ON THE `no` LEG
 ///
@@ -1033,17 +1131,24 @@ pub fn basket_record(
         "relationship_id": f.rel_id,
         "title": format!("{} (rust naked-leg hedge)", f.rel_id),
         "qty": filled,
-        "strategy": "take-take",
+        "strategy": NAKED_HEDGE_STRATEGY,
         "status": "open",
         "source": ledger::SOURCE,
         "fees_pending": true,
         "naked_hedge_basis": o.basis,
         "naked_hedge_lot_ts": o.lot_ts,
+        "note": "venue-truth reconciliation found this PM-US short uncovered and bought the \
+                 missing Kalshi YES to complete it. ONLY THE KALSHI LEG TRADED: no order was \
+                 sent to PM-US, and the PM leg below restates the lot that vouched for the \
+                 basis (`naked_hedge_lot_ts`) so that a reader recovers the same cost the \
+                 order was priced against. Its `yes_price` is therefore a basis carried \
+                 forward, NOT a fill — nothing was bought at that price at this ts. The leg \
+                 carries `adopted: true` for readers that parse rather than read.",
         "legs": [
             {"venue": "kalshi", "market_id": o.market, "side": "yes", "role": "taker",
              "qty": filled, "yes_price": k_px},
             {"venue": "polymarket_us", "market_id": f.pmus, "side": "no", "role": o.src_role,
-             "qty": filled, "yes_price": o.src_yes_px},
+             "qty": filled, "yes_price": o.src_yes_px, "adopted": true},
         ],
     })
 }
@@ -1275,8 +1380,8 @@ mod tests {
             Held::ShortYes,
         )
         .expect_err("a fully unwound relationship vouches for nothing");
-        assert!(e.contains("unaccounted for"), "{e}");
-        assert!(e.contains("none will be invented"), "{e}");
+        assert!(e.to_string().contains("unaccounted for"), "{e}");
+        assert!(e.to_string().contains("none will be invented"), "{e}");
     }
 
     /// An INVERTED basket (long PM YES against short Kalshi) is 9 of the open
@@ -1302,7 +1407,7 @@ mod tests {
             Held::ShortYes,
         )
         .expect_err("an inverted basket is not a naked short's other half");
-        assert!(e.contains("1 pointing the other way"), "{e}");
+        assert!(e.to_string().contains("1 pointing the other way"), "{e}");
     }
 
     /// Two open lots, and the DEARER one prices the hedge. Contracts are
@@ -1455,7 +1560,7 @@ mod tests {
         let (mut cx, fees) = ready();
         let basis = cx.parse_exact("0.998");
         let e = buy_limit(&mut cx, &fees, &penny(), basis, 1).expect_err("no price completes it");
-        assert!(e.contains("buying a known loss"), "{e}");
+        assert!(e.to_string().contains("buying a known loss"), "{e}");
     }
 
     /// The sell floor beats the basis NET of the fee, and one tick below it does
@@ -1511,8 +1616,8 @@ mod tests {
         let q = quote(penny(), Some("0.90"), Some("0.95"));
         let e = decide(&mut cx, &fees, &recs, &finding(Leg::PmShort, 3), &q, 1e9)
             .expect_err("0.95 against a 0.78 basis is a loss");
-        assert!(e.contains("waiting for a better book"), "{e}");
-        assert!(e.contains("0.780000"), "names the basis: {e}");
+        assert!(e.to_string().contains("waiting for a better book"), "{e}");
+        assert!(e.to_string().contains("0.780000"), "names the basis: {e}");
     }
 
     /// THE `0.0000` TRAP. Kalshi spells an empty ask as a price of zero, and
@@ -1526,7 +1631,7 @@ mod tests {
         let q = quote(penny(), Some("0.18"), None);
         let e = decide(&mut cx, &fees, &recs, &finding(Leg::PmShort, 3), &q, 1e9)
             .expect_err("no ask is not an ask of zero");
-        assert!(e.contains("no ask"), "{e}");
+        assert!(e.to_string().contains("no ask"), "{e}");
     }
 
     /// The clip cap binds, and it binds on the SMALLEST of the three bounds.
@@ -1569,8 +1674,8 @@ mod tests {
         let q = quote(penny(), Some("0.10"), Some("0.12"));
         let e = decide(&mut cx, &fees, &recs, &finding(Leg::KalshiLong, 2), &q, 1e9)
             .expect_err("0.10 against a ~0.20 basis is a realised loss");
-        assert!(e.contains("HOLDING"), "{e}");
-        assert!(e.contains("flattening is not the instruction"), "{e}");
+        assert!(e.to_string().contains("HOLDING"), "{e}");
+        assert!(e.to_string().contains("flattening is not the instruction"), "{e}");
     }
 
     /// A market the venue is not trading takes no order, whatever its last
@@ -1585,7 +1690,7 @@ mod tests {
         q.status = "finalized".into();
         let e = decide(&mut cx, &fees, &recs, &finding(Leg::PmShort, 3), &q, 1e9)
             .expect_err("a finalized market is not tradable");
-        assert!(e.contains("not `active`"), "{e}");
+        assert!(e.to_string().contains("not `active`"), "{e}");
     }
 
     // ---- the interlock ----------------------------------------------------
@@ -1601,8 +1706,8 @@ mod tests {
         let q = quote(penny(), Some("0.18"), Some("0.19"));
         let e = decide(&mut cx, &fees, &recs, &finding(Leg::PmShort, 3), &q, 1e9)
             .expect_err("the engine owes a hedge here");
-        assert!(e.contains("double hedge"), "{e}");
-        assert!(e.contains("hedges_overfilled"), "names why it is invisible: {e}");
+        assert!(e.to_string().contains("double hedge"), "{e}");
+        assert!(e.to_string().contains("hedges_overfilled"), "names why it is invisible: {e}");
     }
 
     /// A publisher that has never spoken is not an empty set. This is the
@@ -1634,8 +1739,11 @@ mod tests {
         let q = quote(penny(), Some("0.18"), Some("0.19"));
         let e = decide(&mut cx, &fees, &recs, &finding(Leg::PmShort, 3), &q, 1e9)
             .expect_err("an exit of ours is working that ticker");
-        assert!(e.contains("maker exit is working"), "{e}");
-        assert!(e.contains("taker_at_cross"), "and it names the rule that decides it: {e}");
+        assert!(e.to_string().contains("maker exit is working"), "{e}");
+        assert!(
+            e.to_string().contains("taker_at_cross"),
+            "and it names the rule that decides it: {e}"
+        );
 
         // ...and the market comes back the moment the exit stops working it,
         // which is what makes this a stand-off and not a disarm.
@@ -1663,7 +1771,7 @@ mod tests {
         let q = quote(penny(), Some("0.18"), Some("0.19"));
         let e = decide(&mut cx, &fees, &recs, &finding(Leg::PmShort, 3), &q, 1e6)
             .expect_err("inside the contest window");
-        assert!(e.contains("contest window"), "{e}");
+        assert!(e.to_string().contains("contest window"), "{e}");
     }
 
     /// ...and one OUTSIDE the window does not, or the module could never act at
@@ -1755,6 +1863,89 @@ mod tests {
         // And the trap the old shape fell into: 1 - 0.78 = 0.22, a basket that
         // renders as 78c of locked profit on a half-cent completion.
         assert_ne!(rec["legs"][1]["yes_price"], "0.780000");
+    }
+
+    /// THE 2026-09-02 ADOPTION, pinned at the record's own end.
+    ///
+    /// Only the Kalshi leg trades on this path, so the PM leg is a basis
+    /// carried forward from the vouching lot. The record has to SAY that:
+    /// stamped `take-take` with no note, the live `xvus-fedcut-26-usfed-2026-cut`
+    /// record of that date was indistinguishable from a two-legged purchase,
+    /// and a PM price nothing filled at sat on the dash's take-take line.
+    #[test]
+    fn a_completed_baskets_pm_leg_is_marked_as_adopted_not_bought() {
+        let f = finding(Leg::PmShort, 3);
+        let o = Order {
+            market: "K-a".into(),
+            buy: true,
+            qty: 3,
+            limit: "0.1900".into(),
+            basis: "0.780000".into(),
+            src_yes_px: "0.22".into(),
+            src_role: "maker".into(),
+            lot_ts: 1.0,
+        };
+        let rec = basket_record(&f, &o, "0.1900", 3, 12.0);
+
+        assert_eq!(
+            rec["strategy"], NAKED_HEDGE_STRATEGY,
+            "not `take-take`: no take-take decision was made and the strategy board buckets \
+             on this string"
+        );
+        assert_ne!(rec["strategy"], "take-take");
+        assert_eq!(
+            rec["legs"][1]["adopted"], true,
+            "the PM leg restates a position that was already at the venue"
+        );
+        assert!(
+            rec["legs"][0].get("adopted").is_none(),
+            "the Kalshi leg really did trade, and must not be tarred with the same flag"
+        );
+        let note = rec["note"].as_str().expect("a note saying which leg traded");
+        assert!(note.contains("ONLY THE KALSHI LEG TRADED"), "{note}");
+
+        // The flag is additive: everything the readers already take off this
+        // leg still reads the same, or the fix would have cost the 2026-09-01
+        // inversion its pin.
+        assert_eq!(rec["legs"][1]["yes_price"], "0.22");
+        assert_eq!(rec["legs"][1]["role"], "maker");
+        assert_eq!(
+            crate::ledger::open_exposure(vec![rec]).get("r1").copied(),
+            Some(3.0),
+            "and it is still exposure the next restart seeds"
+        );
+    }
+
+    /// A position no open lot vouches for is a BOOKS-VS-VENUE disagreement, and
+    /// `decide` must hand the caller a different answer for it than for "the
+    /// book does not pay yet" — the two shared `ACT_REFUSED` until 2026-09-09,
+    /// which is how the live fedcut contract went six days without escalating.
+    #[tokio::test]
+    async fn an_unvouched_position_refuses_differently_from_a_bad_price() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let f = finding(Leg::KalshiLong, 1);
+        let q = quote(penny(), Some("0.0600"), Some("0.0700"));
+
+        // Nothing in the ledger for this relationship at all.
+        match decide(&mut cx, &fees, &[], &f, &q, 100.0) {
+            Err(Refusal::Unaccounted(why)) => {
+                assert!(why.to_string().contains("no open ledger lot vouches"), "{why}")
+            }
+            other => panic!("an unaccounted position must not read as an ordinary wait: {}",
+                match other { Ok(_) => "it PLACED".into(), Err(Refusal::Waiting(w)) => w,
+                              Err(Refusal::Unaccounted(w)) => w }),
+        }
+
+        // ...and a lot that IS vouched for, whose bid merely does not clear the
+        // basis, is the ordinary wait it has always been.
+        let recs = vec![open_basket(1.0, 5, "0.22", "0.19")];
+        match decide(&mut cx, &fees, &recs, &f, &q, 100.0) {
+            Err(Refusal::Waiting(_)) => {}
+            other => panic!("a bad price is not a books disagreement: {}",
+                match other { Ok(_) => "it PLACED".into(), Err(Refusal::Waiting(w)) => w,
+                              Err(Refusal::Unaccounted(w)) => w }),
+        }
     }
 
     /// A Case B record CLOSES the lot it beat, and refuses to state a P&L it

@@ -1673,6 +1673,12 @@ impl Engine {
             // be in the account and are certainly not in the ledger, which is
             // the one state no exposure fold can see. Alarm on any change.
             "positions_recon_act_unresolved": crate::positions::act_unresolved(),
+            // MUST STAY 0. Confirmed naked legs the venue holds and no open
+            // ledger lot accounts for. A GAUGE, not a counter: it clears itself
+            // when the books and the account agree, so a value that persists
+            // across cycles is a real disagreement about what is owned. Waiting
+            // never resolves one — see `naked_act::Refusal`.
+            "positions_recon_act_unaccounted": crate::positions::act_unaccounted(),
             "would_place": self.exec_stats.placed.load(std::sync::atomic::Ordering::Relaxed),
             "would_cancel": self.exec_stats.cancelled.load(std::sync::atomic::Ordering::Relaxed),
             "exec_dropped": self.exec_stats.dropped.load(std::sync::atomic::Ordering::Relaxed),
