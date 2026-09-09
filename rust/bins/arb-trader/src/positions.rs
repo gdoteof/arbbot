@@ -139,6 +139,24 @@ static ACT_REFUSED: AtomicU64 = AtomicU64::new(0);
 /// because "the book did not pay" and "we do not know what we own" must never
 /// share a number.
 static ACT_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
+/// Confirmed naked legs whose venue position NO OPEN LEDGER LOT ACCOUNTS FOR,
+/// as of the last completed act pass.
+///
+/// MUST STAY 0, and unlike every other gauge here it is a standing condition
+/// rather than an event count: it is overwritten each pass, so it falls back to
+/// 0 by itself the moment the books and the account agree again. A number that
+/// persists across cycles is the alarm — the ledger and the venue disagree
+/// about what is owned, and no amount of waiting closes that gap.
+///
+/// Split out of `ACT_REFUSED` on 2026-09-09. It had been folded in there, which
+/// meant the one condition on this path that needs a human was arriving on a
+/// counter documented as "NOT an error count". See `naked_act::Refusal`.
+///
+/// It moves only when the act pass runs (`--positions-recon-act`), because the
+/// ledger is read there. Without that flag it stays 0 and says nothing — which
+/// is honest, not clean: read it next to `positions_recon_act_refused`, which is
+/// also 0 in that configuration.
+static ACT_UNACCOUNTED: AtomicI64 = AtomicI64::new(0);
 
 pub fn naked() -> i64 {
     NAKED.load(Ordering::Relaxed)
@@ -157,6 +175,9 @@ pub fn act_refused() -> u64 {
 }
 pub fn act_unresolved() -> u64 {
     ACT_UNRESOLVED.load(Ordering::Relaxed)
+}
+pub fn act_unaccounted() -> i64 {
+    ACT_UNACCOUNTED.load(Ordering::Relaxed)
 }
 
 /// Seconds since the last completed cycle. `-1` = never completed one, which
@@ -562,6 +583,9 @@ async fn act(
     kalshi: &Arc<dyn crate::sink::OrderSink>,
 ) -> Result<(), String> {
     if confirmed.is_empty() {
+        // Nothing confirmed is nothing unaccounted, and saying so is the point:
+        // a stale non-zero here would outlive the position that earned it.
+        ACT_UNACCOUNTED.store(0, Ordering::Relaxed);
         return Ok(());
     }
     let own = act.ownership()?;
@@ -573,6 +597,11 @@ async fn act(
         .map_err(|e| format!("the ledger is unreadable ({e}) — nothing may be priced off it"))?;
     let now = now_s() as f64;
     let mut placed = 0usize;
+    // A GAUGE, counted over this whole pass and published once at the end, so
+    // that a position the ledger has caught up with stops being reported the
+    // cycle it is caught up. A running counter could only ever climb, which is
+    // the shape that let this condition hide in `ACT_REFUSED` in the first place.
+    let mut unaccounted = 0i64;
     for f in confirmed {
         if placed >= crate::naked_act::MAX_ACTIONS_PER_CYCLE {
             eprintln!(
@@ -635,15 +664,34 @@ async fn act(
             now,
         ) {
             Ok(o) => o,
-            Err(why) => {
+            Err(crate::naked_act::Refusal::Waiting(why)) => {
                 ACT_REFUSED.fetch_add(1, Ordering::Relaxed);
                 eprintln!("[recon-act] NO — {}: {why}", f.rel_id);
+                continue;
+            }
+            // NOT a refusal to trade — a refusal to pretend. The contracts are
+            // real at the venue and absent from the ledger, so every cap, fold
+            // and unwind downstream is reasoning about a book that is missing
+            // them. Counted apart from the ordinary declines and said in words
+            // a `grep` for trouble will find, because the previous shape of
+            // this arm was indistinguishable from "the book did not pay" and
+            // repeated itself for six days.
+            Err(crate::naked_act::Refusal::Unaccounted(why)) => {
+                unaccounted += 1;
+                eprintln!(
+                    "[recon-act] UNACCOUNTED — {}: {why}. positions_recon_act_unaccounted is a \
+                     BOOKS-VS-VENUE disagreement, not a price this pass is waiting out: no \
+                     book at any price makes the ledger account for these contracts. \
+                     RECONCILE BY HAND.",
+                    f.line()
+                );
                 continue;
             }
         };
         placed += 1;
         place_and_book(act, f, &order, kalshi).await;
     }
+    ACT_UNACCOUNTED.store(unaccounted, Ordering::Relaxed);
     Ok(())
 }
 
