@@ -81,7 +81,9 @@ Leave-one-family-out moves the premium coefficient only between +0.167 and
 The ratio is the correction: `0.198 / 0.489 = 0.41`.
 
 **Subtract 0.41x the pair's own standing premium from the basis before reading
-it as edge.**
+it as edge** -- but see [Deployability](#deployability-the-rule-does-not-survive-a-real-time-estimator)
+below, which is the section that decides whether this can be acted on. It
+largely cannot, yet.
 
 Note this is a *partial* correction, and fully demeaning would overshoot. An
 earlier cut of this bucketed on demeaned basis and appeared to double the
@@ -89,6 +91,51 @@ convergence (-1.06c to -2.18c per window), but that bucket spanned 2c to 50c of
 raw basis, so it was mostly selecting a bigger raw basis. Holding raw basis in
 narrow bands and regressing is what isolates the premium's own contribution, and
 it is 0.41, not 1.0.
+
+## Deployability: the rule does not survive a real-time estimator
+
+The +0.198 coefficient uses each pair's FIRST-HALF MEAN as its premium. That is
+a long, clean estimate computed with hindsight, and no live engine can have it.
+A shippable estimator has to be trailing and causal, and it is much noisier:
+predicting the next day's mean basis, a 7d trailing mean gets MAE 2.20c against
+a population mean premium of only 1.24c.
+
+Noise in a regressor attenuates its coefficient, so the same design was re-run
+with the premium computed strictly from prior days:
+
+| premium estimator | n | raw basis | premium coef | clustered se | t |
+|---|---|---|---|---|---|
+| first-half mean (hindsight) | 942 | -0.489 | **+0.198** | 0.045 | **+4.42** |
+| 7d trailing mean | 216 | -0.463 | +0.103 | 0.153 | +0.68 |
+| expanding mean | 742 | -0.428 | +0.073 | 0.074 | +0.99 |
+| expanding + shrink to global | 1409 | -0.359 | +0.138 | 0.098 | +1.40 |
+| pooled across family | 2007 | -0.322 | -0.004 | 0.069 | -0.06 |
+| EWMA, 7d half-life | 742 | -0.435 | +0.082 | 0.082 | +1.01 |
+
+**No causal estimator clears significance.** The best is shrinkage at t=+1.40,
+and leave-one-family-out on the 7d version spans 0.00 to 0.41 — it contains
+zero. The premium correction is therefore NOT deployable as it stands, and the
+0.41 figure should not be shipped.
+
+Two things are learned rather than lost:
+
+- **The premium is pair-specific, not family-level.** Pooling across a family
+  destroys the effect outright (t=-0.06) while nearly tripling n, so a family
+  does NOT share a premium and pooling is the wrong way to buy precision.
+- **Shrinkage is the promising direction.** It is the only variant that both
+  raises t and nearly doubles usable n, because it can price a pair with a short
+  history instead of discarding it. Its `K0` was set to 5.0 by hand and has not
+  been tuned.
+
+**The raw-basis coefficient, by contrast, is robust to all of this** — it sits
+between -0.32 and -0.49 across every estimator and every clustering, at t=-4.84
+to -10.09. About 46% of a basis converges within 24h regardless of how the
+premium is measured. That number is usable today; the premium correction is not.
+
+The bottleneck is estimator precision, and it is a data problem before it is a
+modelling one: requiring a few prior days with >=200 tight-book bars each is
+what cut n from 942 to 216. More tape per pair is the cheapest way to buy the
+significance back.
 
 ## What it would have changed on the book we actually put on
 
@@ -171,4 +218,8 @@ running away. Chasing the cheap shape would forfeit more edge than the fee costs
   one; the naive t was +4.26, so clustering did not flatter it here.
 - This is an entry-pricing change and therefore an engine-behaviour change. It
   is not deployed and should not be without an explicit decision and a digest
-  re-pin.
+  re-pin -- and on the evidence in Deployability it should not be deployed at
+  all yet, because the coefficient does not survive a real-time estimator.
+- Endogeneity was checked and cleared: we are short the premium on 184 of 220
+  baskets, so our own flow pushes PM-US YES down, but the premium is +0.92c and
+  positive on 77% of the 26 pairs we have NEVER traded. It is not our footprint.
