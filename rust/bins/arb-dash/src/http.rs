@@ -107,7 +107,13 @@ pub fn serve(a: Args) {
 
 #[cfg(test)]
 mod tests {
-    use super::query_param;
+    use super::{query_param, PAGE};
+
+    #[test]
+    fn shared_duration_formatter_is_embedded() {
+        assert!(PAGE.contains("function dur(sec)"));
+        assert!(PAGE.matches("dur(").count() > 10, "duration formatting is shared across views");
+    }
 
     /// An absent key must be absent, so the caller's own default applies
     /// rather than something this parser invented.
@@ -145,8 +151,8 @@ mod tests {
         assert_eq!(query_param("n=5", "nn"), None);
     }
 
-    /// A bare flag carries no `=`, so it reads as absent. That is why
-    /// A bare `all` flag does NOT open the untradable universe — only
+    /// A bare flag carries no `=`, so it reads as absent. A bare `all` flag
+    /// does NOT open the untradable universe — only
     /// `all=1` does, and the gate is written to require exactly that.
     #[test]
     fn a_bare_flag_with_no_equals_is_not_a_value() {

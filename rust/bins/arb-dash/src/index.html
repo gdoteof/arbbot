@@ -444,6 +444,18 @@ function coveragePanel(iv){
   </section>`);
 }
 
+/* Human-readable duration shared by every live view. */
+function dur(sec){
+  if(sec==null||sec<0) return '—';
+  const s=Math.round(sec);
+  if(s<60) return s+'s';
+  const m=Math.floor(s/60), r=s%60;
+  if(m<60) return r?`${m}m ${r}s`:`${m}m`;
+  const h=Math.floor(m/60), rm=m%60;
+  if(h<24) return rm?`${h}h ${rm}m`:`${h}h`;
+  const d=Math.floor(h/24); return `${d}d ${h%24}h`;
+}
+
 
 /* 143 rows of registry, unsorted and unsearchable, with 78-digit Polymarket
    token ids in the legs column. Finding one pair meant ctrl-F. */
