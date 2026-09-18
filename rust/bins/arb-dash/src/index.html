@@ -109,6 +109,59 @@
     .leg-card.pmus .leg-top{flex-direction:row}.pair-summary{text-align:left}.pair-board-head{display:block}
   }
 
+  /* --- trades / ledger -------------------------------------------------- */
+  .trades-hero{padding:24px;background:
+    radial-gradient(circle at 100% 0,rgba(80,216,144,.10),transparent 38%),var(--panel)}
+  .trades-hero .hero-value{font-size:38px}
+  .trade-headline{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:7px}
+  .trade-headline .badge{font-family:ui-sans-serif,system-ui,sans-serif}
+  .trade-explorer{padding:0;overflow:hidden}
+  .trade-explorer-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:20px 22px 15px}
+  .trade-explorer-head h2{margin-bottom:5px}
+  .trade-count{font:600 14px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}
+  .trade-tabs{display:flex;gap:5px;padding:0 22px 14px;overflow-x:auto}
+  .trade-tab{border-color:var(--line);color:var(--dim);background:transparent;border-radius:99px;padding:6px 12px;white-space:nowrap}
+  .trade-tab:hover{color:var(--ink);border-color:var(--line-strong)}
+  .trade-tab.on{color:var(--ink);border-color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent)}
+  .trade-toolbar{display:grid;grid-template-columns:minmax(220px,1fr) repeat(3,minmax(130px,auto));gap:9px;padding:12px 22px;background:var(--raised);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .trade-control{width:100%;min-width:0;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:7px;padding:8px 10px;font:12px/1.3 inherit;outline:none}
+  .trade-control:focus{border-color:var(--accent);box-shadow:0 0 0 2px color-mix(in srgb,var(--accent) 18%,transparent)}
+  .trade-table{min-width:1030px}
+  .trade-table th{padding:10px 10px}.trade-table td{padding:10px;vertical-align:top}
+  .trade-table tbody tr:hover{background:color-mix(in srgb,var(--raised) 64%,transparent)}
+  .trade-primary{font-weight:600;max-width:350px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .trade-when{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim);margin-top:3px}
+  .trade-legs{display:flex;gap:5px;flex-wrap:wrap;margin-top:5px}
+  .leg-pill{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--dim);background:var(--raised);border:1px solid var(--line);border-radius:4px;padding:2px 5px}
+  .leg-pill.kalshi{border-left:2px solid var(--kalshi)}.leg-pill.polymarket_us{border-left:2px solid var(--pmus)}
+  .trade-state{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+  .trade-state:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+  .trade-state.open{color:var(--ok)}.trade-state.realized{color:var(--accent)}.trade-state.retired{color:var(--dim)}
+  .trade-money{font-weight:650;font-size:14px}.trade-money .sub{display:block;font-family:ui-sans-serif,system-ui,sans-serif;font-weight:400;margin-top:2px}
+  .trade-pagination{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:13px 22px;border-top:1px solid var(--line);background:var(--raised)}
+  .trade-pagination button{border-color:var(--line-strong);color:var(--ink);background:var(--panel)}
+  .trade-pagination button:not(:disabled):hover{border-color:var(--accent);color:var(--accent)}
+  .trade-page-buttons{display:flex;align-items:center;gap:8px}
+  .trade-method{padding:14px 22px;border-top:1px solid var(--line)}
+  details.audit-note summary{cursor:pointer;color:var(--dim);font-size:12px;list-style:none}
+  details.audit-note summary::-webkit-details-marker{display:none}
+  details.audit-note summary:before{content:"+";display:inline-block;width:18px;color:var(--accent)}
+  details.audit-note[open] summary:before{content:"−"}
+  details.audit-note .sub{margin:10px 0 0 18px;max-width:1050px;line-height:1.65}
+  .analysis-grid{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,.85fr);gap:18px;grid-column:1/-1}
+  .analysis-grid section{min-width:0}
+  @media (max-width:900px){
+    .trade-toolbar{grid-template-columns:1fr 1fr}.trade-search{grid-column:1/-1}
+    .analysis-grid{grid-template-columns:1fr}
+  }
+  @media (max-width:600px){
+    .trades-hero .hero-value{font-size:31px}.trade-toolbar{grid-template-columns:1fr}.trade-search{grid-column:auto}
+    .trades-hero .metric-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+    .trades-hero .metric-card{padding:10px}
+    .trade-explorer-head{display:block}.trade-count{margin-top:8px}.trade-pagination{align-items:flex-start;flex-direction:column}
+  }
+  @media (max-width:350px){.trades-hero .metric-grid{grid-template-columns:1fr}}
+
   /* --- now view --------------------------------------------------------- */
   .rowflex{display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start}
   .banner{border:1px solid var(--warn);color:var(--warn);border-radius:6px;
@@ -263,7 +316,8 @@ const money = (s) => {
   return n.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
 };
 const sign = (s) => Number(s) < 0 ? 'bad' : 'ok';
-const esc = (s) => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const esc = (s) => String(s).replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 /* A dollar cell that refuses to invent a number. money(null) renders "0.00",
    and a 0.00 in a column of dollars reads as "nothing happened" rather than "we
    could not establish this" — that ambiguity is how 35 unpriceable ledger
@@ -662,7 +716,7 @@ function nowConstraints(d){
           <div>last ${dur(c.last_age_s)} ago</div></td>
       </tr>`).join('')}</tbody>
     </table></div>
-    <div class="sub" style="margin-top:8px">
+    <details class="audit-note" style="margin-top:10px"><summary>How to read the strategy table</summary><div class="sub">
       Every number in this table except <b>headroom</b> and <b>to unblock</b> was
       printed by the engine as it refused an order; those two are
       <code>limit &minus; deployed</code> and <code>need &minus; headroom</code>.
@@ -1105,6 +1159,7 @@ const S = {
   data:      {},                 // endpoint key -> payload, or {error}
   stream:    {},                 // last SSE frame
   pairQuery: '',
+  trades:    {query:'', status:'all', strategy:'all', sort:'time:desc', page:1, pageSize:25},
   link:      {cls:'dim', text:'● connecting…', title:''},
 };
 
@@ -1271,9 +1326,11 @@ const DRAW = {
     if(!d) return loading(f, 'trades');
     if(d.error) return fail(f, d.error);
     f.append(tradeTotals(d));
-    f.append(venueRolePanel(d));
-    f.append(roundTrips(d));
     f.append(tradeRows(d));
+    const analysis = $(`<div class="analysis-grid"></div>`);
+    analysis.append(venueRolePanel(d));
+    analysis.append(roundTrips(d));
+    f.append(analysis);
     const t = d.totals || {};
     return `${t.open_trades||0} open &middot; locked <b class="${sign(t.open_net_usd)}">$${money(t.open_net_usd||0)}</b>` +
            ` &middot; ${pctf(t.blended_apr_pct)}/yr to hold` +
@@ -1372,34 +1429,22 @@ const held = (d) => {
 
 function tradeTotals(d){
   const t = d.totals || {};
-  const kv = (label, val, cls) =>
-    `<div class="kv"><span>${label}</span><b class="${cls||''}">${val}</b></div>`;
-  return $(`<section>
-    <h2>Book &middot; ${t.open_trades||0} open, ${t.realized_trades||0} closed</h2>
-    ${kv('Open contracts', Number(t.open_contracts||0).toLocaleString())}
-    ${kv('Capital committed', '$'+money(t.open_cost_usd||0))}
-    ${kv('Locked, still open', '$'+money(t.open_net_usd||0), sign(t.open_net_usd))}
-    ${kv('APR to hold', pctf(t.blended_apr_pct), sign(t.blended_apr_pct))}
-    ${kv('Realized', '$'+money(t.realized_net_usd||0), sign(t.realized_net_usd))}
-    ${t.round_trips ? kv('Realized APR',
-        `${pctf(t.realized_apr_pct)} <span class="sub">on $${money(t.realized_cost_usd||0)} over
-         ${Number(t.realized_dollar_years||0).toFixed(2)} dollar-years, ${t.round_trips} round trip(s)` +
-        (t.unrated_round_trips ? `, ${t.unrated_round_trips} of them held too briefly to annualize
-         and excluded from this rate (their P&amp;L is still in Realized)` : '') + `</span>`,
-        sign(t.realized_apr_pct)) : ''}
-    ${kv('Fees &mdash; settled', '$'+money(t.fees_settled_usd||0), 'warn')}
-    ${kv('Fees &mdash; modelled', '$'+money(t.fees_modelled_usd||0), 'warn')}
-    ${t.open_unpriced_trades ? kv('Naked, NOT in locked',
-        `${t.open_unpriced_trades} pos &middot; ${Number(t.open_unpriced_contracts||0).toLocaleString()} ct
-         &middot; $${money(t.open_unpriced_cost_usd||0)} at risk`, 'warn') : ''}
-    ${t.realized_derived_trades ? kv('Realized, derived not banked',
-        `${t.realized_derived_trades} record(s) <span class="sub">priced from the exit's own fills
-         against the entry's basis &mdash; venue-reported fees where available, otherwise estimated</span>`, 'warn') : ''}
-    ${t.realized_unpriced_trades ? kv('Closed but unpriceable',
-        `${t.realized_unpriced_trades} record(s)`, 'warn') : ''}
-    ${t.closed_by_unwind ? kv('Folded out as closed',
-        `${t.closed_by_unwind} basket(s)`, 'dim') : ''}
-    <div class="sub" style="margin-top:8px">
+  const review = Number(t.unpriced_rows||0);
+  return $(`<section class="wide trades-hero"><div class="hero-line"><div>
+    <div class="eyebrow">Ledger performance</div>
+    <div class="hero-value ${usdSign(t.realized_net_usd)}">${usd(t.realized_net_usd||0)}</div>
+    <div class="trade-headline"><span>realized net</span>
+      <span class="badge ${review?'warn':'ok'}">${review ? review+' need review' : 'fully priced'}</span></div>
+    <div class="sub" style="margin-top:7px">${Number(t.realized_trades||0).toLocaleString()} realized records · ${Number(t.round_trips||0).toLocaleString()} matched round trips</div>
+    </div><div class="metric-grid">
+      <div class="metric-card"><span>Locked while open</span><b class="${usdSign(t.open_net_usd)}">${usd(t.open_net_usd||0)}</b><div class="sub">${Number(t.open_trades||0).toLocaleString()} positions · ${Number(t.open_contracts||0).toLocaleString()} contracts</div></div>
+      <div class="metric-card"><span>Capital working</span><b>${usd(t.open_cost_usd||0)}</b><div class="sub">at cost, including fees</div></div>
+      <div class="metric-card"><span>APR to resolution</span><b class="${usdSign(t.blended_apr_pct)}">${pctf(t.blended_apr_pct)}</b><div class="sub">capital-weighted open book</div></div>
+      <div class="metric-card"><span>Realized APR</span><b class="${usdSign(t.realized_apr_pct)}">${pctf(t.realized_apr_pct)}</b><div class="sub">over ${dyears(t.realized_dollar_years||0)} dollar-years</div></div>
+      <div class="metric-card"><span>Fees</span><b class="warn">${usd(Number(t.fees_settled_usd||0)+Number(t.fees_modelled_usd||0))}</b><div class="sub">${usd(t.fees_settled_usd||0)} settled · ${usd(t.fees_modelled_usd||0)} modelled</div></div>
+      <div class="metric-card"><span>Realized basis</span><b>${usd(t.realized_cost_usd||0)}</b><div class="sub">capital across matched exits</div></div>
+    </div></div>
+    <details class="audit-note" style="margin-top:18px"><summary>How these figures are defined</summary><div class="sub">
       A <b>hedged</b> basket &mdash; both sides held, each covering the whole
       contract count &mdash; pays exactly <b>$1.00/contract</b> at resolution
       whatever the event does, so profit is payoff minus cost: locked, not
@@ -1421,7 +1466,7 @@ function tradeTotals(d){
       to the Books statement — different populations, and the PM-US side of that
       statement is plug-dominated. Do not read agreement between the two as a
       check on either.
-    </div>
+    </div></details>
   </section>`);
 }
 
@@ -1444,7 +1489,7 @@ function venueRolePanel(d){
       <td class="num dim">${s.dollar_years?dyears(s.dollar_years):'&mdash;'}</td>
       <td class="num ${usdSign(s.realized_apr_pct)}">${pctf(s.realized_apr_pct)}</td>
     </tr>`).join('');
-  return $(`<section class="wide">
+  return $(`<section>
     <h2>Make vs take &middot; by venue</h2>
     <div class="scroll"><table>
       <thead><tr><th>venue</th><th>role</th><th class="num">legs</th>
@@ -1458,7 +1503,7 @@ function venueRolePanel(d){
         <th class="num">realized</th><th class="num">$-years</th>
         <th class="num">realized APR</th></tr></thead>
       <tbody>${strat || '<tr><td colspan="9">none</td></tr>'}</tbody></table></div>
-    <div class="sub" style="margin-top:8px">
+    <details class="audit-note" style="margin-top:10px"><summary>How to read the strategy table</summary><div class="sub">
       <b>net</b> sums exactly to Locked + Realized above. A trade whose P&amp;L is
       not knowable (<b>unpriced</b>) or is already booked on its unwind row
       (<b>closed</b>) contributes 0 rather than a guess, so a strategy can show
@@ -1472,7 +1517,7 @@ function venueRolePanel(d){
       why the book-level rate is weighted by the second column and not the
       first.
       <br>${esc(d.fee_note||'')}
-    </div>
+    </div></details>
   </section>`);
 }
 
@@ -1486,7 +1531,8 @@ function venueRolePanel(d){
    -------------------------------------------------------------------------- */
 function roundTrips(d){
   const trips = (d.rows||[]).filter(r => r.entry_ts);
-  const rows = trips.map(r => {
+  const recent = trips.slice(0,8);
+  const rows = recent.map(r => {
     const when = (ts) => esc(new Date((ts||0)*1000).toISOString().slice(0,16).replace('T',' '));
     /* MODELLED at either end is modelled overall. A round trip's P&L is only as
        settled as both of its legs, and the entry's fees are inside its basis. */
@@ -1511,8 +1557,8 @@ function roundTrips(d){
     </tr>`;
   }).join('');
   const t = d.totals || {};
-  return $(`<section class="wide">
-    <h2>Round trips &middot; ${trips.length} close(s), newest first</h2>
+  return $(`<section>
+    <h2>Recent round trips &middot; ${trips.length} total</h2>
     <div class="scroll"><table>
       <thead><tr><th>entered / exited (UTC)</th><th>relationship</th><th>strategy</th>
         <th class="num">qty</th><th class="num">entry cost</th><th class="num">proceeds</th>
@@ -1520,7 +1566,7 @@ function roundTrips(d){
         <th class="num">realized APR</th></tr></thead>
       <tbody>${rows || '<tr><td colspan="10">no position has been closed against a known entry yet</td></tr>'}</tbody>
     </table></div>
-    <div class="sub" style="margin-top:8px">
+    <details class="audit-note" style="margin-top:10px"><summary>How round-trip pricing and APR work</summary><div class="sub">
       A row appears here only when the ledger still holds the <b>entry</b> the
       exit retired &mdash; matched on the <code>closes_ts</code> the exit names.
       <b>entry cost</b> is that entry's all-in basis (its own fees inside),
@@ -1552,17 +1598,44 @@ function roundTrips(d){
         <code>2 &times; (pm &minus; kalshi) &times; qty</code>, enough to flip most of them between
         profit and loss, so they are left unpriced rather than shown wrong. Append their
         corrections and they price themselves with no code change.` : ''}
-    </div>
+    </div></details>
   </section>`);
 }
 
 function tradeRows(d){
-  const rows = (d.rows||[]).map(r=>{
+  const ui = S.trades;
+  const all = d.rows || [];
+  const strategies = [...new Set(all.map(r=>r.strategy).filter(Boolean))].sort();
+  const category = r => r.status === 'open' ? 'open'
+    : r.status === 'closed' ? 'retired' : 'realized';
+  const counts = {all:all.length,open:0,realized:0,retired:0,review:0};
+  all.forEach(r => { counts[category(r)]++; if(r.net_usd==null && r.status!=='closed') counts.review++; });
+  const needle = ui.query.trim().toLowerCase();
+  let filtered = all.filter(r => {
+    if(ui.status === 'review' && !(r.net_usd==null && r.status!=='closed')) return false;
+    if(ui.status !== 'all' && ui.status !== 'review' && category(r) !== ui.status) return false;
+    if(ui.strategy !== 'all' && r.strategy !== ui.strategy) return false;
+    if(!needle) return true;
+    const hay = [r.relationship_id,r.strategy,r.source,r.status,
+      ...(r.legs||[]).flatMap(l=>[l.venue,l.market_id,l.side,l.role])].join(' ').toLowerCase();
+    return hay.includes(needle);
+  });
+  const sortVal = (r, key) => key==='time' ? Number(r.ts||0)
+    : key==='net' ? Number(r.net_usd ?? -Infinity)
+    : key==='qty' ? Number(r.qty||0)
+    : Number((r.status==='open' ? r.apr_pct : r.realized_apr_pct) ?? -Infinity);
+  const [sortKey, sortDir] = ui.sort.split(':');
+  filtered = filtered.slice().sort((a,b) => (sortVal(a,sortKey)-sortVal(b,sortKey))*(sortDir==='asc'?1:-1));
+  const pages = Math.max(1,Math.ceil(filtered.length/ui.pageSize));
+  const page = Math.min(ui.page,pages);
+  const start = (page-1)*ui.pageSize;
+  const visible = filtered.slice(start,start+ui.pageSize);
+  const rows = visible.map(r=>{
+    const cat = category(r);
     const legs = (r.legs||[]).map(l =>
-      `${esc(l.venue)} ${esc(l.side)} ${Number(l.qty)} @ ${Number(l.price).toFixed(4)}` +
-      ` <span class="badge ${l.role==='maker'?'ok':''}">${esc(l.role)}</span>`).join('<br>');
+      `<span class="leg-pill ${l.venue}">${esc(l.venue==='polymarket_us'?'PM-US':l.venue)} ${esc(l.side)} ${Number(l.qty)} @ ${Number(l.price).toFixed(3)}</span>`).join('');
     const est = r.resolves_estimated ? ' <span class="sub">est</span>' : '';
-    const feeMark = r.fees_settled ? '' : ' <span class="sub">~</span>';
+    const feeMark = r.fees_settled ? '' : ' <span title="modelled, not settled">~</span>';
     /* NAKED is not a decoration: it is the difference between a hedged basket
        whose profit is arithmetic and a directional bet whose outcome nobody
        knows. `closed` means a later unwind record already retired this line —
@@ -1571,30 +1644,54 @@ function tradeRows(d){
       ? ' <span class="badge bad" title="single leg or same-side legs — not hedged">NAKED</span>' : '';
     const qtyNote = (Number(r.qty_booked) !== Number(r.qty))
       ? `<div class="sub">of ${Number(r.qty_booked).toLocaleString()} booked</div>` : '';
-    return `<tr>
-      <td>${esc(new Date((r.ts||0)*1000).toISOString().slice(0,16).replace('T',' '))}</td>
-      <td>${esc(r.relationship_id)}<div class="sub">${legs}</div></td>
+    const capital = cat==='realized' ? r.entry_cost_usd
+      : cat==='retired' ? r.cost_booked_usd : r.cost_usd;
+    const value = cat==='realized' ? r.exit_proceeds_usd : r.payoff_usd;
+    const rate = cat==='realized' ? r.realized_apr_pct : r.apr_pct;
+    const valueCell = cat==='retired' ? '&mdash;' : usd(value, r.unpriced_reason);
+    const netCell = cat==='retired' ? '&mdash;' : usd(r.net_usd, r.unpriced_reason);
+    const rateCell = cat==='retired' ? '&mdash;' : pctf(rate);
+    return `<tr data-k="trade-${r.ts}">
+      <td><div class="trade-primary" title="${esc(r.relationship_id)}">${esc(r.relationship_id)}</div>
+        <div class="trade-when">${esc(new Date((r.ts||0)*1000).toISOString().slice(0,16).replace('T',' '))} UTC</div>
+        <div class="trade-legs">${legs}</div></td>
       <td>${esc(r.strategy)}<div class="sub">${esc(r.source)}</div></td>
-      <td><span class="badge ${r.status==='open'?'ok':''}">${esc(r.status)}</span>${naked}</td>
-      <td class="num">${Number(r.qty).toLocaleString()}${qtyNote}</td>
-      <td class="num">${usd(r.cost_usd, r.unpriced_reason)}</td>
-      <td class="num">${usd(r.payoff_usd, r.unpriced_reason)}</td>
-      <td class="num warn">$${money(r.fees_usd||0)}${feeMark}</td>
-      <td class="num ${usdSign(r.net_usd)}">${usd(r.net_usd, r.unpriced_reason)}</td>
-      <td>${esc(r.resolves_by||'—')}${est}</td>
-      <td class="num ${usdSign(r.apr_pct)}">${pctf(r.apr_pct)}</td>
+      <td><span class="trade-state ${cat}">${cat}</span>${naked}${r.net_source==='derived:exit_vs_entry'?'<div class="sub warn">derived net</div>':''}</td>
+      <td class="num"><b>${Number(r.qty).toLocaleString()}</b>${qtyNote}</td>
+      <td class="num trade-money">${usd(capital, r.unpriced_reason)}<span class="sub">${cat==='realized'?'entry basis':'all-in cost'}</span></td>
+      <td class="num trade-money">${valueCell}<span class="sub">${cat==='realized'?'exit proceeds':cat==='retired'?'moved to exit row':'payoff at resolve'}</span></td>
+      <td class="num trade-money ${usdSign(r.net_usd)}">${netCell}<span class="sub warn">${usd(r.fees_usd||0)} fees${feeMark}</span></td>
+      <td>${esc(r.resolves_by||'—')}${est}${cat==='realized'?`<div class="sub">held ${held(r.held_days)}</div>`:''}</td>
+      <td class="num ${usdSign(rate)}">${rateCell}<div class="sub">${cat==='open'?'to hold':cat==='realized'?'realized':''}</div></td>
     </tr>`;
   }).join('');
-  return $(`<section class="wide">
-    <h2>Trades &middot; newest first</h2>
-    <div class="scroll"><table>
-      <thead><tr><th>when (UTC)</th><th>relationship / legs</th><th>strategy</th>
-        <th>status</th><th class="num">qty</th><th class="num">cost</th>
-        <th class="num">payoff</th><th class="num">fees</th><th class="num">net</th>
-        <th>resolves</th><th class="num">APR</th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="11">no trades booked yet</td></tr>'}</tbody>
+  const tabs = [['all','All'],['open','Open'],['realized','Realized'],['retired','Retired'],['review','Needs review']]
+    .map(([k,label])=>`<button class="trade-tab ${ui.status===k?'on':''}" data-trade-status="${k}" aria-pressed="${ui.status===k}">${label} <span class="num">${counts[k]}</span></button>`).join('');
+  const option = (v,label) => `<option value="${v}" ${ui.sort===v?'selected':''}>${label}</option>`;
+  const stratOptions = `<option value="all">All strategies</option>` + strategies.map(s=>
+    `<option value="${esc(s)}" ${ui.strategy===s?'selected':''}>${esc(s)}</option>`).join('');
+  const lo = filtered.length ? start+1 : 0, hi = Math.min(start+ui.pageSize,filtered.length);
+  return $(`<section class="wide trade-explorer">
+    <div class="trade-explorer-head"><div><h2>Trade ledger</h2><div class="sub">Search and slice every booked record without losing the accounting context.</div></div>
+      <div class="trade-count">${lo}&ndash;${hi} of ${filtered.length.toLocaleString()}</div></div>
+    <div class="trade-tabs">${tabs}</div>
+    <div class="trade-toolbar">
+      <input id="trade-search" class="trade-control trade-search" type="search" placeholder="Search relationship, market, venue…" value="${esc(ui.query)}" aria-label="Search trades">
+      <select id="trade-strategy" class="trade-control" aria-label="Filter by strategy">${stratOptions}</select>
+      <select id="trade-sort" class="trade-control" aria-label="Sort trades">
+        ${option('time:desc','Newest first')}${option('time:asc','Oldest first')}${option('net:desc','Net: high to low')}${option('net:asc','Net: low to high')}${option('apr:desc','APR: high to low')}${option('qty:desc','Quantity: high to low')}
+      </select>
+      <select id="trade-page-size" class="trade-control" aria-label="Rows per page">${[25,50,100].map(n=>`<option value="${n}" ${ui.pageSize===n?'selected':''}>${n} per page</option>`).join('')}</select>
+    </div>
+    <div class="scroll"><table class="trade-table">
+      <thead><tr><th>trade / legs</th><th>strategy</th><th>state</th><th class="num">qty</th>
+        <th class="num">capital</th><th class="num">value</th><th class="num">net / fees</th>
+        <th>resolution</th><th class="num">rate</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="9" style="padding:28px;text-align:center" class="dim">No trades match these filters.</td></tr>'}</tbody>
     </table></div>
-    <div class="sub" style="margin-top:8px">
+    <div class="trade-pagination"><span class="sub">Showing ${lo}&ndash;${hi} of ${filtered.length.toLocaleString()} matching · ${all.length.toLocaleString()} total</span>
+      <div class="trade-page-buttons"><button id="trade-prev" data-page="${Math.max(1,page-1)}" ${page<=1?'disabled':''}>Previous</button><span class="num">Page ${page} / ${pages}</span><button id="trade-next" data-page="${page+1}" ${page>=pages?'disabled':''}>Next</button></div></div>
+    <div class="trade-method"><details class="audit-note"><summary>Ledger quality and pricing notes</summary><div class="sub">
       <b>~</b> on a fee means MODELLED, not settled &mdash; the engine books
       <code>fees_pending</code> because it does not read fill reports. Cost is
       all-in where the ledger reported it, and derived ex-fees where it did not.
@@ -1607,7 +1704,7 @@ function tradeRows(d){
       ${d.orphan_unwinds ? `<br><b class="warn">${d.orphan_unwinds}</b> unwind record(s) name no open basket (missing, unknown, or already-closed <code>closes_ts</code>) &mdash; they close nothing, so something is still reported as on.` : ''}
       ${d.unusable_unwinds ? `<br><b class="bad">▲ ${d.unusable_unwinds} basket(s) named by an unwind that recorded no usable qty</b> &mdash; the remainder cannot be established, so they are unpriced rather than reported as fully open.` : ''}
       ${d.unparsed_lines ? `<br><b class="warn">${d.unparsed_lines}</b> unparsed line(s) &mdash; normal mid-append.` : ''}
-    </div>
+    </div></details></div>
   </section>`);
 }
 
@@ -1705,6 +1802,25 @@ function tapeWire(){
     if(b) b.innerHTML=''; TAPE.rows=0; TAPE.seen={}; tapeStat(); });
 }
 
+function tradeWire(){
+  const update = (fn) => set(st => { fn(st.trades); st.trades.page = 1; });
+  document.querySelectorAll('[data-trade-status]').forEach(el => {
+    el.onclick = () => update(ui => { ui.status = el.dataset.tradeStatus; });
+  });
+  const search = document.getElementById('trade-search');
+  if(search) search.oninput = () => update(ui => { ui.query = search.value; });
+  const strategy = document.getElementById('trade-strategy');
+  if(strategy) strategy.onchange = () => update(ui => { ui.strategy = strategy.value; });
+  const sort = document.getElementById('trade-sort');
+  if(sort) sort.onchange = () => update(ui => { ui.sort = sort.value; });
+  const size = document.getElementById('trade-page-size');
+  if(size) size.onchange = () => update(ui => { ui.pageSize = Number(size.value); });
+  const prev = document.getElementById('trade-prev');
+  if(prev) prev.onclick = () => set(st => { st.trades.page = Number(prev.dataset.page); });
+  const next = document.getElementById('trade-next');
+  if(next) next.onclick = () => set(st => { st.trades.page = Number(next.dataset.page); });
+}
+
 /* --------------------------------------------------------------------------
    RENDER — the only function permitted to touch the document
    -------------------------------------------------------------------------- */
@@ -1732,6 +1848,8 @@ function render(){
   }
   document.getElementById('meta').innerHTML = meta;
   apply(document.getElementById('root'), frag);
+
+  if(p === '/trades') tradeWire();
 
   // The live tape owns a dedicated connection, so it has to be opened and
   // closed as the view comes and goes — leaving it open would keep an SSE
