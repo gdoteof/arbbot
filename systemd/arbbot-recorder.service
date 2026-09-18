@@ -6,11 +6,9 @@
 # how to put Python back (`git checkout` this file first — the unit NAME did not
 # change, so a rollback that skips that step restarts the Rust binary).
 #
-# WHY THIS UNIT AND NOT arbbot-recorder-rs.service: both trader units carry
-# `After=arbbot-recorder.service` / `Wants=arbbot-recorder.service`. Promoting
-# the -rs unit would have left the armed engine ordered against a dead unit.
-# arbbot-recorder-rs.service is stopped and disabled; it is the same binary and
-# a second copy would open a second WS session on the same PM-US key.
+# The former `arbbot-recorder-rs.service` shadow unit was retired after this
+# unit became authoritative. Do not start a second copy: it would open another
+# WS session on the same PM-US key.
 #
 # CREDENTIALS: the `rs`-suffixed keys, deliberately — they are what the shadow
 # ran on and what the promotion gate tested, and a live swap should not change

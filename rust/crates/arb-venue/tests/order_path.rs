@@ -1626,3 +1626,43 @@ fn a_kalshi_read_that_failed_is_not_zero_spendable_cash() {
     let g = gw(vec![(503, "service unavailable")]);
     assert!(g.spendable_cash().is_err());
 }
+
+#[test]
+fn terminal_fill_read_requires_both_terminal_state_and_readable_quantity() {
+    for (state, expected) in [("resting", None), ("canceled", Some(2)), ("executed", Some(2)), ("unknown", None)] {
+        let body = serde_json::json!({"order":{"order_id":"o-1", "status":state,"fill_count_fp":"2.00"}}).to_string();
+        assert_eq!(gw(vec![(200, &body)]).terminal_filled_qty("o-1").unwrap(), expected);
+    }
+    let missing = r#"{"order":{"order_id":"o-1","status":"canceled"}}"#;
+    assert!(gw(vec![(200, missing)]).terminal_filled_qty("o-1").is_err());
+}
+
+#[test]
+fn terminal_fill_read_waits_for_a_new_order_to_become_visible() {
+    let body = r#"{"order":{"order_id":"o-1","status":"executed","fill_count_fp":"7.00"}}"#;
+    let g = gw(vec![(404, "not visible yet"), (200, body)])
+        .with_settle(std::time::Duration::ZERO, 2);
+    assert_eq!(g.terminal_filled_qty("o-1").unwrap(), Some(7));
+}
+
+#[test]
+fn capital_includes_all_position_pages_without_inventing_values() {
+    let g=gw(vec![
+        (200,r#"{"balance_dollars":"157.8480","portfolio_value":18949}"#),
+        (200,r#"{"market_positions":[{"ticker":"KXA","position_fp":"2.25"}],"cursor":"c1"}"#),
+        (200,r#"{"market_positions":[{"ticker":"KXB","position_fp":"-3.5"},{"ticker":"FLAT","position_fp":"0"}],"cursor":""}"#),
+    ]);
+    let a=g.account_capital().unwrap();
+    assert_eq!(a.equity_usd,"347.338000");
+    assert_eq!(g.transport.sent().len(),3);
+    assert_eq!(a.holdings.len(),2);
+    assert_eq!(a.holdings[0].quantity,"2.25");
+    assert_eq!(a.holdings[1].quantity,"-3.5");
+    assert!(a.holdings.iter().all(|h| h.value_usd.is_none()));
+}
+
+#[test]
+fn capital_rejects_incomplete_position_reads() {
+    let g=gw(vec![(200,r#"{"balance_dollars":"10","portfolio_value":200}"#), (503,"outage")]);
+    assert!(g.account_capital().is_err());
+}

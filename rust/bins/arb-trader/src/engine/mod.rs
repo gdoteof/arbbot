@@ -1,6 +1,6 @@
 //! Single-owner engine task: books + quoters + decision policy live here and
 //! nowhere else (no locks). Consumes the feed channel; emits canonical intent
-//! lines (identical bytes to arb-intent / scripts/intent_replay.py) and
+//! lines (identical bytes to the historical replay reference) and
 //! routes effect commands to per-venue executors. Time-based behavior runs on
 //! deadlines (tokio intervals) in the same select loop — kill-switch watch
 //! and stats — never on per-event syscalls.
@@ -1024,6 +1024,11 @@ impl Engine {
                         }
                     }
                     if !queued {
+                        if let (Intent::Place(p), Some(rv), Some(r)) = (&it, &self.cfg.risk, rel) {
+                            if p.tag == Some(Tag::TakeTake) {
+                                rv.finish_ioc(&r.id, &p.order_id, p.side);
+                            }
+                        }
                         // The commands of ONE intent are a sequence: an
                         // amend's place must never go out without the
                         // cancel that precedes it, or the amend doubles
@@ -1298,8 +1303,16 @@ impl Engine {
     /// toward being too permissive, which is the direction that costs money.
     pub(super) fn apr_tick(&mut self, quoters: &mut [Quoter]) {
         let Some(a) = self.cfg.apr.clone() else { return };
+        // Makers must clear the current taker hurdle too, including when
+        // the portfolio yield exceeds the utilization curve's ceiling.
+        let min_apr = self.tt_bar.map(|taker| {
+            let maker = a.min_apr.unwrap_or_else(|| {
+                self.cfg.risk.as_deref().map_or(0.0, |rv| crate::apr_bar(rv.utilization()))
+            });
+            maker.max(taker)
+        }).or(a.min_apr);
         let (bar, asof, _) =
-            crate::apply_apr(quoters, a.min_apr, a.asof.as_deref(), self.cfg.risk.as_deref());
+            crate::apply_apr(quoters, min_apr, a.asof.as_deref(), self.cfg.risk.as_deref());
         // 0.05%/yr: below that the quantized cent price cannot move, so it is
         // not a change anyone could act on.
         if (bar - self.apr_bar).abs() >= 0.05 || asof != self.apr_asof {
@@ -1307,9 +1320,9 @@ impl Engine {
                 "[apr] maker hurdle {:.2} -> {bar:.2}%/yr, holds measured from {asof}",
                 self.apr_bar
             );
-            self.apr_bar = bar;
-            self.apr_asof = asof;
         }
+        self.apr_bar = bar;
+        self.apr_asof = asof;
     }
 
     /// Publish what `crate::maker_exit` cannot derive, and install what it asks
@@ -1362,6 +1375,7 @@ impl Engine {
         for k in &asked {
             self.maker_exit_suppressed.entry(k.clone()).or_insert(now);
         }
+        crate::capital::publish_marks(&self.books);
         // PM-US top-of-book ASK for every market this engine holds a book for.
         // The engine's book is the ONLY PM-US price read in this process —
         // `PmusGateway` has no `market_quote` — so an exit priced without it
@@ -1810,6 +1824,27 @@ impl Engine {
         let ts_local_ns = v.get("ts_local_ns").and_then(|x| x.as_i64()).unwrap_or(0);
         let ts_venue = v.get("ts_venue").and_then(|x| x.as_str()).map(str::to_owned);
         match kind {
+            "ioc_terminal" => {
+                if let (Some(oid), Some(cum)) = (
+                    v.get("order_id").and_then(|x| x.as_str()),
+                    v.get("cum_qty").and_then(|x| x.as_i64()).filter(|n| *n >= 0),
+                ) {
+                    self.on_ioc_terminal(oid, cum, venue, &market_id, ts_local_ns);
+                }
+                return;
+            }
+            "price_grid" => {
+                let ranges = v.get("ranges").cloned().and_then(|r|
+                    serde_json::from_value::<Vec<(String, String, String)>>(r).ok());
+                let grid = ranges.as_deref().and_then(arb_core::price_grid::PriceGrid::from_ranges);
+                if let Some(idxs) = by_market.get(&(venue, market_id.clone())) {
+                    for &qi in idxs { quoters[qi].set_price_grid(&market_id, grid.clone()); }
+                    if !self.killed && self.feed_reason.is_none() {
+                        self.quote(quoters, idxs, ts_local_ns as f64 / 1e9);
+                    }
+                }
+                return;
+            }
             "snapshot" => {
                 let (Some(bids), Some(asks)) = (levels_of(v.get("bids")), levels_of(v.get("asks")))
                 else {
@@ -2106,19 +2141,14 @@ impl Engine {
                 // leads (risk.rs) — but the refusal reason should
                 // name the leg we were about to send first.
                 //
-                // `rests_on: None` — leg 1 is a marketable IOC, so it does
-                // not rest and reserves nothing. Nothing would ever release a
-                // reservation for it: an IOC that does not fill dies at the
-                // venue and produces no cancel, and reserving would COLLIDE
-                // with the maker quote on the same leg, which shares the slot
-                // key (see `MakerOrder::rested`).
-                //
-                // The window between this check and the fill that books it is
-                // therefore still unreserved. `tt_gate` narrows it PER
-                // RELATIONSHIP only — it stops the same crossing re-firing on
-                // every book event, and does nothing about N relationships
-                // each firing one clip against the same unmoved exposure.
-                let v = rv.check(&quoters[qi].rel, c.lead, c.size, None);
+                // Reserve against this order id until fills consume it or
+                // terminal venue evidence releases the unfilled remainder.
+                let v = if self.cfg.armed {
+                    rv.check_ioc(&quoters[qi].rel, c.lead, c.size,
+                        &format!("t{}", self.next_tt_oid + 1), c.leg1().3)
+                } else {
+                    rv.check(&quoters[qi].rel, c.lead, c.size, None)
+                };
                 if !v.allowed {
                     eprintln!(
                         "[take-take] REFUSED {} x{} apr={:.0}%/yr — {}",
@@ -2240,7 +2270,7 @@ impl Engine {
     }
 
     /// The stats line, and the take-take bar it re-derives.
-    fn stats_tick(&mut self) {
+    fn stats_tick(&mut self, quoters: &mut [Quoter]) {
         println!("{}", self.summary());
         // The tick window closes with the line that reports it. A
         // `tokio::time::interval`'s first tick is ready immediately, so every
@@ -2272,6 +2302,10 @@ impl Engine {
                 eprintln!("[take-take] {}", bar.describe());
             }
             self.tt_bar = now_bar;
+            self.apr_tick(quoters);
+            // Publish the same hurdle to exits in this refresh, too. Waiting
+            // for the separate APR timer leaves exits on the previous bar.
+            self.maker_exit_tick(quoters);
         }
         for line in self.unwind_tick() {
             eprintln!("{line}");
@@ -2619,6 +2653,9 @@ pub async fn run(
     let hedge_retry = cfg.hedge_retry.is_some();
     let stats_every_s = cfg.stats_every_s;
     let mut eng = Engine::new(cfg, exec_txs, exec_stats, &by_market, &quoters);
+    if !bench {
+        eng.apr_tick(&mut quoters);
+    }
 
     let mut kill_iv = tokio::time::interval(std::time::Duration::from_secs(1));
     kill_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2702,7 +2739,7 @@ pub async fn run(
             // already false in bench (`run_cfg`); the guard is belt to that
             // brace, and it keeps the arm out of the poll set entirely.
             _ = marks_iv.tick(), if marking && !bench => { let t = std::time::Instant::now(); eng.marks_tick(); eng.record_tick("marks", t); }
-            _ = stats_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.stats_tick(); eng.record_tick("stats", t); }
+            _ = stats_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.stats_tick(&mut quoters); eng.record_tick("stats", t); }
             // The budget is spent and every deadline that was DUE has now had
             // its turn: the arms above are polled first and this one is always
             // ready, so it is reached only once none of them will fire. Refill
@@ -3867,7 +3904,7 @@ mod feed_wiring_tests {
         let mut eng = test_engine(cfg(&out, None, None));
         // Startup: the first `tox_tick` reads its file cold.
         eng.record_tick("tox", std::time::Instant::now() - std::time::Duration::from_secs(3));
-        eng.stats_tick();
+        eng.stats_tick(&mut []);
         // ...and hours later the loop is healthy. The line must say so.
         eng.record_tick("kill", std::time::Instant::now());
         let s = eng.summary();
@@ -4187,7 +4224,8 @@ mod apr_refresh_tests {
     /// floor. That composition is correct and is pinned below; what it is not
     /// is an idle book, which is what this fixture is for.
     fn idle_risk() -> Arc<crate::risk::RiskView> {
-        let d = std::env::temp_dir().join(format!("arb-trader-apr-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("arb-trader-apr-{}-{}",
+            std::process::id(), std::thread::current().name().unwrap_or("test")));
         std::fs::create_dir_all(&d).unwrap();
         let exec = d.join("exec.yaml");
         std::fs::write(&exec, "bankroll_usd: 980\nper_class_cap: 0.35\n").unwrap();
@@ -4208,9 +4246,98 @@ mod apr_refresh_tests {
         test_engine(cfg)
     }
 
-    /// The bar an idle book asks for is the floor; the bar a full one asks for
-    /// is higher, and the REFRESH is what moves it. Without `apr_tick` the
-    /// engine would still be charging the startup bar after the book filled.
+    /// A taker hurdle can exceed the utilization ceiling, and can fall again.
+    #[test]
+    fn maker_hurdle_tracks_taker_without_losing_utilization_floor() {
+        let (mut quoters, _) = quoter_and_books();
+        let risk = idle_risk();
+        let mut eng = engine_with(risk.clone(), &mut quoters);
+        for taker in [12.0, 25.0, 25.01, 8.0] {
+            eng.tt_bar = Some(taker);
+            eng.apr_tick(&mut quoters);
+            assert_eq!(eng.apr_bar, taker);
+        }
+        risk.record_open("xvus-france-pres-27-test", "cross-venue-equivalent", 490.0);
+        eng.apr_tick(&mut quoters);
+        assert_eq!(eng.apr_bar, crate::APR_CEIL);
+        eng.tt_bar = None;
+        eng.apr_tick(&mut quoters);
+        assert_eq!(eng.apr_bar, crate::APR_CEIL);
+        eng.cfg.apr.as_mut().unwrap().min_apr = Some(30.0);
+        eng.tt_bar = Some(18.0);
+        eng.apr_tick(&mut quoters);
+        assert_eq!(eng.apr_bar, 30.0, "a stricter explicit maker minimum survives");
+    }
+
+    #[test]
+    fn stats_refresh_keeps_the_exit_view_on_the_same_hurdle_as_entry() {
+        let _g = crate::maker_exit::test_serial();
+        crate::maker_exit::reset_view();
+        let (mut quoters, _) = quoter_and_books();
+        let mut eng = engine_with(idle_risk(), &mut quoters);
+        eng.cfg.maker_exit_view = true;
+        eng.maker_exit_tick(&mut quoters);
+        let dir = std::env::temp_dir().join(format!("apr-refresh-marks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("marks.json");
+        eng.cfg.take_take = Some(TakeTake {
+            max_ct_per_rel: 50, max_clip: 5, detect_only: true, cooldown_s: 60.0,
+            marks_path: path.to_string_lossy().into_owned(),
+        });
+        let now = wall_now();
+        let s = (now as i64).rem_euclid(86_400);
+        let stamp = format!("{}T{:02}:{:02}:{:02}Z", crate::taketake::today_iso(now),
+            s / 3600, (s % 3600) / 60, s % 60);
+        // A one-day horizon with $1 profit on $100 cost yields 365.25% APR.
+        let marks = serde_json::json!({"generated_at": stamp, "positions": [{
+            "cost_usd": 100.0, "locked_profit_usd": 1.0,
+            "resolves_by": crate::taketake::today_iso(now),
+        }]}).to_string();
+        for contents in [marks.as_str(), "{}", ""] {
+            std::fs::write(&path, contents).unwrap();
+            eng.stats_tick(&mut quoters);
+            assert_eq!(eng.apr_bar, eng.tt_bar.unwrap_or(crate::APR_FLOOR));
+            assert_eq!(crate::maker_exit::engine_view().unwrap().apr_bar, eng.apr_bar,
+                "exit must receive a changed bar in the same refresh, not a minute later");
+        }
+        crate::maker_exit::reset_view();
+    }
+
+    #[test]
+    fn taker_hurdle_changes_real_quotes_and_lowering_it_restores_them() {
+        for (market, side) in [("P", BookSide::Bid), ("K", BookSide::Ask)] {
+            let (mut quoters, mut books) = quoter_and_books();
+            let mut eng = engine_with(idle_risk(), &mut quoters);
+            let lvl = |p: &str| Level { price: p.into(), size: "500".into() };
+            books.apply_snapshot(Venue::PolymarketUs, "P", vec![lvl("0.45")],
+                vec![lvl("0.99")], 2, 2_000_000_000, None);
+            if side == BookSide::Ask {
+                books.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.01")],
+                    vec![lvl("0.55")], 2, 2_000_000_000, None);
+                books.apply_snapshot(Venue::PolymarketUs, "P", vec![lvl("0.01")],
+                    vec![lvl("0.40")], 2, 2_000_000_000, None);
+            }
+            let mut cx = Cx::default();
+            let fees = FeeSchedule::new(&mut cx);
+            let mut oid = 0;
+            for (taker, should_place, should_cancel, ts) in [
+                (12.0, true, false, 1000.0),
+                (40.0, false, true, 1100.0),
+                (12.0, true, false, 1200.0),
+            ] {
+                eng.tt_bar = Some(taker);
+                eng.apr_tick(&mut quoters);
+                let mut intents = Vec::new();
+                quoters[0].on_book(&mut cx, &fees, &books, ts, &mut oid, &mut intents);
+                assert_eq!(intents.iter().any(|i| matches!(i, Intent::Place(p) if p.place == market && p.side == side)),
+                    should_place, "bar {taker}: {intents:?}");
+                assert_eq!(intents.iter().any(|i| matches!(i, Intent::Cancel(c) if c.cancel == market && c.side == side)),
+                    should_cancel, "bar {taker}: {intents:?}");
+            }
+        }
+    }
+
+    /// The refresh must move the bar as the book fills.
     #[test]
     fn a_book_that_fills_raises_the_bar_without_a_restart() {
         let (mut quoters, _) = quoter_and_books();
@@ -4781,7 +4908,10 @@ mod marks_wiring_tests {
     use serde_json::json;
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("arb-trader-marks-{}", std::process::id()));
+        static RUN: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+        let run = RUN.get_or_init(|| std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let d = std::env::temp_dir().join(format!("arb-trader-marks-{}-{run}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d.join(name)
     }

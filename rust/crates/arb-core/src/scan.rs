@@ -644,6 +644,28 @@ pub fn maker_quote(
     metas: &dyn Fn(&RelLeg) -> MarketMeta,
     hedge_size: D,
 ) -> Option<D> {
+    let p = maker_quote_limit(cx, fees, rel, maker_leg_index, books, metas, hedge_size)?;
+    // Preserve the historical penny-grid arithmetic exactly. Dividing by the
+    // tick before rounding is not byte-equivalent to quantizing `p` directly
+    // at decimal-context precision; the real-tape gate caught the direct form
+    // admitting unrelated borderline quotes. Explicit venue grids use the
+    // unrounded limit above and are rounded by `PriceGrid` in the quoter.
+    let tick = cx.parse_exact("0.01");
+    let ticks = cx.div(p, tick);
+    let ticks = cx.quantize_int_down(ticks);
+    let p = cx.mul(ticks, tick);
+    cx.is_pos(p).then_some(p)
+}
+
+pub fn maker_quote_limit(
+    cx: &mut Cx,
+    fees: &FeeSchedule,
+    rel: &Rel,
+    maker_leg_index: usize,
+    books: &BookBuilder,
+    metas: &dyn Fn(&RelLeg) -> MarketMeta,
+    hedge_size: D,
+) -> Option<D> {
     if rel.legs.len() != 2 {
         return None;
     }
@@ -690,15 +712,29 @@ pub fn maker_quote(
         return None;
     }
     // p = (p / tick).quantize(ONE, ROUND_DOWN) * tick   (tick = 0.01 default)
-    let tick = cx.parse_exact("0.01");
-    let ticks = cx.div(p, tick);
-    let ticks = cx.quantize_int_down(ticks);
-    let p = cx.mul(ticks, tick);
-    if cx.is_pos(p) { Some(p) } else { None }
+    Some(p)
 }
 
 /// maker_ask_quote — min YES-ask; mirror with ROUND_CEILING.
 pub fn maker_ask_quote(
+    cx: &mut Cx,
+    fees: &FeeSchedule,
+    rel: &Rel,
+    maker_leg_index: usize,
+    books: &BookBuilder,
+    metas: &dyn Fn(&RelLeg) -> MarketMeta,
+    hedge_size: D,
+) -> Option<D> {
+    let p = maker_ask_quote_limit(cx, fees, rel, maker_leg_index, books, metas, hedge_size)?;
+    // See `maker_quote`: this spelling is part of the legacy replay contract.
+    let tick = cx.parse_exact("0.01");
+    let ticks = cx.div(p, tick);
+    let ticks = cx.quantize_int_ceil(ticks);
+    let p = cx.mul(ticks, tick);
+    (cx.cmp(p, cx.one) == Ordering::Less).then_some(p)
+}
+
+pub fn maker_ask_quote_limit(
     cx: &mut Cx,
     fees: &FeeSchedule,
     rel: &Rel,
@@ -746,11 +782,7 @@ pub fn maker_ask_quote(
     if cx.cmp(p, one) != std::cmp::Ordering::Less {
         return None;
     }
-    let tick = cx.parse_exact("0.01");
-    let ticks = cx.div(p, tick);
-    let ticks = cx.quantize_int_ceil(ticks);
-    let p = cx.mul(ticks, tick);
-    if cx.cmp(p, one) == std::cmp::Ordering::Less { Some(p) } else { None }
+    Some(p)
 }
 
 #[cfg(test)]

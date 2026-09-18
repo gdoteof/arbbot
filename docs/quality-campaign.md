@@ -57,10 +57,10 @@ The `sha256` field of that summary line MUST equal the baseline:
 
 | field | baseline | where it came from |
 |---|---|---|
-| `sha256` | `214d4e94ebc19a4a33fe3af218016d9300313ab46246d7def66d3201a755722d` | re-pinned 2026-08-23 for #82's adaptive clip (was `b84e6079…`, re-pinned 2026-08-14 by `touch_excl_self`; before that `f4141b53…`) |
-| `intents` | 31703 | same |
-| `would_place` | 187 | same |
-| `would_cancel` | 136 | same |
+| `sha256` | `434305e4e4f5c0bbc91b4a731337f0e552d6692e240d4fc4c65606adc6130989` | re-pinned 2026-09-18 for immediate cancellation of unsafe resting quotes (was `214d4e94…` from #82's adaptive clip) |
+| `intents` | 31705 | same |
+| `would_place` | 185 | same |
+| `would_cancel` | 134 | same |
 | `book_events` | 675950 | property of the tape; identical in both gates |
 | wall time | ~4 s | 2026-07-29, production box, `nice -n 19` |
 
@@ -72,6 +72,18 @@ joiner behind it. Nothing else in the intent stream differs — and the directio
 matters, because the first cut of this fix skipped our price unconditionally and
 took the same tape to 1,212 places by walking `cpc-btc-*-140k:ask` off a
 1,500,238-lot wall it had merely joined. `touch_excl_self` carries that story.
+
+The 2026-09-18 safety re-pin is intentionally asymmetric: gate 5 moved to
+31705/185/134 while the APR gate remained byte-identical at 31487/16/7. With
+the hurdle off, four PM-US UNRWA reprices now pull a resting 0.02 bid as soon as
+the current hedge makes it unsafe, then respect the re-entry throttle instead
+of atomically replacing it; two French BRET placements are withheld for the
+same reason. With the 12% hurdle on, those prices were already excluded, so not
+one intent changes. A first implementation also emitted two unrelated
+Polymarket International quotes and changed BRET from 0.02 to 0.03 because its
+default-grid arithmetic was not replay-equivalent. The gate caught that; the
+legacy path was restored exactly, while explicit live venue grids retain the
+new sub-cent behavior.
 
 ### The gate runs itself, on push
 

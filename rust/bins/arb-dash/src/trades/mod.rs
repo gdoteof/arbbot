@@ -178,6 +178,7 @@ impl Trade {
             "held_days": self.round_trip.as_ref().map(|r| r.held_days),
             "realized_apr_pct": self.realized_apr,
             // A realized P&L is only as settled as BOTH ends of the round trip.
+            "entry_fees_settled": self.round_trip.as_ref().map(|r| r.fees_settled),
             "round_trip_fees_settled":
                 self.round_trip.as_ref().map(|r| r.fees_settled && self.fees_settled),
             "legs": self.legs,

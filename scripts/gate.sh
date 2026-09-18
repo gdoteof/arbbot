@@ -60,7 +60,13 @@ ROOT="$(git rev-parse --show-toplevel)"
 #
 # Nothing in #84-#87 moves either stage: the maker exit is off in bench
 # (`maker_exit_view: !bench && ...`), so it cannot reach a replay decision.
-BASELINE_SHA=214d4e94ebc19a4a33fe3af218016d9300313ab46246d7def66d3201a755722d
+# Re-pinned 2026-09-18 for the unsafe-resting-quote fix. The quoter now checks
+# the price already on the venue against the current hedge before the requote
+# throttle: four PM-US UNRWA reprices become prompt cancel then throttled
+# re-entry, and two French BRET quotes that no longer clear are withheld. Net:
+# 31703/187/136 -> 31705/185/134. The APR stage is byte-identical because its
+# hurdle had already excluded those unsafe quotes.
+BASELINE_SHA=434305e4e4f5c0bbc91b4a731337f0e552d6692e240d4fc4c65606adc6130989
 # Re-pinned 2026-08-23 by the same #82 bisect as the baseline above: this stage
 # moved with it, 38978b34/31485/15/6 -> 02c9a582/31487/16/7. One extra place and
 # one extra cancel, from the same adaptive clip — the hurdle refuses all but a
@@ -460,7 +466,7 @@ elif [ "$skip_digest" = 1 ]; then
   suffix=" (DIGESTS SKIPPED)"
 else
 echo "--- 5/6 real-tape digest ---"
-  digest_stage DIGEST "$BASELINE_SHA" "31703 / 187 / 136"
+  digest_stage DIGEST "$BASELINE_SHA" "31705 / 185 / 134"
 
 # --- 6/6 The SAME tape with the maker APR hurdle turned on.
 #

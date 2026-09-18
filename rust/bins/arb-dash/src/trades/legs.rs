@@ -191,7 +191,7 @@ impl Legs {
         let mut out = Legs {
             n: legs.len(),
             fees: 0.0,
-            settled: false,
+            settled: !legs.is_empty(),
             derived_cost: 0.0,
             yes_qty: 0.0,
             no_qty: 0.0,
@@ -220,11 +220,11 @@ impl Legs {
             let px = num(l.get("avg_price")).or_else(|| num(l.get("yes_price")));
 
             let leg_fee = match num(l.get("fees")) {
-                Some(f) => {
-                    out.settled = true;
-                    f
+                Some(f) => f,
+                None => {
+                    out.settled = false;
+                    m.model(&venue_s, &role_s, px, lqty, fee_category)
                 }
-                None => m.model(&venue_s, &role_s, px, lqty, fee_category),
             };
             out.fees += leg_fee;
 

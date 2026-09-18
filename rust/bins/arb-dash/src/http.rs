@@ -7,11 +7,10 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::exit;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use crate::endpoints::{books, current, intents, now, opportunities, pairs, trades};
-use crate::rollup::{self, Rollup, Shared};
-use crate::{integrity, series, stream, Args};
+use crate::endpoints::{books, now, opportunities, pairs, trades};
+use crate::{integrity, stream, Args};
 
 const PAGE: &str = include_str!("index.html");
 
@@ -36,7 +35,7 @@ fn respond(mut s: TcpStream, status: &str, ctype: &str, body: &str) {
     let _ = s.flush();
 }
 
-fn handle(s: TcpStream, a: &Args, sh: &Shared) {
+fn handle(s: TcpStream, a: &Args) {
     let mut line = String::new();
     {
         let mut r = BufReader::new(match s.try_clone() {
@@ -47,27 +46,23 @@ fn handle(s: TcpStream, a: &Args, sh: &Shared) {
             return;
         }
     }
-    let method = line.split_whitespace().next().unwrap_or("GET").to_string();
     let full = line.split_whitespace().nth(1).unwrap_or("/").to_string();
     let path = full.split('?').next().unwrap_or("/");
     let query = full.split_once('?').map(|(_, q)| q.to_string()).unwrap_or_default();
-    if path.starts_with("/pair/") {
-        respond(s, "200 OK", "text/html; charset=utf-8", PAGE);
-        return;
-    }
     match path {
         // Every view is a real URL. The shell is the same document; its
         // router picks the view from the path and fetches ONLY that view's
         // endpoints, which is the point — a single page would fan out to
         // every endpoint on every load as views are added.
-        "/" | "/recording" | "/opportunities" | "/pairs" | "/current" | "/intents"
-        | "/trades" | "/live" | "/architecture" | "/now" => {
+        "/" | "/recording" | "/opportunities" | "/pairs" | "/trades" | "/live"
+        | "/architecture" | "/now" => {
             respond(s, "200 OK", "text/html; charset=utf-8", PAGE)
         }
         // Long-lived: these return only when the client goes away.
-        "/api/stream" => stream::state(s, a, sh),
+        "/api/stream" => stream::state(s, a),
         "/api/tape" => stream::tape(s, a),
-        "/api/books" => respond(s, "200 OK", "application/json", &books::json(a)),
+        "/api/books" => respond(s, "200 OK", "application/json", &crate::endpoints::capital::json(a)),
+        "/api/books/history" => respond(s, "200 OK", "application/json", &books::json(a)),
         "/api/now" => respond(s, "200 OK", "application/json", &now::json(a)),
         // Built from /proc, the unit files and the artifacts on disk on every
         // request — it holds no picture of its own to go stale.
@@ -83,23 +78,7 @@ fn handle(s: TcpStream, a: &Args, sh: &Shared) {
             respond(s, "200 OK", "application/json", &opportunities::json(a, &query))
         }
         "/api/pairs" => respond(s, "200 OK", "application/json", &pairs::list_json(a)),
-        "/api/intents" => respond(s, "200 OK", "application/json", &intents::json(a)),
         "/api/trades" => respond(s, "200 OK", "application/json", &trades::json(a)),
-        "/api/top-series" => respond(s, "200 OK", "application/json", &series::top_json(a, &query)),
-        "/api/intent-series" => {
-            respond(s, "200 OK", "application/json", &series::intent_json(a, &query))
-        }
-        // The single write surface. GET reports status; only POST can start a
-        // build, so nothing fires it by merely loading a page.
-        "/api/rollup" => {
-            if method == "POST" {
-                respond(s, "200 OK", "application/json", &rollup::start(a, sh, &query))
-            } else {
-                respond(s, "200 OK", "application/json", &rollup::status(a, sh))
-            }
-        }
-        "/api/current" => respond(s, "200 OK", "application/json", &current::json(a, &query)),
-        "/api/pair" => respond(s, "200 OK", "application/json", &pairs::detail_json(a, &query)),
         _ => respond(s, "404 Not Found", "text/plain", "not found"),
     }
 }
@@ -116,14 +95,13 @@ pub fn serve(a: Args) {
         }
     };
     println!("arb-dash on http://{addr}  (read-only, 127.0.0.1 only)");
-    let shared: Shared = Arc::new(Mutex::new(Rollup::default()));
     // A thread per connection. Not for throughput — one person reads this —
     // but because /api/stream never returns, and a serial loop would let the
     // first subscriber wedge every later request.
     let args = Arc::new(a);
     for s in l.incoming().flatten() {
-        let (a, sh) = (Arc::clone(&args), Arc::clone(&shared));
-        std::thread::spawn(move || handle(s, &a, &sh));
+        let a = Arc::clone(&args);
+        std::thread::spawn(move || handle(s, &a));
     }
 }
 
@@ -168,7 +146,7 @@ mod tests {
     }
 
     /// A bare flag carries no `=`, so it reads as absent. That is why
-    /// `/api/current?all` does NOT open the untradable universe — only
+    /// A bare `all` flag does NOT open the untradable universe — only
     /// `all=1` does, and the gate is written to require exactly that.
     #[test]
     fn a_bare_flag_with_no_equals_is_not_a_value() {

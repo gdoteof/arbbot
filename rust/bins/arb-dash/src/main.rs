@@ -3,11 +3,7 @@
 //! Binds 127.0.0.1 only and never touches a venue order path: it holds no
 //! credentials and cannot place, cancel or move an order.
 //!
-//! It is read-only with ONE exception: `POST /api/rollup` rebuilds the local
-//! ToB series. That writes files under the rollup dir and burns ~30s of two
-//! cores, so it is deliberately POST-only (a prefetch or crawler cannot fire
-//! it), single-flight (one build at a time), and atomic (temp file + rename,
-//! so a reader never sees a half-built series). Deliberately runs on a DIFFERENT port from the Python
+//! It is read-only. Deliberately runs on a DIFFERENT port from the Python
 //! dash (4748) so both can be open side by side while the numbers are compared.
 //!
 //! No HTTP crate: the workspace's only dependencies are serde/serde_json, and a
@@ -26,16 +22,13 @@
 //!            [--data-dir data] [--port 4749] [--kalshi-balance <usd>]
 //!
 //! Layout: `http` is the socket and the router, `stream` the two SSE channels,
-//! `rollup` the one write surface, `endpoints` the JSON behind each view and
-//! `series` its charts. `integrity` and `trades` are views that were already
+//! and `endpoints` the JSON behind each view. `integrity` and `trades` are views that were already
 //! big enough to own a file before the rest of this was split up.
 
 mod architecture;
 mod endpoints;
 mod http;
 mod integrity;
-mod rollup;
-mod series;
 mod stream;
 mod trades;
 
@@ -71,8 +64,6 @@ pub struct Args {
     scan_dir: String,
     raw_dir: String,
     parquet_dir: String,
-    rollup_dir: String,
-    intents_path: String,
     /// Append-only trade ledger. The Trades view derives every number from
     /// this file and stores nothing, so it cannot disagree with what the
     /// engine booked.
@@ -106,8 +97,6 @@ impl Args {
             scan_dir: "/nonexistent/data/scan".into(),
             raw_dir: "/nonexistent/data/raw".into(),
             parquet_dir: "/nonexistent/data/parquet".into(),
-            rollup_dir: "/nonexistent/data/rollup".into(),
-            intents_path: "/nonexistent/data/intents.jsonl".into(),
             ledger_path: "/nonexistent/data/trades.jsonl".into(),
             registry: "/nonexistent/config/registry.yaml".into(),
             tradable: "/nonexistent/config/tradable.yaml".into(),
@@ -129,8 +118,6 @@ fn main() {
         scan_dir: "data/scan".into(),
         raw_dir: "data/raw".into(),
         parquet_dir: "data/parquet".into(),
-        rollup_dir: "data/rollup".into(),
-        intents_path: "data/trader-rs/intents.jsonl".into(),
         ledger_path: "data/exec/trades.jsonl".into(),
         registry: "config/registry.yaml".into(),
         tradable: "config/tradable.yaml".into(),
@@ -152,8 +139,6 @@ fn main() {
             "--scan-dir" => a.scan_dir = v,
             "--raw-dir" => a.raw_dir = v,
             "--parquet-dir" => a.parquet_dir = v,
-            "--rollup-dir" => a.rollup_dir = v,
-            "--intents" => a.intents_path = v,
             "--ledger" => a.ledger_path = v,
             "--registry" => a.registry = v,
             "--exec-config" => a.exec_config = v,

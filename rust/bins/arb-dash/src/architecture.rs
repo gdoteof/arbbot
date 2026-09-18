@@ -163,13 +163,6 @@ const NODES: &[Decl] = &[
                in per-venue executors so a slow venue can never stall the reader.",
     },
     Decl {
-        id: "trader_rs", label: "arb-trader (shadow)", sub: "arbbot-trader-rs.service",
-        lane: 3, row: 2, kind: "process", unit: Some("arbbot-trader-rs.service"),
-        probe: Probe::Unit, max_age_s: None, expect: Expect::Live,
-        what: "The same binary with no order path and no credentials loaded. It prices the \
-               whole registry, so intents can be read without arming anything.",
-    },
-    Decl {
         id: "scanner", label: "scan.daemon (Python)", sub: "arbbot-scanner.service",
         lane: 3, row: 3, kind: "process", unit: Some("arbbot-scanner.service"),
         probe: Probe::Unit, max_age_s: None, expect: Expect::Live,
@@ -207,16 +200,7 @@ const NODES: &[Decl] = &[
         lane: 4, row: 2, kind: "artifact", unit: None,
         probe: Probe::File("data/trader-rs/m3-intents.jsonl"), max_age_s: Some(3600),
         expect: Expect::Live,
-        what: "What the armed engine decided. The Live tape reads this; the Intents view is \
-               pointed at the shadow file below, so the two views are not about the same \
-               engine.",
-    },
-    Decl {
-        id: "rs_intents", label: "intents.jsonl", sub: "shadow engine decisions",
-        lane: 4, row: 3, kind: "artifact", unit: None,
-        probe: Probe::File("data/trader-rs/intents.jsonl"), max_age_s: Some(3600),
-        expect: Expect::Live,
-        what: "The dry-run engine's intents, and what --intents points arb-dash at.",
+        what: "What the armed engine decided. The Live tape reads this file directly.",
     },
     Decl {
         id: "ledger", label: "data/exec/trades.jsonl", sub: "append-only record of money",
@@ -247,9 +231,8 @@ const NODES: &[Decl] = &[
         id: "dash_rs", label: "arb-dash", sub: "arbbot-dash-rs.service · you are here",
         lane: 5, row: 1, kind: "process", unit: Some("arbbot-dash-rs.service"),
         probe: Probe::Unit, max_age_s: None, expect: Expect::Live,
-        what: "Binds 127.0.0.1 only, holds no credentials, and cannot place or cancel an \
-               order. Read-only with one exception: POST /api/rollup rebuilds the local ToB \
-               series.",
+        what: "Binds 127.0.0.1 only, holds no credentials, cannot place or cancel an \
+               order, and is entirely read-only.",
     },
     Decl {
         id: "dash_py", label: "Python dash", sub: "arbbot-dash.service · :4748",
@@ -304,10 +287,8 @@ const EDGES: &[Edge] = &[
     Edge { from: "recorder", to: "tape", label: "append", kind: "write" },
     Edge { from: "recorder", to: "health", label: "liveness", kind: "write" },
     Edge { from: "sock", to: "trader_m3", label: "frames", kind: "feed" },
-    Edge { from: "sock", to: "trader_rs", label: "frames", kind: "feed" },
     Edge { from: "sock", to: "scanner", label: "frames", kind: "feed" },
     Edge { from: "registry", to: "trader_m3", label: "vetted pairs", kind: "read" },
-    Edge { from: "registry", to: "trader_rs", label: "vetted pairs", kind: "read" },
     Edge { from: "health", to: "trader_m3", label: "quote gate", kind: "read" },
     Edge { from: "trader_m3", to: "marks", label: "writes", kind: "write" },
     Edge { from: "marks", to: "trader_m3", label: "take-take bar", kind: "read" },
@@ -318,10 +299,8 @@ const EDGES: &[Edge] = &[
     Edge { from: "trader_m3", to: "m3_intents", label: "decisions", kind: "write" },
     Edge { from: "trader_m3", to: "ledger", label: "booked baskets", kind: "write" },
     Edge { from: "ledger", to: "trader_m3", label: "open book at start", kind: "read" },
-    Edge { from: "trader_rs", to: "rs_intents", label: "decisions", kind: "write" },
     Edge { from: "scanner", to: "scan", label: "lifetimes / maker", kind: "write" },
     Edge { from: "m3_intents", to: "dash_rs", label: "live tape", kind: "read" },
-    Edge { from: "rs_intents", to: "dash_rs", label: "intents view", kind: "read" },
     Edge { from: "ledger", to: "dash_rs", label: "trades view", kind: "read" },
     Edge { from: "scan", to: "dash_rs", label: "opportunities", kind: "read" },
     Edge { from: "parquet", to: "dash_rs", label: "history", kind: "read" },

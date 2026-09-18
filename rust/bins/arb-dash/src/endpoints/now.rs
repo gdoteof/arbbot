@@ -321,6 +321,7 @@ struct TopicsDoc {
 
 #[derive(Deserialize, Default)]
 struct CapsDoc {
+    capital_source: Option<String>,
     bankroll_usd: Option<serde_yaml::Value>,
     per_class_cap: Option<serde_yaml::Value>,
 }
@@ -342,12 +343,20 @@ pub fn json(a: &Args) -> String {
         .ok()
         .and_then(|t| serde_yaml::from_str(&t).ok())
         .unwrap_or_default();
-    let bankroll = yaml_num(&caps.bankroll_usd);
-    let per_class = yaml_num(&caps.per_class_cap);
-    let class_cap = match (bankroll, per_class) {
+    let mut bankroll = yaml_num(&caps.bankroll_usd);
+    let mut per_class = yaml_num(&caps.per_class_cap);
+    let mut class_cap = match (bankroll, per_class) {
         (Some(b), Some(p)) => Some(b * p),
         _ => None,
     };
+
+    if caps.capital_source.as_deref()==Some("venue") {
+        let live:Value=serde_json::from_str(&crate::endpoints::capital::json(a)).unwrap_or(Value::Null);
+        let fresh=live["fresh"]==true;
+        bankroll=if fresh {live["totals"]["equity_usd"].as_f64()} else {None};
+        per_class=live["risk_policy"]["deployment_fraction"].as_str().and_then(|s|s.parse().ok());
+        class_cap=if fresh {live["risk_policy"]["deployment_cap_usd"].as_f64()} else {None};
+    }
 
     let topics: TopicsDoc = std::fs::read_to_string(&a.topics_config)
         .ok()
@@ -376,7 +385,7 @@ pub fn json(a: &Args) -> String {
     // ---- the window ------------------------------------------------------
     let intents_path = proc
         .and_then(|p| out_path(&p.cmd))
-        .unwrap_or_else(|| a.intents_path.clone());
+        .unwrap_or_else(|| format!("{}/trader-rs/m3-intents.jsonl", a.data_dir));
     let all = tail_json(&intents_path, INTENTS_TAIL);
     let lines: Vec<&Value> = all
         .iter()

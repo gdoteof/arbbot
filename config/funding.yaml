@@ -1,0 +1,5 @@
+# Original external cash only, confirmed by Geoff 2026-09-18.
+# Reporting baseline; never read by the trader's risk gate.
+# Goodwill credits are included in profit, not contributed capital.
+kalshi: '439.78'
+polymarket_us: '500.00'

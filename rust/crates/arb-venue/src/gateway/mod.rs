@@ -17,6 +17,7 @@
 //! gateways share live here; `kalshi` and `pmus` hold nothing but their own
 //! venue's paths and quirks.
 
+pub mod capital;
 mod kalshi;
 mod pmus;
 
@@ -236,6 +237,13 @@ pub trait VenueGateway {
     /// window (see [`Settle::retry_404`]) rather than reporting it as unknown.
     fn order_filled_qty(&self, order_id: &str) -> Result<i64, VenueError>;
 
+    /// Cumulative fills only after the venue reports a terminal order state.
+    /// None means still working or an unrecognized state, never zero fills.
+    fn terminal_filled_qty(&self, _order_id: &str) -> Result<Option<i64>, VenueError> {
+        Err(VenueError::NotWired)
+    }
+
+
     /// What that same order actually traded AT. `order_filled_qty` answers only
     /// the count, and every caller that needed a price then recorded the LIMIT
     /// IT SENT — see [`crate::resp::FilledCost`] for what that cost.
@@ -327,6 +335,10 @@ pub trait VenueGateway {
     /// [`Self::net_positions`] refuses an empty map: "$0" is not inert. It is
     /// an affirmative claim that this account can buy nothing, and a caller
     /// gating on it acts by refusing every order.
+    fn account_capital(&self) -> Result<capital::AccountCapital, VenueError> {
+        Err(VenueError::NotWired)
+    }
+
     fn spendable_cash(&self) -> Result<String, VenueError> {
         Err(VenueError::NotWired)
     }

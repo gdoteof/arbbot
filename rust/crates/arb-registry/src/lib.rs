@@ -3,7 +3,7 @@
 //! `config/registry.yaml` is PRIVATE and gitignored (it is the trading pair
 //! set), so it is always read from a runtime path, never embedded.
 //!
-//! NOTE: `arb-recorder`, `arb-trader`, `arb-golden` and `arb-intent` each carry
+//! NOTE: `arb-recorder`, `arb-trader`, and `arb-golden` each carry
 //! their own partial `RegistryDoc`, each deserializing only the fields it
 //! happens to need. This crate is the full model. Those four are working code
 //! and are deliberately left alone; they can migrate here when something else

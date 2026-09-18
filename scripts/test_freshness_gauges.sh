@@ -52,6 +52,8 @@ case "$2" in
     case "$p" in
       LoadState) echo "${STUB_LOADSTATE:-loaded}" ;;
       Result) echo exit-code ;;
+      SubState) echo "${STUB_SUBSTATE:-running}" ;;
+      NRestarts) echo "${STUB_RESTARTS:-0}" ;;
       ActiveEnterTimestamp) echo "${STUB_ACTIVE_SINCE:-}" ;;
       InvocationID) echo "${STUB_INVOCATION:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
     esac ;;
@@ -204,6 +206,17 @@ check "a standing fills_unattributed=1 does not re-page" silent
 # 5. ...but a further rise does.
 stats 540 fills_unattributed=3 > "$TMP/journal"; run
 check "fills_unattributed 1->3 pages the DELTA" "fills_unattributed +2 (now 3)"
+
+# Outage recovery is visible, but neither a single retry nor a manual stop pages.
+fresh; stats 60 > "$TMP/journal"
+export STUB_INACTIVE=arbbot-trader-m3 STUB_SUBSTATE=auto-restart STUB_RESTARTS=1
+run; check "a first outage retry does not page" silent
+export STUB_RESTARTS=3
+run; check "prolonged recovery pages without claiming it stopped retrying" "RECOVERING after 3 restarts"
+run; check "recovery notifications retain the existing cooldown" silent
+fresh; export STUB_SUBSTATE=dead STUB_RESTARTS=100
+run; check "an intentional stop stays quiet despite historical restarts" silent
+unset STUB_INACTIVE STUB_SUBSTATE STUB_RESTARTS
 
 # 6. Restart: elapsed_s falls, counters reset. Asserted SILENT until
 #    2026-08-14, which is exactly how the 2026-08-09 armed SIGABRT went

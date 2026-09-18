@@ -694,3 +694,37 @@ fn an_empty_balances_array_is_refused_rather_than_read_as_no_money() {
         other => panic!("an empty array must not be reported as $0 spendable: {other:?}"),
     }
 }
+
+#[test]
+fn terminal_fill_read_does_not_release_pending_or_unreadable_orders() {
+    for state in ["ORDER_STATE_NEW", "ORDER_STATE_PARTIALLY_FILLED", "unknown"] {
+        let body = serde_json::json!({"order":{"id":"pm-1", "state":state,"cumQuantity":2}}).to_string();
+        assert_eq!(gw(vec![(200, &body)]).terminal_filled_qty("pm-1").unwrap(), None);
+    }
+    for state in ["ORDER_STATE_CANCELED", "ORDER_STATE_FILLED", "ORDER_STATE_REJECTED", "ORDER_STATE_EXPIRED"] {
+        let body = serde_json::json!({"order":{"id":"pm-1", "state":state,"cumQuantity":2}}).to_string();
+        assert_eq!(gw(vec![(200, &body)]).terminal_filled_qty("pm-1").unwrap(), Some(2));
+    }
+    let missing = r#"{"order":{"id":"pm-1","state":"ORDER_STATE_CANCELED"}}"#;
+    assert!(gw(vec![(200, missing)]).terminal_filled_qty("pm-1").is_err());
+}
+
+#[test]
+fn terminal_fill_read_waits_for_a_new_order_to_become_visible() {
+    let body = r#"{"order":{"id":"pm-1","state":"ORDER_STATE_FILLED","cumQuantity":7}}"#;
+    let g = gw(vec![(404, "not visible yet"), (200, body)])
+        .with_settle(std::time::Duration::ZERO, 2);
+    assert_eq!(g.terminal_filled_qty("pm-1").unwrap(), Some(7));
+    let g = gw(vec![(404, "not visible yet"), (404, "still not visible")])
+        .with_settle(std::time::Duration::ZERO, 2);
+    assert!(g.terminal_filled_qty("pm-1").is_err(), "absence never proves zero fill");
+}
+
+#[test]
+fn capital_reads_positions_and_avoids_double_counting_margin() {
+    let g=gw(vec![(200,r#"{"balances":[{"currency":"USD","buyingPower":100,"currentBalance":151,"marginRequirement":50}]}"#),
+        (200,r#"{"positions":{"a":{"netPositionDecimal":"-50.25","cashValue":{"value":"45.10"}}}}"#)]);
+    let a=g.account_capital().unwrap();assert_eq!(a.equity_usd,"146.100000");
+    let g=gw(vec![(200,r#"{"balances":[{"currency":"USD","buyingPower":100,"currentBalance":151,"marginRequirement":50}]}"#),(503,"outage")]);
+    assert!(g.account_capital().is_err());
+}

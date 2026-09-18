@@ -153,6 +153,7 @@ enum Cash {
 
 pub struct RiskView {
     bankroll: String,
+    venue_capital: Mutex<Option<Option<f64>>>,
     per_class_cap: String,
     topics: Vec<(String, String, Option<String>)>, // family, budget, only_below_util
     default_topic_budget: Option<String>,
@@ -259,9 +260,9 @@ pub struct RiskView {
     ///     an `order_ack`, so the order really is resting and the reservation
     ///     is correct. A recovery that finds nothing is the rejected case.
     ///
-    /// A marketable IOC reserves NOTHING (`rests_on: None`): it does not rest,
-    /// there is no cancel to release it, and take-take's own cooldown gate is
-    /// what bounds re-firing in the window before its fill books.
+    /// Armed take-take IOCs use separate `ioc/<order-id>` slots. Fills consume
+    /// them and terminal venue reads release the unfilled remainder. Unknown
+    /// execution outcomes keep their reservation; dry-run checks reserve nothing.
     reserved: Mutex<HashMap<Slot, (&'static str, f64)>>,
     /// Counts, for the stats line. Rejections are not errors — a gate that
     /// never fires is a gate nobody can see working.
@@ -513,8 +514,12 @@ fn caps_from_yaml(path: &str) -> Caps {
     };
     // An empty or truncated-to-nothing file parses as YAML null, on which
     // `get` is None — so it lands here rather than needing its own arm.
-    let Some(bankroll) = num(doc.get("bankroll_usd")) else {
-        return Caps::corrupt(format!("{path} has no usable `bankroll_usd`"));
+    let bankroll = if doc.get("capital_source").and_then(|v|v.as_str()) == Some("venue") {
+        "0".to_string() // No static fallback in live-capital mode.
+    } else {
+        let Some(n) = num(doc.get("bankroll_usd")) else {
+            return Caps::corrupt(format!("{path} has no usable `bankroll_usd`"));
+        }; n
     };
     let Some(per_class) = num(doc.get("per_class_cap")) else {
         return Caps::corrupt(format!("{path} has no usable `per_class_cap`"));
@@ -537,6 +542,7 @@ impl RiskView {
         let t = topics_from_yaml(topics_yaml);
         RiskView {
             bankroll: c.bankroll,
+            venue_capital: Mutex::new(None),
             per_class_cap: c.per_class,
             topics: t.list,
             default_topic_budget: t.default_budget,
@@ -599,6 +605,52 @@ impl RiskView {
         if let Cash::Declared(pairs) = &*g {
             *g = Cash::Seed { pairs: pairs.clone(), since: Instant::now() };
         }
+    }
+
+    /// Armed production never spends startup declarations or uses deposit-based caps.
+    pub fn expect_live_capital(&self) {
+        self.expect_live_balances();
+        *self.venue_capital.lock().expect("capital") = Some(None);
+        if let Cash::Seed { pairs, .. } = &mut *self.balances.lock().expect("balances") { pairs.clear(); }
+    }
+
+    pub fn set_live_capital(&self, accounts: &[(String, arb_venue::gateway::capital::AccountCapital)]) -> Result<(),String> {
+        if accounts.len()!=2 || !accounts.iter().any(|(v,_)|v=="kalshi") || !accounts.iter().any(|(v,_)|v=="polymarket_us") {
+            return Err("both venue capital snapshots required".into());
+        }
+        let mut nav=0.;
+        for (_,a) in accounts {
+            let n=a.equity_usd.parse::<f64>().map_err(|_|"invalid venue equity")?;
+            if !n.is_finite() || n<0. { return Err("invalid venue equity".into()); }
+            let components=[&a.available_cash_usd,&a.reserved_cash_usd,&a.positions_value_usd];
+            let mut sum=0.;
+            for value in components {
+                let value=value.parse::<f64>().map_err(|_|"invalid venue capital component")?;
+                if !value.is_finite() || value<0. {return Err("invalid venue capital component".into());}
+                sum+=value;
+            }
+            if (sum-n).abs()>0.000002 {return Err("venue equity does not equal cash plus positions".into());}
+            nav+=n;
+        }
+        if !nav.is_finite() { return Err("invalid total equity".into()); }
+        self.set_live_balances(accounts.iter().map(|(v,a)|(v.clone(),a.available_cash_usd.clone())).collect())?;
+        *self.venue_capital.lock().expect("capital")=Some(Some(nav));
+        Ok(())
+    }
+
+    pub fn set_cached_capital(&self, accounts: &[(String, arb_venue::gateway::capital::AccountCapital)], age_s:u64) -> Result<(),String> {
+        if age_s>BALANCE_MAX_AGE.as_secs() {return Err("capital snapshot stale".into());}
+        self.set_live_capital(accounts)?;
+        if let Cash::Live {at,..}=&mut *self.balances.lock().expect("balances") {
+            *at=Instant::now().checked_sub(Duration::from_secs(age_s)).ok_or("invalid snapshot age")?;
+        }
+        Ok(())
+    }
+
+    pub fn capital_policy(&self) -> serde_json::Value {
+        serde_json::json!({"deployment_fraction":TARGET_DEPLOY,"deployment_cap_usd":self.global_cap_usd(),
+            "per_relationship_contracts":PER_REL_CAP,"tail_fraction":TAIL_FRACTION,
+            "topics":self.topics,"default_topic_budget":self.default_topic_budget})
     }
 
     /// Install what the venues just said. `main::spawn_balance_poll` is the
@@ -760,6 +812,18 @@ impl RiskView {
     /// The remainder stays reserved: a 5-lot that fills 3 is still resting 2.
     /// A slot with nothing left is dropped, and a slot that was never reserved
     /// (a take-take IOC, or a fill on an order this run inherited) is a no-op.
+    pub fn check_ioc(&self, rel: &Rel, venue: Venue, qty: i64, oid: &str, side: BookSide) -> RiskVerdict {
+        self.check(rel, venue, qty, Some((&format!("ioc/{oid}"), side)))
+    }
+
+    pub fn finish_ioc(&self, rel: &str, oid: &str, side: BookSide) {
+        self.release(rel, &format!("ioc/{oid}"), side);
+    }
+
+    pub fn consume_ioc(&self, rel: &str, oid: &str, side: BookSide, qty: f64) {
+        self.consume(rel, &format!("ioc/{oid}"), side, qty);
+    }
+
     pub fn consume(&self, rel_id: &str, market_id: &str, side: BookSide, qty: f64) {
         let mut r = self.reserved.lock().expect("reserved");
         let key = (rel_id.to_string(), market_id.to_string(), side);
@@ -889,6 +953,9 @@ impl RiskView {
     /// Today nothing does: `check` drops its guard before anything else runs,
     /// and `utilization` and `global_cap_usd` are the only internal callers.
     fn cap_over_book(&self, book: f64) -> f64 {
+        if let Some(nav) = *self.venue_capital.lock().expect("capital") {
+            return if self.caps_corrupt.is_some() { 0. } else { nav.unwrap_or(0.) * TARGET_DEPLOY.parse::<f64>().unwrap() };
+        }
         let configured =
             self.bankroll.parse::<f64>().unwrap_or(0.0) * GLOBAL_CAP.parse::<f64>().unwrap_or(0.0);
         // A damaged `exec.yaml` forces the bankroll to $0 and must stay
@@ -963,7 +1030,7 @@ impl RiskView {
         // A damaged `exec.yaml` keeps its $0 bankroll: `live_cash` must not
         // quietly undo the degenerate caps `Caps::corrupt` forces.
         let live = if self.caps_corrupt.is_some() { None } else { self.live_cash() };
-        let (bankroll, per_class, global) = match live {
+        let (mut bankroll, mut per_class, mut global) = match live {
             Some(cash) => (
                 format!("{:.6}", cash + book),
                 TARGET_DEPLOY.to_string(),
@@ -975,6 +1042,10 @@ impl RiskView {
                 GLOBAL_CAP.to_string(),
             ),
         };
+        if let Some(nav) = *self.venue_capital.lock().expect("capital") {
+            bankroll=format!("{:.6}",if self.caps_corrupt.is_some() {0.} else {nav.unwrap_or(0.)});
+            per_class=TARGET_DEPLOY.into(); global=TARGET_DEPLOY.into();
+        }
         ConfigIn {
             bankroll,
             tail_fraction: TAIL_FRACTION.into(),
@@ -1751,15 +1822,23 @@ mod tests {
         assert_eq!(v.reserved_ct(), 0.0);
     }
 
-    /// A marketable IOC does not rest, so it reserves nothing — nothing would
-    /// ever release it. An IOC that does not fill dies at the venue and produces
-    /// no cancel; take-take's own cooldown gate bounds the window instead.
     #[test]
-    fn a_marketable_ioc_reserves_nothing() {
+    fn in_flight_iocs_cannot_share_headroom_and_terminal_release_preserves_makers() {
         let v = funded("low");
-        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
-        assert_eq!(v.reserved_ct(), 0.0);
+        v.record_open("already-open", "cross-venue-equivalent", 330.0);
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
+        assert!(v.check_ioc(&rel("r1"), Venue::Kalshi, 5, "t1", BookSide::Bid).allowed);
+        assert!(!v.check_ioc(&rel("r2"), Venue::Kalshi, 5, "t2", BookSide::Bid).allowed);
+        assert_eq!(v.reserved_ct(), 10.0);
+        v.record_open("r1", "cross-venue-equivalent", 2.0);
+        v.consume_ioc("r1", "t1", BookSide::Bid, 2.0);
+        assert_eq!(v.reserved_ct(), 8.0);
+        v.finish_ioc("r1", "t1", BookSide::Bid);
+        v.finish_ioc("r1", "t1", BookSide::Bid); // duplicate terminal report
+        assert_eq!(v.reserved_ct(), 5.0, "the maker reservation is separate");
+        assert!(v.check_ioc(&rel("r2"), Venue::Kalshi, 5, "t2", BookSide::Bid).allowed);
     }
+
 
     // ---- the capital-scarcity signal: a whole-book numerator needs a
     //      whole-book denominator ----
@@ -2555,4 +2634,31 @@ mod tests {
             d.reasons
         );
     }
+    fn capital_account(cash:&str, equity:&str)->arb_venue::gateway::capital::AccountCapital {
+        arb_venue::gateway::capital::AccountCapital {available_cash_usd:cash.into(),reserved_cash_usd:"0".into(),
+            positions_value_usd:format!("{}",equity.parse::<f64>().unwrap()-cash.parse::<f64>().unwrap()),equity_usd:equity.into(),valuation:"test".into(),holdings:vec![]}
+    }
+    #[test]
+    fn armed_capital_ignores_starting_cash_deposits_and_contract_face_value() {
+        let v=view_with_configs(&valid_exec(),"/absent-topics",vec![("kalshi","99999"),("polymarket_us","99999")],"0");
+        v.expect_live_capital();
+        assert!(v.spendable().is_empty());assert_eq!(v.global_cap_usd(),0.);
+        let accounts=vec![("kalshi".into(),capital_account("100","200")),("polymarket_us".into(),capital_account("300","800"))];
+        v.set_live_capital(&accounts).unwrap();
+        assert_eq!(v.global_cap_usd(),850.);
+        assert_eq!(v.cap_over_book(99999.),850.,"contract counts do not inflate equity");
+        assert_eq!(v.config_over_book(99999.).bankroll,"1000.000000");
+        v.set_cached_capital(&accounts,180).unwrap();
+        assert!(v.spendable().is_empty());
+        assert_eq!(v.global_cap_usd(),850.,"stale cash must never restore the old $490 cap");
+    }
+    #[test]
+    fn venue_config_needs_no_starting_bankroll() {
+        let p=write_exec("venue-capital","capital_source: venue\nper_class_cap: 0.50\n");
+        let v=view_with_configs(p.to_str().unwrap(),"/absent-topics",vec![],"0");
+        assert!(v.caps_corrupt.is_none());v.expect_live_capital();
+        v.set_live_capital(&[("kalshi".into(),capital_account("100","200")),("polymarket_us".into(),capital_account("300","800"))]).unwrap();
+        assert_eq!(v.global_cap_usd(),850.);
+    }
+
 }

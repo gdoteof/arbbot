@@ -59,7 +59,6 @@ dependencies = [
  "arb-query",
  "arb-registry",
  "arb-scenario",
- "arb-tob",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -67,17 +66,6 @@ dependencies = [
 
 [[package]]
 name = "arb-golden"
-version = "0.1.0"
-dependencies = [
- "arb-core",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
-]
-
-[[package]]
-name = "arb-intent"
 version = "0.1.0"
 dependencies = [
  "arb-core",
@@ -150,31 +138,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "arb-shadow-gate"
-version = "0.1.0"
-dependencies = [
- "arb-core",
- "serde_json",
-]
-
-[[package]]
 name = "arb-tape"
 version = "0.1.0"
 dependencies = [
  "arb-core",
  "serde_json",
  "tokio",
-]
-
-[[package]]
-name = "arb-tob"
-version = "0.1.0"
-dependencies = [
- "arb-core",
- "arb-query",
- "parquet",
- "serde",
- "serde_json",
 ]
 
 [[package]]

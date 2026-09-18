@@ -53,24 +53,8 @@ impl MakerOrder {
         }
     }
 
-    /// Did this order REST at the venue, and so reserve capital in the risk
-    /// view? Only the maker path does.
-    ///
-    /// This is not cosmetic. The reservation key is `(rel_id, market, side)`
-    /// and take-take leg 1 SHARES one with the maker: a Kalshi-lead crossing is
-    /// a BID on the Kalshi market (`Candidate::leg1`), the maker quotes both
-    /// legs of the same relationship (`maker_leg_indices`), and take-take is
-    /// placed through `drain_intents(Some(rel))`, so `order_rel` carries the
-    /// identical triple. A take-take fill calling `consume` therefore deletes
-    /// the MAKER's reservation for a quote that is still resting at the venue —
-    /// `record_open` books the crossing's contracts and the same call frees the
-    /// maker's, so the gate's total does not move while real committed capital
-    /// rose. If the maker's target price has not changed, `Quoter::on_book`
-    /// takes the hysteresis `continue` and never re-reserves.
-    ///
-    /// It does not RESERVE either, and must not: reserving would overwrite the
-    /// maker's slot with the same collision, and an IOC that does not fill dies
-    /// at the venue with no cancel to release it.
+    /// Maker orders reserve a market-side slot; take-take entries reserve
+    /// their own order id until terminal venue evidence arrives.
     fn rested(&self) -> bool {
         self.strategy != "take-take"
     }
@@ -377,9 +361,7 @@ impl Engine {
                         // places would refuse the same dollars twice; releasing
                         // the whole slot would free the part still resting.
                         //
-                        // Only a maker order, though. Take-take leg 1 reserved
-                        // nothing and SHARES a slot key with the maker quote on
-                        // the same leg — see `MakerOrder::rested`.
+                        // Take-take uses its independent order-id reservation.
                         //
                         // KNOWN, BOUNDED, AND NOT GATED: a SUPERSEDED order's
                         // fill consumes the slot its replacement now owns. The
@@ -409,6 +391,8 @@ impl Engine {
                         // replaces. Whoever needs it tighter has the shape.
                         if mo.rested() {
                             rv.consume(&mo.rel_id, &mo.market_id, mo.side, ob.qty() as f64);
+                        } else {
+                            rv.consume_ioc(&mo.rel_id, oid, mo.side, ob.qty() as f64);
                         }
                     }
                     // No anchor => no hedge target. The obligation is
@@ -608,6 +592,18 @@ impl Engine {
     /// a live order would match nothing and the hedge would never fire — and a
     /// CANCEL cannot be addressed at all, because both venues accept only their
     /// own id.
+    pub(super) fn on_ioc_terminal(&mut self, oid: &str, cum: i64, venue: Venue, market: &str, ts_ns: i64) {
+        if !self.order_rel.get(oid).is_some_and(|m|
+            !m.rested() && m.venue == venue.as_str() && m.market_id == market) {
+            return;
+        }
+        let _ = self.attribute_fill(oid, cum, venue, market,
+            ts_ns as f64 / 1e9, std::time::Instant::now());
+        if let (Some(rv), Some(mo)) = (&self.cfg.risk, self.order_rel.get(oid)) {
+            rv.finish_ioc(&mo.rel_id, oid, mo.side);
+        }
+    }
+
     pub(super) fn on_order_ack(
         &mut self,
         v: &serde_json::Value,
@@ -1278,6 +1274,9 @@ mod attribute_fill_tests {
         assert!(rv.check(&rel, V::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
         assert_eq!(rv.reserved_ct(), 5.0);
 
+        assert!(rv.check_ioc(&rel, V::Kalshi, 5, "t1", BookSide::Bid).allowed);
+        assert_eq!(rv.reserved_ct(), 10.0);
+
         let mut cfg = test_cfg();
         cfg.risk = Some(rv.clone());
         let mut e = test_engine(cfg);
@@ -1287,17 +1286,16 @@ mod attribute_fill_tests {
         e.fills.register_order("t1", "K", 5, Some(anchor()));
         e.order_rel.insert("t1".into(), tt);
 
-        e.attribute_fill("t1", 5, Venue::Kalshi, "K", 1.0, Instant::now());
-        assert_eq!(
-            rv.open_ct("synth-attribution-rel"),
-            5.0,
-            "the crossing's contracts are real exposure"
-        );
-        assert_eq!(
-            rv.reserved_ct(),
-            5.0,
-            "and the maker's quote is STILL resting, so its capital is still committed"
-        );
+        e.attribute_fill("t1", 2, Venue::Kalshi, "K", 1.0, Instant::now());
+        assert_eq!(rv.reserved_ct(), 8.0);
+        // Terminal read finds one further fill whose stream frame was lost.
+        e.on_ioc_terminal("t1", 3, Venue::Kalshi, "K", 2_000_000_000);
+        assert_eq!(rv.open_ct("synth-attribution-rel"), 3.0);
+        assert_eq!(rv.reserved_ct(), 5.0, "maker capital survives terminal IOC release");
+        e.on_ioc_terminal("t1", 3, Venue::Kalshi, "K", 3_000_000_000);
+        e.attribute_fill("t1", 3, Venue::Kalshi, "K", 4.0, Instant::now());
+        assert_eq!(rv.open_ct("synth-attribution-rel"), 3.0, "late stream and repeated reads are idempotent");
+        assert_eq!(rv.reserved_ct(), 5.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -59,7 +59,7 @@ fn engine_shape_derives_cost_and_models_fees() {
 fn python_shape_uses_its_own_settled_cost_and_fees() {
     let out = build(PYTHON, "default", 1784646659.0);
     let r = &out["rows"][0];
-    assert_eq!(r["fees_settled"], true, "the ledger reported real fees");
+    assert_eq!(r["fees_settled"], false, "only Kalshi fees are reported; PM-US remains modeled");
     assert!((r["cost_usd"].as_f64().unwrap() - 43.9027).abs() < 1e-9);
     // cost_usd is ALL-IN, so fees must NOT be subtracted a second time
     assert!((r["net_usd"].as_f64().unwrap() - 6.0973).abs() < 1e-6);
@@ -880,4 +880,38 @@ fn the_strategy_board_shows_which_strategies_earned_the_rate() {
     let entry = out["by_strategy"].as_array().unwrap().iter()
         .find(|s| s["strategy"] == "maker-hedge").expect("the entry's strategy");
     assert_eq!(entry["realized_apr_pct"], serde_json::Value::Null);
+}
+
+#[test]
+fn settled_fees_require_every_leg_including_explicit_zero_fees() {
+    let mut rec: serde_json::Value = serde_json::from_str(ENGINE).unwrap();
+    rec["legs"][0]["fees"] = serde_json::json!("0");
+    let mixed = build(&rec.to_string(), "default", 1785250000.0);
+    assert_eq!(mixed["rows"][0]["fees_settled"], false);
+    rec["legs"][1]["fees"] = serde_json::json!("0.0134");
+    let settled = build(&rec.to_string(), "default", 1785250000.0);
+    assert_eq!(settled["rows"][0]["fees_settled"], true);
+    assert!((settled["rows"][0]["fees_usd"].as_f64().unwrap()-0.0134).abs()<1e-10);
+    rec["legs"] = serde_json::json!([]);
+    assert_eq!(build(&rec.to_string(), "default", 1785250000.0)["rows"][0]["fees_settled"], false);
+}
+
+#[test]
+fn verified_entry_and_exit_fees_are_each_charged_once() {
+    let entry = serde_json::json!({"ts":1789347984.1050923,"relationship_id":"r1","status":"open","qty":3,
+        "legs":[{"venue":"kalshi","side":"yes","role":"taker","qty":3,"yes_price":"0.0890","fees":"0.0171"},
+                {"venue":"polymarket_us","side":"no","role":"maker","qty":3,"yes_price":"0.14"}]});
+    let exit = serde_json::json!({"ts":1789751557.640962,"relationship_id":"r1","status":"unwound","qty":3,
+        "closes_ts":1789347984.1050923,"strategy":"maker-exit",
+        "legs":[{"venue":"kalshi","side":"yes","action":"sell","role":"taker","qty":3,"yes_price":"0.0490","fees":"0.0098"},
+                {"venue":"polymarket_us","side":"no","action":"sell","role":"taker","qty":3,"yes_price":"0.06","fees":"0.0100"}]});
+    let out = build(&format!("{entry}\n{exit}"), "default",1789751558.);
+    let r = out["rows"].as_array().unwrap().iter().find(|r|r["status"]=="unwound").unwrap();
+    assert!((r["entry_cost_usd"].as_f64().unwrap()-2.8641).abs()<1e-9);
+    assert!((r["exit_proceeds_usd"].as_f64().unwrap()-2.967).abs()<1e-9);
+    assert!((r["fees_usd"].as_f64().unwrap()-0.0198).abs()<1e-9);
+    assert!((r["net_usd"].as_f64().unwrap()-0.0831).abs()<1e-9);
+    assert_eq!(r["fees_settled"],true);
+    assert_eq!(r["entry_fees_settled"],false);
+    assert_eq!(r["round_trip_fees_settled"],false);
 }

@@ -860,6 +860,50 @@ pub fn install_armed_panic_hook() {
     }));
 }
 
+fn is_entry_ioc(req: &PlaceRequest) -> bool {
+    is_taker(req) && req.client_order_id.strip_prefix('t')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn ioc_terminal(venue: Venue, req: &PlaceRequest, cum: i64) -> serde_json::Value {
+    serde_json::json!({"kind": "ioc_terminal", "venue": venue.as_str(),
+        "market_id": req.market, "order_id": req.client_order_id,
+        "cum_qty": cum, "ts_local_ns": now_ns()})
+}
+
+/// Poll outside the serial executor: an unreadable IOC must retain its capital
+/// without delaying hedge placements or cancels. Only terminal venue evidence
+/// releases unused capacity; an elapsed timeout never does.
+fn track_entry_ioc(
+    venue: Venue, req: &PlaceRequest, vid: &str, sink: Arc<dyn OrderSink>,
+    acks: &Option<mpsc::Sender<crate::feed::FeedMsg>>,
+) {
+    if !is_entry_ioc(req) || acks.is_none() { return; }
+    let (req, vid, acks) = (req.clone(), vid.to_string(), acks.clone());
+    tokio::spawn(async move {
+        let mut attempt = 0u32;
+        loop {
+            if acks.as_ref().is_none_or(|tx| tx.is_closed()) { return; }
+            let (s, id) = (sink.clone(), vid.clone());
+            let result = tokio::task::spawn_blocking(move || s.terminal_filled_qty(&id)).await;
+            if let Ok(Ok(Some(cum))) = result {
+                if cum >= 0 && cum <= req.qty {
+                    tell_engine(&acks, ioc_terminal(venue, &req, cum)).await;
+                    return;
+                }
+            }
+            attempt = attempt.saturating_add(1);
+            if attempt >= 6 {
+                eprintln!("[risk] IOC {} still unverified; keeping its unfilled capital reserved",
+                    req.client_order_id);
+            }
+            tokio::time::sleep(Duration::from_secs(match attempt {
+                1 => 1, 2 => 2, 3 => 5, 4 => 10, 5 => 30, _ => 60,
+            })).await;
+        }
+    });
+}
+
 /// Tell the engine what a venue call decided.
 ///
 /// `acks` is the SAME channel the feed writes to, so a venue reply is an event
@@ -1046,6 +1090,9 @@ async fn run_executor(
                         p.price
                     );
                 }
+                if is_entry_ioc(p) {
+                    tell_engine(&acks, ioc_terminal(venue, p, 0)).await;
+                }
                 continue;
             }
         }
@@ -1202,6 +1249,9 @@ async fn run_executor(
             Action::Cancel { .. } | Action::SweepAndVerify => None,
         }) else {
             eprintln!("[exec] {venue:?}: HALTED mid-dispatch — place discarded, not sent");
+            if let Some(p) = placing.as_ref().filter(|p| is_entry_ioc(p)) {
+                tell_engine(&acks, ioc_terminal(venue, p, 0)).await;
+            }
             continue;
         };
         let res = tokio::task::spawn_blocking(move || {
@@ -1240,6 +1290,7 @@ async fn run_executor(
                             }),
                         )
                         .await;
+                        track_entry_ioc(venue, p, &vid, sink2.clone(), &acks);
                     }
                     _ => eprintln!("[exec] {venue:?} cancelled"),
                 }
@@ -1249,6 +1300,11 @@ async fn run_executor(
                 st2.failed.fetch_add(1, Ordering::Relaxed);
                 eprintln!("[exec] {venue:?} FAILED: {e}");
                 unreadable = place_answer_was_lost(&e);
+                if !unreadable {
+                    if let Some(p) = placing.as_ref().filter(|p| is_entry_ioc(p)) {
+                        tell_engine(&acks, ioc_terminal(venue, p, 0)).await;
+                    }
+                }
                 // THE VENUE SAID "NOT THIS MARKET, NOT YET", and until now
                 // nothing carried that back. A rejected place answered the
                 // engine with silence — the same gap `cancel_result` was
@@ -1309,8 +1365,8 @@ async fn run_executor(
         // proving it, which reaches this order without needing its id, and the
         // read would compete with the only evidence the halt accepts.
         let (Some(p), true, false) = (&placing, unreadable, halt.is_on()) else { continue };
-        let (req, mine) = (p.clone(), claimed.clone());
-        match tokio::task::spawn_blocking(move || sink2.recover_place(&req, &mine)).await {
+        let (req, mine, recovery_sink) = (p.clone(), claimed.clone(), sink2.clone());
+        match tokio::task::spawn_blocking(move || recovery_sink.recover_place(&req, &mine)).await {
             Ok(Ok(Some(vid))) => {
                 st2.recovered.fetch_add(1, Ordering::Relaxed);
                 claimed.insert(vid.clone());
@@ -1339,6 +1395,7 @@ async fn run_executor(
                     }),
                 )
                 .await;
+                track_entry_ioc(venue, p, &vid, sink2.clone(), &acks);
             }
             Ok(Ok(None)) => {}
             Ok(Err(e)) => eprintln!(
@@ -1393,6 +1450,7 @@ mod tests {
         /// that cannot be read at all, which is NOT the same answer as 0 — see
         /// `OrderSink::filled_qty`.
         prior_filled: Option<i64>,
+        terminal_filled: Option<i64>,
         /// Every order the executor asked the venue about, so "it never asked"
         /// is as observable as "it asked and ignored the answer". This is also
         /// what makes the read's cost against the shared budget testable: a
@@ -1457,6 +1515,9 @@ mod tests {
                 std::thread::sleep(d);
             }
             Ok(self.resting.lock().unwrap().clone())
+        }
+        fn terminal_filled_qty(&self, _: &str) -> Result<Option<i64>, VenueError> {
+            self.terminal_filled.map(Some).ok_or(VenueError::NotWired)
         }
         fn filled_qty(&self, order_id: &str) -> Result<i64, VenueError> {
             self.status_reads.lock().unwrap().push(order_id.to_string());
@@ -2678,4 +2739,34 @@ mod tests {
             "a maker that never reached a venue rests nothing and is naked nothing"
         );
     }
+    #[tokio::test]
+    async fn an_entry_ioc_reports_terminal_quantity_after_its_ack() {
+        let sink = Arc::new(Recorder { terminal_filled: Some(3), ..Default::default() });
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(taker_place("t123")).await.unwrap();
+        drop(tx);
+        let (atx, mut arx) = mpsc::channel(8);
+        run_executor(Venue::Kalshi, 0.0, Some(sink), rx, stats(),
+            Arc::new(Halt::default()), Some(atx)).await;
+        let ack: serde_json::Value = serde_json::from_str(&arx.recv().await.unwrap().line).unwrap();
+        assert_eq!(ack["kind"], "order_ack");
+        let terminal = tokio::time::timeout(Duration::from_secs(2), arx.recv()).await.unwrap().unwrap();
+        let terminal: serde_json::Value = serde_json::from_str(&terminal.line).unwrap();
+        assert_eq!(terminal["kind"], "ioc_terminal");
+        assert_eq!(terminal["order_id"], "t123");
+        assert_eq!(terminal["cum_qty"], 3);
+    }
+
+    #[tokio::test]
+    async fn a_definitive_entry_rejection_releases_but_a_lost_answer_does_not() {
+        let rejected = Arc::new(Recorder { refuse_places_from: 1,
+            place_err: Some(VenueError::Status { endpoint: "place", status: 400, body: "bad price".into() }),
+            ..Default::default() });
+        let (_, messages) = drain_reporting(Venue::Kalshi, rejected, vec![taker_place("t124")]).await;
+        assert!(messages.iter().any(|m| m["kind"] == "ioc_terminal" && m["cum_qty"] == 0));
+        let lost = Arc::new(Recorder { refuse_places_from: 1, ..Default::default() });
+        let (_, messages) = drain_reporting(Venue::Kalshi, lost, vec![taker_place("t125")]).await;
+        assert!(!messages.iter().any(|m| m["kind"] == "ioc_terminal"));
+    }
+
 }

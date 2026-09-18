@@ -2,10 +2,8 @@
 # Alert (ntfy, 30-min self-cooldown) when scan output goes stale while the
 # recorder is alive — catches a dead, hung, or crash-looping scanner.
 # Adversarial review P1 fix (2026-07-20): before this, nothing watched the scanner.
-# 2026-07-29: extended past the Python stack. It watched arbbot-recorder,
-# arbbot-scanner, data/raw and disk — and nothing else, so the Rust recorder,
-# the dry-run engine, the ARMED m3 session, data/raw-rs, data/health.jsonl and
-# data/health-rs.jsonl could all stop dead without a sound.
+# 2026-07-29: extended past the Python stack to cover the armed Rust engine and
+# its live feed. The retired shadow recorder/trader are intentionally omitted.
 set -u
 cd "$(dirname "$0")/.."
 TOPIC=$(python3 -c "import yaml;print(yaml.safe_load(open('config/recorder.yaml')).get('ntfy_topic',''))" 2>/dev/null)
@@ -113,42 +111,26 @@ else
   note "scanner service DOWN"
 fi
 
-# --- Rust stack ---
-# recorder-rs is --shadow and trader-rs has no --enable-orders: neither touches
-# money. Both are Restart=always/RestartSec=5, so a real crash self-heals inside
-# one 5-minute poll and the state that actually survives long enough to be seen
-# here is an operator's `systemctl stop` — e.g. freeing CPU for a cargo build,
-# which this repo already nices to 19 because builds starve the live feed.
-# Paging high on that trains the operator to swipe away the notification that
-# one day reads ARMED trader-m3 FAILED. Reported, quietly, on its own cooldown.
-if systemctl --user is-active --quiet arbbot-recorder-rs; then
-  # Same defect as the data/raw check above, fixed in the same breath:
-  # dormant today (the unit is stopped), wrong the day someone starts it.
-  newest_raw_rs=$(ls -t data/raw-rs/*-"$DAY".jsonl 2>/dev/null | head -1)
-  raw_rs_age=$(age "$newest_raw_rs")
-  [ "$raw_rs_age" -gt 900 ] && note "recorder-rs writing NOTHING for ${raw_rs_age}s"
-  health_rs_age=$(age data/health-rs.jsonl)
-  [ "$health_rs_age" -gt 120 ] && note "health-rs.jsonl not appended for ${health_rs_age}s (recorder-rs health task dead)"
-else
-  note "recorder-rs service DOWN"
-fi
-systemctl --user is-active --quiet arbbot-trader-rs || note "trader-rs service DOWN"
-# arbbot-trader-m3 is the ARMED, real-money session. Since 2026-08-01 it is
-# Restart=on-failure bounded at 3 tries in 600s (systemd/arbbot-trader-m3
-# .service:26) — the Restart=no this comment used to reason from is gone, and a
-# single crash now self-heals and is reported by the gauge block's RESTARTED
-# page, not here. The unit is still deliberately STOPPED between supervised
-# sessions, so is-active would page on every clean disarm, and an alarm that
-# cries wolf on an operator's own action is worse than no alarm. A clean stop
-# leaves it inactive/Result=success. What is-failed means now is that the
-# restart budget is SPENT: it crashed three times in ten minutes and systemd
-# has stopped trying — strictly more urgent than the reading it replaced.
+# --- Armed Rust trader ---
+# The armed trader retries failures indefinitely with 30s -> 5min backoff.
+# A manual stop stays inactive and must not page. A failed state means recovery
+# is no longer scheduled (for example invalid arguments), not an outage retry.
 if systemctl --user is-failed --quiet arbbot-trader-m3; then
-  armed_page "ARMED trader-m3 FAILED (Result=$(systemctl --user show arbbot-trader-m3 -p Result --value)) — the 3-in-600s restart budget is spent, it will NOT come back on its own"
+  armed_page "ARMED trader-m3 FAILED (Result=$(systemctl --user show arbbot-trader-m3 -p Result --value)) — automatic recovery is not scheduled; inspect the service journal"
+fi
+# Recovery must remain visible even though an auto-restarting service is not
+# is-failed. NRestarts is cumulative until reset: after three restarts, report
+# a current recovery wait even if earlier failures were separated by uptime.
+# Existing armed-page cooldown bounds notifications.
+if [ "$(systemctl --user show arbbot-trader-m3 -p SubState --value)" = auto-restart ]; then
+  recovery_attempts=$(systemctl --user show arbbot-trader-m3 -p NRestarts --value)
+  if [[ "$recovery_attempts" =~ ^[0-9]+$ ]] && [ "$recovery_attempts" -ge 3 ]; then
+    armed_page "ARMED trader-m3 RECOVERING after $recovery_attempts restarts — trading startup has not succeeded; retries continue automatically with up to 5min backoff"
+  fi
 fi
 # But is-failed returns 4, not 0, for a unit that is gone or unloadable, so on
 # its own it makes the ARMED unit the only one whose DISAPPEARANCE is silent —
-# the is-active checks above already page when the shadow units vanish.
+# the explicit LoadState check below is what catches disappearance.
 # arbbot-trader-m3.service is not tracked in this repo and carries hand-edited
 # --balance figures, so a typo'd directive plus a daemon-reload gives
 # LoadState=error and an armed session watched by nothing, forever. This fires

@@ -209,6 +209,20 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
         order.id.clone()
     }
 
+    fn terminal_filled_qty(&self, order_id: &str) -> Result<Option<i64>, VenueError> {
+        let o = self.settle.retry_404("pmus terminal_filled_qty", order_id, || {
+            self.order_status_at(Priority::Critical, order_id)
+        })?;
+        if matches!(o.state.as_deref(), Some("ORDER_STATE_FILLED" | "ORDER_STATE_CANCELED" | "ORDER_STATE_REJECTED" | "ORDER_STATE_EXPIRED")) {
+            o.try_filled_qty().filter(|n| *n >= 0).map(Some).ok_or_else(|| VenueError::Parse {
+                endpoint: "pmus terminal_filled_qty",
+                detail: "terminal order omitted a readable cumulative fill count".into(),
+            })
+        } else {
+            Ok(None)
+        }
+    }
+
     fn order_filled_qty(&self, order_id: &str) -> Result<i64, VenueError> {
         let o = self.settle.retry_404("pmus order_filled_qty", order_id, || {
             self.order_status_at(Priority::Critical, order_id)
@@ -537,6 +551,13 @@ impl<T: Transport> VenueGateway for PmusGateway<T> {
     /// rule: an empty answer is an affirmative claim about the account, and
     /// this one reads as "this venue can buy nothing", which closes every
     /// basket with a leg on it.
+    fn account_capital(&self) -> Result<super::capital::AccountCapital, VenueError> {
+        let b = self.call(Priority::Background, "GET", P_BALANCES, None)?;
+        if b.status != 200 { return Err(VenueError::Status {endpoint:"pmus capital",status:b.status,body:b.body}); }
+        let p = self.call(Priority::Background, "GET", P_POSITIONS, None)?;
+        if p.status != 200 { return Err(VenueError::Status {endpoint:"pmus capital positions",status:p.status,body:p.body}); }
+        super::capital::pmus(&b.body,&p.body)
+    }
     fn spendable_cash(&self) -> Result<String, VenueError> {
         match self.balances()?.balances.into_iter().next() {
             Some(b) => Ok(b.buying_power),

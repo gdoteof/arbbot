@@ -1,225 +1,16 @@
-//! MAKER EXIT: resting an offer that flattens a basket, when the passive exit
-//! pays against what we actually paid for it.
+//! Passive exits own inventory by (relationship, opening timestamp).
+//! Every eligible lot can rest its full remaining paired quantity, including
+//! multiple orders on the same market and orders away from the touch. Each
+//! order retains its own basis, fill receipts and durable recovery checkpoint.
+//! Shared registries preserve entry suppression and reconciliation stand-off
+//! until every sibling order and hedge has finished.
 //!
-//! `crate::unwind` selects. This places. Its module header is the spec this was
-//! written against and it is not restated here; what IS restated is which of its
-//! five obstacles this answers, which it answers by NARROWING THE TRADE rather
-//! than by solving, and which it leaves open. Read that file first.
-//!
-//! # A MAKER EXIT IS NOT THE TAKE, AND THE TAKE STILL LOSES MONEY
-//!
-//! `unwind_apr` on the france lots is about −111%/yr: crossing the spread to get
-//! out of them is a large realized loss and nothing here will ever do it. This
-//! RESTS and only trades if somebody comes to us. Those are different trades
-//! with different signs and the only reason this module can exist is that they
-//! are different.
-//!
-//! # WHICH LEG RESTS IS A CHOICE, AND IT USED TO BE MADE BY ACCIDENT
-//!
-//! **RETRACTED: "one resting Kalshi ask".** For the whole life of this module
-//! the passive leg was the Kalshi one, always, and the PM-US leg was always
-//! crossed. That was never argued for — it was the first shape written and it
-//! became the only shape. It is wrong on this book more often than it is right.
-//!
-//! An exit assigns each of the two legs a role, so the space is 2x2. Gross of
-//! fees the two single-maker cells differ by exactly
-//! `kalshi_spread - pmus_spread`: you capture the spread on the venue you rest
-//! at and you pay it on the venue you cross. Fees tilt it a further
-//! `0.0075 * p * (1 - p)` toward PM-US, which charges makers NOTHING while
-//! Kalshi charges them 0.0175. **So the rule is "rest where the spread is
-//! wider", and on this book that is overwhelmingly PM-US** — median Kalshi
-//! spread 1-3c against 2-9c on PM-US across the eleven pairs this engine holds.
-//! Resting on Kalshi meant capturing 3c and paying 8c, on every contract, for
-//! as long as this module has existed. [`Shape`] carries the measurement.
-//!
-//! # WHAT THIS DOES, EXACTLY
-//!
-//! One basket, one lot, one resting order, one cross on the other venue:
-//!
-//!   1. `unwind::select` picks candidates against the hurdle in force;
-//!   2. [`Debounce`] holds each one for [`DEBOUNCE_S`] of CONTINUOUS selection
-//!      across at least [`DEBOUNCE_SCANS`] scans;
-//!   3. the basis comes from `data/exec/trades.jsonl` — `naked_act::lot_at` on
-//!      BOTH legs of the ONE record `select` named, addressed by its
-//!      `opened_ts`;
-//!   4. BOTH shapes are priced off that one basis and the better lock wins
-//!      ([`decide`]). [`exit_limit`] solves for the resting leg when it is the
-//!      Kalshi ask; [`close_limit`] solves for it when it is the PM-US bid.
-//!      They are the same solver run with the other leg pinned, which is why
-//!      the two shapes cannot drift apart;
-//!   5. the entry quoter is asked to yield BOTH sides the winner might need —
-//!      the shape is not known until the books are priced — and given
-//!      [`SUPPRESS_SETTLE_S`] to do it. [`decide`] then checks the one it
-//!      actually picked;
-//!   6. ONE post-only GTC order rests, for at most [`MAX_CLIP`] contracts, on
-//!      whichever venue won;
-//!   7. on a fill the OTHER leg is closed with an IOC re-priced against the
-//!      book AT THAT MOMENT, and one `unwound` record naming that lot's `ts`
-//!      goes in through `ledger::append_basket`.
-//!
-//! Everything below that says "the ask" or "the Kalshi leg" about the RESTING
-//! order is describing [`Shape::RestKalshi`] specifically. The interlocks —
-//! [`MAX_RESTING`], the stand-off, the naked-leg halt — are shape-independent
-//! and unchanged: there is still at most ONE exit outstanding in this process,
-//! of either shape.
-//!
-//! # HOW §5's FIVE PROBLEMS ARE ANSWERED — THREE BY REFUSING TO HAVE THEM
-//!
-//!   * **AGGREGATE N BASKETS BEHIND ONE ASK, AND SPLIT A PARTIAL FILL BACK
-//!     ACROSS N `closes_ts`.** NOT DONE, AND NOT NEEDED, because the trade was
-//!     narrowed until the problem stopped existing. `unwind::select` already
-//!     answers "which lot" — it names the basket by `(rel_id, opened_ts)` — and
-//!     the exit is sized to THAT LOT ALONE. One exit therefore names exactly one
-//!     `closes_ts` and no split can arise. The cost is that a ticker carrying
-//!     six lots takes six passes to empty rather than one; the benefit is that
-//!     the hardest correctness requirement in that header is structurally
-//!     absent rather than implemented.
-//!
-//!     THIS USED TO SAY the lot was `worst_lot`'s dearest, and that pricing
-//!     against the dearest was "the only attribution-safe choice — contracts are
-//!     fungible, and an exit that pays against the dearest pays against every
-//!     other one". The first half was true of the code and the second half is
-//!     true of a ONE-LEGGED question, which this is not. `worst_lot` called once
-//!     per leg pairs the dearest Kalshi record with the dearest PM-US record,
-//!     and on a ticker with several lots those are DIFFERENT records: the
-//!     composite is dearer than any basket we ever traded and can exceed the $1
-//!     the pair pays, at which point no legal ask exits it. That is not
-//!     conservative, it is unsatisfiable, and it is what held
-//!     `maker_exit_closed` at 0. See `naked_act::lot_at`.
-//!   * **RECORD THAT AN EXIT IS OUTSTANDING.** [`Resting`], and it is the reason
-//!     `select` re-choosing the same basket next scan cannot rest a second ask:
-//!     [`Live::target`] refuses while anything is outstanding at all. The cap is
-//!     [`MAX_RESTING`] = 1 across the whole process, so "a second ask" is not a
-//!     bug this can express.
-//!   * **PULL THE ENTRY QUOTE FIRST.** [`request_suppress`] publishes the (market,
-//!     Ask) pair; `Engine::maker_exit_tick` merges it into every quoter's
-//!     suppress set and publishes back WHEN it did. Nothing is placed until that
-//!     has held for [`SUPPRESS_SETTLE_S`]. **THIS IS A BOUNDED WAIT AND NOT A
-//!     PROOF** — nothing here reads the venue's resting list — and the reason
-//!     that is acceptable is that the exit is POST-ONLY. Kalshi's self-trade
-//!     prevention answers a post-only collision by REJECTING the order, which
-//!     costs a log line and a cycle. The 14 deadlocked unwinds of card ed6a5910
-//!     were IOCs, where the same collision eats the whole clip.
-//!   * **RE-PRICE AT FILL TIME, AGAINST THE BOOK, AND ABANDON IF IT NO LONGER
-//!     PAYS.** [`close_limit`] does the re-price and [`Live::on_fill`] does the
-//!     abandon — but read what "abandon" means here, because it is NOT the same
-//!     as declining to trade. By the time this runs the Kalshi ask HAS FILLED:
-//!     we are already flat one leg and long the other. Refusing to close leaves
-//!     a naked PM-US short, which is a real directional position. So the refusal
-//!     is loud, lands on a must-stay-0 gauge, and is left to the naked-leg
-//!     reconciliation — see the last section.
-//!   * **§1, THE BLOCKER, IS RETRACTED IN FULL.** Both halves, on two dates,
-//!     re-derived rather than inherited:
-//!       - the half that BLOCKED went on 2026-07-31. That header was written
-//!         when the armed process ran three families; it now runs
-//!         `--rel-prefix xvus-`, and all 25 priced positions in
-//!         `data/exec/marks.json` are `xvus-`. The candidate set and the owned
-//!         set are no longer disjoint — they are identical. [`Live::target`]
-//!         still refuses anything `unwind` marked unactionable, so the test is
-//!         enforced rather than assumed.
-//!       - the COVERAGE GAP went on 2026-08-14, and this is what unblocks the
-//!         flywheel: an exit could only ever recycle capital somebody else's
-//!         writer had booked. `marks::build` now derives a missing cost basis
-//!         from the record's own legs (`marks::derived_basis`), so the
-//!         `source: arb-trader` baskets that were absent from `marks.json` are
-//!         rows in it — 31 records, about $133, on the ledger the day it
-//!         landed. **THIS MODULE CAN NOW EXIT A BASKET THIS ENGINE OPENED**,
-//!         and the previous sentence here said the opposite.
-//!         Two things bound what that opened. The basis those rows carry is
-//!         per-RECORD arithmetic, and `decide` re-derives it off the same record
-//!         through `naked_act::lot_at`, so a row this module accepts and a lot
-//!         it prices cannot disagree. (They could and did while `decide` used
-//!         `worst_lot`: marks priced the selected record and `decide` priced the
-//!         dearest leg of each venue, 0.9263 against 1.0023 on
-//!         `xvus-time-poty-26-artificialintelligence`.) And an INVERTED engine
-//!         basket
-//!         (Kalshi `side:"ask"`) publishes `maker_exit_ct: null`, which
-//!         `unwind::consider` refuses as `NotPriceable` before it is ever a
-//!         candidate; `lot_at` would refuse its direction here in any case.
-//!
-//! # THE DEBOUNCE IS SIZED ON THE TAPE, NOT ON A GUESS
-//!
-//! See [`DEBOUNCE_S`]. The short version: on 4,735 samples of
-//! `data/exec/marks_history.jsonl` spanning 172.7 h, 60% of every excursion
-//! above the two-tick floor is ONE SAMPLE LONG.
-//!
-//! # THREE ORDER-OWNERS, ONE ACCOUNT, AND THE RULE THAT DECIDES COLLISIONS
-//!
-//! This is not the only thing sending Kalshi orders on these markets. The engine
-//! hedges, `--positions-recon-act` completes naked legs from venue truth, and
-//! this rests exits — and every Kalshi order this binary sends carries
-//! `self_trade_prevention_type: taker_at_cross` (`arb_venue::wire`), which
-//! answers a collision by CANCELLING THE TAKER. This module is the maker in
-//! every one of those collisions, so its ask is never the order that dies. The
-//! other one is, and it dies quietly: an IOC that crossed our own resting ask
-//! comes back unfilled, and its owner reports that the book moved.
-//!
-//!   * **THE BACKSTOP COMPLETING A LEG WE ARE ALREADY WORKING.**
-//!     [`working_check`] stands `naked_act` off every market in
-//!     [`Live::working_set`] while an ARMED exit is working it. Armed only: a
-//!     shadow exit rests nothing, so standing the backstop off would cost a real
-//!     naked leg its completion for a trade that is not going to happen.
-//!   * **OUR ASK ON A MARKET THE ENGINE OWES A HEDGE ON.** There the engine's
-//!     hedge is the IOC, so the hedge is what `taker_at_cross` cancels and the
-//!     leg it was covering stays naked. [`decide`] refuses through
-//!     `naked_act::inflight_check` — the same registry the backstop reads, for
-//!     the same reason.
-//!   * **A NAKED LEG WE MADE OURSELVES.** [`Live::target`] refuses every new
-//!     exit once [`UNRESOLVED`] is non-zero, and that counter never decrements,
-//!     so the refusal is a LATCH cleared by a restart and by nothing else. What
-//!     it prevents is the compounding shape: a close that failed leaves the
-//!     ledger still calling the lot open, `unwind` re-selects it on the next
-//!     scan, and a second ask rests against contracts the venue sold an hour
-//!     ago. The refusal prints on every 60 s cycle while it holds, the same
-//!     cadence as every other "nothing to rest:" line — that is the alarm
-//!     working, not a loop to fix.
-//!
-//! THE STAND-OFF RELEASES ITSELF and nothing hands it over: an exit that fails
-//! its close clears [`Live::resting`] and latches `target` off, so the very next
-//! cycle publishes a working set without that market and the backstop is free to
-//! complete the leg this module just left naked. The one exception is an order
-//! this process could not address — a place or a cancel that never completed —
-//! which joins [`Live::unaddressable`] and is never released, because nothing
-//! here can learn that it is gone.
-//!
-//! # WHAT THIS STILL CANNOT DO
-//!
-//! It cannot make the fill-time PM close safe, only bounded. Between the Kalshi
-//! ask filling and the PM-US IOC returning we are one-legged, and if the IOC
-//! fails or is refused we STAY one-legged. Two things bound that and neither
-//! removes it: [`MAX_CLIP`] is 5 contracts, and `--positions-recon-act` already
-//! runs in this same binary every 5 minutes and completes profitable naked legs
-//! from venue truth. **THOSE TWO WILL FIGHT.** The naked leg this leaves is a
-//! `PmShort` finding, and `naked_act` answers a `PmShort` by BUYING Kalshi YES —
-//! i.e. by re-opening the basket this just exited. It will only do so
-//! profitably, against its own ledger basis, so the money is safe; what is not
-//! safe is an operator's model of what the process is doing. If both are armed,
-//! `positions_recon_acted` climbing in step with `maker_exit_unresolved` is that
-//! fight, and it is a reason to disarm one of them, not a curiosity. The
-//! stand-off above narrows that fight to its one legitimate case — the backstop
-//! completing a leg this module has ALREADY abandoned — and does not remove it.
-//!
-//! It also works ONE candidate per cycle and gives that cycle up when the
-//! candidate refuses. [`Live::target`] returns the first admitted candidate of
-//! `unwind::select`'s display order (`qty` descending, then forward APR) and
-//! [`cycle`] pushes the refusal and returns rather than trying the next one, so
-//! one candidate that refuses PERSISTENTLY — a floor above the bid, a PM-US book
-//! gone dark, no `polymarket_us` leg in the registry — blocks every candidate
-//! behind it for as long as it is selected. The debounce keeps folding for all
-//! of them, so nothing is lost but time; what is lost is a paying exit waiting
-//! behind an unexitable lot. It is left that way deliberately: trying the next
-//! candidate means publishing the UNION of their suppression requests, because
-//! `Engine::maker_exit_tick` drops the install stamp of any market absent from
-//! the current request and a rotating request would therefore never accumulate
-//! [`SUPPRESS_SETTLE_S`] — so the cheap-looking fix yields the entry quoter's
-//! ask on three markets in order to rest at most one exit.
-//!
-//! It also prices the PM close off a book that INCLUDES OUR OWN RESTING SIZE.
-//! `unwind::MIN_EXIT_CT` names this bias exactly — always adverse, a tick is a
-//! lower bound on it and not a bound — and the answer here is the same
-//! instalment: [`close_limit`] pays one full [`TICK`] THROUGH the ask it can
-//! see. On a book where our own quote is the only ask that is not enough, and
-//! nothing in this process can tell us when that is true.
+//! The lot module is the production execution path. Single-order helpers below
+//! also support the legacy unscoped test harness; their historical rotation
+//! policy does not limit production markets or portfolios.
+
+mod lot;
+mod batch;
 
 use crate::ledger;
 use crate::naked_act::{ceil_to_tick, lot_at, Held};
@@ -329,16 +120,6 @@ pub const DEBOUNCE_S: f64 = (DEBOUNCE_SCANS as f64 - 1.0) * CYCLE_S as f64;
 /// two-sample tape is exactly the noise this is filtering.
 pub const DEBOUNCE_SCANS: u32 = 3;
 
-/// Contracts in ONE resting exit.
-///
-/// Five, and the same reasoning as `naked_act::MAX_CLIP`, which this
-/// deliberately matches: everything here is priced off a basis RECONSTRUCTED
-/// from ledger records rather than off a fill we watched, and that
-/// reconstruction has never met live money. Five contracts bounds the cost of
-/// the reconstruction being wrong at a few dollars. A 34-lot france basket still
-/// empties — in seven passes, each re-decided from scratch against a fresh book.
-pub const MAX_CLIP: i64 = 5;
-
 /// The profit floor a maker exit must clear to be OPENED or KEPT, per contract,
 /// net of both legs' fees and against both legs' ledger basis.
 ///
@@ -365,15 +146,10 @@ pub const MAX_CLIP: i64 = 5;
 /// the first leg naked, which is strictly worse than being a little over
 /// budget." Completing a close is the same trade with the same asymmetry, so it
 /// keeps `MIN_LOCK` and `heal` keeps its cross-out.
-const EXIT_FLOOR: &str = crate::unwind::MIN_EXIT_CT_S;
+// Net of reconstructed entry cost, exit fees, and the hedge slippage allowance.
+const EXIT_FLOOR: &str = MIN_LOCK;
 
-/// Exits resting at once, across the whole process. ONE.
-///
-/// This is the answer to `unwind` §5's "a naive placer rests a SECOND ask", and
-/// it is a cap rather than a per-market interlock on purpose: a per-market rule
-/// would still let one pass rest five asks on five markets, five separate
-/// one-legged exposures, each of which becomes a naked PM-US short the moment it
-/// fills. One at a time means at most one leg can be in flight, ever.
+/// One reservation per lot; market and portfolio order counts are uncapped.
 pub const MAX_RESTING: usize = 1;
 
 /// How long a resting exit may hold the single [`MAX_RESTING`] slot while other
@@ -409,7 +185,7 @@ pub const MAX_RESTING_S: f64 = 3600.0;
 /// symmetric case — "never consult this for a HEDGE. Refusing a hedge leaves the
 /// first leg naked, which is strictly worse than being a little over budget" —
 /// and completing a close is the same trade with the same asymmetry. The sizes
-/// make it lopsided rather than arguable: [`MAX_CLIP`] is 5 and [`MAX_RESTING`]
+/// make it lopsided rather than arguable: the former five-contract clip is 5 and [`MAX_RESTING`]
 /// is 1, so at most five contracts are ever naked at once. Crossing out costs
 /// cents; carrying them costs up to $5 of unhedged direction for months.
 ///
@@ -916,7 +692,7 @@ impl Debounce {
 /// optimisation: under the old single shape there is NO legal Kalshi ask that
 /// exits it at a profit, at any price, ever — `exit_limit` refuses it — while a
 /// PM-US bid at the touch exits it profitably four samples in five.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Shape {
     /// Rest a post-only Kalshi ask (sell the YES we hold); on fill, cross the
     /// PM-US ask to buy the YES back. The original and only shape until now.
@@ -1355,7 +1131,7 @@ fn quantize_down(cx: &mut Cx, x: D, tick: D) -> D {
 
 /// CROSS BOTH LEGS NOW instead of resting one and waiting. See [`Order::cross`]
 /// for why, and for the arithmetic that decides when it is worth the spread.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Cross {
     /// Marketable limit for the leg that would otherwise have rested. The other
     /// leg is re-priced by `price_close` at fill time, exactly as it is after a
@@ -1369,9 +1145,12 @@ pub struct Cross {
 
 /// One exit, priced and ready to rest — or, when [`Order::cross`] is set, to
 /// cross.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Order {
     pub rel_id: String,
+    /// Old durable checkpoints predate opportunity-cost pricing.
+    #[serde(default)]
+    pub resolves_by: Option<String>,
     /// WHICH LEG RESTS. Everything below that reads "the resting leg" or "the
     /// close leg" resolves through this and not through the venue names.
     pub shape: Shape,
@@ -1544,6 +1323,35 @@ pub fn lock_per_ct(
     cx.sub(gross, paid)
 }
 
+/// Minimum realized profit for a passive reservation price. A standard paired
+/// basket pays $1 at resolution. Releasing V now is at least as valuable as
+/// holding when V * (1 + hurdle * years) >= 1. Also retain the basis/fee buffer.
+/// This uses the attainable hurdle as an opportunity-cost model, not a promise
+/// that future redeployment will earn that rate.
+fn reservation_floor(cx: &mut Cx, k_basis: D, pm_basis: D, resolves: Option<&str>,
+    hurdle: f64, now: f64) -> Result<D, String> {
+    let minimum = cx.parse_exact(EXIT_FLOOR);
+    let Some(resolves) = resolves else { return Ok(minimum); };
+    if !hurdle.is_finite() || hurdle < crate::APR_FLOOR {
+        return Err("untrusted hurdle for passive exit pricing".into());
+    }
+    let today = arb_core::resolve::today_iso(now);
+    let days = arb_core::resolve::parse_iso(resolves).ok_or("invalid resolution date")?
+        - arb_core::resolve::parse_iso(&today).ok_or("invalid current date")?;
+    let days = cx.from_i64(days.max(0));
+    let year = cx.parse_exact("365.25");
+    let years = cx.div(days, year);
+    let rate = cx.parse(&hurdle.to_string()).ok_or("invalid hurdle")?;
+    let hundred = cx.parse_exact("100");
+    let rate = cx.div(rate, hundred);
+    let growth = cx.mul(rate, years);
+    let denominator = cx.add(cx.one, growth);
+    let value = cx.div(cx.one, denominator);
+    let basis = cx.add(k_basis, pm_basis);
+    let profit = cx.sub(value, basis);
+    Ok(if cx.cmp(profit, minimum) == Ordering::Greater { profit } else { minimum })
+}
+
 /// Decide the exit for one debounced candidate. Pure.
 ///
 /// Every refusal is a `String` a human can act on: at 3am "the book is not
@@ -1629,7 +1437,7 @@ pub fn decide(
         Held::ShortYes,
     )
     .map_err(|e| refuse(format!("PM-US leg: {e}")))?;
-    let qty = k_lot.qty.min(pm_lot.qty).min(cand.qty).min(MAX_CLIP);
+    let qty = k_lot.qty.min(pm_lot.qty).min(cand.qty);
     if qty < 1 {
         return Err(refuse(format!(
             "nothing to exit on {}: kalshi lot {}, pm lot {}, marks {}",
@@ -1642,6 +1450,8 @@ pub fn decide(
     let pm_basis = cx
         .parse(&pm_lot.cost_per_ct)
         .ok_or_else(|| refuse(format!("unparseable PM-US basis {}", pm_lot.cost_per_ct)))?;
+    let min_lock = reservation_floor(cx, k_basis, pm_basis, cand.resolves_by.as_deref(),
+        view.apr_bar, wall_now())?.to_standard_notation_string();
     let tick = cx.parse_exact(TICK);
 
     // ------------------------------------------------------ the shape contest ---
@@ -1656,7 +1466,7 @@ pub fn decide(
         let pm_close = cx.add(pm_ask_d, tick);
         let floor = exit_limit(
             cx, fees, &quote.ladder, k_basis, pm_basis, pm_close, qty, Role::Maker, Role::Taker,
-            EXIT_FLOOR,
+            &min_lock,
         )?;
         let limit =
             rest_price(cx, &quote.ladder, floor, quote.yes_bid.as_deref(), quote.yes_ask.as_deref())?;
@@ -1685,7 +1495,7 @@ pub fn decide(
             ));
         }
         let ceiling = close_limit(
-            cx, fees, k_take, k_basis, pm_basis, qty, Role::Taker, Role::Maker, EXIT_FLOOR,
+            cx, fees, k_take, k_basis, pm_basis, qty, Role::Taker, Role::Maker, &min_lock,
         )?;
         let pm_bid = view.pm_bid.get(pm_market).map(String::as_str);
         let limit = rest_price_bid(cx, ceiling, pm_bid, Some(pm_ask.as_str()))?;
@@ -1695,30 +1505,10 @@ pub fn decide(
         Ok((limit, lock))
     })(cx);
 
-    // A shape that cannot clear MIN_LOCK is not a candidate for the contest,
-    // whatever the other one does. Priced-but-unprofitable and unpriceable are
-    // reported differently because they need different people.
-    // THE SAME FLOOR THE SELECTOR USED, on the price we are actually about to
-    // send. This used to be `MIN_LOCK` (0.005), which is ported verbatim from
-    // `hedge_naked_legs.py` and was chosen for a leg that is ALREADY NAKED and
-    // needs out — a case where half a cent beats carrying direction for months.
-    // It was never chosen for "should we exit a hedged position at all", and it
-    // is four times looser than `MIN_EXIT_CT`, the floor `unwind::consider` had
-    // to clear to admit this lot in the first place.
-    //
-    // The gap was reachable, not theoretical: `consider` screens on the MARKS
-    // snapshot and `select` will price off one up to 900 s old, while this
-    // re-prices against the book NOW. A lot admitted at 2c could therefore go
-    // out at 0.6c on a book that had moved — the exact case of owning at 0.95
-    // and selling at 0.96, which the 2c screen refuses and the 0.5c floor let
-    // through.
-    //
-    // `MIN_EXIT_CT` is a NOISE floor, not a profit target, and its own doc says
-    // why two ticks: the exit prices against a snapshot and the Kalshi fee term
-    // steps by a whole tick at qty=1, so anything clearing by less than that is
-    // measurement error. That reasoning is about the arithmetic, not about when
-    // it runs, so it applies here exactly as it does there.
-    let lock_floor = cx.parse_exact(crate::unwind::MIN_EXIT_CT_S);
+    // Price each passive exit against its actual lot and current hedge costs.
+    // The half-cent net buffer is shared with hedge completion; the marks
+    // snapshot's two-cent display threshold is not a realized-profit target.
+    let lock_floor = cx.parse_exact(&min_lock);
     let graded = |cx: &mut Cx, r: &Result<(D, D), String>| -> Result<(D, D), String> {
         match r {
             Ok((limit, lock)) if cx.cmp(*lock, lock_floor) != Ordering::Less => Ok((*limit, *lock)),
@@ -1727,7 +1517,7 @@ pub fn decide(
                  admitted it under",
                 cx.emit_6dp(*limit),
                 cx.emit_6dp(*lock),
-                crate::unwind::MIN_EXIT_CT_S
+                min_lock
             )),
             Err(e) => Err(e.clone()),
         }
@@ -1840,7 +1630,7 @@ pub fn decide(
                 pm_basis,
                 qty,
             );
-            let floor = cx.parse_exact(crate::unwind::MIN_EXIT_CT_S);
+            let floor = cx.parse_exact(&min_lock);
             if cx.cmp(lock, floor) == Ordering::Less {
                 return None;
             }
@@ -1860,6 +1650,7 @@ pub fn decide(
 
     Ok(Order {
         rel_id: cand.rel_id.clone(),
+        resolves_by: cand.resolves_by.clone(),
         shape,
         market: cand.market_id.clone(),
         pm_market: pm_market.to_string(),
@@ -2173,7 +1964,30 @@ pub struct PendingClose {
 }
 
 /// Everything the armed pass keeps between cycles.
+struct ExitOwnership {
+    pm_market: Option<String>,
+    market: Option<String>,
+    at: Instant,
+    suppress: BTreeSet<(String, String)>,
+    working: BTreeSet<String>,
+}
+
+impl Default for ExitOwnership {
+    fn default() -> Self {
+        Self { pm_market: None, market: None, at: Instant::now(), suppress: BTreeSet::new(), working: BTreeSet::new() }
+    }
+}
+
+type ExitOwners = std::sync::Arc<Mutex<BTreeMap<String, ExitOwnership>>>;
+
 pub struct Live {
+    // One independent order/hedge state machine per opening lot.
+    scope_market: Option<String>,
+    lot: Option<lot::State>,
+    plan_only: bool,
+    planned: Option<Order>,
+    quote_cache: Option<std::sync::Arc<Mutex<BTreeMap<String, Quote>>>>,
+    owners: Option<ExitOwners>,
     /// DECIDE, LOG, AND STOP. Everything above the wire runs — the view, the
     /// debounce, the ledger basis, the limit, every refusal — and the order is
     /// printed instead of sent.
@@ -2254,6 +2068,12 @@ impl Live {
         let mut cx = Cx::default();
         let fees = FeeSchedule::new(&mut cx);
         Live {
+            scope_market: None,
+            lot: None,
+            plan_only: false,
+            planned: None,
+            quote_cache: None,
+            owners: None,
             shadow,
             take_ok: false,
             ledger_path,
@@ -2267,6 +2087,51 @@ impl Live {
             cx,
             fees,
             parked: BTreeMap::new(),
+        }
+    }
+
+    fn owner_key(&self) -> Option<String> {
+        self.lot.as_ref().map(lot::State::key).or_else(|| self.scope_market.clone())
+    }
+
+    fn claim_pm_market(&self, pm: &str) -> bool {
+        let (Some(scope), Some(owners)) = (self.owner_key(), &self.owners) else { return true; };
+        let mut owners = owners.lock().unwrap_or_else(|e| e.into_inner());
+        if owners.iter().any(|(key, o)| key != &scope && o.market != self.scope_market && o.pm_market.as_deref() == Some(pm)
+            && (!o.working.is_empty() || !o.suppress.is_empty())) {
+            return false;
+        }
+        let owner = owners.entry(scope).or_default();
+        owner.pm_market = Some(pm.into());
+        owner.market = self.scope_market.clone();
+        true
+    }
+
+    fn request_suppress(&self, markets: BTreeSet<(String, String)>) {
+        if let (Some(scope), Some(owners)) = (self.owner_key(), &self.owners) {
+            let mut owners = owners.lock().unwrap_or_else(|e| e.into_inner());
+            owners.entry(scope.clone()).or_default().suppress = markets;
+            request_suppress(owners.values().flat_map(|o| o.suppress.iter().cloned()).collect());
+        } else {
+            request_suppress(markets);
+        }
+    }
+
+    fn publish_working(&self, markets: BTreeSet<String>) {
+        if let (Some(scope), Some(owners)) = (self.owner_key(), &self.owners) {
+            let mut owners = owners.lock().unwrap_or_else(|e| e.into_inner());
+            let owner = owners.entry(scope.clone()).or_default();
+            owner.working = markets;
+            owner.at = Instant::now();
+            if let Ok(mut global) = WORKING.lock() {
+                *global = Some(Working {
+                    markets: owners.values().flat_map(|o| o.working.iter().cloned()).collect(),
+                    // A busy healthy owner must not conceal a stalled owner.
+                    at: owners.values().map(|o| o.at).min().unwrap_or_else(Instant::now),
+                });
+            }
+        } else {
+            publish_working(markets);
         }
     }
 
@@ -2286,6 +2151,9 @@ impl Live {
     /// rest on.
     fn working_set(&self, extra: Option<&str>) -> BTreeSet<String> {
         let mut s = self.unaddressable.clone();
+        if self.lot.as_ref().is_some_and(lot::State::busy) {
+            s.extend(self.scope_market.iter().cloned());
+        }
         if let Some(r) = &self.resting {
             s.insert(r.order.market.clone());
         }
@@ -2323,15 +2191,9 @@ impl Live {
             // at the venue. See the gauge's own doc for why the two must never
             // share a number.
             return Err(format!(
-                "{outstanding} naked leg(s) outstanding — a Kalshi exit SOLD contracts whose \
-                 PM-US leg this process could not close or could not read, so the lot the \
-                 ledger still calls open is one the venue has already sold. Resting another \
-                 ask against it compounds the naked short by a clip a cycle, which is the \
-                 failure this halt exists to make unexpressible. `heal` IS WORKING ON IT every \
-                 cycle — re-reading venue truth, re-sizing to the shortfall and re-pricing — \
-                 and this clears the moment it is flat; no restart, and no hand. ({} of {} \
-                 candidate(s) are still held, and the debounce is still being folded for all \
-                 of them.)",
+                "{outstanding} unresolved exit order(s) or hedge(s) — pausing fresh exits \
+                 until their fills and remaining obligations are confirmed. Existing orders \
+                 continue to be managed. ({} of {} candidate(s) held)",
                 admitted.len(),
                 exits.len()
             ));
@@ -2370,9 +2232,10 @@ impl Live {
                 self.handover_age = 0;
             }
             return Err(format!(
-                "an exit is already resting ({} of {} in-scope candidate(s) held) — \
-                 MAX_RESTING is {MAX_RESTING}, so nothing else may rest until it fills or is \
-                 pulled",
+                "an exit is already resting on {} ({} contract(s); {} of {} candidate lots held) — \
+                 limit {MAX_RESTING} resting order per lot; other lots can rest independently",
+                r.order.market,
+                r.order.qty,
                 admitted.len(),
                 exits.len()
             ));
@@ -2380,8 +2243,7 @@ impl Live {
         if admitted.is_empty() {
             return Err(format!(
                 "{} candidate(s), none held for {DEBOUNCE_S:.0}s across {DEBOUNCE_SCANS} \
-                 scans — 60% of every excursion above the floor on the live tape is one \
-                 sample long",
+                 scans",
                 exits.len()
             ));
         }
@@ -2444,17 +2306,16 @@ impl Live {
 
 }
 
-/// `x` + millis — a SEPARATE id space from the engine's `m`/`h`/`t` and the
+/// `x` + monotonically allocated microseconds — a SEPARATE id space from the engine's `m`/`h`/`t` and the
 /// recon pass's `n`, so a post-mortem can tell whose order was whose.
 /// `gateway::is_ours` must recognise it or the kill sweep would not clean it up.
 pub fn client_order_id() -> String {
-    format!(
-        "x{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0)
-    )
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64).unwrap_or(0);
+    let previous = LAST.fetch_update(AtomicOrd::SeqCst, AtomicOrd::SeqCst,
+        |last| Some(now.max(last + 1))).expect("infallible update");
+    format!("x{}", now.max(previous + 1))
 }
 
 /// One line describing what was decided, used by both the shadow and the armed
@@ -2608,6 +2469,7 @@ pub const CYCLE_S: u64 = 60;
 const CYCLE: Duration = Duration::from_secs(CYCLE_S);
 
 /// What the loop needs that is not in [`Live`].
+#[derive(Clone)]
 pub struct Cfg {
     pub marks_path: String,
     /// This process's `--rel-prefix` scope, passed to `unwind::select` so a
@@ -2626,19 +2488,12 @@ pub struct Cfg {
 /// shared token bucket (quirk `xv-shared-api-budget`), and a private gateway
 /// here would be a second bucket against the same account.
 pub async fn exit_loop(
-    mut live: Live,
+    live: Live,
     cfg: Cfg,
     kalshi: std::sync::Arc<dyn crate::sink::OrderSink>,
     pmus: std::sync::Arc<dyn crate::sink::OrderSink>,
 ) {
-    let mut iv = tokio::time::interval(CYCLE);
-    iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        iv.tick().await;
-        for line in cycle(&mut live, &cfg, &kalshi, &pmus).await {
-            eprintln!("{line}");
-        }
-    }
+    batch::run(live, cfg, kalshi, pmus).await;
 }
 
 /// One cycle. Returns the lines the operator should see, for `unwind_tick`'s
@@ -2650,13 +2505,16 @@ async fn cycle(
     kalshi: &std::sync::Arc<dyn crate::sink::OrderSink>,
     pmus: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> Vec<String> {
+    if live.lot.as_ref().is_some_and(lot::State::busy) {
+        return lot::manage(live, engine_view().ok().as_ref(), kalshi, pmus).await;
+    }
     let mut out = Vec::new();
     // WHAT WE ARE WORKING, BEFORE ANYTHING CAN RETURN. Published first so that
     // every early return below — an unusable view, a failed scan, a held
     // target — leaves the backstop reading a set this cycle actually built,
     // and so that a market this module has just given up on is given up on
     // within one cycle rather than at the next successful place.
-    publish_working(live.working_set(None));
+    live.publish_working(live.working_set(None));
     let view = match engine_view() {
         Ok(v) => v,
         Err(why) => {
@@ -2666,9 +2524,9 @@ async fn cycle(
             // exit that it can no longer value.
             if live.resting.is_some() {
                 out.push(format!("[maker-exit] engine view unusable ({why}) — pulling the ask"));
-                out.extend(pull(live, kalshi, pmus).await);
+                out.extend(pull(live, None, kalshi, pmus).await);
             }
-            request_suppress(BTreeSet::new());
+            live.request_suppress(BTreeSet::new());
             return out;
         }
     };
@@ -2687,7 +2545,7 @@ async fn cycle(
     }
 
     let marks = std::fs::read_to_string(&cfg.marks_path).unwrap_or_default();
-    let sel = crate::unwind::select(
+    let sel = crate::unwind::select_passive(
         &marks,
         view.apr_bar,
         view.global_cap_usd,
@@ -2695,11 +2553,14 @@ async fn cycle(
         wall_now(),
     );
     let exits = match sel {
-        Ok((e, _)) => e,
+        Ok((e, _)) => e.into_iter().filter(|e| {
+            live.scope_market.as_ref().is_none_or(|m| m == &e.market_id)
+                && live.lot.as_ref().is_none_or(|lot| lot.matches(e))
+        }).collect::<Vec<_>>(),
         Err(why) => {
             out.push(format!("[maker-exit] NO SCAN — cannot decide: {why}"));
             // Keep suppressing whatever is resting; select nothing new.
-            request_suppress(live.resting.iter().map(|r| rest_key(&r.order)).collect());
+            live.request_suppress(live.resting.iter().map(|r| rest_key(&r.order)).collect());
             return out;
         }
     };
@@ -2707,7 +2568,8 @@ async fn cycle(
     let target = match live.target(&exits, now, outstanding()) {
         Ok(e) => e.clone(),
         Err(why) => {
-            out.push(format!("[maker-exit] nothing to rest: {why}"));
+            let scope = live.scope_market.as_deref().unwrap_or("unscoped");
+            out.push(format!("[maker-exit] market={scope}: no additional order: {why}"));
             // ...but the slot may have been held too long by an ask nothing is
             // going to lift. Pull it HERE rather than inside `target`, which is
             // pure and does not own the wire. The next cycle then re-decides
@@ -2715,9 +2577,9 @@ async fn cycle(
             // every other decision here takes.
             if let Some(reason) = live.rotate.take() {
                 out.push(format!("[maker-exit] ROTATING — {reason}"));
-                out.extend(pull(live, kalshi, pmus).await);
+                out.extend(pull(live, Some(&view), kalshi, pmus).await);
             }
-            request_suppress(live.resting.iter().map(|r| rest_key(&r.order)).collect());
+            live.request_suppress(live.resting.iter().map(|r| rest_key(&r.order)).collect());
             return out;
         }
     };
@@ -2731,7 +2593,7 @@ async fn cycle(
     // publication at the top of this cycle did not know which candidate would be
     // picked, and the recon pass runs on its own 5-minute timer inside this
     // process.
-    publish_working(live.working_set(Some(&target.market_id)));
+    live.publish_working(live.working_set(Some(&target.market_id)));
 
     let Some(pm) = cfg.pm_market.get(&target.rel_id).cloned() else {
         out.push(refuse(format!(
@@ -2741,9 +2603,15 @@ async fn cycle(
         )));
         // Nothing about this target may rest, but whatever IS resting still
         // must keep its quote yielded.
-        request_suppress(want);
+        live.request_suppress(want);
         return out;
     };
+    if !live.claim_pm_market(&pm) {
+        live.publish_working(live.working_set(None));
+        live.request_suppress(want);
+        out.push(format!("[maker-exit] {pm} is owned by another exit; keeping one owner per venue market"));
+        return out;
+    }
     // BOTH sides this candidate might rest, published before the decision — the
     // first cycle that picks a market ASKS and the next one places, which is
     // what `decide`'s settle guard refuses on by name.
@@ -2752,25 +2620,36 @@ async fn cycle(
     // unconditionally under the flag rather than after pricing, because the
     // shape — and so which side a cross would hit — is not known until the
     // books are read, which is the same reason `candidate_keys` yields both.
-    if live.take_ok {
+    if live.take_ok || live.lot.is_some() {
         want.extend(cross_keys(&target.market_id, &pm));
     }
-    request_suppress(want);
-    let market = target.market_id.clone();
-    let k = kalshi.clone();
-    let quote = match tokio::task::spawn_blocking(move || k.market_quote(&market)).await {
-        Ok(Ok(q)) => q,
-        Ok(Err(e)) => {
-            out.push(refuse(format!(
-                "[maker-exit] NO QUOTE for {} ({e}) — cannot price an exit",
-                target.market_id
-            )));
-            return out;
+    live.request_suppress(want);
+    if live.lot.is_some() && cross_keys(&target.market_id, &pm).iter().any(|key|
+        view.suppressed_at.get(key).is_none_or(|since|
+            since.elapsed().as_secs_f64() < SUPPRESS_SETTLE_S)) {
+        out.push(format!("[maker-exit] {}: waiting for entry quotes to yield the hedge sides", target.market_id));
+        return out;
+    }
+    let cached = live.quote_cache.as_ref().and_then(|cache|
+        cache.lock().unwrap_or_else(|e| e.into_inner()).get(&target.market_id).cloned());
+    let quote = if let Some(q) = cached { q } else {
+        let market = target.market_id.clone();
+        let k = kalshi.clone();
+        let q = match tokio::task::spawn_blocking(move || k.market_quote(&market)).await {
+            Ok(Ok(q)) => q,
+            Ok(Err(e)) => {
+                out.push(refuse(format!("[maker-exit] NO QUOTE for {} ({e})", target.market_id)));
+                return out;
+            }
+            Err(e) => {
+                out.push(refuse(format!("[maker-exit] quote task failed for {} ({e})", target.market_id)));
+                return out;
+            }
+        };
+        if let Some(cache) = &live.quote_cache {
+            cache.lock().unwrap_or_else(|e| e.into_inner()).insert(target.market_id.clone(), q.clone());
         }
-        Err(e) => {
-            out.push(refuse(format!("[maker-exit] quote task failed for {} ({e})", target.market_id)));
-            return out;
-        }
+        q
     };
     let records = match ledger::read(&live.ledger_path) {
         Ok(r) => r,
@@ -2805,7 +2684,8 @@ async fn cycle(
     if live.shadow {
         return out;
     }
-    out.extend(place(live, order, &view, kalshi, pmus).await);
+    if live.plan_only { live.planned = Some(order); }
+    else { out.extend(place(live, order, &view, kalshi, pmus).await); }
     out
 }
 
@@ -2961,6 +2841,9 @@ async fn place(
     pmus: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> Vec<String> {
     use arb_venue::gateway::{PlaceRequest, Side, Tif};
+    if live.lot.is_some() {
+        return lot::place(live, order, view, kalshi, pmus).await;
+    }
     if order.cross.is_some() {
         return cross(live, order, view, kalshi, pmus).await;
     }
@@ -3354,39 +3237,21 @@ async fn manage(
                  closing, so nothing else can trade while the other leg is open",
                 r.order.rest_market(), r.order.qty
             ));
-            let (lines, unaddressable) = cancel_at_venue(rest_sink, &r).await;
+            let (lines, _) = cancel_at_venue(rest_sink, &r).await;
             out.extend(lines);
-            if let Some(m) = unaddressable {
-                live.unaddressable.insert(m);
-            }
-            // ...and the count is RE-READ after the cancel. Anything that traded
-            // between the poll and the cancel is ours too, and closing less than
-            // we sold is precisely the naked leg this path exists to avoid.
-            //
-            // THROUGH THE REST SINK, which is the only venue that has ever heard
-            // of this order id. This read was hardcoded to `kalshi` while that
-            // was the only venue an exit could rest on; under `Shape::RestPmUs`
-            // the id is a PM-US one, asking Kalshi about it errors, and the
-            // error falls through to the lower bound below — so a fill that
-            // raced the cancel would go naked and unbooked, which is the exact
-            // failure this re-read exists to prevent.
             let k = rest_sink.clone();
             let id = r.venue_order_id.clone();
-            match tokio::task::spawn_blocking(move || k.filled_qty(&id)).await {
-                Ok(Ok(n)) => n.max(filled),
-                // Unreadable after the cancel. `filled` is a LOWER bound and is
-                // still the best number we have, so close that much rather than
-                // nothing — and say that the difference, if any, is invisible.
+            match tokio::task::spawn_blocking(move || k.terminal_filled_qty(&id)).await {
+                Ok(Ok(Some(n))) if n >= filled => n,
                 _ => {
                     out.push(format!(
-                        "[maker-exit] could not re-read {} after the cancel — closing the \
-                         {filled} we know traded. If the cancel raced a further fill, the \
-                         difference is naked and unbooked; CHECK BY HAND.",
+                        "[maker-exit] {} has {filled} known fills but its final cancelled quantity is unconfirmed; retaining the order and retrying before closing its hedge",
                         r.order.rest_market()
                     ));
-                    filled
+                    return out;
                 }
             }
+
         };
         if settled > r.order.qty {
             // The venue reports more filled than we ordered. Same clamp and same
@@ -3409,7 +3274,7 @@ async fn manage(
         Ok(()) => out,
         Err(why) => {
             out.push(format!("[maker-exit] PULLING {} — {why}", r.order.market));
-            out.extend(pull(live, kalshi, pmus).await);
+            out.extend(pull(live, Some(view), kalshi, pmus).await);
             out
         }
     }
@@ -3428,94 +3293,67 @@ fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> 
         return Err("a price on the resting exit does not parse".into());
     };
     let tick = cx.parse_exact(TICK);
-    // A one-rung penny ladder is enough to re-derive the bound: we are only
-    // asking whether it has passed the price we are already at, and the real
-    // ladder was used to pick that price.
-    let ladder = vec![("0.0000".to_string(), "1.0000".to_string(), "0.0100".to_string())];
-    match o.shape {
-        // We are RESTING an ask. The bound is a FLOOR and it rises as the PM-US
-        // ask we would cross gets dearer.
+    let (k_sell, pm_buy) = match o.shape {
         Shape::RestKalshi => {
-            let Some(pm_ask) = view.pm_ask.get(&o.pm_market) else {
-                return Err(format!(
-                    "the PM-US book for {} has gone dark, so the close leg can no longer be \
-                     valued",
-                    o.pm_market
-                ));
-            };
-            let Some(pm_ask_d) = cx.parse(pm_ask) else {
-                return Err("a price on the resting exit does not parse".into());
-            };
-            let pm_close = cx.add(pm_ask_d, tick);
-            let floor = exit_limit(
-                cx, fees, &ladder, k_basis, pm_basis, pm_close, o.qty, Role::Maker, Role::Taker,
-                EXIT_FLOOR,
-            )?;
-            if cx.cmp(resting, floor) == Ordering::Less {
-                return Err(format!(
-                    "the PM-US ask has moved to {pm_ask}, which puts the profit floor at {} — \
-                     above the {} we are resting at, so a fill here would no longer lock \
-                     {EXIT_FLOOR}/ct",
-                    cx.emit_6dp(floor),
-                    o.limit
-                ));
-            }
+            let ask = view.pm_ask.get(&o.pm_market)
+                .ok_or_else(|| format!("the PM-US book for {} has gone dark", o.pm_market))?;
+            let ask = cx.parse(ask).ok_or("the PM-US ask does not parse")?;
+            (resting, cx.add(ask, tick))
         }
-        // We are RESTING a bid. The bound is a CEILING and it falls as the
-        // Kalshi bid we would sell into gets cheaper — the same test with the
-        // inequality turned over, for the same reason.
         Shape::RestPmUs => {
-            let Some(k_bid) = view.k_bid.get(&o.market) else {
-                return Err(format!(
-                    "the Kalshi book for {} has gone dark, so the close leg can no longer be \
-                     valued",
-                    o.market
-                ));
-            };
-            let Some(k_bid_d) = cx.parse(k_bid) else {
-                return Err("a price on the resting exit does not parse".into());
-            };
-            let k_take = cx.sub(k_bid_d, tick);
-            let ceiling = close_limit(
-                cx, fees, k_take, k_basis, pm_basis, o.qty, Role::Taker, Role::Maker,
-                EXIT_FLOOR,
-            )?;
-            if cx.cmp(resting, ceiling) == Ordering::Greater {
-                return Err(format!(
-                    "the Kalshi bid has moved to {k_bid}, which puts the profit ceiling at {} \
-                     — below the {} we are bidding, so a fill here would no longer lock \
-                     {MIN_LOCK}/ct",
-                    cx.emit_6dp(ceiling),
-                    o.limit
-                ));
-            }
+            let bid = view.k_bid.get(&o.market)
+                .ok_or_else(|| format!("the Kalshi book for {} has gone dark", o.market))?;
+            let bid = cx.parse(bid).ok_or("the Kalshi bid does not parse")?;
+            (cx.sub(bid, tick), resting)
         }
+    };
+    for price in [k_sell, pm_buy] {
+        if !cx.is_pos(price) || cx.cmp(price, cx.one) != Ordering::Less {
+            return Err("the close leg no longer has a valid executable price".into());
+        }
+    }
+    // Evaluate the actual resting price. Rounding a derived bound to a penny
+    // incorrectly pulls valid sub-cent Kalshi exits on an unchanged book.
+    let lock = lock_per_ct(cx, fees, o.shape.roles(), k_sell, pm_buy, k_basis, pm_basis, o.qty);
+    let floor = reservation_floor(cx, k_basis, pm_basis, o.resolves_by.as_deref(), view.apr_bar, wall_now())?;
+    if cx.cmp(lock, floor) == Ordering::Less {
+        let moved = match o.shape {
+            Shape::RestKalshi => "PM-US ask moved above the profit floor",
+            Shape::RestPmUs => "Kalshi bid moved below the profit ceiling",
+        };
+        return Err(format!("{moved}: {} would no longer lock {}/ct (now {})",
+            o.limit, cx.emit_6dp(floor), cx.emit_6dp(lock)));
     }
     Ok(())
 }
 
-/// Cancel the resting ask and forget it.
-///
-/// Forgetting it on a FAILED cancel too, deliberately, and this is the one place
-/// that choice is not obviously right. The alternative — keep it and retry — is
-/// worse: `filled_qty` is still polled every cycle for as long as we remember
-/// it, so a cancel that failed because the order had already filled is caught
-/// next cycle either way, while an order the venue has already removed would be
-/// retried for ever. What is NOT covered is a cancel that failed and left the
-/// order resting: the account-wide sweep at kill and at exit reaches it (it
-/// carries an `x` id, which `gateway::is_ours` recognises), and nothing else
-/// does — but the market joins [`Live::unaddressable`], so nothing else in this
-/// process will cross it in the meantime either.
+/// Cancel an exit, then reconcile any fill that raced the cancel. Failed
+/// cancels and unreadable final counts retain the order for the next cycle.
 async fn pull(
     live: &mut Live,
+    view: Option<&EngineView>,
     kalshi: &std::sync::Arc<dyn crate::sink::OrderSink>,
     pmus: &std::sync::Arc<dyn crate::sink::OrderSink>,
 ) -> Vec<String> {
-    let Some(r) = live.resting.take() else { return Vec::new() };
-    let (rest_sink, _) = sinks(r.order.shape, kalshi, pmus);
-    let (out, unaddressable) = cancel_at_venue(rest_sink, &r).await;
-    if let Some(m) = unaddressable {
-        live.unaddressable.insert(m);
+    let Some(r) = live.resting.clone() else { return Vec::new() };
+    let (rest_sink, close_sink) = sinks(r.order.shape, kalshi, pmus);
+    let (mut out, unaddressable) = cancel_at_venue(rest_sink, &r).await;
+    if unaddressable.is_some() {
+        out.push("[maker-exit] retaining the exit id and retrying its cancel next cycle".into());
+        return out;
+    }
+    let (sink, id) = (rest_sink.clone(), r.venue_order_id.clone());
+    match tokio::task::spawn_blocking(move || sink.terminal_filled_qty(&id)).await {
+        Ok(Ok(Some(0))) => { live.resting = None; }
+        Ok(Ok(Some(n))) if n > 0 && n <= r.order.qty => {
+            if let Some(view) = view {
+                out.push(format!("[maker-exit] {n} contracts filled while cancelling {}; closing the other leg", r.order.rest_market()));
+                out.extend(close_leg(live, view, &r, n, rest_sink, close_sink).await);
+            } else {
+                out.push(format!("[maker-exit] {n} contracts filled while cancelling; retaining the order until the hedge book is available"));
+            }
+        }
+        _ => out.push("[maker-exit] final cancel fill count unconfirmed; retaining the order for reconciliation".into()),
     }
     out
 }
@@ -3556,8 +3394,7 @@ async fn cancel_at_venue(
         Ok(Err(e)) => (
             vec![format!(
                 "[maker-exit] CANCEL FAILED on {} ({e}) — order {} may still be RESTING. It \
-                 carries client id {} and the account-wide sweep will reach it at kill or exit; \
-                 nothing else will.",
+                 carries client id {}; its owner must retain tracking until cancellation is confirmed.",
                 r.order.rest_market(), r.venue_order_id, r.client_order_id
             )],
             Some(r.order.rest_market().to_string()),
@@ -4146,7 +3983,7 @@ mod tests {
     /// An ordinary open basket in the live ledger's commonest shape: PM-US
     /// short YES at `pm_yes` (so `1 - pm_yes` a contract of NO), Kalshi long YES
     /// at `k_yes`, both maker so the recorded fee is zero-ish.
-    fn open_basket(ts: f64, qty: i64, pm_yes: &str, k_yes: &str) -> Value {
+    pub(super) fn open_basket(ts: f64, qty: i64, pm_yes: &str, k_yes: &str) -> Value {
         v(&format!(
             r#"{{"ts":{ts},"relationship_id":"r1","status":"open","qty":{qty},"legs":[
                  {{"venue":"polymarket_us","market_id":"p-a","side":"no","role":"maker",
@@ -4156,13 +3993,13 @@ mod tests {
         ))
     }
 
-    fn cand(qty: i64, opened_ts: f64) -> Cand {
+    pub(super) fn cand(qty: i64, opened_ts: f64) -> Cand {
         Cand {
-            rel_id: "r1".into(),
-            market_id: "K-a".into(),
+            rel_id: "r1".into(),            market_id: "K-a".into(),
             opened_ts,
             qty,
             fwd_apr: 11.0,
+            resolves_by: None,
             exit_ct: 0.03,
             // Not crossable by default: the cross is opt-in and every test written
             // before it keeps asserting the resting exit it was written about.
@@ -4187,7 +4024,7 @@ mod tests {
     }
 
     /// A view with the market already yielded long enough to place.
-    fn view(pm_ask: &str) -> EngineView {
+    pub(super) fn view(pm_ask: &str) -> EngineView {
         // A ONE-TICK PM-US BOOK BY DEFAULT, so `Shape::RestPmUs` has almost no
         // spread to capture and pays the Kalshi TAKER fee for the privilege:
         // shape A wins, and every test written before the shape contest keeps
@@ -4910,7 +4747,7 @@ mod tests {
         l.resting = Some(Resting {
             order: Order {
                 rel_id: "r1".into(),
-                market: "K-a".into(),
+                resolves_by: None,                market: "K-a".into(),
                 pm_market: "p-a".into(),
                 qty: 5,
                 limit: "0.5000".into(),
@@ -4929,7 +4766,9 @@ mod tests {
         });
         let why = l.target(&c, t0 + 4.0 * DEBOUNCE_S, 0).expect_err("one at a time");
         assert!(why.contains("already resting"), "{why}");
-        assert!(why.contains("MAX_RESTING"), "and it names the cap: {why}");
+        assert!(why.contains("on K-a (5 contract(s)"), "names the working market and size: {why}");
+        assert!(why.contains("1 resting order per lot"), "names the per-lot reservation: {why}");
+        assert!(why.contains("other lots can rest independently"), "{why}");
     }
 
     /// The debounce is still folded on a cycle that cannot place, or every
@@ -4942,7 +4781,7 @@ mod tests {
         l.resting = Some(Resting {
             order: Order {
                 rel_id: "r1".into(),
-                market: "K-a".into(),
+                resolves_by: None,                market: "K-a".into(),
                 pm_market: "p-a".into(),
                 qty: 5,
                 limit: "0.5000".into(),
@@ -4986,12 +4825,12 @@ mod tests {
         }
         let before = refused();
         let why = l.target(&c, t0 + 3.0 * DEBOUNCE_S, 1).expect_err("one naked leg is enough");
-        assert!(why.contains("1 naked leg(s) outstanding"), "it names the count: {why}");
+        assert!(why.contains("1 unresolved exit order(s) or hedge(s)"), "it names the count: {why}");
         // The copy must NOT still promise a restart: `heal` clears this, and an
         // operator who reads "RESTARTED" at 3am restarts a process that was
         // already fixing itself — losing the debounce and the queue for nothing.
         assert!(!why.contains("RESTARTED"), "the restart claim is retracted: {why}");
-        assert!(why.contains("`heal` IS WORKING ON IT"), "and says what clears it: {why}");
+        assert!(why.contains("until their fills and remaining obligations are confirmed"), "and says what clears it: {why}");
         assert_eq!(
             refused(),
             before,
@@ -5262,7 +5101,7 @@ mod tests {
             false,
         )
         .expect("a priced exit");
-        assert_eq!(o.qty, MAX_CLIP, "capped at the clip, not the 34-lot");
+        assert_eq!(o.qty, 34, "all remaining inventory in this lot may rest");
         assert_eq!(o.closes_ts, 1.0, "ONE lot, so ONE closes_ts — no split");
         // 0.19 PLUS the Kalshi MAKER fee the schedule charges on a 34-lot at
         // that price, per contract. The basis is all-in — `worst_lot` computes
@@ -5476,27 +5315,9 @@ mod tests {
         assert_eq!(out.len(), 1, "three independent scans past the window admit it");
     }
 
-    /// **OWNING AT 0.95 AND SELLING AT 0.96 IS NOT AN EXIT, IT IS A FEE.**    /// **OWNING AT 0.95 AND SELLING AT 0.96 IS NOT AN EXIT, IT IS A FEE.**
-    ///
-    /// The floor `decide` grades on used to be `MIN_LOCK` (0.005) while the
-    /// selector that admitted the lot used `MIN_EXIT_CT` (0.02) — four times
-    /// tighter. The gap was reachable, not theoretical: `consider` screens on a
-    /// MARKS snapshot `select` will price off at up to 900 s old, and `decide`
-    /// re-prices against the book NOW, so a lot admitted at 2c could go out at
-    /// 0.6c on a book that had moved.
-    ///
-    /// This is that case with real numbers, and the answer is better than a
-    /// refusal: THE SOLVER ASKS A HIGHER PRICE. The dear lot (PM leg cost 0.90,
-    /// Kalshi 0.194) used to rest at 0.3300 for a lock of 0.012046/ct —
-    /// comfortably over the old floor, comfortably under the one the selector
-    /// used. Aiming the same solver at the same floor the selector used walks it
-    /// one rung further up the ladder: 0.3400, locking 0.022046/ct.
-    ///
-    /// So the fix does not forgo the exit, it prices it. A refusal happens only
-    /// when NO rung on the ladder reaches the floor — which is the honest answer
-    /// in that case, because a price that does not exist cannot be rested at.
+    /// Profitable exits under two cents no longer pay for an extra price rung.
     #[tokio::test]
-    async fn a_lock_between_the_two_floors_is_re_priced_not_taken() {
+    async fn a_profitable_exit_below_two_cents_is_allowed() {
         let _g = allow_all().await;
         let (mut cx, fees) = ready();
         let recs = vec![open_basket(1.0, 5, "0.10", "0.19")];
@@ -5512,21 +5333,18 @@ mod tests {
             false,
         )
         .expect("the ladder has a rung that clears the selection floor");
-        assert_eq!(o.limit, "0.3400", "one rung above the 0.3300 the old floor settled for: {o:?}");
+        assert_eq!(o.limit, "0.3300", "fees and the hedge buffer are already included: {o:?}");
         let lock: f64 = o.lock_ct.parse().expect("a decimal");
         assert!(
-            lock >= 0.02,
-            "and it clears the floor the selector admitted this lot under: {}",
+            (0.005..0.02).contains(&lock),
+            "the actual net lock is positive but below the old fixed target: {}",
             o.lock_ct
         );
     }
 
-    /// The floor `decide` grades on IS the floor `unwind::consider` admits on.
-    /// Two constants would drift, and the drift is invisible: the selector would
-    /// go on admitting lots the wire then refuses, or worse, the other way.
     #[test]
-    fn the_exit_floor_is_the_selection_floor() {
-        assert_eq!(EXIT_FLOOR, crate::unwind::MIN_EXIT_CT_S);
+    fn passive_exit_and_completion_share_the_net_buffer() {
+        assert_eq!(EXIT_FLOOR, MIN_LOCK);
     }
 
     /// EVERY LOT ON THE TICKER GETS ITS OWN PRICE.    /// EVERY LOT ON THE TICKER GETS ITS OWN PRICE.
@@ -5724,7 +5542,7 @@ mod tests {
     fn the_close_books_against_the_one_lot_it_was_sized_to() {
         let o = Order {
             rel_id: "r1".into(),
-            market: "K-a".into(),
+                resolves_by: None,            market: "K-a".into(),
             pm_market: "p-a".into(),
             qty: 5,
             limit: "0.2100".into(),
@@ -5767,7 +5585,7 @@ mod tests {
         let _g = crate::naked_act::TEST_SERIAL.lock().await;
         let o = Order {
             rel_id: "r1".into(),
-            market: "K-a".into(),
+                resolves_by: None,            market: "K-a".into(),
             pm_market: "p-a".into(),
             qty: 5,
             limit: "0.2100".into(),
@@ -5817,6 +5635,7 @@ mod tests {
         /// arm the vanished-order path turns on: the venue refusing to answer,
         /// with a status that says why.
         fill_err: Mutex<Option<arb_venue::VenueError>>,
+        terminal_unreadable: Mutex<bool>,
         /// What `net_positions` answers. `None` means the sink has no positions
         /// wired and refuses, which is itself one of the cases under test.
         net: Mutex<Option<BTreeMap<String, f64>>>,
@@ -5829,6 +5648,7 @@ mod tests {
                 fills: Mutex::new(v.to_vec()),
                 place_err: Mutex::new(None),
                 fill_err: Mutex::new(None),
+                terminal_unreadable: Mutex::new(false),
                 net: Mutex::new(None),
                 log: Mutex::new(Vec::new()),
             })
@@ -5880,6 +5700,12 @@ mod tests {
         fn resting_order_ids(&self) -> Result<Vec<String>, arb_venue::VenueError> {
             unreachable!("this path never lists")
         }
+        fn terminal_filled_qty(&self, id: &str) -> Result<Option<i64>, arb_venue::VenueError> {
+            if *self.terminal_unreadable.lock().unwrap() {
+                return Err(arb_venue::VenueError::NotWired);
+            }
+            self.filled_qty(id).map(Some)
+        }
         fn filled_qty(&self, _id: &str) -> Result<i64, arb_venue::VenueError> {
             if let Some(e) = self.fill_err.lock().unwrap().clone() {
                 self.note(format!("filled_qty -> ERR {e}"));
@@ -5901,11 +5727,11 @@ mod tests {
         }
     }
 
-    fn resting_exit(qty: i64) -> Resting {
+    pub(super) fn resting_exit(qty: i64) -> Resting {
         Resting {
             order: Order {
                 rel_id: "r1".into(),
-                market: "K-a".into(),
+                resolves_by: None,                market: "K-a".into(),
                 pm_market: "p-a".into(),
                 qty,
                 // 0.21 against a 0.19+0.78 basis: comfortably above the floor,
@@ -6995,4 +6821,182 @@ mod tests {
             "{id} would survive the shutdown sweep — that is exit code 17 territory"
         );
     }
+    #[test]
+    fn a_subcent_exit_survives_an_unchanged_hedge_book() {
+        let (mut cx, fees) = ready();
+        let mut o = resting_exit(5).order;
+        let ladder = vec![("0".into(), "1".into(), "0.001".into())];
+        let k_basis = cx.parse(&o.k_basis).unwrap();
+        let pm_basis = cx.parse(&o.pm_basis).unwrap();
+        let close = cx.parse_exact("0.213");
+        let limit = exit_limit(&mut cx, &fees, &ladder, k_basis, pm_basis,
+            close, o.qty, Role::Maker, Role::Taker, EXIT_FLOOR).unwrap();
+        o.limit = cx.emit_6dp(limit);
+        assert!(still_pays(&mut cx, &fees, &o, &view("0.203")).is_ok(), "{o:?}");
+        assert!(still_pays(&mut cx, &fees, &o, &view("0.303")).is_err());
+    }
+
+    #[tokio::test]
+    async fn independent_exits_preserve_each_others_orders_and_interlocks() {
+        let _g = allow_all().await;
+        let owners = ExitOwners::default();
+        let mut a = Live::new(false, "/dev/null".into());
+        let mut b = Live::new(false, "/dev/null".into());
+        a.scope_market = Some("K-a".into());
+        b.scope_market = Some("K-b".into());
+        a.owners = Some(owners.clone());
+        b.owners = Some(owners);
+        let venue = FakeVenue::with_fills(&[0]);
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = venue.clone();
+        let mut other = resting_exit(5).order;
+        other.market = "K-b".into();
+        other.pm_market = "p-b".into();
+        place(&mut a, resting_exit(5).order, &view("0.20"), &k, &kalshi_stub()).await;
+        place(&mut b, other, &view("0.20"), &k, &kalshi_stub()).await;
+        assert!(a.resting.is_some() && b.resting.is_some());
+        assert_eq!(venue.calls().iter().filter(|c| c.starts_with("place")).count(), 2);
+        arm_standoff();
+        a.publish_working(a.working_set(None));
+        b.publish_working(b.working_set(None));
+        assert!(a.claim_pm_market("p-a"));
+        assert!(!b.claim_pm_market("p-a"), "shared PM markets also have only one owner");
+        assert!(b.claim_pm_market("p-b"));
+        assert!(working_check("K-a").is_err());
+        assert!(working_check("K-b").is_err());
+        pull(&mut a, Some(&view("0.20")), &k, &kalshi_stub()).await;
+        a.publish_working(a.working_set(None));
+        let _view_guard = test_serial();
+        a.request_suppress(candidate_keys("K-a", "p-a").into_iter().collect());
+        b.request_suppress(candidate_keys("K-b", "p-b").into_iter().collect());
+        a.request_suppress(BTreeSet::new());
+        assert!(a.resting.is_none() && b.resting.is_some());
+        assert!(working_check("K-a").is_ok());
+        assert!(working_check("K-b").is_err());
+        assert_eq!(suppress_requests(), candidate_keys("K-b", "p-b").into_iter().collect());
+        b.request_suppress(BTreeSet::new());
+        a.owners.as_ref().unwrap().lock().unwrap().get_mut("K-a").unwrap().at =
+            Instant::now() - WORKING_MAX_AGE - Duration::from_secs(1);
+        b.publish_working(b.working_set(None));
+        assert!(working_check("unrelated").unwrap_err().contains("old"),
+            "a healthy owner cannot conceal a stalled worker");
+        reset_standoff();
+    }
+
+    #[tokio::test]
+    async fn a_fill_racing_a_pull_is_closed_and_booked_before_forgetting_the_order() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let kalshi = FakeVenue::with_fills(&[1]);
+        let pmus = FakeVenue::with_fills(&[1]);
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
+        let p: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+        let path = ledger_with_open("pull-fill-race", 5);
+        let mut live = Live::new(false, path.clone());
+        live.resting = Some(resting_exit(5));
+        let out = pull(&mut live, Some(&view("0.20")), &k, &p).await.join("\n");
+        assert!(out.contains("filled while cancelling"), "{out}");
+        assert!(live.resting.is_none() && live.pending.is_none(), "{out}");
+        assert!(pmus.calls().iter().any(|c| c.starts_with("place p-a 1x")), "{:?}", pmus.calls());
+        let rows = crate::ledger::read(&path).unwrap();
+        assert_eq!(rows.last().unwrap()["qty"], 1);
+        assert_eq!(rows.last().unwrap()["status"], "unwound");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn an_unconfirmed_partial_cancel_keeps_tracking_until_it_can_close_exactly_once() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let kalshi = FakeVenue::with_fills(&[2]);
+        let pmus = FakeVenue::with_fills(&[2]);
+        *kalshi.terminal_unreadable.lock().unwrap() = true;
+        let k: std::sync::Arc<dyn crate::sink::OrderSink> = kalshi.clone();
+        let p: std::sync::Arc<dyn crate::sink::OrderSink> = pmus.clone();
+        let path = ledger_with_open("cancel-unconfirmed", 5);
+        let mut live = Live::new(false, path.clone());
+        live.resting = Some(resting_exit(5));
+        let out = manage(&mut live, &view("0.20"), &k, &p).await.join("\n");
+        assert!(out.contains("unconfirmed"), "{out}");
+        assert!(live.resting.is_some());
+        assert!(!pmus.calls().iter().any(|c| c.starts_with("place")));
+        *kalshi.terminal_unreadable.lock().unwrap() = false;
+        manage(&mut live, &view("0.20"), &k, &p).await;
+        assert!(live.resting.is_none() && live.pending.is_none());
+        assert_eq!(pmus.calls().iter().filter(|c| c.starts_with("place")).count(), 1);
+        assert_eq!(crate::ledger::read(&path).unwrap().last().unwrap()["qty"], 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn passive_reservation_price_uses_time_value_and_never_waives_the_profit_buffer() {
+        let (mut cx, _) = ready();
+        let kb = cx.parse_exact("0.20");
+        let pb = cx.parse_exact("0.60");
+        let now = arb_core::resolve::parse_iso("2026-09-18").unwrap() as f64 * 86400.0;
+        let floor = reservation_floor(&mut cx, kb, pb, Some("2027-09-18"), 18., now).unwrap();
+        let value = cx.emit_6dp(floor).parse::<f64>().unwrap() + 0.8;
+        assert!((value - 1. / (1. + 0.18 * 365. / 365.25)).abs() < 1e-6);
+        let near = reservation_floor(&mut cx, kb, pb, Some("2026-09-25"), 18., now).unwrap();
+        assert!(cx.cmp(near, floor) == Ordering::Greater, "nearer resolution requires a better exit");
+        let expensive = cx.parse_exact("0.79");
+        let minimum = reservation_floor(&mut cx, kb, expensive, Some("2027-09-18"), 18., now).unwrap();
+        assert_eq!(cx.emit_6dp(minimum), "0.005000");
+        assert!(reservation_floor(&mut cx, kb, pb, Some("2027-09-18"), f64::NAN, now).is_err());
+    }
+
+    #[tokio::test]
+    async fn high_holding_apr_gets_an_off_touch_order_instead_of_a_blanket_rejection() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1., 34, "0.22", "0.19")];
+        let mut c = cand(34, 1.);
+        c.fwd_apr = 100.;
+        let today = (wall_now() / 86400.).floor() as i64;
+        c.resolves_by = Some(arb_core::resolve::iso_from_day(today + 7));
+        let v = view("0.20");
+        let o = decide(&mut cx, &fees, &recs, &c, "p-a",
+            &quote(Some("0.10"), Some("0.20")), &v, Instant::now(), true).unwrap();
+        assert_eq!(o.qty, 34);
+        let limit = o.limit.parse::<f64>().unwrap();
+        match o.shape {
+            Shape::RestKalshi => assert!(limit > 0.20, "{o:?}"),
+            Shape::RestPmUs => assert!(limit < 0.19, "{o:?}"),
+        }
+        assert!(o.cross.is_none(), "the current touch is not an acceptable immediate exit");
+        let kb = cx.parse(&o.k_basis).unwrap(); let pb = cx.parse(&o.pm_basis).unwrap();
+        let floor = reservation_floor(&mut cx, kb, pb, o.resolves_by.as_deref(), v.apr_bar, wall_now()).unwrap();
+        let lock = cx.parse(&o.lock_ct).unwrap();
+        assert!(cx.cmp(lock, floor) != Ordering::Less);
+    }
+
+    #[test]
+    fn old_exit_checkpoints_still_deserialize_without_a_resolution_horizon() {
+        let o = resting_exit(5).order;
+        let mut value = serde_json::to_value(o).unwrap();
+        value.as_object_mut().unwrap().remove("resolves_by");
+        let restored: Order = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.resolves_by, None);
+    }
+
+    #[tokio::test]
+    async fn profitable_touch_below_holding_value_is_quoted_passively_not_crossed() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1., 34, "0.40", "0.20")];
+        let v = view("0.30");
+        let q = quote(Some("0.20"), Some("0.22"));
+        let mut c = cand(34, 1.);
+        let plain = decide(&mut cx, &fees, &recs, &c, "p-a", &q, &v, Instant::now(), true).unwrap();
+        assert!(plain.cross.is_some(), "this touch clears the old realized-profit-only floor");
+        let day = (wall_now() / 86400.).floor() as i64;
+        c.resolves_by = Some(arb_core::resolve::iso_from_day(day + 7));
+        c.fwd_apr = 100.;
+        let priced = decide(&mut cx, &fees, &recs, &c, "p-a", &q, &v, Instant::now(), true).unwrap();
+        assert!(priced.cross.is_none(), "do not cross below the holding-value reservation price");
+        assert!(still_pays(&mut cx, &fees, &priced, &v).is_ok());
+        let mut cheap = plain;
+        cheap.cross = None;
+        cheap.resolves_by = c.resolves_by;
+        assert!(still_pays(&mut cx, &fees, &cheap, &v).is_err(),
+            "resting orders must preserve the opportunity-cost floor too");
+    }
+
 }

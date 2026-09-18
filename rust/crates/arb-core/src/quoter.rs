@@ -13,7 +13,8 @@ use crate::book::BookBuilder;
 use crate::fees::FeeSchedule;
 use crate::intent::{self, Intent};
 use crate::model::{BookSide, Venue};
-use crate::scan::{maker_ask_quote, maker_quote, Cx, MarketMeta, Rel, RelType, D};
+use crate::price_grid::PriceGrid;
+use crate::scan::{maker_ask_quote, maker_quote, maker_ask_quote_limit, maker_quote_limit, Cx, MarketMeta, Rel, RelType, D};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -258,6 +259,7 @@ pub const MIN_CLIP: i64 = 3;
 pub const MAX_CLIP: i64 = 25;
 
 pub struct Quoter {
+    price_grids: HashMap<String, Option<PriceGrid>>,
     pub rel: Rel,
     /// The FALLBACK clip, and the reservation a side takes before its hedge
     /// depth is known. Live sizing is [`Quoter::hedge_clip`].
@@ -299,6 +301,7 @@ fn default_meta(cx: &mut Cx) -> MarketMeta {
 impl Quoter {
     pub fn new(rel: Rel) -> Self {
         Quoter {
+            price_grids: HashMap::new(),
             rel,
             clip: 5,
             min_requote_s: 15.0,
@@ -340,6 +343,12 @@ impl Quoter {
 
     pub fn set_suppress(&mut self, pairs: HashSet<(String, BookSide)>) {
         self.suppress = pairs;
+    }
+
+    /// None explicitly disables this market until usable metadata arrives.
+    /// Absent entries retain the legacy penny grid for deterministic replay.
+    pub fn set_price_grid(&mut self, market: &str, grid: Option<PriceGrid>) {
+        self.price_grids.insert(market.to_string(), grid);
     }
 
     pub fn set_risk(&mut self, risk: Option<Arc<dyn RiskGate>>) {
@@ -445,6 +454,12 @@ impl Quoter {
         // tick 0.01 (default Market), safety_ticks 0 => buf 0
         let cur = self.resting.get(&(i, side));
         let comp = self.touch_excl_self(cx, books, i, side);
+        let configured_grid = self.price_grids.get(&leg.market_id);
+        let grid = match configured_grid {
+            Some(grid) => grid.as_ref()?,
+            None => PriceGrid::cents(),
+        };
+        let explicit_grid = configured_grid.is_some();
         let tick = cx.parse_exact("0.01");
         // The clip is PRICED, not just sized: Kalshi's fee ceils to the cent
         // on the whole order, so a bigger clip amortises it and affords a
@@ -456,7 +471,8 @@ impl Quoter {
             default_meta(&mut Cx::default())
         };
         if side == BookSide::Bid {
-            let mut p_max = maker_quote(cx, fees, &self.rel, i, books, &metas, clip)?;
+            let quote = if self.price_grids.contains_key(&leg.market_id) { maker_quote_limit } else { maker_quote };
+            let mut p_max = quote(cx, fees, &self.rel, i, books, &metas, clip)?;
             if let Some(m) = self.apr_margin {
                 p_max = cx.sub(p_max, m); // fill must annualize >= min_apr
             }
@@ -475,19 +491,21 @@ impl Quoter {
             if cx.cmp(p_max, comp) == Ordering::Less {
                 return None; // can't get inside the competition profitably
             }
-            let step = cx.add(comp, tick);
+            let step = if explicit_grid { grid.above(cx, comp)? } else { cx.add(comp, tick) };
             let mut raw = cx.min(p_max, step);
             if let Some(ba) = book.asks.first() {
                 let bap = cx.parse(&ba.price)?;
-                let cap = cx.sub(bap, tick);
+                let cap = if explicit_grid { grid.below(cx, bap)? } else { cx.sub(bap, tick) };
                 raw = cx.min(raw, cap);
             }
             if cx.cmp(raw, comp) == Ordering::Less {
                 return None; // too tight to post passively
             }
-            Some(cx.quantize_cent(raw, false))
+            let price = if explicit_grid { grid.floor(cx, raw)? } else { cx.quantize_cent(raw, false) };
+            (cx.cmp(price, comp) != Ordering::Less).then_some(price)
         } else {
-            let mut p_min = maker_ask_quote(cx, fees, &self.rel, i, books, &metas, clip)?;
+            let quote = if self.price_grids.contains_key(&leg.market_id) { maker_ask_quote_limit } else { maker_ask_quote };
+            let mut p_min = quote(cx, fees, &self.rel, i, books, &metas, clip)?;
             if let Some(m) = self.apr_margin {
                 p_min = cx.add(p_min, m); // fill must annualize >= min_apr
             }
@@ -503,11 +521,11 @@ impl Quoter {
             if cx.cmp(p_min, comp) == Ordering::Greater {
                 return None;
             }
-            let step = cx.sub(comp, tick);
+            let step = if explicit_grid { grid.below(cx, comp)? } else { cx.sub(comp, tick) };
             let mut raw = if cx.cmp(p_min, step) == Ordering::Greater { p_min } else { step };
             if let Some(bb) = book.bids.first() {
                 let bbp = cx.parse(&bb.price)?;
-                let floor = cx.add(bbp, tick);
+                let floor = if explicit_grid { grid.above(cx, bbp)? } else { cx.add(bbp, tick) };
                 if cx.cmp(raw, floor) == Ordering::Less {
                     raw = floor;
                 }
@@ -515,7 +533,8 @@ impl Quoter {
             if cx.cmp(raw, comp) == Ordering::Greater {
                 return None;
             }
-            Some(cx.quantize_cent(raw, true))
+            let price = if explicit_grid { grid.ceil(cx, raw)? } else { cx.quantize_cent(raw, true) };
+            (cx.cmp(price, comp) != Ordering::Greater).then_some(price)
         }
     }
 
@@ -681,6 +700,28 @@ impl Quoter {
                 // requote throttle. The next book event re-posts smaller.
                 if let (Some(c), Some(curq)) = (clip, self.resting.get(&key)) {
                     if curq.count > c {
+                        target = None;
+                    }
+                }
+                // A permissible replacement does not make the OLD price safe.
+                // Pull an order that no longer clears its hedge/APR limit before
+                // either the requote throttle or a replacement's risk refusal.
+                if let Some(curq) = self.resting.get(&key) {
+                    let metas = |_: &crate::scan::RelLeg| default_meta(&mut Cx::default());
+                    let size = cx.from_i64(curq.count);
+                    let bid_limit = if self.price_grids.contains_key(&leg_market) { maker_quote_limit } else { maker_quote };
+                    let ask_limit = if self.price_grids.contains_key(&leg_market) { maker_ask_quote_limit } else { maker_ask_quote };
+                    let limit = match side {
+                        BookSide::Bid => bid_limit(cx, fees, &self.rel, i, books, &metas, size)
+                            .map(|p| self.apr_margin.map_or(p, |m| cx.sub(p, m))),
+                        BookSide::Ask => ask_limit(cx, fees, &self.rel, i, books, &metas, size)
+                            .map(|p| self.apr_margin.map_or(p, |m| cx.add(p, m))),
+                    };
+                    let safe = limit.is_some_and(|p| match side {
+                        BookSide::Bid => cx.cmp(curq.price, p) != Ordering::Greater,
+                        BookSide::Ask => cx.cmp(curq.price, p) != Ordering::Less,
+                    });
+                    if !safe {
                         target = None;
                     }
                 }
@@ -1063,6 +1104,70 @@ pub(crate) mod tests_support {
         q.on_book(&mut cx, &fees, &bb, 2.0, &mut oid, &mut intents);
         assert_eq!(intents.len(), 1, "first quote suppressed: {intents:?}");
         assert!(place_on(&intents, "P").is_some(), "{intents:?}");
+    }
+
+    #[test]
+    fn subcent_grid_quotes_both_sides_and_missing_metadata_pulls() {
+        for side in [BookSide::Bid, BookSide::Ask] {
+            let (mut cx, fees, mut bb, mut q) = fixture();
+            bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.041", "500")],
+                vec![lvl("0.047", "500")], 1, 1, None);
+            let (bid, ask) = if side == BookSide::Bid { ("0.20", "0.99") } else { ("0.001", "0.01") };
+            bb.apply_snapshot(Venue::PolymarketUs, "P", vec![lvl(bid, "500")],
+                vec![lvl(ask, "500")], 1, 1, None);
+            let grid = PriceGrid::from_ranges(&[("0".into(), "1".into(), "0.001".into())]).unwrap();
+            q.set_price_grid("K", Some(grid));
+            let mut oid = 0;
+            let mut intents = Vec::new();
+            q.on_book(&mut cx, &fees, &bb, 1000.0, &mut oid, &mut intents);
+            let placed = place_on(&intents, "K").expect("a sub-cent spread is quotable");
+            assert_eq!(placed.side, side);
+            assert_eq!(placed.price, if side == BookSide::Bid { "0.042" } else { "0.046" });
+            q.set_price_grid("K", None);
+            intents.clear();
+            q.on_book(&mut cx, &fees, &bb, 1001.0, &mut oid, &mut intents);
+            assert!(cancel_on(&intents, "K").is_some(), "metadata loss cancels immediately");
+            assert!(place_on(&intents, "K").is_none());
+        }
+    }
+
+    #[test]
+    fn unsafe_resting_prices_cancel_inside_the_requote_throttle_on_both_sides() {
+        for side in [BookSide::Bid, BookSide::Ask] {
+            let (mut cx, fees, mut bb, mut q) = fixture();
+            q.set_apr(&mut cx, 18.0, Some(0.6));
+            pm_bid(&mut bb, "0.30", 1, 1);
+            if side == BookSide::Ask {
+                bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.01", "500")],
+                    vec![lvl("0.40", "500")], 1, 1, None);
+                bb.apply_snapshot(Venue::PolymarketUs, "P", vec![lvl("0.01", "500")],
+                    vec![lvl("0.70", "500")], 1, 1, None);
+            }
+            let mut oid = 0;
+            let mut intents = Vec::new();
+            q.on_book(&mut cx, &fees, &bb, 1000.0, &mut oid, &mut intents);
+            let first = place_on(&intents, "P").expect("initial quote").clone();
+            assert_eq!(first.side, side);
+            if side == BookSide::Bid {
+                bb.apply_snapshot(Venue::PolymarketUs, "P",
+                    vec![lvl(&first.price, "25"), lvl("0.10", "500")],
+                    vec![lvl("0.99", "500")], 2, 2, None);
+            } else {
+                bb.apply_snapshot(Venue::PolymarketUs, "P", vec![lvl("0.01", "500")],
+                    vec![lvl(&first.price, "25"), lvl("0.90", "500")], 2, 2, None);
+            }
+            intents.clear();
+            q.on_book(&mut cx, &fees, &bb, 1001.0, &mut oid, &mut intents);
+            assert!(cancel_on(&intents, "P").is_none(), "safe quote keeps its queue position");
+            let (bid, ask) = if side == BookSide::Bid { ("0.30", "0.99") } else { ("0.01", "0.70") };
+            bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl(bid, "500")],
+                vec![lvl(ask, "500")], 2, 2, None);
+            intents.clear();
+            q.on_book(&mut cx, &fees, &bb, 1002.0, &mut oid, &mut intents);
+            assert_eq!(cancel_on(&intents, "P").expect("unsafe quote must cancel NOW").order_id,
+                first.order_id);
+            assert!(place_on(&intents, "P").is_none(), "re-entry still respects the throttle");
+        }
     }
 
     /// An amend is ONE intent carrying `replaces` — Python performed the cancel

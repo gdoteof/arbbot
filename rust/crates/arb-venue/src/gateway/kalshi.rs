@@ -787,6 +787,20 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
         self.order_status_at(Priority::Background, order_id)
     }
 
+    fn terminal_filled_qty(&self, order_id: &str) -> Result<Option<i64>, VenueError> {
+        let o = self.settle.retry_404("kalshi terminal_filled_qty", order_id, || {
+            self.order_status_at(Priority::Critical, order_id)
+        })?;
+        if matches!(o.status.as_deref(), Some("executed" | "canceled")) {
+            o.try_filled_qty().filter(|n| *n >= 0).map(Some).ok_or_else(|| VenueError::Parse {
+                endpoint: "kalshi terminal_filled_qty",
+                detail: "terminal order omitted a readable cumulative fill count".into(),
+            })
+        } else {
+            Ok(None)
+        }
+    }
+
     fn order_filled_qty(&self, order_id: &str) -> Result<i64, VenueError> {
         let o = self.settle.retry_404("kalshi order_filled_qty", order_id, || {
             self.order_status_at(Priority::Critical, order_id)
@@ -1134,6 +1148,20 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
     /// field is the analogue of PM-US's `buyingPower`, not of its
     /// `currentBalance`, and deducting shorts here again would double-deduct
     /// them.
+    fn account_capital(&self) -> Result<super::capital::AccountCapital, VenueError> {
+        let r = self.call(Priority::Background, "GET", K_BALANCE, None, None)?;
+        if r.status != 200 { return Err(VenueError::Status {endpoint:"kalshi capital",status:r.status,body:r.body}); }
+        let mut capital = super::capital::kalshi(&r.body)?;
+        capital.holdings = self.net_positions()?.into_iter().filter_map(|(market, qty)| {
+            (qty != 0.).then_some(super::capital::Holding {
+                market, quantity: qty.to_string(), value_usd: None, mark_updated_at: None,
+            })
+        }).collect();
+        if capital.holdings.iter().any(|h| h.quantity.parse::<f64>().map_or(true, |q| !q.is_finite())) {
+            return Err(VenueError::Parse { endpoint: "kalshi capital", detail: "invalid position quantity".into() });
+        }
+        Ok(capital)
+    }
     fn spendable_cash(&self) -> Result<String, VenueError> {
         Ok(self.balances()?.balance_dollars)
     }

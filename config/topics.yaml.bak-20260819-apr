@@ -1,0 +1,21 @@
+# Per-topic capital budgets (Geoff 2026-07-22): bigger budgets where the
+# annualized return is higher; low-APR topics get small budgets AND only open
+# new baskets while overall class utilization is below their gate.
+#
+# family: substring key matched against relationship ids (longest match wins).
+# budget_usd: max open notional (contracts ~ $) across the family.
+# only_below_util: optional — new baskets allowed only while
+#   exposure.total / (bankroll * per_class_cap) is below this.
+#
+# APR rationale (2026-07-22 marks): nobel resolves Oct-26 (fastest turn),
+# TIME PotY Dec-26 (~15%/yr realized), fedcut event-driven bursts,
+# france Apr-27 (~7%/yr — long-dated, low APR).
+topics:
+  - {family: nobel-peace-26, budget_usd: 80}
+  - {family: time-poty-26, budget_usd: 175}  # highest proven APR. 150 -> 175 (Geoff, 2026-07-31): it held $154 against $150 and was the most-refused gate on the book, 4,103 refusals in 6h
+  - {family: fedcut-26, budget_usd: 60}
+  - {family: brazil-pres-26, budget_usd: 40}
+  - {family: france-pres-27, budget_usd: 60, only_below_util: 0.5}
+  - {family: btcmax-26, budget_usd: 60}  # 7 rungs, 2-6c gaps, hard Dec-31 bound (card 47fc2ea3)
+default_topic_budget: 30
+default_only_below_util: 0.5

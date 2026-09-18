@@ -7,12 +7,8 @@
 //!   quoters, kill/stats deadlines) -> per-venue executor tasks (rate
 //!   budgets, dry-run gateway seam).
 //!
-//! Shadow soak (live feed from the Rust shadow recorder's socket):
-//!   arb-trader --socket data/arbbot-rs.sock --registry config/registry.yaml \
-//!       --out data/trader-rs/intents.jsonl
-//!
-//! Bench + shell digest gate (must reproduce arb-intent / Python
-//! scripts/intent_replay.py byte-for-byte over the same tape — proves the
+//! Bench + shell digest gate (must reproduce the historical Python
+//! `scripts/intent_replay.py` reference byte-for-byte over the same tape — proves the
 //! concurrent shell does not alter decisions):
 //!   arb-trader --bench-tape merged-<day>.jsonl --registry config/registry.yaml \
 //!       [--max-events N] [--out intents.jsonl]
@@ -33,6 +29,7 @@
 // shape as #33, caught here only because the gate now refuses a stale base.
 #![recursion_limit = "256"]
 
+mod capital;
 mod engine;
 mod exec;
 mod feed;
@@ -104,9 +101,8 @@ struct Args {
     /// Capital config for the risk gate.
     exec_yaml: String,
     topics_yaml: String,
-    /// `--balance venue=usd`, repeatable. The dry-run engine holds no
-    /// credentials, so venue cash is supplied here; the per-venue cash check
-    /// sees $0 for any venue omitted, which refuses its orders.
+    /// Legacy/replay cash seeds. Live mode ignores these and polls venues;
+    /// the shadow follows the live capital snapshot without credentials.
     balances: Vec<(String, String)>,
     out: Option<String>,
     max_events: u64,
@@ -590,11 +586,6 @@ fn place_preconditions(args: &Args) -> Vec<String> {
     if args.socket.is_none() {
         missing.push("no --socket: orders require the live feed".into());
     }
-    if args.balances.is_empty() {
-        missing.push(
-            "no --balance: the risk gate would see $0 cash and refuse everything anyway".into(),
-        );
-    }
     if args.health.is_empty() {
         missing.push("--health disabled: quoting on an unwatched feed".into());
     }
@@ -955,8 +946,8 @@ fn apply_apr(
 /// `Quoter::new` hardcodes `apr_margin: None`, an empty `suppress` and
 /// `toxgate: None`, and until now `arb-trader` called only `set_risk` — so the
 /// APR hurdle at quoter.rs:213/:244 and the toxicity skip at :413 were
-/// unreachable in the live process. `bins/arb-intent`, a replay tool, was the
-/// only caller of the other three setters in the workspace. The engine
+/// unreachable in the live process. The retired replay harness was the only
+/// caller of the other three setters in the workspace. The engine
 /// therefore rested maker quotes locking as little as one tick — 0.27%/yr on
 /// france-pres-27 money committed until 2027 — and quoted sides the research
 /// feed scored at up to 7x `TOXGATE_MAX`.
@@ -1021,9 +1012,8 @@ fn install_policy(args: &Args, quoters: &mut [Quoter], risk: Option<&risk::RiskV
     // of `toxgate.json` in the tree is a READER.
     //
     // Defaulting this on would therefore not mean "gate on, feed occasionally
-    // stale" — it would mean the gate can never clear, and `arbbot-trader-rs`
-    // (Restart=always, no --bench-tape) would go dark on its next restart and
-    // stay dark, taking the dashboard's /intents view with it. Turning it on is
+    // stale" — it would mean the gate can never clear, and an engine configured
+    // with that missing feed would go dark on its next restart. Turning it on is
     // an explicit `--toxgate <path>` the day something writes one.
     let Some(path) = args.toxgate.as_deref().filter(|p| !p.is_empty()) else {
         eprintln!("[toxgate] OFF (no --toxgate) — no adverse-selection gate on maker quotes");
@@ -1077,8 +1067,7 @@ fn build_risk_view(
     eprintln!("[risk] {}", rv.describe());
     if args.balances.is_empty() {
         eprintln!(
-            "[risk] NO --balance given: the per-venue cash check sees $0 and \
-             will refuse every order. Pass --balance kalshi=<usd> etc."
+            "[risk] waiting for venue-derived cash and equity before admitting entries"
         );
     }
     seed_exposure_from_ledger(&rv, ledger, &args.ledger, rel_meta);
@@ -1583,40 +1572,13 @@ fn spawn_maker_exit(
         // that is not going to happen.
         maker_exit::arm_standoff();
         eprintln!(
-            "[maker-exit] *** ARMED *** — it will REST a post-only order that flattens ONE lot \
-             of ONE basket at a time, at a price that locks >= {}/ct against a cost basis \
-             taken from {} for BOTH legs, and cross the OTHER leg with an IOC re-priced at \
-             fill time. WHICH LEG RESTS IS DECIDED PER EXIT: both shapes are priced off the \
-             same basis and the better lock wins — a Kalshi ask (crossing PM-US) or a PM-US \
-             bid (crossing Kalshi), whichever venue carries the wider spread. Every log line \
-             names the shape it chose. Caps: {} contracts per exit, {} exit resting at once, \
-             and a candidate must hold for {:.0}s across {} scans before anything rests.",
-            maker_exit::MIN_LOCK,
-            args.ledger,
-            maker_exit::MAX_CLIP,
-            maker_exit::MAX_RESTING,
-            maker_exit::DEBOUNCE_S,
-            maker_exit::DEBOUNCE_SCANS,
-        );
-        eprintln!(
-            "[maker-exit] *** IT CAN LEAVE A NAKED LEG, AND WHICH SIDE DEPENDS ON THE SHAPE. \
-             *** Between the resting order filling and the IOC on the other leg returning we \
-             are one-legged, and if that IOC fails we STAY one-legged with the ledger still \
-             calling the basket open. A `rest-kalshi` exit sells the Kalshi YES and leaves a \
-             PM-US SHORT uncovered; a `rest-pmus` exit buys the PM-US YES back and leaves a \
-             KALSHI LONG uncovered. THOSE ARE OPPOSITE POSITIONS NEEDING OPPOSITE \
-             CORRECTIONS — read the alarm line, which names the one we actually have, rather \
-             than assuming. ALARM ON `maker_exit_unresolved`; it must stay 0. If \
-             --positions-recon-act is also armed the two WILL fight over that leg, in \
-             whichever direction the shape left it. ONE naked leg HALTS NEW EXITS while it \
-             lasts — but it no longer waits for you: `maker_exit::heal` runs first on every \
-             60s cycle, re-reads THAT VENUE's truth, re-sizes to the SHORTFALL (never to the \
-             fill, or an unreadable IOC gets bought twice) and re-prices. It stays \
-             profitable-only for 10 cycles and then CROSSES OUT regardless, because at most 5 \
-             contracts are ever naked and carrying them to resolution costs more than the \
-             spread. The halt clears on evidence — the shortfall reaching zero — not on a \
-             timer and not on a restart. `maker_exit_unresolved` still ratchets, so the page \
-             still fires; `maker_exit_healed` is how many it closed by itself."
+            "[maker-exit] ARMED: independent exits across eligible markets, same-price lots grouped with oldest-first fills, \
+             sized to its full remaining paired inventory. No per-market order cap. Off-touch limits are allowed. \
+             Each order covers its lot basis, fees, hedge slippage and >= {}/ct net buffer. \
+             Each market owns its fills and hedge retries; unresolved naked legs pause new exits. \
+             Ledger: {}. Candidate persistence: {:.0}s / {} scans.",
+            maker_exit::MIN_LOCK, args.ledger,
+            maker_exit::DEBOUNCE_S, maker_exit::DEBOUNCE_SCANS,
         );
     }
     tokio::spawn(maker_exit::exit_loop(
@@ -1667,6 +1629,7 @@ const EXPOSURE_RELEASE_POLL: std::time::Duration = std::time::Duration::from_sec
 /// bucket or a body we cannot parse all say the venue did not answer; folding
 /// any of them into a number is how a gate stops spending money it has, or
 /// spends money it has not.
+#[cfg(test)]
 async fn balance_cycle(
     kalshi: &std::sync::Arc<dyn sink::OrderSink>,
     pmus: &std::sync::Arc<dyn sink::OrderSink>,
@@ -1763,9 +1726,8 @@ async fn balance_loop(
     snapshot: &str,
 ) {
     // `tokio::time::interval`'s first tick is ready immediately, and that is
-    // wanted: until it lands the gate is spending against the `--balance` seed,
-    // so the window where the C13 constant is still in force is one venue round
-    // trip rather than a minute.
+    // wanted: entries wait for venue cash, so startup waits one venue round
+    // trip rather than a minute. Declared cash seeds are never used live.
     let mut iv = tokio::time::interval(BALANCE_POLL);
     let mut last: Option<Vec<(String, String)>> = None;
     loop {
@@ -1776,12 +1738,16 @@ async fn balance_loop(
         // the same abandoned path as a 503 and leaves the previous figure
         // ageing rather than replacing it with something that would panic the
         // engine at the next quote.
-        let cycle = match balance_cycle(&kalshi, &pmus).await {
-            Ok(pairs) => risk.set_live_balances(pairs.clone()).map(|()| pairs),
+        let cycle = match capital::read(&kalshi, &pmus).await {
+            Ok(accounts) => risk.set_live_capital(&accounts).map(|()| accounts),
             Err(e) => Err(e),
         };
         match cycle {
-            Ok(pairs) => {
+            Ok(accounts) => {
+                let pairs: Vec<_> = accounts.iter().map(|(v,a)|(v.clone(),a.available_cash_usd.clone())).collect();
+                if let Err(e) = capital::publish("data/exec/capital.json", &accounts, &risk) {
+                    eprintln!("[capital] snapshot write failed: {e}");
+                }
                 // Only when the number MOVES. A 60s heartbeat would bury the
                 // one line that matters — cash falling as capital deploys,
                 // which is the thing `--balance` could never show.
@@ -1813,32 +1779,9 @@ async fn balance_loop(
     }
 }
 
-/// Poll live venue cash into the risk gate.
-///
-/// THE DEFECT THIS CLOSES (audit C13): `--balance` is hand-typed in the unit
-/// file and is never decremented as capital deploys, so the cash gate could
-/// only ever catch "that venue is not funded at all". The venues both report
-/// spendable cash — Kalshi `balance_dollars`, PM-US `buyingPower` — and both
-/// figures fall as we spend AND as the venue withholds $1.00 per short
-/// contract, so an armed engine now stops OPENING when it actually runs out.
-/// That is a live behaviour change and it reads as the engine going quiet:
-/// `balances_source` / `balances_age_s` in the stats JSON are what distinguish
-/// it from a quiet market.
-///
-/// AND THE SAME IS TRUE OF A POLL THAT NEVER STARTS ANSWERING. Arming this is a
-/// promise the gate holds us to: `expect_live_balances` starts the `--balance`
-/// seed ageing on the same `risk::BALANCE_MAX_AGE` clock as a reading, so an
-/// armed run with wrong credentials or a moved endpoint closes after three
-/// minutes instead of trading the hand-typed constant indefinitely, which was
-/// C13 wearing a new coat. `stale` with `balances_age_s` of `-1` is that case.
-///
-/// It reads through the SINKS rather than building its own gateways, for
-/// `spawn_positions_recon`'s reason — they are where this process's
-/// credentials and its single background token bucket live — which is also
-/// what ties it to `--enable-orders`. `arm_venues` returns either an empty map
-/// or BOTH venues, so falling through here is the unarmed case and not a
-/// half-armed one, and the unarmed shadow keeps `--balance` as its only
-/// possible source.
+/// Armed runs poll authenticated account capital through their shared gateways.
+/// Shadows follow the published snapshot without extra API requests. Neither
+/// spends declared startup cash; stale readings refuse new entries.
 fn spawn_balance_poll(
     sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
     risk: Option<&std::sync::Arc<risk::RiskView>>,
@@ -1846,12 +1789,15 @@ fn spawn_balance_poll(
     let (Some(k), Some(p), Some(rv)) =
         (sinks.get(&Venue::Kalshi), sinks.get(&Venue::PolymarketUs), risk)
     else {
+        if let Some(rv)=risk {
+            rv.expect_live_capital();
+            tokio::spawn(capital::follow_snapshot(rv.clone()));
+        }
         return;
     };
     eprintln!(
         "[balance] polling both venues every {}s; the gate refuses everything once a \
-         reading is over {}s old, INCLUDING the --balance seed if the first cycle \
-         never lands",
+         reading is over {}s old; startup waits for venue capital (no declared-cash seed)",
         BALANCE_POLL.as_secs(),
         risk::BALANCE_MAX_AGE.as_secs()
     );
@@ -1859,7 +1805,7 @@ fn spawn_balance_poll(
     // ageing from the promise rather than from whenever the task first gets
     // scheduled. Until this call the declaration never expires, which is right
     // for a run that holds no credentials and wrong for this one.
-    rv.expect_live_balances();
+    rv.expect_live_capital();
     tokio::spawn(balance_loop(rv.clone(), k.clone(), p.clone(), BALANCE_SNAPSHOT));
 }
 
@@ -2244,6 +2190,41 @@ async fn main() {
     let armed = !sinks.is_empty();
     spawn_positions_recon(&args, &sinks);
     spawn_maker_exit(&args, &sinks);
+    if let (Some(k), Some(tx)) = (sinks.get(&Venue::Kalshi), tx_acks.as_ref()) {
+        let mut markets = std::collections::BTreeSet::new();
+        for q in &mut quoters {
+            let ids: Vec<String> = q.rel.legs.iter().filter(|l| l.venue == Venue::Kalshi)
+                .map(|l| l.market_id.clone()).collect();
+            for market in ids {
+                q.set_price_grid(&market, None);
+                markets.insert(market);
+            }
+        }
+        let (k, tx) = (k.clone(), tx.clone());
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(60));
+            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                iv.tick().await;
+                for market in &markets {
+                    let (sink, name) = (k.clone(), market.clone());
+                    let ranges = match tokio::task::spawn_blocking(move || sink.market_quote(&name)).await {
+                        Ok(Ok(q)) => Some(q.ladder),
+                        other => {
+                            eprintln!("[price-grid] {market}: metadata unavailable ({other:?}); maker quotes withheld");
+                            None
+                        }
+                    };
+                    let line = serde_json::json!({"kind":"price_grid", "venue":"kalshi",
+                        "market_id":market, "ranges":ranges,
+                        "ts_local_ns":(arb_core::clock::now_s()*1e9) as i64}).to_string();
+                    if tx.send(feed::FeedMsg {line, t_read:std::time::Instant::now()}).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
     // Here and not earlier: the risk view is built before `arm_venues`, so the
     // sinks it reads through do not exist when it is constructed, which is why
     // the live figure arrives through a setter rather than the constructor.
@@ -2666,13 +2647,13 @@ mod precondition_tests {
     use super::*;
 
     #[test]
-    fn placing_requires_a_feed_cash_health_and_a_readable_ledger() {
+    fn placing_requires_a_feed_health_and_a_readable_ledger() {
         let mut a = default_args();
         a.ledger = "/nonexistent/dir/trades.jsonl".into();
         a.health = String::new();
         let missing = place_preconditions(&a).join("\n");
         assert!(missing.contains("--socket"), "{missing}");
-        assert!(missing.contains("--balance"), "{missing}");
+        assert!(!missing.contains("--balance"), "{missing}");
         assert!(missing.contains("--health"), "{missing}");
         assert!(missing.contains("ledger"), "{missing}");
     }
@@ -3667,6 +3648,11 @@ mod balance_poll_tests {
         fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
             unreachable!("the balance poll reads no book")
         }
+        fn account_capital(&self) -> Result<arb_venue::gateway::capital::AccountCapital, VenueError> {
+            let cash=self.spendable_cash()?;
+            Ok(arb_venue::gateway::capital::AccountCapital {available_cash_usd:cash.clone(),equity_usd:cash,
+                reserved_cash_usd:"0".into(),positions_value_usd:"0".into(),valuation:"test".into(),holdings:vec![]})
+        }
         fn spendable_cash(&self) -> Result<String, VenueError> {
             self.0.map(|s| s.to_string()).map_err(|_| VenueError::Status {
                 endpoint: "test",
@@ -3736,7 +3722,7 @@ mod balance_poll_tests {
     /// decision gate diffs. `declared` rather than `seed` is what says the
     /// promise was never made.
     #[tokio::test]
-    async fn an_unarmed_run_starts_no_poll() {
+    async fn an_unarmed_run_waits_for_shared_venue_capital() {
         let rv = std::sync::Arc::new(risk::RiskView::load(
             "/nonexistent/exec.yaml",
             "/nonexistent/topics.yaml",
@@ -3744,8 +3730,8 @@ mod balance_poll_tests {
             HashMap::new(),
         ));
         spawn_balance_poll(&HashMap::new(), Some(&rv));
-        tokio::task::yield_now().await;
-        assert_eq!(rv.balances_source(), "declared");
+        assert_eq!(rv.balances_source(), "seed");
+        assert_eq!(rv.balance_of("kalshi"),None);
         assert_eq!(rv.balances_age_s(), -1);
     }
 

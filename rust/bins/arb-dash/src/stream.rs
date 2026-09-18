@@ -8,7 +8,6 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::rollup::{self, Shared};
 use crate::{integrity, Args, VENUES};
 
 /// Length and mtime of one file, folded into a number. Never reads content:
@@ -29,28 +28,17 @@ fn stat_all(paths: &[String]) -> u64 {
     paths.iter().fold(0u64, |acc, p| acc.rotate_left(7) ^ stat_sig(p))
 }
 
-/// What each view depends on, one number per view, plus the rollup's own
-/// status. The client re-renders ONLY the view whose number moved, which is
+/// What each view depends on, one number per view. The client re-renders ONLY
+/// the view whose number moved, which is
 /// what makes a push cheaper than a poll: an idle board redraws nothing.
-fn state_json(a: &Args, sh: &Shared) -> String {
+fn state_json(a: &Args) -> String {
     let day = integrity::build(&a.data_dir).today;
-    let books = stat_all(&[
-        format!("{}/kalshi_deposits.json", a.kalshi_dir),
-        format!("{}/kalshi_fills.json", a.kalshi_dir),
-        format!("{}/kalshi_settlements.json", a.kalshi_dir),
-        format!("{}/pmus_balances.json", a.pmus_dir),
-        format!("{}/pmus_positions.json", a.pmus_dir),
-    ]);
+    let books = stat_all(&[format!("{}/exec/capital.json", a.data_dir),"config/funding.yaml".into()])
+        ^ (arb_core::clock::now_secs()/5); // Refresh ages and outage status even when snapshots stop.
     let recording = stat_all(
         &VENUES.iter().map(|v| format!("{}/raw/{v}-{day}.jsonl", a.data_dir)).collect::<Vec<_>>(),
     );
-    let rollup = stat_all(
-        &VENUES.iter().map(|v| format!("{}/tob-{v}-{day}.jsonl", a.rollup_dir)).collect::<Vec<_>>(),
-    );
-    let intents = stat_sig(&a.intents_path);
-    // The Now view is about the ARMED engine, whose file is not the one
-    // `--intents` names, plus the two files that move under it. Its own key,
-    // so it refreshes when the engine acts rather than when the shadow does.
+    // The Now view follows the armed engine's output plus the marks file.
     let armed: u64 = tape_sources(a)
         .iter()
         .map(|(_, p)| stat_sig(p))
@@ -61,9 +49,7 @@ fn state_json(a: &Args, sh: &Shared) -> String {
     let registry = stat_all(&[a.registry.clone(), a.tradable.clone()]);
     format!(
         "{{\"today\":\"{day}\",\"books\":{books},\"recording\":{recording},\
-         \"rollup\":{rollup},\"intents\":{intents},\"opportunities\":{opps},\
-         \"pairs\":{registry},\"now\":{now_sig},\"rollup_status\":{}}}",
-        rollup::status(a, sh)
+         \"opportunities\":{opps},\"pairs\":{registry},\"now\":{now_sig}}}"
     )
 }
 
@@ -76,7 +62,7 @@ fn state_json(a: &Args, sh: &Shared) -> String {
 /// into at most one frame every `MIN_PUSH`: idle still costs nothing, and a
 /// moving market still shows up an order of magnitude sooner than the 15s
 /// timer this replaced.
-pub fn state(mut s: TcpStream, a: &Args, sh: &Shared) {
+pub fn state(mut s: TcpStream, a: &Args) {
     const MIN_PUSH: u32 = 3;
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
                 Cache-Control: no-store\r\nConnection: keep-alive\r\n\r\n";
@@ -86,7 +72,7 @@ pub fn state(mut s: TcpStream, a: &Args, sh: &Shared) {
     let mut last = String::new();
     let (mut tick, mut since_push) = (0u32, MIN_PUSH);
     loop {
-        let body = state_json(a, sh);
+        let body = state_json(a);
         let out = if body != last && since_push >= MIN_PUSH {
             last = body.clone();
             since_push = 0;
@@ -107,20 +93,16 @@ pub fn state(mut s: TcpStream, a: &Args, sh: &Shared) {
 
 /// Append-only files worth watching live, newest-writer first.
 ///
-/// Discovered rather than configured: any `*intents*.jsonl` beside the
-/// configured intents file, plus the ledger. That covers the shadow engine and
-/// every armed slice without a new flag each time one is added.
+/// Discovered rather than configured: active engine intent files plus the
+/// ledger. Historical shadow files are deliberately excluded.
 fn tape_sources(a: &Args) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
-    let dir = std::path::Path::new(&a.intents_path)
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let dir = std::path::Path::new(&a.data_dir).join("trader-rs");
     if let Ok(rd) = std::fs::read_dir(&dir) {
         let mut names: Vec<String> = rd
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.contains("intents") && n.ends_with(".jsonl"))
+            .filter(|n| n.starts_with("m3-intents") && n.ends_with(".jsonl"))
             .collect();
         names.sort();
         for n in names {
@@ -153,10 +135,8 @@ pub fn tape(mut s: TcpStream, a: &Args) {
     // would bury what is happening now under history. A short backlog keeps the
     // view from opening blank.
     //
-    // Backlog only from files something is ACTIVELY writing. The trader-rs dir
-    // also holds archived runs (intents-shadow-0724.jsonl), and seeding from
-    // those replayed four-day-old quotes into a live tape — history dressed up
-    // as news, which is worse than an empty view. Stale files are still
+    // Backlog only from files something is ACTIVELY writing. Seeding archived
+    // output would replay history dressed up as news. Stale files are still
     // watched; they simply start at EOF and stay silent unless written again.
     const BACKLOG: u64 = 8 * 1024;
     const FRESH_S: u64 = 300;

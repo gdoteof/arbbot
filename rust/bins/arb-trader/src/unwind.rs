@@ -193,7 +193,7 @@
 //! basket whose remaining forward APR is below the maker hurdle that the freed
 //! capital would itself have to clear. Both halves already existed:
 //!
-//!   * the hurdle is `crate::apr_bar(utilization())`, the number
+//!   * the hurdle is the higher of `crate::apr_bar(utilization())` and the taker bar, the number
 //!     `Engine::apr_tick` already installs on every quoter and reports as
 //!     `maker_apr_bar`. The caller passes the bar IN FORCE, so the exit is
 //!     measured against the same number a fresh quote is — subject to §4 above;
@@ -323,6 +323,7 @@ const MIN_EXIT_CT: f64 = 2.0 * TICK_CT;
 /// Two spellings of one number, so `min_exit_ct_spellings_agree` pins them
 /// together: a floor that drifted between the selector and the thing it gates
 /// would spend the spread to reach a trade the selector had already refused.
+#[cfg(test)]
 pub const MIN_EXIT_CT_S: &str = "0.02";
 
 /// A basket that should be quoted out of: holding it is worse than redeploying
@@ -342,6 +343,8 @@ pub struct Exit {
     pub qty: i64,
     /// Remaining forward APR of CONTINUING to hold, %/yr.
     pub fwd_apr: f64,
+    /// Resolution horizon used to price passive exits against holding.
+    pub resolves_by: Option<String>,
     /// Per-contract profit the maker exit locks, net of both legs' fees.
     pub exit_ct: f64,
     /// Per-contract profit CROSSING both legs would lock, estimated from the
@@ -532,6 +535,7 @@ fn consider(
     hurdle: f64,
     owned: &[String],
     today: &str,
+    passive: bool,
 ) -> Result<Exit, Skip> {
     let rel_id = p.get("relationship_id").and_then(|v| v.as_str()).unwrap_or_default();
     if rel_id.starts_with("sports-") {
@@ -555,12 +559,13 @@ fn consider(
     if qty < 1 {
         return Err(Skip::NotPriceable);
     }
-    // THE RULE. Holding beats redeploying while the remaining forward APR still
-    // clears the bar a fresh maker quote would have to clear.
-    if fwd_apr >= hurdle {
+    // Immediate-exit reporting still compares the current mark with holding.
+    // Passive quotes can instead wait at a better price; the placer computes
+    // that reservation price from the resolution horizon and current hurdle.
+    if !passive && fwd_apr >= hurdle {
         return Err(Skip::HoldIsBetter { fwd_apr, hurdle });
     }
-    if exit_ct < MIN_EXIT_CT {
+    if !passive && exit_ct < MIN_EXIT_CT {
         return Err(Skip::ExitUnprofitable { exit_ct, qty });
     }
     // The liquidation mark IS the cross, at the touch: `marks` prices it by
@@ -578,6 +583,7 @@ fn consider(
         opened_ts,
         qty,
         fwd_apr,
+        resolves_by: Some(resolves_by.to_string()),
         exit_ct,
         cross_ct,
         // `main.rs:387`'s rule, exactly: no prefixes means the process loaded
@@ -601,9 +607,9 @@ fn consider(
 ///      answers a degenerate one with `1.0` — the CEILING hurdle, maximally
 ///      eager to liquidate. See §4: fail-closed for entry is fail-open for
 ///      exit, so the exit side must refuse rather than inherit the number.
-///   2. `hurdle` is outside the band `crate::apr_bar` can produce. A bar that
-///      did not come from the utilization curve is a bar this rule cannot
-///      interpret — including the `0.0` a bench/no-risk run installs.
+///   2. `hurdle` is nonfinite or below the utilization floor, including the
+///      `0.0` a bench/no-risk run installs. The taker bar can legitimately
+///      raise the effective maker hurdle above the utilization ceiling.
 ///   3. Marks that are stale, unageable or corrupt. The rule is
 ///      `taketake::bar_from_marks`'s and not a second copy of it — one file,
 ///      one definition of "too old to act on".
@@ -620,18 +626,41 @@ pub fn select(
     owned: &[String],
     now: f64,
 ) -> Result<(Vec<Exit>, Vec<Skip>), String> {
+    select_impl(marks_json, hurdle, global_cap_usd, owned, now, false)
+}
+
+/// Passive orders may wait behind the touch at a profitable limit. A poor
+/// touch price or high holding APR is not a reason to prevent such an order
+/// from resting. The placer prices against holding as well as the lot basis.
+pub fn select_passive(
+    marks_json: &str,
+    hurdle: f64,
+    global_cap_usd: f64,
+    owned: &[String],
+    now: f64,
+) -> Result<(Vec<Exit>, Vec<Skip>), String> {
+    select_impl(marks_json, hurdle, global_cap_usd, owned, now, true)
+}
+
+fn select_impl(
+    marks_json: &str,
+    hurdle: f64,
+    global_cap_usd: f64,
+    owned: &[String],
+    now: f64,
+    passive: bool,
+) -> Result<(Vec<Exit>, Vec<Skip>), String> {
     if !global_cap_usd.is_finite() || global_cap_usd <= 0.0 {
         return Err(format!(
             "global cap is {global_cap_usd} — utilization() answers a degenerate cap with 1.0, \
              which pins the exit hurdle at its CEILING. Refusing to select."
         ));
     }
-    if !hurdle.is_finite() || !(crate::APR_FLOOR..=crate::APR_CEIL).contains(&hurdle) {
+    if !hurdle.is_finite() || hurdle < crate::APR_FLOOR {
         return Err(format!(
-            "hurdle {hurdle} is outside [{}, {}] — not a bar apr_bar() can produce. \
+            "hurdle {hurdle} must be finite and at least {}. \
              Refusing to select.",
-            crate::APR_FLOOR,
-            crate::APR_CEIL
+            crate::APR_FLOOR
         ));
     }
     if let Bar::Untrusted { why } = bar_from_marks(marks_json, now) {
@@ -643,7 +672,7 @@ pub fn select(
     let doc: serde_json::Value = serde_json::from_str(marks_json).unwrap_or_default();
     let empty = Vec::new();
     for p in doc.get("positions").and_then(|v| v.as_array()).unwrap_or(&empty) {
-        match consider(p, hurdle, owned, &today) {
+        match consider(p, hurdle, owned, &today, passive) {
             Ok(e) => exits.push(e),
             Err(s) => skips.push(s),
         }
@@ -696,6 +725,21 @@ pub fn identity_set(exits: &[Exit]) -> Vec<(String, u64)> {
 #[cfg(test)]
 mod tests {
     /// The two spellings of the exit floor are one number.
+    #[test]
+    fn passive_selection_admits_high_apr_off_touch_lots_but_requires_fresh_marks() {
+        let m = marks(&pos("off-touch", 26, "2027-04-25", "11.0", "-0.033"));
+        assert!(sel(&m, 18.0).unwrap().0.is_empty());
+        let (exits, _) = select_passive(&m, 18.0, CAP, &[], NOW).unwrap();
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].exit_ct, -0.033);
+        let held = marks(&pos("hold", 26, "2027-04-25", "20.0", "-0.033"));
+        let exits = select_passive(&held, 18.0, CAP, &[], NOW).unwrap().0;
+        assert_eq!(exits.len(), 1);
+        assert_eq!(exits[0].resolves_by.as_deref(), Some("2027-04-25"));
+        assert!(sel(&held, 18.0).unwrap().0.is_empty(), "immediate-exit reporting is unchanged");
+        assert!(select_passive(&m, 18.0, CAP, &[], NOW + 1000.0).is_err());
+    }
+
     #[test]
     fn min_exit_ct_spellings_agree() {
         assert_eq!(
@@ -912,11 +956,22 @@ mod tests {
             assert!(e.contains("global cap"), "and it names the input: {e}");
         }
 
-        // ...and a hurdle that did not come off the utilization curve is
-        // refused too, including the 0.0 a bench/no-risk run installs.
-        for bad in [0.0, crate::APR_FLOOR - 0.1, crate::APR_CEIL + 0.1, f64::NAN] {
+        // Invalid hurdles still refuse, including the bench/no-risk sentinel.
+        for bad in [0.0, crate::APR_FLOOR - 0.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(select(&m, bad, CAP, &[], NOW).is_err(), "hurdle {bad} must refuse");
         }
+    }
+
+    #[test]
+    fn a_taker_linked_hurdle_above_the_utilization_ceiling_still_scans_exits() {
+        let m = marks(&pos("longdated", 26, "2027-04-25", "17.0", "0.0312"));
+        assert!(sel(&m, crate::APR_CEIL).unwrap().0.is_empty());
+        for hurdle in [17.511127928529856, 18.01627407112253, 25.0] {
+            let (exits, _) = sel(&m, hurdle).expect("a finite taker-linked hurdle is valid");
+            assert_eq!(exits.len(), 1);
+            assert_eq!(exits[0].rel_id, "longdated");
+        }
+        assert!(select(&m, 18.0, 0.0, &[], NOW).is_err(), "bad capital still refuses");
     }
 
     /// WHAT THIS ENGINE COULD ACT ON IS NOT WHAT IT SELECTS.

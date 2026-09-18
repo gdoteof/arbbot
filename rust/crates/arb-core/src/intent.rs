@@ -20,7 +20,7 @@
 //!
 //! # The emitted bytes are a contract
 //!
-//! These lines are appended to `data/trader-rs/intents.jsonl`, folded by
+//! These lines are appended to the armed engine's intent tape and folded by
 //! `arb_query::intents` for the dashboard, and hashed into the golden digest
 //! that every refactor in this repo has to reproduce. One byte of difference is
 //! a changed decision until proven otherwise.

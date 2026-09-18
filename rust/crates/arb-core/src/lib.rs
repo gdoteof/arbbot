@@ -12,5 +12,6 @@ pub mod scan;
 pub mod dec;
 pub mod model;
 pub mod quoter;
+pub mod price_grid;
 pub mod resolve;
 pub mod risk;

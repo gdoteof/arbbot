@@ -304,6 +304,9 @@ pub trait OrderSink: Send + Sync {
     /// `fills_since` -> no history). Here "0" is not inert: it is an
     /// affirmative claim that the order did not trade, and the caller acts on
     /// it by sending another order. A sink that cannot answer must say so.
+    fn terminal_filled_qty(&self, _order_id: &str) -> Result<Option<i64>, VenueError> {
+        Err(VenueError::NotWired)
+    }
     fn filled_qty(&self, _order_id: &str) -> Result<i64, VenueError> {
         Err(VenueError::NotWired)
     }
@@ -343,6 +346,10 @@ pub trait OrderSink: Send + Sync {
     /// [`arb_venue::gateway::VenueGateway::spendable_cash`], which explains
     /// which field each venue means by "spendable" and why "$0" is the one
     /// answer this must never invent.
+    fn account_capital(&self) -> Result<arb_venue::gateway::capital::AccountCapital, VenueError> {
+        Err(VenueError::NotWired)
+    }
+    #[cfg(test)]
     fn spendable_cash(&self) -> Result<String, VenueError> {
         Err(VenueError::NotWired)
     }
@@ -389,6 +396,9 @@ where
     fn fills_since(&self, min_ts: i64) -> Result<Vec<arb_venue::resp::KalshiFillRow>, VenueError> {
         VenueGateway::fills_since(self, min_ts)
     }
+    fn terminal_filled_qty(&self, order_id: &str) -> Result<Option<i64>, VenueError> {
+        VenueGateway::terminal_filled_qty(self, order_id)
+    }
     fn filled_qty(&self, order_id: &str) -> Result<i64, VenueError> {
         VenueGateway::order_filled_qty(self, order_id)
     }
@@ -398,6 +408,10 @@ where
     fn net_positions(&self) -> Result<std::collections::BTreeMap<String, f64>, VenueError> {
         VenueGateway::net_positions(self)
     }
+    fn account_capital(&self) -> Result<arb_venue::gateway::capital::AccountCapital, VenueError> {
+        VenueGateway::account_capital(self)
+    }
+    #[cfg(test)]
     fn spendable_cash(&self) -> Result<String, VenueError> {
         VenueGateway::spendable_cash(self)
     }
