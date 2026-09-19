@@ -114,6 +114,14 @@ pub(super) async fn run(template: Live, cfg: Cfg, k: Sink, p: Sink) {
             }
         }
         let reserved = reservations(&workers);
+        // One close-depth budget per ladder for the whole pass: resting groups
+        // claim first, then each lot planned here claims what it was sized to.
+        let mut claims: BTreeMap<String, i64> = BTreeMap::new();
+        for live in workers.values() {
+            if let Some((close, qty)) = live.lot.as_ref().unwrap().passive_claim() {
+                *claims.entry(close.to_owned()).or_default() += qty;
+            }
+        }
         let mut plans = Vec::new();
         for (key, live) in &mut workers {
             live.planned = None;
@@ -125,8 +133,11 @@ pub(super) async fn run(template: Live, cfg: Cfg, k: Sink, p: Sink) {
                 live.publish_working(BTreeSet::new());
                 continue;
             }
+            live.depth_claims = claims.clone();
             log(cycle(live, &cfg, &k, &p).await);
+            live.depth_claims.clear();
             if let Some(order) = live.planned.take() {
+                *claims.entry(order.close_market().to_owned()).or_default() += order.qty;
                 plans.push(order);
             }
         }

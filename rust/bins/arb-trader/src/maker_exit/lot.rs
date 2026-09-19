@@ -237,6 +237,14 @@ impl State {
             .filter(|a| a.order.cross.is_none())
             .map(|a| group_key(&a.order))
     }
+    /// The close-ladder contracts this lot's resting order still speaks for:
+    /// its market and its full quantity while nothing has filled.
+    pub fn passive_claim(&self) -> Option<(&str, i64)> {
+        self.active
+            .as_ref()
+            .filter(|a| a.order.cross.is_none() && a.filled.is_none())
+            .map(|a| (a.order.close_market(), a.order.qty))
+    }
     pub fn request_regroup(&mut self) {
         if let Some(a) = &mut self.active {
             a.regroup = true;
@@ -589,15 +597,25 @@ async fn advance(
                 Ok(Ok(n)) if n >= 0 && n <= a.order.qty => n,
                 other => return Err(format!("cannot read resting fills: {other:?}")),
             };
-            let keep = !a.regroup
-                && a.order.cross.is_none()
-                && filled == 0
-                && view.is_some_and(|v| {
-                    a.members()
+            // Each member must still pay at its own basis, and the GROUP must
+            // still have close depth for its whole quantity: members were
+            // sized within one shared budget, so the sum is what the ladder
+            // has to back.
+            let stale = if a.regroup || a.order.cross.is_some() || filled != 0 {
+                None
+            } else {
+                match view {
+                    None => Some("no engine view to hold it against".to_string()),
+                    Some(v) => a
+                        .members()
                         .iter()
-                        .all(|o| still_pays(cx, fees, o, v).is_ok())
-                });
-            if keep {
+                        .chain(std::iter::once(&a.order))
+                        .find_map(|o| still_pays(cx, fees, o, v).err()),
+                }
+            };
+            if let Some(why) = stale {
+                out.push(format!("[maker-exit] PULLING {} — {why}", a.order.rest_market()));
+            } else if !a.regroup && a.order.cross.is_none() && filled == 0 {
                 state.unlatch();
                 return Ok(());
             }
@@ -1462,4 +1480,33 @@ mod tests {
             .iter()
             .all(|l| l["role"] == "taker"));
     }
+
+    /// Members are sized within one shared budget, so the ladder has to back
+    /// their SUM. Each member alone still fits when the depth falls to seven;
+    /// the ten-lot group does not, and it is pulled with the reason logged.
+    #[tokio::test]
+    async fn a_group_is_pulled_when_the_ladder_no_longer_backs_its_total() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let _v = test_serial();
+        let f = Fixture::new();
+        let mut a = f.owner(1., 3);
+        let _b = f.owner(2., 7);
+        let k: Sink = f.k.clone();
+        let p: Sink = f.p.clone();
+        let ladder = |size: &str| {
+            let mut v = view("0.20");
+            v.pm_ask_depth.insert("p-a".into(), vec![Level { price: "0.20".into(), size: size.into() }]);
+            v
+        };
+        place_group(&mut a, vec![member(2., 7), member(1., 3)], &ladder("10"), &k, &p).await;
+        assert_eq!(a.lot.as_ref().unwrap().passive_claim(), Some(("p-a", 10)));
+        let out = manage(&mut a, Some(&ladder("10")), &k, &p).await;
+        assert!(!out.iter().any(|l| l.contains("PULLING")), "ten back ten: {out:?}");
+        assert!(a.lot.as_ref().unwrap().busy());
+        let out = manage(&mut a, Some(&ladder("7")), &k, &p).await;
+        let why = out.iter().find(|l| l.contains("PULLING")).unwrap_or_else(|| panic!("{out:?}"));
+        assert!(why.contains("depth fell to 7"), "{why}");
+        assert_eq!(a.lot.as_ref().unwrap().passive_claim(), None, "nothing rests, nothing is claimed");
+    }
+
 }

@@ -362,6 +362,18 @@ fn refuse(why: String) -> String {
 
 // ------------------------------------------------ the engine's published view ---
 
+/// Whole contracts on each close ladder already spoken for by sibling exits
+/// on the same relationship: groups resting now, and lots planned earlier in
+/// this same pass. Every lot prices against the same book snapshot, so without
+/// this each one would size itself as if the ladder were its alone.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DepthClaims {
+    /// Contracts of `pm_market`'s YES asks claimed by resting-Kalshi exits.
+    pub pm_ask: i64,
+    /// Contracts of `market`'s YES bids claimed by resting-PM-US exits.
+    pub k_bid: i64,
+}
+
 /// What the ENGINE knows and this module cannot derive: the hurdle in force, the
 /// cap it was derived from, the PM-US book, and which Kalshi asks it has yielded.
 ///
@@ -1386,6 +1398,7 @@ pub fn decide(
     view: &EngineView,
     now: Instant,
     take_ok: bool,
+    claims: DepthClaims,
 ) -> Result<Order, String> {
     if !cand.actionable {
         return Err(refuse(format!(
@@ -1496,14 +1509,15 @@ pub fn decide(
             // `pm_close` prices the top of book and `still_pays` re-prices
             // the ladder; a level counts only if that crossing price clears.
             let depth = executable_depth(cx, levels,
-                |cx, price| { let close = cx.add(price, tick); cx.cmp(close, ceiling) != Ordering::Greater });
+                |cx, price| { let close = cx.add(price, tick); cx.cmp(close, ceiling) != Ordering::Greater })
+                .saturating_sub(claims.pm_ask);
             if depth >= sized {
                 let lock = lock_per_ct(cx, fees, Shape::RestKalshi.roles(), limit, pm_close,
                     k_basis, pm_basis, sized);
                 return Ok((limit, lock, sized));
             }
         }
-        Err(format!("{pm_market} has no whole-contract ask depth inside the profitable close ceiling"))
+        Err(format!("{pm_market} has no whole-contract ask depth inside the profitable close ceiling beyond the {} sibling exits already claim", claims.pm_ask))
     })(cx);
 
     // B: rest a PM-US bid; cross the Kalshi bid one tick under, which is the
@@ -1536,14 +1550,15 @@ pub fn decide(
                 Role::Taker, Role::Maker, &min_lock)?;
             // Mirror of A: the close is priced one tick UNDER each bid level.
             let depth = executable_depth(cx, levels,
-                |cx, price| { let close = cx.sub(price, tick); cx.cmp(close, floor) != Ordering::Less });
+                |cx, price| { let close = cx.sub(price, tick); cx.cmp(close, floor) != Ordering::Less })
+                .saturating_sub(claims.k_bid);
             if depth >= sized {
                 let lock = lock_per_ct(cx, fees, Shape::RestPmUs.roles(), k_take, limit,
                     k_basis, pm_basis, sized);
                 return Ok((limit, lock, sized));
             }
         }
-        Err(format!("{} has no whole-contract bid depth above the profitable close floor", cand.market_id))
+        Err(format!("{} has no whole-contract bid depth above the profitable close floor beyond the {} sibling exits already claim", cand.market_id, claims.k_bid))
     })(cx);
 
     // Price each passive exit against its actual lot and current hedge costs.
@@ -2073,6 +2088,9 @@ pub struct Live {
     /// judge whether the slot is contested — and consumed by [`cycle`], which
     /// owns the wire. See [`MAX_RESTING_S`].
     pub rotate: Option<String>,
+    /// Close-market -> contracts claimed by sibling exits, set by the batch
+    /// scheduler before each planning pass. Empty outside it.
+    pub depth_claims: BTreeMap<String, i64>,
     /// Markets that have ALREADY HELD the single [`MAX_RESTING`] slot during the
     /// current rotation, oldest first. Selection skips them, so the slot goes
     /// round the held set instead of back to whoever `select` ranks first.
@@ -2142,6 +2160,7 @@ impl Live {
             resting: None,
             pending: None,
             rotate: None,
+            depth_claims: BTreeMap::new(),
             served: Vec::new(),
             handover_age: 0,
             unaddressable: BTreeSet::new(),
@@ -2721,6 +2740,10 @@ async fn cycle(
             return out;
         }
     };
+    let claims = DepthClaims {
+        pm_ask: live.depth_claims.get(&*pm).copied().unwrap_or(0),
+        k_bid: live.depth_claims.get(&*target.market_id).copied().unwrap_or(0),
+    };
     let decided = decide(
         &mut live.cx,
         &live.fees,
@@ -2731,6 +2754,7 @@ async fn cycle(
         &view,
         Instant::now(),
         live.take_ok,
+        claims,
     );
     let order = match decided {
         Ok(o) => o,
@@ -4177,7 +4201,7 @@ mod tests {
         // Kalshi 0.20/0.22 (2c), PM-US 0.16/0.24 (8c).
         let q = quote(Some("0.20"), Some("0.22"));
         let vw = wide_pm_view("0.24", "0.16", "0.20");
-        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false)
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false, DepthClaims::default())
             .expect("the mirror shape pays");
         assert_eq!(o.shape, Shape::RestPmUs, "the wider spread is PM-US's");
         assert_eq!(o.rest_market(), "p-a", "and that is where the order rests");
@@ -4203,7 +4227,7 @@ mod tests {
         let recs = vec![open_basket(1.0, 5, "0.57", "0.43")];
         let q = quote(Some("0.16"), Some("0.24"));
         let vw = wide_pm_view("0.22", "0.20", "0.16");
-        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false)
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false, DepthClaims::default())
             .expect("the resting shape pays");
         assert!(o.cross.is_none(), "the flag is off, so nothing crosses: {o:?}");
     }
@@ -4229,7 +4253,7 @@ mod tests {
         let recs = vec![open_basket(1.0, 5, "0.57", "0.43")];
         let q = quote(Some("0.16"), Some("0.24"));
         let vw = wide_pm_view("0.22", "0.20", "0.16");
-        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true)
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true, DepthClaims::default())
             .expect("the resting shape pays");
         assert_eq!(o.shape, Shape::RestKalshi, "the wider spread is Kalshi's");
         let c = o.cross.as_ref().expect("crossing clears the floor here: {o:?}");
@@ -4262,7 +4286,7 @@ mod tests {
         let q = quote(Some("0.16"), Some("0.24"));
         let mut vw = wide_pm_view("0.22", "0.20", "0.16");
         vw.suppressed_at.remove(&("K-a".to_string(), SIDE_BID.to_string()));
-        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true)
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true, DepthClaims::default())
             .expect("the resting shape still pays");
         assert_eq!(o.shape, Shape::RestKalshi);
         assert!(
@@ -4290,7 +4314,7 @@ mod tests {
         let recs = vec![open_basket(1.0, 5, "0.57", "0.46")];
         let q = quote(Some("0.16"), Some("0.24"));
         let vw = wide_pm_view("0.22", "0.20", "0.16");
-        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true)
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true, DepthClaims::default())
             .expect("the resting shape still pays");
         assert!(o.cross.is_none(), "crossing does not clear the floor, so it rests: {o:?}");
         assert_eq!(o.limit, "0.2300", "and rests where it always did: {o:?}");
@@ -4308,7 +4332,7 @@ mod tests {
         // Kalshi 0.16/0.24 (8c), PM-US 0.20/0.22 (2c) — the mirror of the above.
         let q = quote(Some("0.16"), Some("0.24"));
         let vw = wide_pm_view("0.22", "0.20", "0.16");
-        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false)
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false, DepthClaims::default())
             .expect("the original shape pays");
         assert_eq!(o.shape, Shape::RestKalshi, "the wider spread is Kalshi's");
         assert_eq!(o.rest_market(), "K-a");
@@ -4330,7 +4354,7 @@ mod tests {
         // the mirror without a strictly better number.
         let q = quote(Some("0.19"), Some("0.23"));
         let vw = wide_pm_view("0.23", "0.19", "0.19");
-        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false)
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false, DepthClaims::default())
             .expect("something pays");
         let a: f64 = o.lock_ct.parse().expect("lock parses");
         let b: f64 = o.runner_up_ct.as_ref().expect("both priced").parse().expect("parses");
@@ -4349,7 +4373,7 @@ mod tests {
         let recs = vec![open_basket(1.0, 5, "0.30", "0.70")];
         let q = quote(Some("0.20"), Some("0.22"));
         let vw = wide_pm_view("0.90", "0.86", "0.20");
-        let why = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false)
+        let why = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false, DepthClaims::default())
             .expect_err("nothing pays");
         assert!(why.contains("rest-kalshi:"), "{why}");
         assert!(why.contains("rest-pmus:"), "{why}");
@@ -4367,7 +4391,7 @@ mod tests {
         let q = quote(Some("0.20"), Some("0.22"));
         let mut vw = wide_pm_view("0.24", "0.16", "0.20");
         vw.suppressed_at.remove(&("p-a".to_string(), SIDE_BID.to_string()));
-        let why = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false)
+        let why = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), false, DepthClaims::default())
             .expect_err("the bid side was never yielded");
         assert!(why.contains("p-a:bid"), "it names the side it needs: {why}");
     }
@@ -5208,7 +5232,7 @@ mod tests {
             &quote(Some("0.10"), Some("0.30")),
             &view("0.20"),
             Instant::now(),
-            false,
+            false, DepthClaims::default(),
         )
         .expect("a priced exit");
         assert_eq!(o.qty, 34, "all remaining inventory in this lot may rest");
@@ -5236,7 +5260,7 @@ mod tests {
             Level { price: "0.99".into(), size: "100".into() },
         ]);
         let o = decide(&mut cx, &fees, &recs, &cand(17, 1.0), "p-a",
-            &quote(Some("0.10"), Some("0.30")), &vw, Instant::now(), false)
+            &quote(Some("0.10"), Some("0.30")), &vw, Instant::now(), false, DepthClaims::default())
             .expect("seven contracts have a profitable hedge");
         assert_eq!(o.shape, Shape::RestKalshi);
         assert_eq!(o.qty, 7, "the unhedgeable ten must never reach the resting first leg");
@@ -5275,7 +5299,7 @@ mod tests {
             &quote(Some("0.10"), Some("0.30")),
             &view("0.20"),
             Instant::now(),
-            false,
+            false, DepthClaims::default(),
         )
         .expect_err("no open lot");
         assert!(e.contains("no open ledger record for r1 opened at 1"), "{e}");
@@ -5299,7 +5323,7 @@ mod tests {
             &quote(Some("0.10"), Some("0.30")),
             &view("0.20"),
             Instant::now(),
-            false,
+            false, DepthClaims::default(),
         )
         .expect_err("an inverted basket has no PM short to close");
         assert!(e.contains("PM-US leg"), "the refusal names the side: {e}");
@@ -5317,7 +5341,7 @@ mod tests {
         let e = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a",
             &quote(Some("0.10"), Some("0.30")), &never, Instant::now(),
-            false,
+            false, DepthClaims::default(),
         )
         .expect_err("the quoter has not been told");
         assert!(e.contains("yield"), "{e}");
@@ -5331,7 +5355,7 @@ mod tests {
         let e = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a",
             &quote(Some("0.10"), Some("0.30")), &just_now, Instant::now(),
-            false,
+            false, DepthClaims::default(),
         )
         .expect_err("told, but not yet settled");
         assert!(e.contains("giving it"), "{e}");
@@ -5414,7 +5438,7 @@ mod tests {
         let o = decide(
             &mut cx, &fees, &recs, &cand(4, 3.0), "p-a",
             &quote(Some("0.0300"), Some("0.0500")), &view("0.05"), Instant::now(),
-            false,
+            false, DepthClaims::default(),
         )
         .expect("the selected lot is exitable");
         assert_eq!(o.closes_ts, 3.0, "the record select named, not the dearest: {o:?}");
@@ -5471,7 +5495,7 @@ mod tests {
             &quote(Some("0.0100"), Some("0.1000")),
             &view("0.20"),
             Instant::now(),
-            false,
+            false, DepthClaims::default(),
         )
         .expect("the ladder has a rung that clears the selection floor");
         assert_eq!(o.limit, "0.3300", "fees and the hedge buffer are already included: {o:?}");
@@ -5505,7 +5529,7 @@ mod tests {
             decide(
                 cx, &fees, &recs, &cand(5, ts), "p-a",
                 &quote(Some("0.0100"), Some("0.1000")), &view("0.20"), Instant::now(),
-                false,
+                false, DepthClaims::default(),
             )
             .map(|o| o.limit)
         };
@@ -5538,7 +5562,7 @@ mod tests {
         let o = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a",
             &quote(Some("0.9000"), Some("0.9500")), &view("0.20"), Instant::now(),
-            false,
+            false, DepthClaims::default(),
         )
         .expect("a bid above the floor is the best case, not a refusal");
         assert_eq!(o.limit, "0.9400", "one rung inside the 0.95 offer, not the floor: {o:?}");
@@ -5609,7 +5633,7 @@ mod tests {
         q.status = "finalized".into();
         let e = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a", &q, &view("0.20"), Instant::now(),
-            false,
+            false, DepthClaims::default(),
         )
         .expect_err("a finalized market takes no order");
         assert!(e.contains("not `active`"), "{e}");
@@ -5629,7 +5653,7 @@ mod tests {
         let e = decide(
             &mut cx, &fees, &recs, &c, "p-a",
             &quote(Some("0.10"), Some("0.30")), &view("0.20"), Instant::now(),
-            false,
+            false, DepthClaims::default(),
         )
         .expect_err("not ours");
         assert!(e.contains("--rel-prefix"), "{e}");
@@ -5647,7 +5671,7 @@ mod tests {
         let e = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a",
             &quote(Some("0.10"), Some("0.30")), &dark, Instant::now(),
-            false,
+            false, DepthClaims::default(),
         )
         .expect_err("no PM ask");
         assert!(e.contains("unpriceable"), "{e}");
@@ -6858,7 +6882,7 @@ mod tests {
         let e = decide(
             &mut cx, &fees, &recs, &cand(34, 1.0), "p-a",
             &quote(Some("0.10"), Some("0.30")), &view("0.20"), Instant::now(),
-            false,
+            false, DepthClaims::default(),
         )
         .expect_err("the engine owes a hedge on this market");
         assert!(e.contains("double hedge"), "the registry's own words: {e}");
@@ -7094,7 +7118,7 @@ mod tests {
         c.resolves_by = Some(arb_core::resolve::iso_from_day(today + 7));
         let v = view("0.20");
         let o = decide(&mut cx, &fees, &recs, &c, "p-a",
-            &quote(Some("0.10"), Some("0.20")), &v, Instant::now(), true).unwrap();
+            &quote(Some("0.10"), Some("0.20")), &v, Instant::now(), true, DepthClaims::default()).unwrap();
         assert_eq!(o.qty, 34);
         let limit = o.limit.parse::<f64>().unwrap();
         match o.shape {
@@ -7125,12 +7149,12 @@ mod tests {
         let v = view("0.30");
         let q = quote(Some("0.20"), Some("0.22"));
         let mut c = cand(34, 1.);
-        let plain = decide(&mut cx, &fees, &recs, &c, "p-a", &q, &v, Instant::now(), true).unwrap();
+        let plain = decide(&mut cx, &fees, &recs, &c, "p-a", &q, &v, Instant::now(), true, DepthClaims::default()).unwrap();
         assert!(plain.cross.is_some(), "this touch clears the old realized-profit-only floor");
         let day = (wall_now() / 86400.).floor() as i64;
         c.resolves_by = Some(arb_core::resolve::iso_from_day(day + 7));
         c.fwd_apr = 100.;
-        let priced = decide(&mut cx, &fees, &recs, &c, "p-a", &q, &v, Instant::now(), true).unwrap();
+        let priced = decide(&mut cx, &fees, &recs, &c, "p-a", &q, &v, Instant::now(), true, DepthClaims::default()).unwrap();
         assert!(priced.cross.is_none(), "do not cross below the holding-value reservation price");
         assert!(still_pays(&mut cx, &fees, &priced, &v).is_ok());
         let mut cheap = plain;
@@ -7160,7 +7184,7 @@ mod tests {
                 Level { price: format!("0.{c:02}"), size: "100".into() },
             ]);
             let Ok(o) = decide(&mut cx, &fees, &recs, &cand(17, 1.0), "p-a",
-                &quote(Some("0.10"), Some("0.30")), &vw, Instant::now(), false) else { continue };
+                &quote(Some("0.10"), Some("0.30")), &vw, Instant::now(), false, DepthClaims::default()) else { continue };
             assert_eq!(o.shape, Shape::RestKalshi);
             if o.qty > 3 { sized_by_depth += 1; }
             still_pays(&mut cx, &fees, &o, &vw)
@@ -7176,13 +7200,45 @@ mod tests {
                 Level { price: format!("0.{c:02}"), size: "100".into() },
             ]);
             let Ok(o) = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw,
-                Instant::now(), false) else { continue };
+                Instant::now(), false, DepthClaims::default()) else { continue };
             assert_eq!(o.shape, Shape::RestPmUs);
             if o.qty > 2 { sized_by_depth += 1; }
             still_pays(&mut cx, &fees, &o, &vw)
                 .unwrap_or_else(|e| panic!("second level 0.{c:02}: decide rested {} but the keep-check pulls it: {e}", o.qty));
         }
         assert!(sized_by_depth > 0, "the sweep must exercise a second level that counts");
+    }
+
+
+    /// Every lot prices against the same snapshot. What siblings already rest
+    /// on the close ladder, and what earlier lots in the same pass were sized
+    /// to, is not available to this one.
+    #[tokio::test]
+    async fn sibling_claims_shrink_the_depth_a_lot_may_rest_on() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 17, "0.22", "0.19")];
+        let mut vw = view("0.20");
+        vw.pm_ask_depth.insert("p-a".into(), vec![
+            Level { price: "0.20".into(), size: "7".into() },
+            Level { price: "0.99".into(), size: "100".into() },
+        ]);
+        let q = quote(Some("0.10"), Some("0.30"));
+        let alone = decide(&mut cx, &fees, &recs, &cand(17, 1.0), "p-a", &q, &vw,
+            Instant::now(), false, DepthClaims::default()).expect("seven back an exit");
+        assert_eq!(alone.qty, 7);
+        let shared = decide(&mut cx, &fees, &recs, &cand(17, 1.0), "p-a", &q, &vw,
+            Instant::now(), false, DepthClaims { pm_ask: 4, k_bid: 0 }).expect("three remain");
+        assert_eq!(shared.qty, 3, "seven on the ladder, four already claimed");
+        // A fully claimed PM-US ladder alone is not a refusal: the contest
+        // falls through to the mirror shape, which rests on the OTHER ladder.
+        let mirror = decide(&mut cx, &fees, &recs, &cand(17, 1.0), "p-a", &q, &vw,
+            Instant::now(), false, DepthClaims { pm_ask: 7, k_bid: 0 }).expect("the mirror still has depth");
+        assert_eq!(mirror.shape, Shape::RestPmUs);
+        let why = decide(&mut cx, &fees, &recs, &cand(17, 1.0), "p-a", &q, &vw,
+            Instant::now(), false, DepthClaims { pm_ask: 7, k_bid: 10_000 })
+            .expect_err("nothing remains for this lot on either ladder");
+        assert!(why.contains("sibling exits already claim"), "{why}");
     }
 
 }
