@@ -1504,7 +1504,7 @@ mod tests {
         assert!(!out.iter().any(|l| l.contains("PULLING")), "ten back ten: {out:?}");
         assert!(a.lot.as_ref().unwrap().busy());
         let out = manage(&mut a, Some(&ladder("7")), &k, &p).await;
-        let why = out.iter().find(|l| l.contains("PULLING")).expect(&format!("{out:?}"));
+        let why = out.iter().find(|l| l.contains("PULLING")).unwrap_or_else(|| panic!("{out:?}"));
         assert!(why.contains("depth fell to 7"), "{why}");
         assert_eq!(a.lot.as_ref().unwrap().passive_claim(), None, "nothing rests, nothing is claimed");
     }
