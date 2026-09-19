@@ -1573,7 +1573,7 @@ fn spawn_maker_exit(
         maker_exit::arm_standoff();
         eprintln!(
             "[maker-exit] ARMED: independent exits across eligible markets, same-price lots grouped with oldest-first fills, \
-             sized to its full remaining paired inventory. No per-market order cap. Off-touch limits are allowed. \
+             sized to remaining paired inventory but capped by profitable executable close depth. No per-market order cap. Off-touch limits are allowed. \
              Each order covers its lot basis, fees, hedge slippage and >= {}/ct net buffer. \
              Each market owns its fills and hedge retries; unresolved naked legs pause new exits. \
              Ledger: {}. Candidate persistence: {:.0}s / {} scans.",

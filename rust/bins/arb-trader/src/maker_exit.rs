@@ -1,6 +1,7 @@
 //! Passive exits own inventory by (relationship, opening timestamp).
-//! Every eligible lot can rest its full remaining paired quantity, including
-//! multiple orders on the same market and orders away from the touch. Each
+//! Every eligible lot can rest up to its remaining paired quantity, capped by
+//! profitable executable depth on the close leg. Multiple orders on the same
+//! market and orders away from the touch are allowed. Each
 //! order retains its own basis, fill receipts and durable recovery checkpoint.
 //! Shared registries preserve entry suppression and reconciliation stand-off
 //! until every sibling order and hedge has finished.
@@ -17,7 +18,7 @@ use crate::naked_act::{ceil_to_tick, lot_at, Held};
 pub use crate::naked_act::MIN_LOCK;
 use arb_core::fees::{FeeSchedule, Role};
 use arb_core::clock::now_s as wall_now;
-use arb_core::model::Venue;
+use arb_core::model::{Level, Venue};
 use arb_core::scan::{Cx, D};
 use arb_venue::gateway::Quote;
 use arb_venue::resp::OrderFill;
@@ -379,6 +380,8 @@ pub struct EngineView {
     /// Absent means the engine holds no book or the side is empty; either way
     /// the close is unpriceable and the exit is refused.
     pub pm_ask: BTreeMap<String, String>,
+    /// Full executable ladder: price without size cannot safely back a first leg.
+    pub pm_ask_depth: BTreeMap<String, Vec<Level>>,
     /// PM-US market -> best YES BID, the price a RESTING close bids against.
     /// [`Shape::RestPmUs`] needs this the way [`Shape::RestKalshi`] needs
     /// `pm_ask`: the leg it prices passively is the one it must see both sides
@@ -389,6 +392,8 @@ pub struct EngineView {
     /// Kalshi prices from a fresh `market_quote`, because it must also know the
     /// ladder and the trading status before it may rest there.
     pub k_bid: BTreeMap<String, String>,
+    /// Full executable ladder for the mirror-image exit shape.
+    pub k_bid_depth: BTreeMap<String, Vec<Level>>,
     /// (market, side) pairs the quoters have been told to yield, and the instant
     /// that was installed. Absent means NOT yielded. The side is the WIRE
     /// spelling and not [`arb_core::model::BookSide`], which is deliberately not
@@ -1323,6 +1328,19 @@ pub fn lock_per_ct(
     cx.sub(gross, paid)
 }
 
+/// Whole contracts visible at prices the close is allowed to take. Fractional
+/// venue sizes are deliberately rounded down.
+fn executable_depth(cx: &mut Cx, levels: &[Level], mut accepts: impl FnMut(&mut Cx, D) -> bool) -> i64 {
+    let mut total = cx.zero();
+    for level in levels {
+        let (Some(price), Some(size)) = (cx.parse(&level.price), cx.parse(&level.size)) else { continue };
+        if cx.is_pos(size) && accepts(cx, price) {
+            total = cx.add(total, size);
+        }
+    }
+    cx.quantize_int_down(total).to_standard_notation_string().parse::<i64>().unwrap_or(0)
+}
+
 /// Minimum realized profit for a passive reservation price. A standard paired
 /// basket pays $1 at resolution. Releasing V now is at least as valuable as
 /// holding when V * (1 + hurdle * years) >= 1. Also retain the basis/fee buffer.
@@ -1462,25 +1480,39 @@ pub fn decide(
 
     // A: rest a Kalshi ask; cross the PM-US ask one tick through, matching
     // `mark_positions.py`'s `p_ask + 0.01`.
-    let a = (|cx: &mut Cx| -> Result<(D, D), String> {
-        let pm_close = cx.add(pm_ask_d, tick);
-        let floor = exit_limit(
-            cx, fees, &quote.ladder, k_basis, pm_basis, pm_close, qty, Role::Maker, Role::Taker,
-            &min_lock,
-        )?;
-        let limit =
-            rest_price(cx, &quote.ladder, floor, quote.yes_bid.as_deref(), quote.yes_ask.as_deref())?;
-        let limit = cx.quantize_4dp(limit);
-        let lock =
-            lock_per_ct(cx, fees, Shape::RestKalshi.roles(), limit, pm_close, k_basis, pm_basis, qty);
-        Ok((limit, lock))
+    let a = (|cx: &mut Cx| -> Result<(D, D, i64), String> {
+        let levels = view.pm_ask_depth.get(pm_market)
+            .ok_or_else(|| format!("no PM-US ask depth for {pm_market}; a top price without size cannot back an exit"))?;
+        for sized in (1..=qty).rev() {
+            let pm_close = cx.add(pm_ask_d, tick);
+            let floor = exit_limit(cx, fees, &quote.ladder, k_basis, pm_basis, pm_close, sized,
+                Role::Maker, Role::Taker, &min_lock)?;
+            let limit = rest_price(cx, &quote.ladder, floor,
+                quote.yes_bid.as_deref(), quote.yes_ask.as_deref())?;
+            let limit = cx.quantize_4dp(limit);
+            let ceiling = close_limit(cx, fees, limit, k_basis, pm_basis, sized,
+                Role::Maker, Role::Taker, &min_lock)?;
+            // The close crosses one tick THROUGH each level, exactly as
+            // `pm_close` prices the top of book and `still_pays` re-prices
+            // the ladder; a level counts only if that crossing price clears.
+            let depth = executable_depth(cx, levels,
+                |cx, price| { let close = cx.add(price, tick); cx.cmp(close, ceiling) != Ordering::Greater });
+            if depth >= sized {
+                let lock = lock_per_ct(cx, fees, Shape::RestKalshi.roles(), limit, pm_close,
+                    k_basis, pm_basis, sized);
+                return Ok((limit, lock, sized));
+            }
+        }
+        Err(format!("{pm_market} has no whole-contract ask depth inside the profitable close ceiling"))
     })(cx);
 
     // B: rest a PM-US bid; cross the Kalshi bid one tick under, which is the
     // mirror of A's tick and conservative in the same direction — a marketable
     // sell limit one tick under the bid fills AT the bid or better, so pricing
     // the decision at `bid - TICK` cannot flatter it.
-    let b = (|cx: &mut Cx| -> Result<(D, D), String> {
+    let b = (|cx: &mut Cx| -> Result<(D, D, i64), String> {
+        let levels = view.k_bid_depth.get(&cand.market_id)
+            .ok_or_else(|| format!("no Kalshi bid depth for {}; a top price without size cannot back an exit", cand.market_id))?;
         let Some(k_bid) = quote.yes_bid.as_deref().and_then(|x| cx.parse(x)) else {
             return Err(format!(
                 "{} has no Kalshi bid — the leg this shape SELLS into is unpriceable",
@@ -1494,25 +1526,34 @@ pub fn decide(
                 cx.emit_6dp(k_bid)
             ));
         }
-        let ceiling = close_limit(
-            cx, fees, k_take, k_basis, pm_basis, qty, Role::Taker, Role::Maker, &min_lock,
-        )?;
-        let pm_bid = view.pm_bid.get(pm_market).map(String::as_str);
-        let limit = rest_price_bid(cx, ceiling, pm_bid, Some(pm_ask.as_str()))?;
-        let limit = cx.quantize_4dp(limit);
-        let lock =
-            lock_per_ct(cx, fees, Shape::RestPmUs.roles(), k_take, limit, k_basis, pm_basis, qty);
-        Ok((limit, lock))
+        for sized in (1..=qty).rev() {
+            let ceiling = close_limit(cx, fees, k_take, k_basis, pm_basis, sized,
+                Role::Taker, Role::Maker, &min_lock)?;
+            let pm_bid = view.pm_bid.get(pm_market).map(String::as_str);
+            let limit = rest_price_bid(cx, ceiling, pm_bid, Some(pm_ask.as_str()))?;
+            let limit = cx.quantize_4dp(limit);
+            let floor = exit_limit(cx, fees, &quote.ladder, k_basis, pm_basis, limit, sized,
+                Role::Taker, Role::Maker, &min_lock)?;
+            // Mirror of A: the close is priced one tick UNDER each bid level.
+            let depth = executable_depth(cx, levels,
+                |cx, price| { let close = cx.sub(price, tick); cx.cmp(close, floor) != Ordering::Less });
+            if depth >= sized {
+                let lock = lock_per_ct(cx, fees, Shape::RestPmUs.roles(), k_take, limit,
+                    k_basis, pm_basis, sized);
+                return Ok((limit, lock, sized));
+            }
+        }
+        Err(format!("{} has no whole-contract bid depth above the profitable close floor", cand.market_id))
     })(cx);
 
     // Price each passive exit against its actual lot and current hedge costs.
     // The half-cent net buffer is shared with hedge completion; the marks
     // snapshot's two-cent display threshold is not a realized-profit target.
     let lock_floor = cx.parse_exact(&min_lock);
-    let graded = |cx: &mut Cx, r: &Result<(D, D), String>| -> Result<(D, D), String> {
+    let graded = |cx: &mut Cx, r: &Result<(D, D, i64), String>| -> Result<(D, D, i64), String> {
         match r {
-            Ok((limit, lock)) if cx.cmp(*lock, lock_floor) != Ordering::Less => Ok((*limit, *lock)),
-            Ok((limit, lock)) => Err(format!(
+            Ok((limit, lock, sized)) if cx.cmp(*lock, lock_floor) != Ordering::Less => Ok((*limit, *lock, *sized)),
+            Ok((limit, lock, _)) => Err(format!(
                 "priced at {} but locks only {}/ct, under the {}/ct floor the selector \
                  admitted it under",
                 cx.emit_6dp(*limit),
@@ -1524,22 +1565,22 @@ pub fn decide(
     };
     let ga = graded(cx, &a);
     let gb = graded(cx, &b);
-    let (shape, limit, lock, runner_up) = match (&ga, &gb) {
+    let (shape, limit, lock, sized_qty, runner_up) = match (&ga, &gb) {
         (Err(ea), Err(eb)) => {
             return Err(refuse(format!(
                 "neither exit shape pays on {}. rest-kalshi: {ea}. rest-pmus: {eb}",
                 cand.rel_id
             )))
         }
-        (Ok((l, lk)), Err(_)) => (Shape::RestKalshi, *l, *lk, None),
-        (Err(_), Ok((l, lk))) => (Shape::RestPmUs, *l, *lk, None),
-        (Ok((la, ka)), Ok((lb, kb))) => {
+        (Ok((l, lk, q)), Err(_)) => (Shape::RestKalshi, *l, *lk, *q, None),
+        (Err(_), Ok((l, lk, q))) => (Shape::RestPmUs, *l, *lk, *q, None),
+        (Ok((la, ka, qa)), Ok((lb, kb, qb))) => {
             // Ties go to RestKalshi: it is the shape with the longer live
             // record, and a tie is not evidence for changing venue.
             if cx.cmp(*kb, *ka) == Ordering::Greater {
-                (Shape::RestPmUs, *lb, *kb, Some(*ka))
+                (Shape::RestPmUs, *lb, *kb, *qb, Some(*ka))
             } else {
-                (Shape::RestKalshi, *la, *ka, Some(*kb))
+                (Shape::RestKalshi, *la, *ka, *qa, Some(*kb))
             }
         }
     };
@@ -1628,7 +1669,7 @@ pub fn decide(
                 pm_take,
                 k_basis,
                 pm_basis,
-                qty,
+                sized_qty,
             );
             let floor = cx.parse_exact(&min_lock);
             if cx.cmp(lock, floor) == Ordering::Less {
@@ -1654,7 +1695,7 @@ pub fn decide(
         shape,
         market: cand.market_id.clone(),
         pm_market: pm_market.to_string(),
-        qty,
+        qty: sized_qty,
         limit: limit.to_standard_notation_string(),
         closes_ts: k_lot.open_ts,
         k_basis: k_lot.cost_per_ct,
@@ -1741,11 +1782,28 @@ pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, t
     // A CROSS PAYS TAKER ON BOTH LEGS. The shape still says which leg went
     // first, but neither rested, so neither is a maker — and the comment below
     // is exactly why that matters.
-    let (k_role, pm_role) = match (o.cross.is_some(), o.shape) {
-        (true, _) => ("taker", "taker"),
-        (false, Shape::RestKalshi) => ("maker", "taker"),
-        (false, Shape::RestPmUs) => ("taker", "maker"),
+    let roles = match (o.cross.is_some(), o.shape) {
+        (true, _) => (Role::Taker, Role::Taker),
+        (false, Shape::RestKalshi) => (Role::Maker, Role::Taker),
+        (false, Shape::RestPmUs) => (Role::Taker, Role::Maker),
     };
+    let (k_role, pm_role) = match roles {
+        (Role::Maker, Role::Taker) => ("maker", "taker"),
+        (Role::Taker, Role::Maker) => ("taker", "maker"),
+        (Role::Taker, Role::Taker) => ("taker", "taker"),
+        (Role::Maker, Role::Maker) => ("maker", "maker"),
+    };
+    let mut cx = Cx::default();
+    let fees = FeeSchedule::new(&mut cx);
+    let actual_lock = match (cx.parse(k_fill), cx.parse(pm_fill),
+        cx.parse(&o.k_basis), cx.parse(&o.pm_basis)) {
+        (Some(k), Some(p), Some(kb), Some(pb)) => {
+            let lock = lock_per_ct(&mut cx, &fees, roles, k, p, kb, pb, filled);
+            cx.emit_6dp(lock)
+        }
+        _ => "unpriced".to_string(),
+    };
+    let planned_lock = o.cross.as_ref().map_or(&o.lock_ct, |c| &c.lock_ct).clone();
     serde_json::json!({
         "ts": ts,
         "relationship_id": o.rel_id,
@@ -1763,15 +1821,17 @@ pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, t
         // takers' fees to convert now, so it locks strictly less than the rest
         // it replaced — recording the rested figure would book a profit this
         // trade did not make.
-        "maker_exit_lock_ct": o.cross.as_ref().map_or(&o.lock_ct, |c| &c.lock_ct),
+        "maker_exit_lock_ct": actual_lock.clone(),
+        "maker_exit_planned_lock_ct": planned_lock.clone(),
         "note": match &o.cross {
             Some(c) => format!(
                 "opportunistic maker exit ({}): BOTH legs were CROSSED — an IOC on {} at {} \
-                 rather than a post-only order rested there — because crossing still locked \
+                 rather than a post-only order rested there — because crossing was planned to lock \
                  {}/ct against BOTH legs' ledger basis, net of both takers' fees, where \
                  resting would have locked {}/ct and waited. The difference is the spread and \
                  the taker fees, and it is what was paid to convert now instead of joining a \
-                 queue. Sized to ONE open lot, so this closes exactly one record. The leg \
+                 queue. The venues' actual fills lock {actual_lock}/ct on the modelled fee schedule. \
+                 Sized to ONE open lot, so this closes exactly one record. The leg \
                  prices are the venues' OWN fills, not the limits sent — an IOC fills at the \
                  touch when the touch is better, and the difference is real money. \
                  realized_pnl_usd is still absent: PM-US fees are not on anything this process \
@@ -1784,9 +1844,10 @@ pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, t
             ),
             None => format!(
                 "opportunistic maker exit ({}): a post-only order rested on {} at the price \
-                 that locked a profit against BOTH legs' ledger basis, and the other leg was \
+                 that was planned to lock {planned_lock}/ct against BOTH legs' ledger basis, and the other leg was \
                  closed with an IOC re-priced against the book at fill time. Sized to ONE open \
-                 lot, so this closes exactly one record. The leg prices are the venues' OWN \
+                 lot, so this closes exactly one record. The venues' actual fills lock \
+                 {actual_lock}/ct on the modelled fee schedule. The leg prices are the venues' OWN \
                  fills, not the limits sent — an IOC fills at the touch when the touch is \
                  better, and the difference is real money. realized_pnl_usd is still absent: \
                  PM-US fees are not on anything this process reads, and half-settled fees would \
@@ -3324,6 +3385,34 @@ fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> 
         return Err(format!("{moved}: {} would no longer lock {}/ct (now {})",
             o.limit, cx.emit_6dp(floor), cx.emit_6dp(lock)));
     }
+    // Price alone is not a hedge. Keep a passive first leg only while the
+    // current close ladder contains enough whole contracts that still clear
+    // the same floor. This catches depth disappearing while an order waits.
+    let depth = match o.shape {
+        Shape::RestKalshi => {
+            let levels = view.pm_ask_depth.get(&o.pm_market)
+                .ok_or_else(|| format!("the PM-US depth for {} has gone dark", o.pm_market))?;
+            executable_depth(cx, levels, |cx, price| {
+                let close = cx.add(price, tick);
+                let got = lock_per_ct(cx, fees, o.shape.roles(), resting, close,
+                    k_basis, pm_basis, o.qty);
+                cx.cmp(got, floor) != Ordering::Less
+            })
+        }
+        Shape::RestPmUs => {
+            let levels = view.k_bid_depth.get(&o.market)
+                .ok_or_else(|| format!("the Kalshi depth for {} has gone dark", o.market))?;
+            executable_depth(cx, levels, |cx, price| {
+                let close = cx.sub(price, tick);
+                let got = lock_per_ct(cx, fees, o.shape.roles(), close, resting,
+                    k_basis, pm_basis, o.qty);
+                cx.cmp(got, floor) != Ordering::Less
+            })
+        }
+    };
+    if depth < o.qty {
+        return Err(format!("close depth fell to {depth} whole contract(s), below the {} resting on the first leg", o.qty));
+    }
     Ok(())
 }
 
@@ -4046,8 +4135,14 @@ mod tests {
             apr_bar: 16.0,
             global_cap_usd: 500.0,
             pm_ask: [("p-a".to_string(), pm_ask.to_string())].into_iter().collect(),
+            pm_ask_depth: [("p-a".to_string(), vec![Level {
+                price: pm_ask.to_string(), size: "10000".into(),
+            }])].into_iter().collect(),
             pm_bid: [("p-a".to_string(), pm_bid.to_string())].into_iter().collect(),
             k_bid: [("K-a".to_string(), k_bid.to_string())].into_iter().collect(),
+            k_bid_depth: [("K-a".to_string(), vec![Level {
+                price: k_bid.to_string(), size: "10000".into(),
+            }])].into_iter().collect(),
             // ALL FOUR sides yielded, which is what `cycle` publishes once
             // `--maker-exit-take` is on: it cannot know which shape will win
             // until it has priced both books, nor whether the winner will rest
@@ -4382,7 +4477,8 @@ mod tests {
             rec["legs"][1]["yes_price"], "0.2200",
             "the price the IOC actually paid, not the rest's 0.20: {rec}"
         );
-        assert_eq!(rec["maker_exit_lock_ct"], "0.025704", "the lock actually taken: {rec}");
+        assert_eq!(rec["maker_exit_planned_lock_ct"], "0.025704", "the placement plan: {rec}");
+        assert_eq!(rec["maker_exit_lock_ct"], "-0.040296", "recomputed from the supplied fills: {rec}");
         assert!(
             rec["note"].as_str().expect("a note").contains("CROSSED"),
             "and the note describes what happened: {rec}"
@@ -4602,6 +4698,20 @@ mod tests {
         let why = still_pays(&mut cx, &fees, &o, &vw).expect_err("the ceiling has fallen");
         assert!(why.contains("ceiling"), "and it says which bound moved: {why}");
         assert!(why.contains("Kalshi bid"), "{why}");
+    }
+
+    #[test]
+    fn a_resting_exit_is_pulled_when_its_hedge_depth_disappears() {
+        let (mut cx, fees) = ready();
+        let o = resting_exit(5).order;
+        let mut vw = view("0.17");
+        assert!(still_pays(&mut cx, &fees, &o, &vw).is_ok());
+        vw.pm_ask_depth.insert("p-a".into(), vec![
+            Level { price: "0.17".into(), size: "2".into() },
+        ]);
+        let why = still_pays(&mut cx, &fees, &o, &vw)
+            .expect_err("only two hedges must not back a five-lot first leg");
+        assert!(why.contains("depth fell to 2"), "{why}");
     }
 
     /// The fill-time close crosses the OTHER venue, and under `rest-pmus` that
@@ -5111,6 +5221,37 @@ mod tests {
         assert_eq!(o.pm_basis, "0.780000", "1 - 0.22, the cost of the NO");
         assert_eq!(o.pm_market, "p-a");
         assert!(o.limit.parse::<f64>().unwrap() > 0.10, "and it does not cross: {}", o.limit);
+    }
+
+    /// The Hollande failure: do not rest 17 first-leg contracts when only 7
+    /// whole contracts are executable on the close leg inside its ceiling.
+    #[tokio::test]
+    async fn a_passive_exit_is_capped_to_profitable_close_depth() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 17, "0.22", "0.19")];
+        let mut vw = view("0.20");
+        vw.pm_ask_depth.insert("p-a".into(), vec![
+            Level { price: "0.20".into(), size: "7".into() },
+            Level { price: "0.99".into(), size: "100".into() },
+        ]);
+        let o = decide(&mut cx, &fees, &recs, &cand(17, 1.0), "p-a",
+            &quote(Some("0.10"), Some("0.30")), &vw, Instant::now(), false)
+            .expect("seven contracts have a profitable hedge");
+        assert_eq!(o.shape, Shape::RestKalshi);
+        assert_eq!(o.qty, 7, "the unhedgeable ten must never reach the resting first leg");
+    }
+
+    #[test]
+    fn a_forced_repair_books_its_actual_negative_lock_not_the_original_plan() {
+        let mut o = resting_exit(10).order;
+        o.k_basis = "0.096000".into();
+        o.pm_basis = "0.886336".into();
+        o.lock_ct = "0.013104".into();
+        let rec = close_record(&o, "0.0600", "0.0900", 10, 1.0);
+        assert_eq!(rec["maker_exit_planned_lock_ct"], "0.013104");
+        assert!(rec["maker_exit_lock_ct"].as_str().unwrap().starts_with('-'),
+            "the 9c repair lost money and must say so: {rec}");
     }
 
     /// NO BASIS IS A NAMED REFUSAL, NEVER A DEFAULT — on EITHER leg. The
@@ -6997,6 +7138,51 @@ mod tests {
         cheap.resolves_by = c.resolves_by;
         assert!(still_pays(&mut cx, &fees, &cheap, &v).is_err(),
             "resting orders must preserve the opportunity-cost floor too");
+    }
+
+
+    /// The sizing and the keep-check must price the ladder the SAME way, or
+    /// an order is rested on depth that `still_pays` pulls a cycle later and
+    /// `decide` re-admits a cycle after that. A level exactly at the ceiling
+    /// is the case: the close crosses one tick through it, and that tick was
+    /// counted by one side and not the other.
+    #[tokio::test]
+    async fn depth_sizing_and_the_keep_check_price_the_ladder_identically() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let mut sized_by_depth = 0;
+        // Shape A: rest Kalshi, close on the PM-US ask ladder.
+        let recs = vec![open_basket(1.0, 17, "0.22", "0.19")];
+        for c in 20..99 {
+            let mut vw = view("0.20");
+            vw.pm_ask_depth.insert("p-a".into(), vec![
+                Level { price: "0.20".into(), size: "3".into() },
+                Level { price: format!("0.{c:02}"), size: "100".into() },
+            ]);
+            let Ok(o) = decide(&mut cx, &fees, &recs, &cand(17, 1.0), "p-a",
+                &quote(Some("0.10"), Some("0.30")), &vw, Instant::now(), false) else { continue };
+            assert_eq!(o.shape, Shape::RestKalshi);
+            if o.qty > 3 { sized_by_depth += 1; }
+            still_pays(&mut cx, &fees, &o, &vw)
+                .unwrap_or_else(|e| panic!("second level 0.{c:02}: decide rested {} but the keep-check pulls it: {e}", o.qty));
+        }
+        // Shape B: rest PM-US, close on the Kalshi bid ladder.
+        let recs = vec![open_basket(1.0, 5, "0.78", "0.19")];
+        let q = quote(Some("0.20"), Some("0.22"));
+        for c in 1..20 {
+            let mut vw = wide_pm_view("0.24", "0.16", "0.20");
+            vw.k_bid_depth.insert("K-a".into(), vec![
+                Level { price: "0.20".into(), size: "2".into() },
+                Level { price: format!("0.{c:02}"), size: "100".into() },
+            ]);
+            let Ok(o) = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw,
+                Instant::now(), false) else { continue };
+            assert_eq!(o.shape, Shape::RestPmUs);
+            if o.qty > 2 { sized_by_depth += 1; }
+            still_pays(&mut cx, &fees, &o, &vw)
+                .unwrap_or_else(|e| panic!("second level 0.{c:02}: decide rested {} but the keep-check pulls it: {e}", o.qty));
+        }
+        assert!(sized_by_depth > 0, "the sweep must exercise a second level that counts");
     }
 
 }

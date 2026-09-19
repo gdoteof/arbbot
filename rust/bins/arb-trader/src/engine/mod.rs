@@ -1384,6 +1384,7 @@ impl Engine {
         for (market, ask) in self.books.pm_us_asks() {
             pm_ask.insert(market, ask);
         }
+        let pm_ask_depth = self.books.pm_us_ask_depth().into_iter().collect();
         // ...and the BID side, for the shape that rests there rather than
         // crossing there. Same book, same tick, one more read.
         let mut pm_bid = std::collections::BTreeMap::new();
@@ -1397,12 +1398,15 @@ impl Engine {
         for (market, bid) in self.books.kalshi_bids() {
             k_bid.insert(market, bid);
         }
+        let k_bid_depth = self.books.kalshi_bid_depth().into_iter().collect();
         crate::maker_exit::publish_view(crate::maker_exit::EngineView {
             apr_bar: self.apr_bar,
             global_cap_usd: self.cfg.risk.as_ref().map_or(0.0, |r| r.global_cap_usd()),
             pm_ask,
+            pm_ask_depth,
             pm_bid,
             k_bid,
+            k_bid_depth,
             suppressed_at: self.maker_exit_suppressed.clone(),
         });
     }
