@@ -127,6 +127,15 @@ impl BookBuilder {
             .collect()
     }
 
+    /// Complete PM-US YES ask ladders, used to size a first leg to the amount
+    /// its second leg can actually absorb.
+    pub fn pm_us_ask_depth(&self) -> Vec<(String, Vec<Level>)> {
+        self.books.iter()
+            .filter(|((v, _), _)| *v == Venue::PolymarketUs)
+            .map(|((_, m), b)| (m.clone(), b.asks.clone()))
+            .collect()
+    }
+
     /// The bid side of the same read. A maker exit that RESTS on PM-US prices
     /// against this; one that crosses PM-US prices against `pm_us_asks`.
     pub fn pm_us_bids(&self) -> Vec<(String, String)> {
@@ -144,6 +153,14 @@ impl BookBuilder {
             .iter()
             .filter(|((v, _), _)| *v == Venue::Kalshi)
             .filter_map(|((_, m), b)| b.bids.first().map(|l| (m.clone(), l.price.clone())))
+            .collect()
+    }
+
+    /// Complete Kalshi YES bid ladders, the mirror of `pm_us_ask_depth`.
+    pub fn kalshi_bid_depth(&self) -> Vec<(String, Vec<Level>)> {
+        self.books.iter()
+            .filter(|((v, _), _)| *v == Venue::Kalshi)
+            .map(|((_, m), b)| (m.clone(), b.bids.clone()))
             .collect()
     }
 
