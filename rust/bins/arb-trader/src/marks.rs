@@ -215,6 +215,8 @@ pub struct Row {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maker_exit_shape: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub maker_exit_direction: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub maker_exit_eligible: Option<bool>,
 }
 
@@ -334,8 +336,9 @@ fn dec_of(cx: &mut Cx, r: &Value, k: &str) -> Option<D> {
 /// See divergence 1 in the module header: the Python turns a missing Kalshi
 /// quote into `Decimal("0")` and dies downstream on it. An absent touch is
 /// absent.
-fn top(cx: &mut Cx, books: &BookBuilder, venue: Venue, market: &str) -> (Option<D>, Option<D>) {
+fn top(cx: &mut Cx, books: &BookBuilder, venue: Venue, market: &str, now: f64) -> (Option<D>, Option<D>) {
     let Some(b) = books.get(venue, market) else { return (None, None) };
+    if !b.actionable_at((now * 1e9) as i64) { return (None, None); }
     (
         b.bids.first().and_then(|l| cx.parse(&l.price)),
         b.asks.first().and_then(|l| cx.parse(&l.price)),
@@ -608,6 +611,7 @@ pub fn compute_row(
         maker_exit_ct_rest_kalshi: None,
         maker_exit_ct_rest_pmus: None,
         maker_exit_shape: None,
+        maker_exit_direction: None,
         maker_exit_eligible: None,
     };
 
@@ -727,10 +731,19 @@ pub fn compute_row(
     row.maker_exit_ct_rest_kalshi = Some(None);
     row.maker_exit_ct_rest_pmus = Some(None);
     row.maker_exit_eligible = Some(false);
+    let (k_bid, k_ask, p_bid, p_ask) = if inverted {
+        (
+            k_ask.map(|p| cx.one_minus(p)),
+            k_bid.map(|p| cx.one_minus(p)),
+            p_ask.map(|p| cx.one_minus(p)),
+            p_bid.map(|p| cx.one_minus(p)),
+        )
+    } else { (k_bid, k_ask, p_bid, p_ask) };
     let (Some(ka), Some(pa)) = (k_ask, p_ask) else { return row };
-    if inverted || cx.cmp(qty, zero) == Ordering::Equal {
+    if cx.cmp(qty, zero) == Ordering::Equal {
         return row;
     }
+    row.maker_exit_direction = Some(if inverted { "inverse" } else { "standard" }.to_string());
     let tick = cx.parse_exact(TICK);
     let one = cx.one;
     let basis = cx.div(cost, qty);
@@ -981,14 +994,14 @@ pub fn build(
         };
         let km = str_of(kleg, "market_id").unwrap_or("");
         let pm = str_of(pleg, "market_id").unwrap_or("");
-        if books.get(Venue::Kalshi, km).is_none() {
+        if books.get(Venue::Kalshi, km).is_none_or(|b| !b.actionable_at((now * 1e9) as i64)) {
             no_book.insert(format!("kalshi:{km}"));
         }
-        if books.get(Venue::PolymarketUs, pm).is_none() {
+        if books.get(Venue::PolymarketUs, pm).is_none_or(|b| !b.actionable_at((now * 1e9) as i64)) {
             no_book.insert(format!("polymarket_us:{pm}"));
         }
-        let (k_bid, k_ask) = top(cx, books, Venue::Kalshi, km);
-        let (p_bid, p_ask) = top(cx, books, Venue::PolymarketUs, pm);
+        let (k_bid, k_ask) = top(cx, books, Venue::Kalshi, km, now);
+        let (p_bid, p_ask) = top(cx, books, Venue::PolymarketUs, pm, now);
         let row = compute_row(cx, fees, &t, k_bid, k_ask, p_bid, p_ask, now);
         if let Some(m) = row.mark_pnl_usd {
             tot_mark += m;
@@ -1137,8 +1150,9 @@ mod tests {
     /// divergence 1's whole subject.
     fn books(k: (&[Level], &[Level]), p: (&[Level], &[Level])) -> BookBuilder {
         let mut b = BookBuilder::new();
-        b.apply_snapshot(Venue::Kalshi, "K", k.0.to_vec(), k.1.to_vec(), 1, 0, None);
-        b.apply_snapshot(Venue::PolymarketUs, "P", p.0.to_vec(), p.1.to_vec(), 1, 0, None);
+        let ts = (at("2026-07-31", 18, 24, 49) * 1e9) as i64;
+        b.apply_snapshot(Venue::Kalshi, "K", k.0.to_vec(), k.1.to_vec(), 1, ts, None);
+        b.apply_snapshot(Venue::PolymarketUs, "P", p.0.to_vec(), p.1.to_vec(), 1, ts, None);
         b
     }
 
@@ -1239,9 +1253,10 @@ mod tests {
         "unwind_hard": false,"reverse_edge_c": -8.0,"reverse_signal": false,
         "maker_exit_ct": -0.0793,"maker_exit_ct_rest_kalshi": -0.0793,
         "maker_exit_ct_rest_pmus": -0.0611,"maker_exit_shape": "rest-kalshi",
+        "maker_exit_direction": "standard",
         "maker_exit_eligible": false}"#;
         let want = keys_in_order(live, 1);
-        assert_eq!(want.len(), 24, "the row has 24 fields: 21 plus the shape contest's 3");
+        assert_eq!(want.len(), 25, "the row includes shape and basket direction");
         assert!(v(live).is_object(), "and the literal above is real JSON");
 
         let mut cx = Cx::default();
@@ -1261,7 +1276,7 @@ mod tests {
         let dark_keys = keys_in_order(&serde_json::to_string(&dark).expect("ser"), 1);
         assert_eq!(
             dark_keys,
-            want[..want.len() - 5].to_vec(),
+            want[..want.len() - 6].to_vec(),
             "an unpriced row omits all five maker_exit fields entirely"
         );
 
@@ -1497,11 +1512,8 @@ mod tests {
         // 0.34) = 0.98/ct instead.
         assert_eq!(row.liq_value_usd, Some(4.547), "(1 - k_ask) + p_bid, less both taker fees");
         assert_eq!(row.reverse_edge_c, Some(-6.0), "p_bid - k_ask, not k_bid - p_ask");
-        assert_eq!(
-            row.maker_exit_ct,
-            Some(None),
-            "the maker exit rests a Kalshi ask against a long YES; this basket has none"
-        );
+        assert_eq!(row.maker_exit_direction.as_deref(), Some("inverse"));
+        assert!(row.maker_exit_ct.flatten().is_some(), "inverse inventory is priceable");
     }
 
     /// Two legs pointing the SAME way is not a basket, and no basis is invented
@@ -1597,7 +1609,7 @@ mod tests {
             vec![lv("0.05", "9")],
             vec![lv("0.08", "9")],
             1,
-            0,
+            (at("2026-07-31", 18, 24, 49) * 1e9) as i64,
             None,
         );
         let m = build(&mut cx, &fees, vec![kuleba()], &bk, at("2026-07-31", 18, 24, 49));
@@ -1631,12 +1643,8 @@ mod tests {
         assert_eq!(row.liq_value_usd, Some(1.2956));
         assert_eq!(row.reverse_edge_c, Some(32.0), "p_bid - k_ask, not k_bid - p_ask");
         assert!(row.reverse_signal, "and it clears the 3c floor");
-        assert_eq!(
-            row.maker_exit_ct,
-            Some(None),
-            "the maker exit rests a Kalshi ask against a long YES; an inverted \
-             basket has none to rest"
-        );
+        assert_eq!(row.maker_exit_direction.as_deref(), Some("inverse"));
+        assert!(row.maker_exit_ct.flatten().is_some(), "inverse inventory is priceable");
 
         // The SAME quotes read as a standard basket give the other answer
         // entirely — which is why the flag is load-bearing.

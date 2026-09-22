@@ -60,10 +60,8 @@ impl Receipt {
         }
     }
     fn request(&self, order: &Order, hedge: bool) -> PlaceRequest {
-        let sell = matches!(
-            (order.shape, hedge),
-            (Shape::RestKalshi, false) | (Shape::RestPmUs, true)
-        );
+        let venue = if hedge { order.shape.close_venue() } else { order.shape.rest_venue() };
+        let sell = order.direction.sells(venue);
         let passive = !hedge && order.cross.is_none();
         PlaceRequest {
             market: if hedge {
@@ -107,6 +105,7 @@ pub(super) fn group_key(o: &Order) -> String {
         o.market.as_str(),
         o.pm_market.as_str(),
         o.shape.tag(),
+        o.direction,
         price,
         o.cross.as_ref().map(|_| o.closes_ts.to_bits()),
     ))
@@ -184,22 +183,9 @@ fn group_hedge_limit(
         let price = cx.parse(&price).ok_or("invalid member hedge price")?;
         limit = Some(match limit {
             None => price,
-            Some(prev) => match a.order.shape {
-                Shape::RestKalshi => {
-                    if cx.cmp(price, prev) == Ordering::Less {
-                        price
-                    } else {
-                        prev
-                    }
-                }
-                Shape::RestPmUs => {
-                    if cx.cmp(price, prev) == Ordering::Greater {
-                        price
-                    } else {
-                        prev
-                    }
-                }
-            },
+            Some(prev) => if a.order.direction.sells(a.order.shape.close_venue()) {
+                if cx.cmp(price, prev) == Ordering::Greater { price } else { prev }
+            } else if cx.cmp(price, prev) == Ordering::Less { price } else { prev },
         });
     }
     limit
@@ -239,11 +225,11 @@ impl State {
     }
     /// The close-ladder contracts this lot's resting order still speaks for:
     /// its market and its full quantity while nothing has filled.
-    pub fn passive_claim(&self) -> Option<(&str, i64)> {
+    pub fn passive_claim(&self) -> Option<(String, i64)> {
         self.active
             .as_ref()
             .filter(|a| a.order.cross.is_none() && a.filled.is_none())
-            .map(|a| (a.order.close_market(), a.order.qty))
+            .map(|a| (close_depth_key(a.order.direction, a.order.shape, &a.order.market, &a.order.pm_market), a.order.qty))
     }
     pub fn request_regroup(&mut self) {
         if let Some(a) = &mut self.active {
@@ -522,9 +508,9 @@ pub(super) async fn manage(
     live.publish_working(live.working_set(None));
     if let Some(a) = live.lot.as_ref().and_then(|s| s.active.as_ref()) {
         live.request_suppress(
-            candidate_keys(&a.order.market, &a.order.pm_market)
+            candidate_keys_for(&a.order.market, &a.order.pm_market, a.order.direction)
                 .into_iter()
-                .chain(cross_keys(&a.order.market, &a.order.pm_market))
+                .chain(cross_keys_for(&a.order.market, &a.order.pm_market, a.order.direction))
                 .collect(),
         );
     }
@@ -557,9 +543,9 @@ pub(super) async fn manage(
         .active
         .as_ref()
         .map(|a| {
-            candidate_keys(&a.order.market, &a.order.pm_market)
+            candidate_keys_for(&a.order.market, &a.order.pm_market, a.order.direction)
                 .into_iter()
-                .chain(cross_keys(&a.order.market, &a.order.pm_market))
+                .chain(cross_keys_for(&a.order.market, &a.order.pm_market, a.order.direction))
                 .collect()
         })
         .unwrap_or_default();
@@ -655,7 +641,7 @@ async fn advance(
                     hedge_sink,
                     receipt.id.as_ref().unwrap(),
                     &receipt.price,
-                    sells_yes(a.order.shape.close_venue()),
+                    a.order.direction.sells(a.order.shape.close_venue()),
                 )
                 .await;
                 let rest_px = filled_price_or_limit(
@@ -663,11 +649,11 @@ async fn advance(
                     rest_sink,
                     a.rest.id.as_ref().unwrap(),
                     &a.rest.price,
-                    sells_yes(a.order.shape.rest_venue()),
+                    a.order.direction.sells(a.order.shape.rest_venue()),
                 )
                 .await;
                 let (k_px, p_px) = fills_by_venue(&a.order, &rest_px, &close_px);
-                let (rest_px, close_px) = if plausible_pair(cx, k_px, p_px) {
+                let (rest_px, close_px) = if plausible_pair_direction(cx, a.order.direction, k_px, p_px) {
                     (rest_px, close_px)
                 } else {
                     (a.rest.price.clone(), receipt.price.clone())
@@ -730,17 +716,19 @@ async fn advance(
             Ok(limit) => limit,
             Err(why) if a.attempts <= HEAL_PROFITABLE_CYCLES => return Err(why),
             Err(_) => {
-                let touch = match a.order.shape {
-                    Shape::RestKalshi => view.pm_ask.get(a.order.close_market()),
-                    Shape::RestPmUs => view.k_bid.get(a.order.close_market()),
+                let venue = a.order.shape.close_venue();
+                let selling = a.order.direction.sells(venue);
+                let touch = match (venue, selling) {
+                    (Venue::PolymarketUs, false) => view.pm_ask.get(a.order.close_market()),
+                    (Venue::PolymarketUs, true) => view.pm_bid.get(a.order.close_market()),
+                    (Venue::Kalshi, false) => view.k_ask.get(a.order.close_market()),
+                    (Venue::Kalshi, true) => view.k_bid.get(a.order.close_market()),
+                    _ => None,
                 }
                 .and_then(|s| cx.parse(s))
                 .ok_or("no executable hedge book")?;
                 let tick = cx.parse_exact(TICK);
-                let limit = match a.order.shape {
-                    Shape::RestKalshi => cx.add(touch, tick),
-                    Shape::RestPmUs => cx.sub(touch, tick),
-                };
+                let limit = if selling { cx.sub(touch, tick) } else { cx.add(touch, tick) };
                 if !cx.is_pos(limit) || cx.cmp(limit, cx.one) != Ordering::Less {
                     return Err("hedge price outside (0, 1)".into());
                 }
@@ -780,6 +768,17 @@ fn hedge_limit(
     qty: i64,
     v: &EngineView,
 ) -> Result<String, String> {
+    if o.direction.inverted() {
+        let mut normalized = o.clone();
+        normalized.direction = Direction::Standard;
+        normalized.limit = complement(cx, &o.limit).ok_or("invalid inverse rest limit")?;
+        if let (Some(src), Some(dst)) = (&o.cross, &mut normalized.cross) {
+            dst.limit = complement(cx, &src.limit).ok_or("invalid inverse cross limit")?;
+        }
+        let view = inverse_view(cx, v);
+        let limit = hedge_limit(cx, fees, &normalized, qty, &view)?;
+        return complement(cx, &limit).ok_or("invalid normalized hedge limit".into());
+    }
     if o.cross.is_none() {
         return price_close(cx, fees, o, qty, v);
     }
@@ -845,6 +844,24 @@ mod tests {
     use super::*;
     use crate::maker_exit::tests::{cand, open_basket, resting_exit, view};
     use std::collections::{BTreeMap, VecDeque};
+
+    #[test]
+    fn inverse_requests_use_the_held_contract_direction_for_both_shapes_and_crosses() {
+        for shape in [Shape::RestKalshi, Shape::RestPmUs] {
+            let mut order = resting_exit(3).order;
+            order.direction = Direction::Inverse;
+            order.shape = shape;
+            let rest = Receipt::new("0.4000".into(), 3).request(&order, false);
+            let hedge = Receipt::new("0.5000".into(), 3).request(&order, true);
+            assert_eq!(rest.side, if order.direction.sells(shape.rest_venue()) { Side::Ask } else { Side::Bid });
+            assert_eq!(hedge.side, if order.direction.sells(shape.close_venue()) { Side::Ask } else { Side::Bid });
+            order.cross = Some(Cross { limit: "0.4000".into(), lock_ct: "0.02".into() });
+            let first = Receipt::new("0.4000".into(), 3).request(&order, false);
+            assert_eq!(first.side, rest.side);
+            assert_eq!(first.tif, Tif::Ioc);
+            assert!(!first.post_only);
+        }
+    }
 
     #[derive(Clone)]
     struct VenueOrder {
@@ -1499,7 +1516,9 @@ mod tests {
             v
         };
         place_group(&mut a, vec![member(2., 7), member(1., 3)], &ladder("10"), &k, &p).await;
-        assert_eq!(a.lot.as_ref().unwrap().passive_claim(), Some(("p-a", 10)));
+        assert_eq!(a.lot.as_ref().unwrap().passive_claim(), Some((
+            close_depth_key(Direction::Standard, Shape::RestKalshi, "K-a", "p-a"), 10
+        )));
         let out = manage(&mut a, Some(&ladder("10")), &k, &p).await;
         assert!(!out.iter().any(|l| l.contains("PULLING")), "ten back ten: {out:?}");
         assert!(a.lot.as_ref().unwrap().busy());

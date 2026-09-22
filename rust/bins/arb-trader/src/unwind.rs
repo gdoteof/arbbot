@@ -333,6 +333,9 @@ pub struct Exit {
     pub rel_id: String,
     /// The Kalshi ticker the exit ask would rest on.
     pub market_id: String,
+    /// Which complementary basket the lot holds. Old marks predate this field
+    /// and are the standard Kalshi-YES / PM-NO direction.
+    pub direction: crate::maker_exit::Direction,
     /// The `ts` of the `open` ledger record this closes. THE BASKET IDENTITY:
     /// one relationship holds SEVERAL independently-priced positions, entered
     /// at different prices on different days and converging at different rates,
@@ -577,9 +580,15 @@ fn consider(
         .get("mark_pnl_usd")
         .and_then(serde_json::Value::as_f64)
         .map_or(f64::NEG_INFINITY, |m| m / qty as f64 - 2.0 * TICK_CT);
+    let direction = match p.get("maker_exit_direction").and_then(|v| v.as_str()) {
+        None | Some("standard") => crate::maker_exit::Direction::Standard,
+        Some("inverse") => crate::maker_exit::Direction::Inverse,
+        Some(_) => return Err(Skip::NotPriceable),
+    };
     Ok(Exit {
         rel_id: rel_id.to_string(),
         market_id: market_id.to_string(),
+        direction,
         opened_ts,
         qty,
         fwd_apr,

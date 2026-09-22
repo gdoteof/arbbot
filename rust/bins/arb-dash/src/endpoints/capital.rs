@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 type EntryBasis = BTreeMap<String, (f64, f64)>; // relationship -> (qty, all-in cost)
+const EXECUTABLE_MARK_MAX_AGE_S: u64 = 180;
 fn number(v: &Value) -> Option<f64> {
     let n = v.as_f64().or_else(|| v.as_str()?.parse().ok())?;
     n.is_finite().then_some(n)
@@ -12,15 +13,22 @@ fn number(v: &Value) -> Option<f64> {
 fn holding_number(h: &Value, key: &str) -> Option<f64> {
     number(&h[key])
 }
+fn executable_mark_fresh(h: &Value, now: u64, snapshot_fresh: bool) -> bool {
+    snapshot_fresh
+        && h["executable_mark_at"]
+            .as_u64()
+            .is_some_and(|at| at <= now && now - at <= EXECUTABLE_MARK_MAX_AGE_S)
+}
 
-/// Put the two venue positions for an equivalent outcome on the same row.  A
-/// holding's value is the bid value of the side we own, so it also gives us a
-/// conservative, executable mark for that side without pretending we know a
-/// mid price.
+/// Put the two venue positions for an equivalent outcome on the same row. A
+/// holding's value becomes an executable mark only when its source-book time
+/// and the enclosing account snapshot are both fresh.
 fn position_pairs(
     snapshot: &Value,
     registry: Option<&Registry>,
     entry_basis: &EntryBasis,
+    now: u64,
+    snapshot_fresh: bool,
 ) -> Value {
     let mut holdings: BTreeMap<(String, String), Value> = BTreeMap::new();
     for venue in ["kalshi", "polymarket_us"] {
@@ -56,8 +64,10 @@ fn position_pairs(
                 };
                 let qty = holding_number(h, "quantity");
                 let value = holding_number(h, "value_usd");
-                let held_mark = qty
-                    .zip(value)
+                let mark_fresh = executable_mark_fresh(h, now, snapshot_fresh);
+                let held_mark = mark_fresh
+                    .then(|| qty.zip(value))
+                    .flatten()
                     .and_then(|(q, v)| (q != 0.).then_some(v / q.abs()));
                 let yes_mark = qty
                     .zip(held_mark)
@@ -68,6 +78,8 @@ fn position_pairs(
                     "held_side":qty.map(|q| if q >= 0. { "YES" } else { "NO" }),
                     "held_mark":held_mark, "yes_mark":yes_mark,
                     "mark_updated_at":h["mark_updated_at"],
+                    "executable_mark_at":h["executable_mark_at"],
+                    "mark_fresh":mark_fresh,
                 })
             };
             let kj = leg("kalshi", &kleg.market_id, kh);
@@ -218,6 +230,7 @@ fn build(
     let marked: Vec<f64> = holdings
         .into_iter()
         .flatten()
+        .filter(|h| executable_mark_fresh(h, now, fresh))
         .filter_map(|h| number(&h["value_usd"]))
         .collect();
     let subtotal: f64 = marked.iter().sum();
@@ -234,7 +247,7 @@ fn build(
     snapshot["totals"] = json!({"available_cash_usd":cash,"reserved_cash_usd":reserved,"positions_value_usd":positions,
         "equity_usd":equity,"deposits_usd":funding_known.then_some(deposits),
         "profit_usd":funding_known.then_some(equity-deposits),"return_pct":(funding_known && deposits>0.).then_some((equity/deposits-1.)*100.)});
-    snapshot["position_comparison"] = position_pairs(&snapshot, registry, entry_basis);
+    snapshot["position_comparison"] = position_pairs(&snapshot, registry, entry_basis, now, fresh);
     snapshot
 }
 pub fn json(a: &Args) -> String {
@@ -280,7 +293,8 @@ mod tests {
     fn reconciliation_requires_every_position_and_preserves_venue_equity() {
         let mut s = snapshot();
         s["accounts"]["kalshi"]["holdings"] = json!([
-            {"value_usd":"50"}, {"value_usd":null}
+            {"value_usd":"50", "executable_mark_at":100},
+            {"value_usd":null, "executable_mark_at":100}
         ]);
         let a = build(s.clone(), None, None, &EntryBasis::new(), 110, true);
         assert_eq!(a["kalshi_reconciliation"]["difference_usd"], Value::Null);
@@ -338,10 +352,10 @@ mod tests {
     fn pairs_positions_and_derives_conservative_distance_to_par() {
         let mut s = snapshot();
         s["accounts"]["kalshi"]["holdings"] = json!([{
-            "market":"K", "quantity":"10", "value_usd":"3"
+            "market":"K", "quantity":"10", "value_usd":"3", "executable_mark_at":100
         }]);
         s["accounts"]["polymarket_us"]["holdings"] = json!([{
-            "market":"P", "quantity":"-8", "value_usd":"5.2"
+            "market":"P", "quantity":"-8", "value_usd":"5.2", "executable_mark_at":100
         }]);
         let path =
             std::env::temp_dir().join(format!("capital-registry-{}.yaml", std::process::id()));
@@ -356,6 +370,71 @@ mod tests {
         assert!((number(&p["distance_to_par_cents"]).unwrap() - 5.).abs() < 1e-9);
         assert!((number(&p["distance_to_par_usd"]).unwrap() - 0.4).abs() < 1e-9);
         assert!((number(&p["entry_price_per_contract"]).unwrap() - 0.8).abs() < 1e-9);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn liquidation_requires_fresh_marks_on_both_legs_but_preserves_basis_and_valuation() {
+        let mut s = snapshot();
+        s["at"] = json!(200);
+        s["accounts"]["kalshi"]["holdings"] = json!([{
+            "market":"K", "quantity":"-150", "value_usd":"58.5",
+            "mark_updated_at":"live book at 280", "executable_mark_at":280
+        }]);
+        s["accounts"]["polymarket_us"]["holdings"] = json!([{
+            "market":"P", "quantity":"150", "value_usd":"96",
+            "mark_updated_at":"2026-08-29T00:00:00Z"
+        }]);
+        let path = std::env::temp_dir().join(format!(
+            "capital-freshness-registry-{}.yaml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "relationships:\n- id: xvus-test-outcome\n  legs:\n  - { venue: kalshi, market_id: K }\n  - { venue: polymarket_us, market_id: P }\n").unwrap();
+        let registry = Registry::load(path.to_str().unwrap()).unwrap();
+        let basis = EntryBasis::from([("xvus-test-outcome".into(), (150., 120.))]);
+
+        // A fresh account poll cannot turn a venue fallback value into an
+        // executable quote, even when the other leg has a current book.
+        let a = build(s.clone(), None, Some(&registry), &basis, 281, true);
+        let p = &a["position_comparison"]["pairs"][0];
+        assert_eq!(p["kalshi"]["mark_fresh"], true);
+        assert_eq!(p["polymarket_us"]["mark_fresh"], false);
+        assert_eq!(p["liquidation_value_per_contract"], Value::Null);
+        assert_eq!(p["entry_price_per_contract"], 0.8);
+        assert_eq!(p["polymarket_us"]["value_usd"], 96.);
+        assert_eq!(a["totals"]["equity_usd"], 105.);
+
+        s["accounts"]["polymarket_us"]["holdings"][0]["executable_mark_at"] = json!(280);
+        let both_fresh = build(s.clone(), None, Some(&registry), &basis, 281, true);
+        assert!(
+            (number(
+                &both_fresh["position_comparison"]["pairs"][0]["liquidation_value_per_contract"]
+            )
+            .unwrap()
+                - 1.03)
+                .abs()
+                < 1e-9
+        );
+
+        // Even otherwise-current marks fail closed with a future timestamp or
+        // once the producer snapshot itself is stale/dead.
+        s["accounts"]["polymarket_us"]["holdings"][0]["executable_mark_at"] = json!(282);
+        let future = build(s.clone(), None, Some(&registry), &basis, 281, true);
+        assert_eq!(
+            future["position_comparison"]["pairs"][0]["liquidation_value_per_contract"],
+            Value::Null
+        );
+        s["accounts"]["polymarket_us"]["holdings"][0]["executable_mark_at"] = json!(280);
+        let dead = build(s.clone(), None, Some(&registry), &basis, 281, false);
+        assert_eq!(
+            dead["position_comparison"]["pairs"][0]["liquidation_value_per_contract"],
+            Value::Null
+        );
+        let stale = build(s, None, Some(&registry), &basis, 381, true);
+        assert_eq!(
+            stale["position_comparison"]["pairs"][0]["liquidation_value_per_contract"],
+            Value::Null
+        );
         let _ = std::fs::remove_file(path);
     }
 }

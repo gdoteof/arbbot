@@ -19,6 +19,11 @@ pub struct Book {
 }
 
 impl Book {
+    pub fn actionable_at(&self, now_ns: i64) -> bool {
+        self.ts_local_ns >= now_ns.saturating_sub(180_000_000_000)
+            && self.ts_local_ns <= now_ns.saturating_add(2_000_000_000)
+            && !self.is_crossed()
+    }
     /// The crossing, if this book is CROSSED: `Some((best_bid, best_ask))` when
     /// `best_bid >= best_ask`, else `None`. Prices are returned verbatim so the
     /// caller can name the corruption in an operator-facing message.
@@ -111,6 +116,12 @@ impl BookBuilder {
         self.books.get(&(venue, market_id.to_owned()))
     }
 
+    /// Per-market snapshot safe for an order decision. Filtering happens once
+    /// for the whole book so tops and depth cannot disagree about freshness.
+    pub fn maker_exit_books(&self, now_ns: i64) -> Vec<Book> {
+        self.books.values().filter(|b| b.actionable_at(now_ns)).cloned().collect()
+    }
+
     /// Every PM-US market this builder holds a book for, with its best YES ASK.
     ///
     /// The ONE price read `crate::maker_exit` has for the leg it closes: PM-US's
@@ -136,6 +147,13 @@ impl BookBuilder {
             .collect()
     }
 
+    pub fn pm_us_bid_depth(&self) -> Vec<(String, Vec<Level>)> {
+        self.books.iter()
+            .filter(|((v, _), _)| *v == Venue::PolymarketUs)
+            .map(|((_, m), b)| (m.clone(), b.bids.clone()))
+            .collect()
+    }
+
     /// The bid side of the same read. A maker exit that RESTS on PM-US prices
     /// against this; one that crosses PM-US prices against `pm_us_asks`.
     pub fn pm_us_bids(&self) -> Vec<(String, String)> {
@@ -153,6 +171,21 @@ impl BookBuilder {
             .iter()
             .filter(|((v, _), _)| *v == Venue::Kalshi)
             .filter_map(|((_, m), b)| b.bids.first().map(|l| (m.clone(), l.price.clone())))
+            .collect()
+    }
+
+    pub fn kalshi_asks(&self) -> Vec<(String, String)> {
+        self.books
+            .iter()
+            .filter(|((v, _), _)| *v == Venue::Kalshi)
+            .filter_map(|((_, m), b)| b.asks.first().map(|l| (m.clone(), l.price.clone())))
+            .collect()
+    }
+
+    pub fn kalshi_ask_depth(&self) -> Vec<(String, Vec<Level>)> {
+        self.books.iter()
+            .filter(|((v, _), _)| *v == Venue::Kalshi)
+            .map(|((_, m), b)| (m.clone(), b.asks.clone()))
             .collect()
     }
 
@@ -304,6 +337,26 @@ mod tests {
             bb.apply_delta(Venue::Kalshi, "T", BookSide::Bid, "0.40", "9", 1, 105, None),
             Err(ApplyError::NotSynced)
         );
+    }
+
+    #[test]
+    fn maker_exit_snapshot_rejects_stale_future_and_crossed_books_atomically() {
+        let now = 1_000_000_000_000i64;
+        let mut bb = BookBuilder::new();
+        for (market, ts, bid, ask) in [
+            ("fresh", now, "0.40", "0.50"),
+            ("stale", now - 180_000_000_001, "0.40", "0.50"),
+            ("future", now + 2_000_000_001, "0.40", "0.50"),
+            ("crossed", now, "0.60", "0.50"),
+        ] {
+            bb.apply_snapshot(Venue::Kalshi, market, vec![lvl(bid, "2")],
+                vec![lvl(ask, "3")], 1, ts, None);
+        }
+        let got: Vec<_> = bb.maker_exit_books(now).into_iter().map(|b| b.market_id).collect();
+        assert_eq!(got, vec!["fresh"]);
+        assert!(!bb.get(Venue::Kalshi, "stale").unwrap().actionable_at(now));
+        assert!(!bb.get(Venue::Kalshi, "fresh").unwrap().actionable_at(i64::MAX));
+        assert!(!bb.get(Venue::Kalshi, "fresh").unwrap().actionable_at(i64::MIN));
     }
 
     fn book(bids: Vec<Level>, asks: Vec<Level>) -> Book {

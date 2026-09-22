@@ -27,9 +27,9 @@ fn owner(
             fatal("conflicting recovered exit ownership");
         }
         live.request_suppress(
-            cross_keys(live.scope_market.as_ref().unwrap(), pm)
+            cross_keys_for(live.scope_market.as_ref().unwrap(), pm, Direction::Standard)
                 .into_iter()
-                .chain(candidate_keys(live.scope_market.as_ref().unwrap(), pm))
+                .chain(candidate_keys_for(live.scope_market.as_ref().unwrap(), pm, Direction::Standard))
                 .collect(),
         );
     }
@@ -119,7 +119,7 @@ pub(super) async fn run(template: Live, cfg: Cfg, k: Sink, p: Sink) {
         let mut claims: BTreeMap<String, i64> = BTreeMap::new();
         for live in workers.values() {
             if let Some((close, qty)) = live.lot.as_ref().unwrap().passive_claim() {
-                *claims.entry(close.to_owned()).or_default() += qty;
+                *claims.entry(close).or_default() += qty;
             }
         }
         let mut plans = Vec::new();
@@ -137,7 +137,7 @@ pub(super) async fn run(template: Live, cfg: Cfg, k: Sink, p: Sink) {
             log(cycle(live, &cfg, &k, &p).await);
             live.depth_claims.clear();
             if let Some(order) = live.planned.take() {
-                *claims.entry(order.close_market().to_owned()).or_default() += order.qty;
+                *claims.entry(close_depth_key(order.direction, order.shape, &order.market, &order.pm_market)).or_default() += order.qty;
                 plans.push(order);
             }
         }
