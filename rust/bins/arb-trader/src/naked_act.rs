@@ -692,6 +692,72 @@ fn tick_up(cx: &mut Cx, ladder: &[(String, String, String)], x: D) -> Option<D> 
     ceil_to_tick(cx, ladder, higher)
 }
 
+/// The largest POSITIVE legal price strictly below `x`, over every rung.
+///
+/// Unlike [`tick_down`] this needs neither `x` on the ladder nor contiguous
+/// rungs, so it also steps a complemented ladder (`maker_exit`'s inverse
+/// normalization), whose rungs have holes between them.
+pub fn rung_below(cx: &mut Cx, ladder: &[(String, String, String)], x: D) -> Option<D> {
+    let mut best: Option<D> = None;
+    for (s, e, st) in ladder {
+        let (s, e, st) = (cx.parse(s)?, cx.parse(e)?, cx.parse(st)?);
+        if cx.cmp(x, s) != Ordering::Greater {
+            continue;
+        }
+        let hi = if cx.cmp(x, e) == Ordering::Greater { e } else { x };
+        let over = cx.sub(hi, s);
+        let n = cx.div(over, st);
+        let n = cx.quantize_int_ceil(n);
+        let n = cx.sub(n, cx.one);
+        let back = cx.mul(n, st);
+        let p = cx.add(s, back);
+        if cx.is_pos(p) && best.is_none_or(|b| cx.cmp(p, b) == Ordering::Greater) {
+            best = Some(p);
+        }
+    }
+    best
+}
+
+/// The smallest legal price strictly above `x`, over every rung. The mirror of
+/// [`rung_below`].
+pub fn rung_above(cx: &mut Cx, ladder: &[(String, String, String)], x: D) -> Option<D> {
+    let mut best: Option<D> = None;
+    for (s, e, st) in ladder {
+        let (s, e, st) = (cx.parse(s)?, cx.parse(e)?, cx.parse(st)?);
+        let p = if cx.cmp(x, s) == Ordering::Less {
+            s
+        } else {
+            let over = cx.sub(x, s);
+            let n = cx.div(over, st);
+            let n = cx.quantize_int_down(n);
+            let n = cx.add(n, cx.one);
+            let up = cx.mul(n, st);
+            cx.add(s, up)
+        };
+        if cx.cmp(p, e) == Ordering::Less
+            && best.is_none_or(|b| cx.cmp(p, b) == Ordering::Less)
+        {
+            best = Some(p);
+        }
+    }
+    best
+}
+
+/// One Kalshi rung from `x`, down or up: on the market's own ladder when the
+/// engine has fetched it, and the flat cent otherwise — which is exactly the
+/// arithmetic every caller used before the ladder was known, so an unknown
+/// market prices bit-identically to before. `None` means no legal price.
+pub fn kalshi_step(cx: &mut Cx, ladder: Option<&[(String, String, String)]>, x: D, down: bool) -> Option<D> {
+    match ladder {
+        Some(l) if down => rung_below(cx, l, x),
+        Some(l) => rung_above(cx, l, x),
+        None => {
+            let tick = cx.parse_exact("0.01");
+            Some(if down { cx.sub(x, tick) } else { cx.add(x, tick) })
+        }
+    }
+}
+
 /// Kalshi's taker fee PER CONTRACT on a clip of `qty` at `price`.
 ///
 /// Per contract because that is the unit the basket arithmetic is in, but

@@ -539,6 +539,9 @@ struct Engine {
     /// re-stamped while the request stands, because the reader's settle window
     /// measures how long the quoter has been out of the side.
     maker_exit_suppressed: std::collections::BTreeMap<(String, String), std::time::Instant>,
+    /// Each Kalshi market's latest valid tick ladder from the `price_grid` feed,
+    /// for exit pricing (`marks`, `maker_exit`). Absent = unknown = the flat cent.
+    kalshi_ladders: std::collections::BTreeMap<String, Vec<(String, String, String)>>,
     unwind_seen: Option<UnwindReport>,
     /// Why the last scan refused to decide, when it did. Same shape and same
     /// reason as `tox_reason`: a subsystem that has gone quiet must be able to
@@ -857,6 +860,7 @@ impl Engine {
             n_unwind_near_miss: 0,
             unwind_near_miss_usd: 0.0,
             maker_exit_suppressed: std::collections::BTreeMap::new(),
+            kalshi_ladders: std::collections::BTreeMap::new(),
             unwind_seen: None,
             unwind_refused: None,
             marks_dirty: false,
@@ -1438,6 +1442,7 @@ impl Engine {
             k_bid_depth,
             k_ask,
             k_ask_depth,
+            k_ladder: self.kalshi_ladders.clone(),
             suppressed_at: self.maker_exit_suppressed.clone(),
         });
     }
@@ -1872,6 +1877,12 @@ impl Engine {
                 let ranges = v.get("ranges").cloned().and_then(|r|
                     serde_json::from_value::<Vec<(String, String, String)>>(r).ok());
                 let grid = ranges.as_deref().and_then(arb_core::price_grid::PriceGrid::from_ranges);
+                // Only a ladder `PriceGrid` accepts is kept; anything else
+                // reverts the market to unknown rather than pricing off it.
+                match (venue, grid.is_some(), ranges) {
+                    (Venue::Kalshi, true, Some(r)) => { self.kalshi_ladders.insert(market_id.clone(), r); }
+                    _ => { self.kalshi_ladders.remove(&market_id); }
+                }
                 if let Some(idxs) = by_market.get(&(venue, market_id.clone())) {
                     for &qi in idxs { quoters[qi].set_price_grid(&market_id, grid.clone()); }
                     if !self.killed && self.feed_reason.is_none() {
@@ -2434,6 +2445,7 @@ impl Engine {
             self.marks_records.clone(),
             &self.books,
             now,
+            &self.kalshi_ladders,
         );
         self.marks_unpriced_rows =
             marked.doc.positions.iter().filter(|p| p.liq_value_usd.is_none()).count();
