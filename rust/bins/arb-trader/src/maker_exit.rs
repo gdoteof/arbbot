@@ -355,6 +355,40 @@ pub fn outstanding() -> u64 {
     unresolved().saturating_sub(healed())
 }
 
+/// Kalshi market -> lots latched unresolved on it. A doubtful fill on one
+/// basket makes THAT basket's ledger untrustworthy, not every other one's.
+static LATCHED: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::new(BTreeMap::new());
+
+pub(crate) fn latch_market(market: &str) {
+    UNRESOLVED.fetch_add(1, AtomicOrd::Relaxed);
+    *LATCHED.lock().expect("latched markets").entry(market.to_owned()).or_default() += 1;
+}
+
+pub(crate) fn unlatch_market(market: &str) {
+    HEALED.fetch_add(1, AtomicOrd::Relaxed);
+    let mut latched = LATCHED.lock().expect("latched markets");
+    if let Some(n) = latched.get_mut(market) {
+        *n -= 1;
+        if *n == 0 {
+            latched.remove(market);
+        }
+    }
+}
+
+/// What pauses fresh exits on `market`: its own latched lots, plus anything
+/// outstanding that no market claimed. The unattributed remainder still pauses
+/// every market, so an alarm raised without a market fails closed.
+pub fn outstanding_for(market: Option<&str>) -> u64 {
+    let latched = LATCHED.lock().expect("latched markets");
+    let attributed: u64 = latched.values().sum();
+    let own = market.and_then(|m| latched.get(m)).copied().unwrap_or(0);
+    let unattributed = outstanding().saturating_sub(attributed);
+    match market {
+        Some(_) => own + unattributed,
+        None => outstanding(),
+    }
+}
+
 fn refuse(why: String) -> String {
     REFUSED.fetch_add(1, AtomicOrd::Relaxed);
     why
@@ -372,6 +406,18 @@ pub struct DepthClaims {
     pub pm_ask: i64,
     /// Contracts of `market`'s YES bids claimed by resting-PM-US exits.
     pub k_bid: i64,
+    pub pm_bid: i64,
+    pub k_ask: i64,
+}
+
+fn close_depth_key(direction: Direction, shape: Shape, market: &str, pm_market: &str) -> String {
+    let (venue, id, side) = match (direction, shape) {
+        (Direction::Standard, Shape::RestKalshi) => ("polymarket_us", pm_market, SIDE_ASK),
+        (Direction::Standard, Shape::RestPmUs) => ("kalshi", market, SIDE_BID),
+        (Direction::Inverse, Shape::RestKalshi) => ("polymarket_us", pm_market, SIDE_BID),
+        (Direction::Inverse, Shape::RestPmUs) => ("kalshi", market, SIDE_ASK),
+    };
+    format!("{venue}:{id}:{side}")
 }
 
 /// What the ENGINE knows and this module cannot derive: the hurdle in force, the
@@ -394,6 +440,7 @@ pub struct EngineView {
     pub pm_ask: BTreeMap<String, String>,
     /// Full executable ladder: price without size cannot safely back a first leg.
     pub pm_ask_depth: BTreeMap<String, Vec<Level>>,
+    pub pm_bid_depth: BTreeMap<String, Vec<Level>>,
     /// PM-US market -> best YES BID, the price a RESTING close bids against.
     /// [`Shape::RestPmUs`] needs this the way [`Shape::RestKalshi`] needs
     /// `pm_ask`: the leg it prices passively is the one it must see both sides
@@ -406,6 +453,8 @@ pub struct EngineView {
     pub k_bid: BTreeMap<String, String>,
     /// Full executable ladder for the mirror-image exit shape.
     pub k_bid_depth: BTreeMap<String, Vec<Level>>,
+    pub k_ask: BTreeMap<String, String>,
+    pub k_ask_depth: BTreeMap<String, Vec<Level>>,
     /// (market, side) pairs the quoters have been told to yield, and the instant
     /// that was installed. Absent means NOT yielded. The side is the WIRE
     /// spelling and not [`arb_core::model::BookSide`], which is deliberately not
@@ -719,6 +768,87 @@ pub enum Shape {
     RestPmUs,
 }
 
+/// Which complementary contracts the open basket owns. Persisted on every
+/// order; the default preserves all checkpoints written before inverse exits.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Direction {
+    #[default]
+    Standard,
+    Inverse,
+}
+
+impl Direction {
+    fn inverted(self) -> bool { self == Self::Inverse }
+    fn held(self, venue: Venue) -> Held {
+        match (self, venue) {
+            (Self::Standard, Venue::Kalshi) | (Self::Inverse, Venue::PolymarketUs) => Held::LongYes,
+            (Self::Standard, Venue::PolymarketUs) | (Self::Inverse, Venue::Kalshi) => Held::ShortYes,
+            _ => unreachable!("maker exits only support Kalshi and PM-US"),
+        }
+    }
+    fn sells(self, venue: Venue) -> bool { self.held(venue) == Held::LongYes }
+}
+
+fn complement(cx: &mut Cx, value: &str) -> Option<String> {
+    cx.parse(value).map(|p| cx.one_minus(p).to_standard_notation_string())
+}
+
+fn complement_levels(cx: &mut Cx, levels: &[Level]) -> Option<Vec<Level>> {
+    levels.iter().map(|l| Some(Level {
+        price: complement(cx, &l.price)?,
+        size: l.size.clone(),
+    })).collect()
+}
+
+fn complement_ladder(cx: &mut Cx, ladder: &[(String, String, String)])
+    -> Option<Vec<(String, String, String)>> {
+    let mut out = Vec::with_capacity(ladder.len());
+    for (start, end, step) in ladder.iter().rev() {
+        let (s, e, d) = (cx.parse(start)?, cx.parse(end)?, cx.parse(step)?);
+        let span = cx.sub(e, s);
+        let divided = cx.div(span, d);
+        let q = cx.quantize_int_down(divided);
+        let qd = cx.mul(q, d);
+        let top = cx.add(s, qd);
+        let aligned = cx.cmp(top, e) == Ordering::Equal;
+        let n = if aligned { cx.sub(q, cx.one) } else { q };
+        let nd = cx.mul(n, d);
+        let max = cx.add(s, nd);
+        let inv_s = cx.one_minus(s);
+        let upper = cx.add(inv_s, d);
+        // Use the actual highest legal point. Rung ends need not be aligned to
+        // their step, so `1-end+step` can invent prices.
+        out.push((
+            cx.one_minus(max).to_standard_notation_string(),
+            upper.to_standard_notation_string(),
+            step.clone(),
+        ));
+    }
+    Some(out)
+}
+
+fn inverse_inputs(cx: &mut Cx, quote: &Quote, view: &EngineView) -> Result<(Quote, EngineView), String> {
+    let mut q = quote.clone();
+    q.yes_bid = quote.yes_ask.as_deref().and_then(|p| complement(cx, p));
+    q.yes_ask = quote.yes_bid.as_deref().and_then(|p| complement(cx, p));
+    q.ladder = complement_ladder(cx, &quote.ladder).ok_or("Kalshi tick ladder does not parse")?;
+    Ok((q, inverse_view(cx, view)))
+}
+
+fn inverse_view(cx: &mut Cx, view: &EngineView) -> EngineView {
+    let mut v = view.clone();
+    v.pm_ask = view.pm_bid.iter().filter_map(|(m,p)| complement(cx,p).map(|x|(m.clone(),x))).collect();
+    v.pm_bid = view.pm_ask.iter().filter_map(|(m,p)| complement(cx,p).map(|x|(m.clone(),x))).collect();
+    v.pm_ask_depth = view.pm_bid_depth.iter().filter_map(|(m,l)| complement_levels(cx,l).map(|x|(m.clone(),x))).collect();
+    v.pm_bid_depth = view.pm_ask_depth.iter().filter_map(|(m,l)| complement_levels(cx,l).map(|x|(m.clone(),x))).collect();
+    v.k_bid = view.k_ask.iter().filter_map(|(m,p)| complement(cx,p).map(|x|(m.clone(),x))).collect();
+    v.k_bid_depth = view.k_ask_depth.iter().filter_map(|(m,l)| complement_levels(cx,l).map(|x|(m.clone(),x))).collect();
+    v.k_ask = view.k_bid.iter().filter_map(|(m,p)| complement(cx,p).map(|x|(m.clone(),x))).collect();
+    v.k_ask_depth = view.k_bid_depth.iter().filter_map(|(m,l)| complement_levels(cx,l).map(|x|(m.clone(),x))).collect();
+    v
+}
+
 impl Shape {
     /// The fee role each leg pays under this shape. `(kalshi, pmus)`.
     pub fn roles(self) -> (Role, Role) {
@@ -814,9 +944,16 @@ pub fn exit_limit(
         // reject or fill instantly against the first bid. Start at the smallest
         // legal tick above zero.
         let zero = cx.zero();
-        let Some(bottom) = ceil_to_tick(cx, ladder, zero) else {
-            return Err("the tick ladder has no bottom rung".into());
-        };
+        let mut first = None;
+        for (s, _, _) in ladder {
+            if let Some(candidate) = cx.parse(s) {
+                if first.is_none_or(|old| cx.cmp(candidate, old) == Ordering::Less) {
+                    first = Some(candidate);
+                }
+            }
+        }
+        let bottom = ceil_to_tick(cx, ladder, zero).or(first)
+            .ok_or("the tick ladder has no bottom rung")?;
         if cx.is_pos(bottom) {
             return Ok(bottom);
         }
@@ -1168,6 +1305,8 @@ pub struct Order {
     /// Old durable checkpoints predate opportunity-cost pricing.
     #[serde(default)]
     pub resolves_by: Option<String>,
+    #[serde(default)]
+    pub direction: Direction,
     /// WHICH LEG RESTS. Everything below that reads "the resting leg" or "the
     /// close leg" resolves through this and not through the venue names.
     pub shape: Shape,
@@ -1260,9 +1399,10 @@ fn sinks<'a>(
 
 /// The (market, side) pair a resting order occupies, for the suppression set.
 pub fn rest_key(o: &Order) -> (String, String) {
-    match o.shape {
-        Shape::RestKalshi => (o.market.clone(), SIDE_ASK.to_string()),
-        Shape::RestPmUs => (o.pm_market.clone(), SIDE_BID.to_string()),
+    match (o.direction, o.shape) {
+        (Direction::Standard, Shape::RestKalshi) | (Direction::Inverse, Shape::RestPmUs) =>
+            (o.rest_market().to_string(), SIDE_ASK.to_string()),
+        _ => (o.rest_market().to_string(), SIDE_BID.to_string()),
     }
 }
 
@@ -1282,10 +1422,11 @@ pub fn rest_key(o: &Order) -> (String, String) {
 /// back unfilled and reads as "the book moved", on precisely the markets we
 /// quote, which is all of them. Ineffective rather than dangerous, and
 /// invisible either way.
-pub fn cross_keys(market_id: &str, pm_market: &str) -> Vec<(String, String)> {
+pub fn cross_keys_for(market_id: &str, pm_market: &str, direction: Direction) -> Vec<(String, String)> {
+    let (k, p) = if direction == Direction::Standard { (SIDE_BID, SIDE_ASK) } else { (SIDE_ASK, SIDE_BID) };
     vec![
-        (market_id.to_string(), SIDE_BID.to_string()),
-        (pm_market.to_string(), SIDE_ASK.to_string()),
+        (market_id.to_string(), k.to_string()),
+        (pm_market.to_string(), p.to_string()),
     ]
 }
 
@@ -1297,10 +1438,15 @@ pub fn cross_keys(market_id: &str, pm_market: &str) -> Vec<(String, String)> {
 /// The cost is one extra entry quote suppressed for the settle window on a
 /// market we are about to stop quoting anyway; the alternative is a two-cycle
 /// handshake that re-decides in between, which is the race this avoids.
+#[cfg(test)]
 pub fn candidate_keys(market_id: &str, pm_market: &str) -> Vec<(String, String)> {
+    candidate_keys_for(market_id, pm_market, Direction::Standard)
+}
+pub fn candidate_keys_for(market_id: &str, pm_market: &str, direction: Direction) -> Vec<(String, String)> {
+    let (k, p) = if direction == Direction::Standard { (SIDE_ASK, SIDE_BID) } else { (SIDE_BID, SIDE_ASK) };
     vec![
-        (market_id.to_string(), SIDE_ASK.to_string()),
-        (pm_market.to_string(), SIDE_BID.to_string()),
+        (market_id.to_string(), k.to_string()),
+        (pm_market.to_string(), p.to_string()),
     ]
 }
 
@@ -1327,14 +1473,34 @@ pub fn lock_per_ct(
     pm_basis: D,
     qty: i64,
 ) -> D {
+    lock_per_ct_direction(cx, fees, Direction::Standard, (k_role, pm_role), k_px, pm_px,
+        k_basis, pm_basis, qty)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lock_per_ct_direction(
+    cx: &mut Cx,
+    fees: &FeeSchedule,
+    direction: Direction,
+    (k_role, pm_role): (Role, Role),
+    k_px: D,
+    pm_px: D,
+    k_basis: D,
+    pm_basis: D,
+    qty: i64,
+) -> D {
     let size = cx.from_i64(qty);
     let kf = fees.fee(cx, Venue::Kalshi, k_role, k_px, size, "");
     let kf = cx.div(kf, size);
     let pf = fees.fee(cx, Venue::PolymarketUs, pm_role, pm_px, size, "");
     let pf = cx.div(pf, size);
-    let out = cx.sub(k_px, kf);
-    let back = cx.one_minus(pm_px);
-    let back = cx.sub(back, pf);
+    let (k_out, p_out) = if direction == Direction::Standard {
+        (k_px, cx.one_minus(pm_px))
+    } else {
+        (cx.one_minus(k_px), pm_px)
+    };
+    let out = cx.sub(k_out, kf);
+    let back = cx.sub(p_out, pf);
     let gross = cx.add(out, back);
     let paid = cx.add(k_basis, pm_basis);
     cx.sub(gross, paid)
@@ -1428,6 +1594,13 @@ pub fn decide(
             cand.market_id
         ))
     })?;
+    // Price both basket directions through one set of equations. For inverse
+    // inventory the complementary contract is the held asset on each venue, so
+    // bid/ask and ladders swap and prices are complemented. Fee curves are
+    // symmetric in p and 1-p; the resulting economics are identical while the
+    // persisted/wire prices remain YES-axis below.
+    let normalized = cand.direction.inverted().then(|| inverse_inputs(cx, quote, view)).transpose()?;
+    let (quote, view) = normalized.as_ref().map_or((quote, view), |(q, v)| (q, v));
     let Some(pm_ask) = view.pm_ask.get(pm_market) else {
         return Err(refuse(format!(
             "no PM-US ask for {pm_market} in the engine's book — the close leg is unpriceable, \
@@ -1454,7 +1627,7 @@ pub fn decide(
         cand.opened_ts,
         Venue::Kalshi,
         &cand.market_id,
-        Held::LongYes,
+        cand.direction.held(Venue::Kalshi),
     )
     .map_err(|e| refuse(format!("Kalshi leg: {e}")))?;
     let pm_lot = lot_at(
@@ -1465,7 +1638,7 @@ pub fn decide(
         cand.opened_ts,
         Venue::PolymarketUs,
         pm_market,
-        Held::ShortYes,
+        cand.direction.held(Venue::PolymarketUs),
     )
     .map_err(|e| refuse(format!("PM-US leg: {e}")))?;
     let qty = k_lot.qty.min(pm_lot.qty).min(cand.qty);
@@ -1604,10 +1777,13 @@ pub fn decide(
     // asks for BOTH sides before deciding — it cannot know which shape will win
     // until the books are priced — so whichever wins here has already been
     // yielded for the same settle window.
-    let rest_key = match shape {
-        Shape::RestKalshi => (cand.market_id.clone(), SIDE_ASK.to_string()),
-        Shape::RestPmUs => (pm_market.to_string(), SIDE_BID.to_string()),
-    };
+    let rest_key = rest_key(&Order {
+        rel_id: String::new(), resolves_by: None, direction: cand.direction, shape,
+        market: cand.market_id.clone(), pm_market: pm_market.to_string(), qty: 0,
+        limit: String::new(), closes_ts: 0.0, k_basis: String::new(), pm_basis: String::new(),
+        pm_ask_at_decision: String::new(), lock_ct: String::new(), cross: None,
+        runner_up_ct: None,
+    });
     match view.suppressed_at.get(&rest_key) {
         None => {
             return Err(refuse(format!(
@@ -1657,10 +1833,10 @@ pub fn decide(
             // would hit our own resting quote, so an unyielded side does not
             // make the cross wrong, it makes it a no-op that reads as "the book
             // moved". Same settle window as the rest guard, for the same reason.
-            let lift = match shape {
-                Shape::RestKalshi => (cand.market_id.clone(), SIDE_BID.to_string()),
-                Shape::RestPmUs => (pm_market.to_string(), SIDE_ASK.to_string()),
-            };
+            let [kalshi_lift, pm_lift]: [_; 2] = cross_keys_for(&cand.market_id, pm_market, cand.direction)
+                .try_into()
+                .expect("one key per venue");
+            let lift = if shape == Shape::RestKalshi { kalshi_lift } else { pm_lift };
             match view.suppressed_at.get(&lift) {
                 Some(since)
                     if now.saturating_duration_since(*since).as_secs_f64()
@@ -1704,9 +1880,18 @@ pub fn decide(
         })
         .flatten();
 
+    let wire = |cx: &mut Cx, p: D| if cand.direction.inverted() { cx.one_minus(p) } else { p };
+    let limit = wire(cx, limit);
+    let cross = cross.map(|mut c| {
+        if cand.direction.inverted() {
+            c.limit = complement(cx, &c.limit).expect("priced cross");
+        }
+        c
+    });
     Ok(Order {
         rel_id: cand.rel_id.clone(),
         resolves_by: cand.resolves_by.clone(),
+        direction: cand.direction,
         shape,
         market: cand.market_id.clone(),
         pm_market: pm_market.to_string(),
@@ -1715,7 +1900,9 @@ pub fn decide(
         closes_ts: k_lot.open_ts,
         k_basis: k_lot.cost_per_ct,
         pm_basis: pm_lot.cost_per_ct,
-        pm_ask_at_decision: against,
+        pm_ask_at_decision: if cand.direction.inverted() {
+            complement(cx, &against).unwrap_or(against)
+        } else { against },
         lock_ct: cx.emit_6dp(lock),
         cross,
         runner_up_ct: runner_up.map(|r| cx.emit_6dp(r)),
@@ -1813,7 +2000,7 @@ pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, t
     let actual_lock = match (cx.parse(k_fill), cx.parse(pm_fill),
         cx.parse(&o.k_basis), cx.parse(&o.pm_basis)) {
         (Some(k), Some(p), Some(kb), Some(pb)) => {
-            let lock = lock_per_ct(&mut cx, &fees, roles, k, p, kb, pb, filled);
+            let lock = lock_per_ct_direction(&mut cx, &fees, o.direction, roles, k, p, kb, pb, filled);
             cx.emit_6dp(lock)
         }
         _ => "unpriced".to_string(),
@@ -1832,6 +2019,7 @@ pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, t
         "maker_exit_k_basis": o.k_basis,
         "maker_exit_pm_basis": o.pm_basis,
         "maker_exit_shape": o.shape.tag(),
+        "maker_exit_direction": if o.direction == Direction::Inverse { "inverse" } else { "standard" },
         // The lock that was actually TAKEN. A cross pays the spread and both
         // takers' fees to convert now, so it locks strictly less than the rest
         // it replaced — recording the rested figure would book a profit this
@@ -1876,9 +2064,11 @@ pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, t
         // `rest-pmus` it is the other way round, and a record that said
         // otherwise would misattribute the fees this file exists to account for.
         "legs": [
-            {"venue": "kalshi", "market_id": o.market, "side": "yes", "action": "sell",
+            {"venue": "kalshi", "market_id": o.market,
+             "side": if o.direction == Direction::Inverse { "no" } else { "yes" }, "action": "sell",
              "role": k_role, "qty": filled, "yes_price": k_fill},
-            {"venue": "polymarket_us", "market_id": o.pm_market, "side": "no", "action": "sell",
+            {"venue": "polymarket_us", "market_id": o.pm_market,
+             "side": if o.direction == Direction::Inverse { "yes" } else { "no" }, "action": "sell",
              "role": pm_role, "qty": filled, "yes_price": pm_fill},
         ],
     })
@@ -1892,6 +2082,7 @@ pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, t
 /// back (buying the YES against a NO long is how PM-US flattens one — there is
 /// no sell intent on that wire). So this is a property of the VENUE, not of
 /// which leg the shape happened to rest.
+#[cfg(test)]
 pub(crate) fn sells_yes(v: Venue) -> bool {
     matches!(v, Venue::Kalshi)
 }
@@ -1960,10 +2151,19 @@ pub(crate) fn fill_price(cx: &mut Cx, f: &OrderFill, limit: &str, selling: bool)
 /// and not an edge check: a genuinely bad exit is still recorded, because
 /// recording bad news correctly is the entire point of this change. An inverted
 /// leg misses by 50c or more and every real close on disk sits inside 0.95-1.05.
+#[cfg(test)]
 fn plausible_pair(cx: &mut Cx, k_px: &str, pm_px: &str) -> bool {
+    plausible_pair_direction(cx, Direction::Standard, k_px, pm_px)
+}
+fn plausible_pair_direction(cx: &mut Cx, direction: Direction, k_px: &str, pm_px: &str) -> bool {
     let (Some(k), Some(pm)) = (cx.parse(k_px), cx.parse(pm_px)) else { return false };
-    let back = cx.one_minus(pm);
-    let gross = cx.add(k, back);
+    let gross = if direction == Direction::Standard {
+        let back = cx.one_minus(pm);
+        cx.add(k, back)
+    } else {
+        let back = cx.one_minus(k);
+        cx.add(back, pm)
+    };
     let (lo, hi) = (cx.parse_exact("0.5"), cx.parse_exact("1.5"));
     cx.cmp(gross, lo) == Ordering::Greater && cx.cmp(gross, hi) == Ordering::Less
 }
@@ -2645,7 +2845,7 @@ async fn cycle(
         }
     };
     let now = wall_now();
-    let target = match live.target(&exits, now, outstanding()) {
+    let target = match live.target(&exits, now, outstanding_for(live.scope_market.as_deref())) {
         Ok(e) => e.clone(),
         Err(why) => {
             let scope = live.scope_market.as_deref().unwrap_or("unscoped");
@@ -2695,16 +2895,16 @@ async fn cycle(
     // BOTH sides this candidate might rest, published before the decision — the
     // first cycle that picks a market ASKS and the next one places, which is
     // what `decide`'s settle guard refuses on by name.
-    want.extend(candidate_keys(&target.market_id, &pm));
+    want.extend(candidate_keys_for(&target.market_id, &pm, target.direction));
     // ...and, when a cross is possible, the two sides it would LIFT. Asked for
     // unconditionally under the flag rather than after pricing, because the
     // shape — and so which side a cross would hit — is not known until the
     // books are read, which is the same reason `candidate_keys` yields both.
     if live.take_ok || live.lot.is_some() {
-        want.extend(cross_keys(&target.market_id, &pm));
+        want.extend(cross_keys_for(&target.market_id, &pm, target.direction));
     }
     live.request_suppress(want);
-    if live.lot.is_some() && cross_keys(&target.market_id, &pm).iter().any(|key|
+    if live.lot.is_some() && cross_keys_for(&target.market_id, &pm, target.direction).iter().any(|key|
         view.suppressed_at.get(key).is_none_or(|since|
             since.elapsed().as_secs_f64() < SUPPRESS_SETTLE_S)) {
         out.push(format!("[maker-exit] {}: waiting for entry quotes to yield the hedge sides", target.market_id));
@@ -2741,9 +2941,14 @@ async fn cycle(
         }
     };
     let claims = DepthClaims {
-        pm_ask: live.depth_claims.get(&*pm).copied().unwrap_or(0),
-        k_bid: live.depth_claims.get(&*target.market_id).copied().unwrap_or(0),
+        pm_ask: live.depth_claims.get(&close_depth_key(Direction::Standard, Shape::RestKalshi, &target.market_id, &pm)).copied().unwrap_or(0),
+        k_bid: live.depth_claims.get(&close_depth_key(Direction::Standard, Shape::RestPmUs, &target.market_id, &pm)).copied().unwrap_or(0),
+        pm_bid: live.depth_claims.get(&close_depth_key(Direction::Inverse, Shape::RestKalshi, &target.market_id, &pm)).copied().unwrap_or(0),
+        k_ask: live.depth_claims.get(&close_depth_key(Direction::Inverse, Shape::RestPmUs, &target.market_id, &pm)).copied().unwrap_or(0),
     };
+    let claims = if target.direction == Direction::Inverse {
+        DepthClaims { pm_ask: claims.pm_bid, k_bid: claims.k_ask, ..claims }
+    } else { claims };
     let decided = decide(
         &mut live.cx,
         &live.fees,
@@ -2803,10 +3008,7 @@ async fn cross(
         market: order.rest_market().to_string(),
         // The same side the rest would have taken — selling the YES we hold, or
         // bidding for the YES we are short. Only the PRICE and the TIF differ.
-        side: match order.shape {
-            Shape::RestKalshi => Side::Ask,
-            Shape::RestPmUs => Side::Bid,
-        },
+        side: if order.direction.sells(order.shape.rest_venue()) { Side::Ask } else { Side::Bid },
         price: plan.limit.clone(),
         qty: order.qty,
         tif: Tif::Ioc,
@@ -3177,7 +3379,7 @@ async fn resolve_vanished(
     // the two are indistinguishable. Refuse. A real sell-to-zero is a naked leg
     // recon confirms from its own consensus reads and `naked_act` closes; a
     // dropped row booked as a fill is money that never moved.
-    if r.order.shape == Shape::RestPmUs && expected > 0 && !net.contains_key(&rest_market) {
+    if rest_venue == Venue::PolymarketUs && expected > 0 && !net.contains_key(&rest_market) {
         return (
             vec![format!(
                 "[maker-exit] {} has vanished from the venue (404) and the ledger has {expected} \
@@ -3190,12 +3392,9 @@ async fn resolve_vanished(
         );
     }
     let signed = net.get(&rest_market).copied().unwrap_or(0.0);
-    let held = match r.order.shape {
-        Shape::RestKalshi => signed,
-        // A PM-US short YES is a NEGATIVE yes-count; the NO contracts we hold
-        // are its magnitude. A position on the wrong side of zero is none of
-        // ours, so it floors rather than counting backwards.
-        Shape::RestPmUs => (-signed).max(0.0),
+    let held = match r.order.direction.held(rest_venue) {
+        Held::LongYes => signed.max(0.0),
+        Held::ShortYes => (-signed).max(0.0),
     };
     let sold = (expected as f64 - held).round() as i64;
     if sold <= 0 {
@@ -3241,10 +3440,7 @@ async fn resolve_vanished(
             // goes means contracts BOUGHT. Same shortfall arithmetic, opposite
             // trade, and a reader reconciling this against the venue needs the
             // right verb.
-            match r.order.shape {
-                Shape::RestKalshi => "SOLD",
-                Shape::RestPmUs => "BOUGHT",
-            },
+            if r.order.direction.sells(rest_venue) { "SOLD" } else { "BOUGHT" },
             r.order.close_market()
         )],
         Some(sold),
@@ -3372,6 +3568,13 @@ async fn manage(
 /// not. `Ok` means the ask is at or above it and a fill would still lock
 /// [`MIN_LOCK`].
 fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> Result<(), String> {
+    if o.direction.inverted() {
+        let normalized = inverse_view(cx, view);
+        let mut order = o.clone();
+        order.direction = Direction::Standard;
+        order.limit = complement(cx, &o.limit).ok_or("inverse resting price does not parse")?;
+        return still_pays(cx, fees, &order, &normalized);
+    }
     let (Some(k_basis), Some(pm_basis), Some(resting)) =
         (cx.parse(&o.k_basis), cx.parse(&o.pm_basis), cx.parse(&o.limit))
     else {
@@ -3643,9 +3846,13 @@ async fn heal(
             // Kalshi YES through the bid. One tick THROUGH either way, so the
             // IOC actually clears rather than reporting "unfilled" at a limit
             // nothing will meet.
-            let touch = match p.order.shape {
-                Shape::RestKalshi => view.pm_ask.get(&open_leg),
-                Shape::RestPmUs => view.k_bid.get(&open_leg),
+            let selling = p.order.direction.sells(open_venue);
+            let touch = match (open_venue, selling) {
+                (Venue::PolymarketUs, false) => view.pm_ask.get(&open_leg),
+                (Venue::PolymarketUs, true) => view.pm_bid.get(&open_leg),
+                (Venue::Kalshi, false) => view.k_ask.get(&open_leg),
+                (Venue::Kalshi, true) => view.k_bid.get(&open_leg),
+                _ => None,
             };
             let Some(touch) = touch else {
                 out.push(format!(
@@ -3666,10 +3873,7 @@ async fn heal(
                 return out;
             };
             let tick = live.cx.parse_exact(TICK);
-            let through = match p.order.shape {
-                Shape::RestKalshi => live.cx.add(touch_d, tick),
-                Shape::RestPmUs => live.cx.sub(touch_d, tick),
-            };
+            let through = if selling { live.cx.sub(touch_d, tick) } else { live.cx.add(touch_d, tick) };
             if !live.cx.is_pos(through) {
                 out.push(format!(
                     "[maker-exit] HEAL {open_leg} — the touch is {touch} and one tick through \
@@ -3696,10 +3900,7 @@ async fn heal(
     let coid = client_order_id();
     let req = PlaceRequest {
         market: open_leg.clone(),
-        side: match p.order.shape {
-            Shape::RestKalshi => Side::Bid,
-            Shape::RestPmUs => Side::Ask,
-        },
+        side: if p.order.direction.sells(open_venue) { Side::Ask } else { Side::Bid },
         price: limit.clone(),
         qty: owed,
         tif: Tif::Ioc,
@@ -3762,7 +3963,7 @@ async fn heal(
                 close_sink,
                 &oid,
                 &limit,
-                sells_yes(p.order.shape.close_venue()),
+                p.order.direction.sells(p.order.shape.close_venue()),
             )
                 .await;
         out.push(book(&live.ledger_path, &p.order, p.order.rest_limit(), &close_px, p.filled, ts));
@@ -3824,9 +4025,9 @@ fn close_shortfall(records: &[Value], p: &PendingClose, venue_net: f64) -> i64 {
         .sum();
     // A position on the WRONG side of zero means there is nothing of ours left
     // to close on this market, so `held` floors at zero either way.
-    let signed = match p.order.shape {
-        Shape::RestKalshi => -venue_net,
-        Shape::RestPmUs => venue_net,
+    let signed = match p.order.direction.held(venue) {
+        Held::LongYes => venue_net,
+        Held::ShortYes => -venue_net,
     };
     let held = signed.round().max(0.0) as i64;
     let already = (ledger_qty - held).max(0);
@@ -3840,6 +4041,14 @@ fn price_close(
     filled: i64,
     view: &EngineView,
 ) -> Result<String, String> {
+    if o.direction.inverted() {
+        let normalized = inverse_view(cx, view);
+        let mut order = o.clone();
+        order.direction = Direction::Standard;
+        order.limit = complement(cx, &o.limit).ok_or("inverse fill price does not parse")?;
+        let price = price_close(cx, fees, &order, filled, &normalized)?;
+        return complement(cx, &price).ok_or("inverse close price does not parse".into());
+    }
     let fill = cx.parse(&o.limit).ok_or("the fill price does not parse")?;
     let k_basis = cx.parse(&o.k_basis).ok_or("the kalshi basis does not parse")?;
     let pm_basis = cx.parse(&o.pm_basis).ok_or("the pm basis does not parse")?;
@@ -3944,10 +4153,7 @@ async fn close_leg(
         // BUYING the YES back is how a short YES is closed; SELLING it is how a
         // long one is. Which leg is left to close is exactly what the shape
         // says, and it is the opposite of the one that just filled.
-        side: match r.order.shape {
-            Shape::RestKalshi => Side::Bid,
-            Shape::RestPmUs => Side::Ask,
-        },
+        side: if r.order.direction.sells(r.order.shape.close_venue()) { Side::Ask } else { Side::Bid },
         price: limit.clone(),
         qty: filled,
         tif: Tif::Ioc,
@@ -4030,7 +4236,7 @@ async fn close_leg(
         rest_sink,
         &r.venue_order_id,
         r.order.rest_limit(),
-        sells_yes(r.order.shape.rest_venue()),
+        r.order.direction.sells(r.order.shape.rest_venue()),
     )
     .await;
     let close_px = filled_price_or_limit(
@@ -4038,7 +4244,7 @@ async fn close_leg(
         close_sink,
         &oid,
         &limit,
-        sells_yes(r.order.shape.close_venue()),
+        r.order.direction.sells(r.order.shape.close_venue()),
     )
     .await;
     // BOTH LEGS TOGETHER, against what a flattened basket can pay. Each price
@@ -4048,7 +4254,7 @@ async fn close_leg(
     // at all, and says so: the ledger is where every future exit's basis comes
     // from and a wrong price there is not one bad row.
     let (k_px, pm_px) = fills_by_venue(&r.order, &rest_px, &close_px);
-    let (rest_px, close_px) = if plausible_pair(&mut live.cx, k_px, pm_px) {
+    let (rest_px, close_px) = if plausible_pair_direction(&mut live.cx, r.order.direction, k_px, pm_px) {
         (rest_px.clone(), close_px.clone())
     } else {
         out.push(format!(
@@ -4106,9 +4312,20 @@ mod tests {
         ))
     }
 
+    fn inverse_basket(ts: f64, qty: i64, pm_yes: &str, k_yes: &str) -> Value {
+        v(&format!(
+            r#"{{"ts":{ts},"relationship_id":"r1","status":"open","qty":{qty},"legs":[
+                 {{"venue":"polymarket_us","market_id":"p-a","side":"yes","role":"maker",
+                   "qty":{qty},"yes_price":"{pm_yes}"}},
+                 {{"venue":"kalshi","market_id":"K-a","side":"no","role":"maker",
+                   "qty":{qty},"yes_price":"{k_yes}"}}]}}"#
+        ))
+    }
+
     pub(super) fn cand(qty: i64, opened_ts: f64) -> Cand {
         Cand {
             rel_id: "r1".into(),            market_id: "K-a".into(),
+            direction: Direction::Standard,
             opened_ts,
             qty,
             fwd_apr: 11.0,
@@ -4162,10 +4379,17 @@ mod tests {
             pm_ask_depth: [("p-a".to_string(), vec![Level {
                 price: pm_ask.to_string(), size: "10000".into(),
             }])].into_iter().collect(),
+            pm_bid_depth: [("p-a".to_string(), vec![Level {
+                price: pm_bid.to_string(), size: "10000".into(),
+            }])].into_iter().collect(),
             pm_bid: [("p-a".to_string(), pm_bid.to_string())].into_iter().collect(),
             k_bid: [("K-a".to_string(), k_bid.to_string())].into_iter().collect(),
             k_bid_depth: [("K-a".to_string(), vec![Level {
                 price: k_bid.to_string(), size: "10000".into(),
+            }])].into_iter().collect(),
+            k_ask: [("K-a".to_string(), "0.2100".to_string())].into_iter().collect(),
+            k_ask_depth: [("K-a".to_string(), vec![Level {
+                price: "0.2100".into(), size: "10000".into(),
             }])].into_iter().collect(),
             // ALL FOUR sides yielded, which is what `cycle` publishes once
             // `--maker-exit-take` is on: it cannot know which shape will win
@@ -4881,7 +5105,7 @@ mod tests {
         l.resting = Some(Resting {
             order: Order {
                 rel_id: "r1".into(),
-                resolves_by: None,                market: "K-a".into(),
+                resolves_by: None, direction: Direction::Standard, market: "K-a".into(),
                 pm_market: "p-a".into(),
                 qty: 5,
                 limit: "0.5000".into(),
@@ -4915,7 +5139,7 @@ mod tests {
         l.resting = Some(Resting {
             order: Order {
                 rel_id: "r1".into(),
-                resolves_by: None,                market: "K-a".into(),
+                resolves_by: None, direction: Direction::Standard, market: "K-a".into(),
                 pm_market: "p-a".into(),
                 qty: 5,
                 limit: "0.5000".into(),
@@ -5707,7 +5931,7 @@ mod tests {
     fn the_close_books_against_the_one_lot_it_was_sized_to() {
         let o = Order {
             rel_id: "r1".into(),
-                resolves_by: None,            market: "K-a".into(),
+                resolves_by: None, direction: Direction::Standard, market: "K-a".into(),
             pm_market: "p-a".into(),
             qty: 5,
             limit: "0.2100".into(),
@@ -5750,7 +5974,7 @@ mod tests {
         let _g = crate::naked_act::TEST_SERIAL.lock().await;
         let o = Order {
             rel_id: "r1".into(),
-                resolves_by: None,            market: "K-a".into(),
+                resolves_by: None, direction: Direction::Standard, market: "K-a".into(),
             pm_market: "p-a".into(),
             qty: 5,
             limit: "0.2100".into(),
@@ -5896,7 +6120,7 @@ mod tests {
         Resting {
             order: Order {
                 rel_id: "r1".into(),
-                resolves_by: None,                market: "K-a".into(),
+                resolves_by: None, direction: Direction::Standard, market: "K-a".into(),
                 pm_market: "p-a".into(),
                 qty,
                 // 0.21 against a 0.19+0.78 basis: comfortably above the floor,
@@ -7137,8 +7361,60 @@ mod tests {
         let o = resting_exit(5).order;
         let mut value = serde_json::to_value(o).unwrap();
         value.as_object_mut().unwrap().remove("resolves_by");
+        value.as_object_mut().unwrap().remove("direction");
         let restored: Order = serde_json::from_value(value).unwrap();
         assert_eq!(restored.resolves_by, None);
+        assert_eq!(restored.direction, Direction::Standard);
+    }
+
+    #[tokio::test]
+    async fn inverse_inventory_prices_both_venues_and_preserves_wire_direction() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let mut c = cand(5, 1.0);
+        c.direction = Direction::Inverse;
+        let q = quote(Some("0.20"), Some("0.30"));
+        let mut vw = view_with("0.80", "0.70", "0.20");
+        vw.k_ask.insert("K-a".into(), "0.30".into());
+        vw.k_ask_depth.insert("K-a".into(), vec![Level { price: "0.30".into(), size: "20".into() }]);
+        vw.pm_bid_depth.insert("p-a".into(), vec![Level { price: "0.70".into(), size: "20".into() }]);
+        let o = decide(&mut cx, &fees, &[inverse_basket(1.0, 5, "0.20", "0.80")],
+            &c, "p-a", &q, &vw, Instant::now(), true, DepthClaims::default())
+            .expect("inverse exit");
+        assert_eq!(o.direction, Direction::Inverse);
+        let (market, side) = rest_key(&o);
+        assert_eq!(market, o.rest_market());
+        assert_eq!(side, if o.direction.sells(o.shape.rest_venue()) { SIDE_ASK } else { SIDE_BID });
+        let rec = close_record(&o, o.rest_limit(), &o.pm_ask_at_decision, 2, 9.0);
+        assert_eq!(rec["maker_exit_direction"], "inverse");
+        assert_eq!(rec["legs"][0]["side"], "no");
+        assert_eq!(rec["legs"][1]["side"], "yes");
+    }
+
+    #[tokio::test]
+    async fn inverse_inventory_refuses_missing_close_depth_and_unprofitable_basis() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let mut c = cand(5, 1.0);
+        c.direction = Direction::Inverse;
+        let q = quote(Some("0.20"), Some("0.30"));
+        let mut dark = view_with("0.80", "0.70", "0.20");
+        dark.k_ask.insert("K-a".into(), "0.30".into());
+        dark.pm_bid_depth.clear();
+        dark.k_ask_depth.clear();
+        let why = decide(&mut cx, &fees, &[inverse_basket(1.0, 5, "0.20", "0.80")],
+            &c, "p-a", &q, &dark, Instant::now(), false, DepthClaims::default())
+            .expect_err("no inverse close ladder");
+        assert!(why.contains("no whole-contract") || why.contains("no PM-US ask depth"), "{why}");
+
+        let mut vw = view_with("0.80", "0.70", "0.20");
+        vw.k_ask.insert("K-a".into(), "0.30".into());
+        vw.k_ask_depth.insert("K-a".into(), vec![Level { price: "0.30".into(), size: "20".into() }]);
+        vw.pm_bid_depth.insert("p-a".into(), vec![Level { price: "0.70".into(), size: "20".into() }]);
+        let why = decide(&mut cx, &fees, &[inverse_basket(1.0, 5, "0.90", "0.10")],
+            &c, "p-a", &q, &vw, Instant::now(), false, DepthClaims::default())
+            .expect_err("fees and basis leave no profitable inverse exit");
+        assert!(why.contains("neither exit shape pays"), "{why}");
     }
 
     #[tokio::test]
@@ -7228,17 +7504,118 @@ mod tests {
             Instant::now(), false, DepthClaims::default()).expect("seven back an exit");
         assert_eq!(alone.qty, 7);
         let shared = decide(&mut cx, &fees, &recs, &cand(17, 1.0), "p-a", &q, &vw,
-            Instant::now(), false, DepthClaims { pm_ask: 4, k_bid: 0 }).expect("three remain");
+            Instant::now(), false, DepthClaims { pm_ask: 4, k_bid: 0, ..Default::default() }).expect("three remain");
         assert_eq!(shared.qty, 3, "seven on the ladder, four already claimed");
         // A fully claimed PM-US ladder alone is not a refusal: the contest
         // falls through to the mirror shape, which rests on the OTHER ladder.
         let mirror = decide(&mut cx, &fees, &recs, &cand(17, 1.0), "p-a", &q, &vw,
-            Instant::now(), false, DepthClaims { pm_ask: 7, k_bid: 0 }).expect("the mirror still has depth");
+            Instant::now(), false, DepthClaims { pm_ask: 7, k_bid: 0, ..Default::default() }).expect("the mirror still has depth");
         assert_eq!(mirror.shape, Shape::RestPmUs);
         let why = decide(&mut cx, &fees, &recs, &cand(17, 1.0), "p-a", &q, &vw,
-            Instant::now(), false, DepthClaims { pm_ask: 7, k_bid: 10_000 })
+            Instant::now(), false, DepthClaims { pm_ask: 7, k_bid: 10_000, ..Default::default() })
             .expect_err("nothing remains for this lot on either ladder");
         assert!(why.contains("sibling exits already claim"), "{why}");
     }
 
+    /// A four-price view for the mirror test. Every side is yielded and THIN,
+    /// each a different size, so a ladder read from the wrong side changes the
+    /// quantity rather than hiding behind depth nothing exhausts.
+    fn full_view(sides: [(&str, &str); 4]) -> EngineView {
+        let [(pm_bid, pb), (pm_ask, pa), (k_bid, kb), (k_ask, ka)] = sides;
+        let mut v = view_with(pm_ask, pm_bid, k_bid);
+        let thin = |p: &str, n: &str| vec![Level { price: p.into(), size: n.into() }];
+        v.pm_bid_depth.insert("p-a".into(), thin(pm_bid, pb));
+        v.pm_ask_depth.insert("p-a".into(), thin(pm_ask, pa));
+        v.k_bid_depth.insert("K-a".into(), thin(k_bid, kb));
+        v.k_ask.insert("K-a".into(), k_ask.into());
+        v.k_ask_depth.insert("K-a".into(), thin(k_ask, ka));
+        v
+    }
+
+    /// AN INVERSE BASKET IS THE STANDARD ONE READ ON THE NO AXIS. The same
+    /// position spelled both ways — every wire price complemented, bids and asks
+    /// swapped — must pick the same shape and size, lock the same amount, and
+    /// put the complement of the same price on the wire. Pinned for every
+    /// normalizing path, not just `decide`.
+    #[tokio::test]
+    async fn an_inverse_basket_decides_exactly_as_its_standard_mirror() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        // Mirror: pm_bid <-> 1-pm_ask, k_bid <-> 1-k_ask, each size travelling
+        // with its price. The first pair's wide PM-US book wins rest-pmus, the
+        // second's wide Kalshi book wins rest-kalshi, so both close ladders are
+        // read.
+        let pairs = [
+            ([("0.2000", "7"), ("0.2400", "3"), ("0.2200", "4"), ("0.2500", "6")],
+             [("0.7600", "3"), ("0.8000", "7"), ("0.7500", "6"), ("0.7800", "4")],
+             (Some("0.22"), Some("0.25")), (Some("0.75"), Some("0.78"))),
+            ([("0.2300", "7"), ("0.2400", "3"), ("0.1800", "4"), ("0.2500", "6")],
+             [("0.7600", "3"), ("0.7700", "7"), ("0.7500", "6"), ("0.8200", "4")],
+             (Some("0.18"), Some("0.25")), (Some("0.75"), Some("0.82"))),
+        ];
+        let mut inv_c = cand(9, 1.0);
+        inv_c.direction = Direction::Inverse;
+        let one = |cx: &mut Cx, p: &str| { let d = cx.parse(p).unwrap(); cx.one_minus(d).to_standard_notation_string() };
+        let same_px = |cx: &mut Cx, a: &str, b: &str| {
+            let (a, b) = (cx.parse(a).unwrap(), cx.parse(b).unwrap());
+            cx.cmp(a, b) == Ordering::Equal
+        };
+        let mut shapes = BTreeSet::new();
+        for ((std_sides, inv_sides, sq, iq), take) in pairs.iter()
+            .flat_map(|p| [false, true].map(|t| (p, t)))
+        {
+            let (std_view, inv_view) = (full_view(*std_sides), full_view(*inv_sides));
+            let (std_q, inv_q) = (quote(sq.0, sq.1), quote(iq.0, iq.1));
+            let s = decide(&mut cx, &fees, &[open_basket(1.0, 9, "0.24", "0.19")], &cand(9, 1.0),
+                "p-a", &std_q, &std_view, Instant::now(), take, DepthClaims::default())
+                .expect("the standard basket exits");
+            let i = decide(&mut cx, &fees, &[inverse_basket(1.0, 9, "0.76", "0.81")], &inv_c,
+                "p-a", &inv_q, &inv_view, Instant::now(), take, DepthClaims::default())
+                .expect("its mirror exits");
+            assert!(s.qty < 9, "depth, not the lot, must bind: {}", s.qty);
+            shapes.insert(s.shape.tag());
+            assert_eq!((i.shape, i.qty, &i.lock_ct), (s.shape, s.qty, &s.lock_ct), "take={take}");
+            assert_eq!((&i.k_basis, &i.pm_basis), (&s.k_basis, &s.pm_basis));
+            let mirrored = one(&mut cx, &s.limit);
+            assert!(same_px(&mut cx, &i.limit, &mirrored), "{} vs 1-{}", i.limit, s.limit);
+            assert_eq!(i.cross.is_some(), s.cross.is_some());
+            if let (Some(ic), Some(sc)) = (&i.cross, &s.cross) {
+                let mirrored = one(&mut cx, &sc.limit);
+                assert!(same_px(&mut cx, &ic.limit, &mirrored), "cross {} vs 1-{}", ic.limit, sc.limit);
+                assert_eq!(ic.lock_ct, sc.lock_ct);
+            }
+            // The resting checks and the close pricing normalize too.
+            assert_eq!(still_pays(&mut cx, &fees, &i, &inv_view).is_ok(),
+                still_pays(&mut cx, &fees, &s, &std_view).is_ok());
+            if s.cross.is_none() {
+                let (sp, ip) = (price_close(&mut cx, &fees, &s, s.qty, &std_view),
+                    price_close(&mut cx, &fees, &i, i.qty, &inv_view));
+                assert_eq!(sp.is_ok(), ip.is_ok(), "{sp:?} / {ip:?}");
+                if let (Ok(sp), Ok(ip)) = (sp, ip) {
+                    let mirrored = one(&mut cx, &sp);
+                    assert!(same_px(&mut cx, &ip, &mirrored), "close {ip} vs 1-{sp}");
+                }
+            }
+        }
+        assert_eq!(shapes.len(), 2, "both shapes exercised: {shapes:?}");
+    }
+
+    /// One doubtful lot pauses its own market, not the book. The stuck PM-US
+    /// read on one Mamdani lot held every other market's exits off for days.
+    #[tokio::test]
+    async fn an_unresolved_lot_pauses_only_its_own_market() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let (a, b) = (outstanding_for(Some("K-a")), outstanding_for(Some("K-b")));
+        latch_market("K-a");
+        assert_eq!(outstanding_for(Some("K-a")), a + 1);
+        assert_eq!(outstanding_for(Some("K-b")), b, "another market keeps exiting");
+        assert_eq!(outstanding_for(None), outstanding(), "unscoped sees everything");
+        // An alarm no market claimed pauses every market.
+        UNRESOLVED.fetch_add(1, AtomicOrd::Relaxed);
+        assert_eq!(outstanding_for(Some("K-b")), b + 1);
+        HEALED.fetch_add(1, AtomicOrd::Relaxed);
+        unlatch_market("K-a");
+        assert_eq!(outstanding_for(Some("K-a")), a);
+        assert_eq!(outstanding_for(Some("K-b")), b);
+    }
 }

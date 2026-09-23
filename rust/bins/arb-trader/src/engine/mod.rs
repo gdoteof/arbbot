@@ -1380,33 +1380,64 @@ impl Engine {
         // The engine's book is the ONLY PM-US price read in this process —
         // `PmusGateway` has no `market_quote` — so an exit priced without it
         // would be a two-leg trade with one leg valued.
+        // While the feed gate has quotes pulled, no book is evidence of an
+        // executable price, however recently it last moved.
+        let fresh = if self.feed_reason.is_some() {
+            Vec::new()
+        } else {
+            self.books.maker_exit_books(
+                (arb_core::clock::now_secs() as i64).saturating_mul(1_000_000_000),
+            )
+        };
         let mut pm_ask = std::collections::BTreeMap::new();
-        for (market, ask) in self.books.pm_us_asks() {
-            pm_ask.insert(market, ask);
-        }
-        let pm_ask_depth = self.books.pm_us_ask_depth().into_iter().collect();
+        let mut pm_ask_depth = std::collections::BTreeMap::new();
+        let mut pm_bid_depth = std::collections::BTreeMap::new();
         // ...and the BID side, for the shape that rests there rather than
         // crossing there. Same book, same tick, one more read.
         let mut pm_bid = std::collections::BTreeMap::new();
-        for (market, bid) in self.books.pm_us_bids() {
-            pm_bid.insert(market, bid);
-        }
         // ...and the Kalshi bid, which is the price `Shape::RestPmUs` SELLS
         // into. Same reason as `pm_ask` for the other shape: a leg that cannot
         // be valued makes the exit a one-legged trade with a number on it.
         let mut k_bid = std::collections::BTreeMap::new();
-        for (market, bid) in self.books.kalshi_bids() {
-            k_bid.insert(market, bid);
+        let mut k_bid_depth = std::collections::BTreeMap::new();
+        let mut k_ask = std::collections::BTreeMap::new();
+        let mut k_ask_depth = std::collections::BTreeMap::new();
+        for b in fresh {
+            match b.venue {
+                Venue::PolymarketUs => {
+                    if let Some(x) = b.asks.first() {
+                        pm_ask.insert(b.market_id.clone(), x.price.clone());
+                    }
+                    if let Some(x) = b.bids.first() {
+                        pm_bid.insert(b.market_id.clone(), x.price.clone());
+                    }
+                    pm_ask_depth.insert(b.market_id.clone(), b.asks);
+                    pm_bid_depth.insert(b.market_id, b.bids);
+                }
+                Venue::Kalshi => {
+                    if let Some(x) = b.asks.first() {
+                        k_ask.insert(b.market_id.clone(), x.price.clone());
+                    }
+                    if let Some(x) = b.bids.first() {
+                        k_bid.insert(b.market_id.clone(), x.price.clone());
+                    }
+                    k_ask_depth.insert(b.market_id.clone(), b.asks);
+                    k_bid_depth.insert(b.market_id, b.bids);
+                }
+                _ => {}
+            }
         }
-        let k_bid_depth = self.books.kalshi_bid_depth().into_iter().collect();
         crate::maker_exit::publish_view(crate::maker_exit::EngineView {
             apr_bar: self.apr_bar,
             global_cap_usd: self.cfg.risk.as_ref().map_or(0.0, |r| r.global_cap_usd()),
             pm_ask,
             pm_ask_depth,
+            pm_bid_depth,
             pm_bid,
             k_bid,
             k_bid_depth,
+            k_ask,
+            k_ask_depth,
             suppressed_at: self.maker_exit_suppressed.clone(),
         });
     }
@@ -4950,10 +4981,11 @@ mod marks_wiring_tests {
     }
 
     fn snapshot(venue: &str, market: &str) -> String {
+        let ts = (arb_core::clock::now_secs() as i64).saturating_mul(1_000_000_000);
         json!({"kind": "snapshot", "venue": venue, "market_id": market,
                "bids": [{"price": "0.05", "size": "50"}],
                "asks": [{"price": "0.08", "size": "50"}],
-               "seq": 1, "ts_local_ns": 1_785_402_100_000_000_000i64})
+               "seq": 1, "ts_local_ns": ts})
         .to_string()
     }
 

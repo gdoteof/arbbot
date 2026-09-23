@@ -9,6 +9,9 @@ pub struct Holding {
     pub quantity: String,
     pub value_usd: Option<String>,
     pub mark_updated_at: Option<String>,
+    /// Source-book time for `value_usd` when it is safe to present as executable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_mark_at: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AccountCapital {
@@ -144,6 +147,7 @@ pub(super) fn pmus(balances: &str, positions: &str) -> Result<AccountCapital, Ve
             quantity: qty.into(),
             value_usd: Some(emit(value)),
             mark_updated_at: p["updateTime"].as_str().map(str::to_owned),
+            executable_mark_at: None,
         });
     }
     account(

@@ -1155,6 +1155,7 @@ impl<T: Transport> VenueGateway for KalshiGateway<T> {
         capital.holdings = self.net_positions()?.into_iter().filter_map(|(market, qty)| {
             (qty != 0.).then_some(super::capital::Holding {
                 market, quantity: qty.to_string(), value_usd: None, mark_updated_at: None,
+                executable_mark_at: None,
             })
         }).collect();
         if capital.holdings.iter().any(|h| h.quantity.parse::<f64>().map_or(true, |q| !q.is_finite())) {

@@ -1206,6 +1206,21 @@ const qtyf = (v) => (v===null||v===undefined||!isFinite(Number(v))) ? '—'
   : Number(v).toLocaleString('en-US',{maximumFractionDigits:2});
 const cents = (v) => (v===null||v===undefined||!isFinite(Number(v))) ? '—'
   : (Number(v)*100).toFixed(1)+'¢';
+function capitalAge(b=S.data.books, now=Date.now()/1000){
+  const at=Number(b?.at);
+  return b?.at!=null&&Number.isFinite(at)&&at<=now ? now-at : null;
+}
+function capitalFresh(b=S.data.books, now=Date.now()/1000){
+  const at=Number(b?.at), max=Number(b?.max_age_s);
+  return b?.producer_alive===true&&b?.at!=null&&b?.max_age_s!=null
+    &&Number.isFinite(at)&&Number.isFinite(max)
+    &&at<=now&&max>0&&now-at<=max;
+}
+function executableLegFresh(leg, b=S.data.books, now=Date.now()/1000){
+  const at=Number(leg?.executable_mark_at);
+  return leg?.executable_mark_at!=null&&capitalFresh(b,now)&&Number.isFinite(at)
+    &&at<=now&&now-at<=180;
+}
 function venueSummary(name, a, color, subtitle){
   return `<div class="venue-summary" style="--venue:${color}">
     <div class="venue-head"><div class="venue-name">${esc(name)}<small>${esc(subtitle)}</small></div><i class="venue-dot"></i></div>
@@ -1219,11 +1234,15 @@ function positionLeg(leg, cls){
   if(!leg?.present) return `<div class="leg-card ${cls}"><span class="bad">No position</span>
     <div class="market-id" title="${esc(leg?.market||'')}">${esc(leg?.market||'unknown market')}</div></div>`;
   const q=Number(leg.quantity), side=leg.held_side||'', sideClass=side==='YES'?'yes':'no';
-  const age=leg.mark_updated_at||'No fresh executable mark';
-  return `<div class="leg-card ${cls}" title="${esc(age)}">
+  const markFresh=executableLegFresh(leg);
+  const markTime=Number(leg.executable_mark_at);
+  const markLabel=markFresh&&Number.isFinite(markTime)
+    ? `Executable book mark · ${new Date(markTime*1000).toLocaleString()}`
+    : 'No fresh executable mark';
+  return `<div class="leg-card ${cls}" title="${esc(markLabel)}">
     <div class="leg-top"><div class="position-chip">${qtyf(Math.abs(q))} <span class="${sideClass}">${esc(side)}</span></div>
-      <span class="mini-label">${cents(leg.yes_mark)} YES</span></div>
-    <div class="leg-value">${cents(leg.held_mark)} <span class="sub">held-side mark</span></div>
+      <span class="mini-label">${cents(markFresh?leg.yes_mark:null)} YES</span></div>
+    <div class="leg-value">${cents(markFresh?leg.held_mark:null)} <span class="sub">${markFresh?'held-side mark':'no fresh mark'}</span></div>
     <div class="market-id" title="${esc(leg.market)}">${esc(leg.market)}</div>
     <div class="sub" style="margin-top:4px">position value ${usd(leg.value_usd)}</div>
   </div>`;
@@ -1232,10 +1251,13 @@ function positionComparison(pc){
   const pairs=pc?.pairs||[], orphans=pc?.orphans||[];
   const complete=pairs.filter(p=>p.kalshi?.present&&p.polymarket_us?.present);
   const balanced=complete.filter(p=>p.balanced).length;
-  const carry=complete.reduce((s,p)=>s+(Number.isFinite(Number(p.distance_to_par_usd))?Number(p.distance_to_par_usd):0),0);
+  const priced=complete.filter(p=>executableLegFresh(p.kalshi)&&executableLegFresh(p.polymarket_us)
+    &&p.liquidation_value_per_contract!==null&&p.liquidation_value_per_contract!==undefined);
+  const carry=priced.reduce((s,p)=>s+Number(p.distance_to_par_usd),0);
   const rows=pairs.map(p=>{
     const hasBoth=p.kalshi?.present&&p.polymarket_us?.present;
-    const known=p.liquidation_value_per_contract!==null&&p.liquidation_value_per_contract!==undefined;
+    const known=executableLegFresh(p.kalshi)&&executableLegFresh(p.polymarket_us)
+      &&p.liquidation_value_per_contract!==null&&p.liquidation_value_per_contract!==undefined;
     const dist=Number(p.distance_to_par_cents);
     const crossed=known&&dist<0;
     const basisMismatch=p.entry_basis_qty!==null&&p.entry_basis_qty!==undefined&&p.paired_qty!==null&&p.paired_qty!==undefined
@@ -1251,7 +1273,7 @@ function positionComparison(pc){
         ${positionLeg(p.kalshi,'kalshi')}
         <div class="pair-core">
           <div class="juice ${juiceClass}">${juice}</div>
-          <div class="juice-label">${crossed?'executable over par':'carry / juice left to par'}</div>
+          <div class="juice-label">${!known?'no fresh paired quote':(crossed?'top-of-book value over par':'carry / juice left to par')}</div>
           <div class="pair-facts"><span><b>${qtyf(p.paired_qty)}</b> paired</span><span><b class="${Number(p.qty_gap)>.005?'warn':''}">${qtyf(p.qty_gap)}</b> gap</span></div>
           ${known?`<div class="sub" style="margin-top:6px">liquidation value <b>${cents(p.liquidation_value_per_contract)} / ct</b> · ${usd(p.distance_to_par_usd)} to $1 payout</div>`:''}
           ${p.entry_price_per_contract!==null&&p.entry_price_per_contract!==undefined
@@ -1266,10 +1288,10 @@ function positionComparison(pc){
   const orphanRows=orphans.map(h=>`<tr><td>${esc(h.venue)}</td><td>${esc(h.market)}</td><td class="num">${qtyf(h.quantity)}</td><td class="num">${usd(h.value_usd)}</td></tr>`).join('');
   return $(`<section class="wide pair-board">
     <div class="pair-board-head"><div><h2>Cross-venue position map</h2><div class="sub">Equivalent outcomes aligned side by side · largest dollar distance to par first</div></div>
-      <div class="pair-summary"><div><b>${balanced}/${complete.length}</b><span>size-balanced</span></div><div><b>${usd(carry)}</b><span>carry to par</span></div><div><b class="${orphans.length?'warn':''}">${orphans.length}</b><span>unmapped</span></div></div></div>
+      <div class="pair-summary"><div><b>${balanced}/${complete.length}</b><span>size-balanced</span></div><div><b>${priced.length?usd(carry):'—'}</b><span>carry · ${priced.length}/${complete.length} fresh</span></div><div><b class="${orphans.length?'warn':''}">${orphans.length}</b><span>unmapped</span></div></div></div>
     <div class="pair-columns"><span style="color:var(--kalshi)">Kalshi position</span><span>Convergence</span><span style="color:var(--pmus)">Polymarket US position</span></div>
     ${rows||'<div class="pair-wrap dim">No registry-linked positions in the latest snapshot.</div>'}
-    <div class="design-note" style="padding:0 22px 18px"><b>Liquidation value</b> is what crossing both books would return per paired contract at this instant; it is not the strategy’s APR-derived exit trigger. <b>Entry price</b> is the weighted all-in ledger basis of the contracts still open, including entry fees. A partial unwind prorates the original basis—it does not net realized sale proceeds against the remaining shares. An amber quantity comparison means the ledger basis and venue truth do not cover the same contracts, so treat that entry price as incomplete. <b>Carry / juice left</b> is $1 minus liquidation value and includes both remaining convergence and today’s crossing spreads.</div>
+    <div class="design-note" style="padding:0 22px 18px"><b>Liquidation value</b> is a gross top-of-book estimate shown only while both executable book marks and the account snapshot are fresh; fees and available depth can reduce actual proceeds. <b>Entry price</b> is the weighted all-in ledger basis of the contracts still open, including entry fees. A partial unwind prorates the original basis—it does not net realized sale proceeds against the remaining shares. An amber quantity comparison means the ledger basis and venue truth do not cover the same contracts, so treat that entry price as incomplete. <b>Carry / juice left</b> is $1 minus liquidation value and includes both remaining convergence and today’s crossing spreads.</div>
     ${orphanRows?`<div class="pair-wrap orphan-table"><h2>Unmapped venue positions</h2><table><thead><tr><th>venue</th><th>market</th><th class="num">signed contracts</th><th class="num">value</th></tr></thead><tbody>${orphanRows}</tbody></table></div>`:''}
   </section>`);
 }
@@ -1281,10 +1303,11 @@ const DRAW = {
     const b = S.data.books;
     if(!b) return loading(f, 'books');
     if(b.error) return fail(f, b.error);
+    const fresh=capitalFresh(b);
     const t=b.totals||{}, p=b.risk_policy||{}, accounts=b.accounts||{};
     f.append($(`<section class="wide capital-hero"><div class="hero-line"><div>
-      <div class="eyebrow">Portfolio equity <span class="badge ${b.fresh?'ok':'bad'}" style="margin-left:8px">${b.fresh?'live':'stale'}</span></div>
-      <div class="hero-value">${usd(t.equity_usd)}</div><div class="sub" style="margin-top:5px">across two regulated venue accounts · snapshot ${dur(Number(b.age_s)||0)} old</div></div>
+      <div class="eyebrow">Portfolio equity <span class="badge ${fresh?'ok':'bad'}" style="margin-left:8px">${fresh?'live':'stale'}</span></div>
+      <div class="hero-value">${usd(t.equity_usd)}</div><div class="sub" style="margin-top:5px">across two regulated venue accounts · snapshot ${dur(capitalAge(b))} old</div></div>
       <div class="metric-grid">
         <div class="metric-card"><span>Available cash</span><b>${usd(t.available_cash_usd)}</b></div>
         <div class="metric-card"><span>Capital in positions</span><b>${usd(t.positions_value_usd)}</b></div>
@@ -1301,13 +1324,17 @@ const DRAW = {
       <p class="sub">These are explicit risk limits, separate from original deposits. Available cash is enforced independently for each venue.</p>
       <table><thead><tr><th>topic</th><th>budget</th></tr></thead><tbody>${(p.topics||[]).map(r=>`<tr><td>${esc(r[0])}</td><td>${usd(r[1])}</td></tr>`).join('')}</tbody></table></section>`));
     const kr=b.kalshi_reconciliation;
+    const kh=Array.isArray(accounts.kalshi?.holdings)?accounts.kalshi.holdings:null;
+    const km=kh?.filter(h=>executableLegFresh(h)&&Number.isFinite(Number(h.value_usd)))||[];
+    const ksubtotal=km.reduce((sum,h)=>sum+Number(h.value_usd),0);
+    const kcomplete=kh!==null&&km.length===kh.length;
     if(kr) f.append($(`<section class="wide"><h2>Kalshi valuation comparison</h2>
-      <p>Fresh book values cover ${Number(kr.marked_positions)} of ${Number(kr.positions)} positions.
-      ${kr.complete?'Position total':'Marked subtotal'}: <b>${usd(kr.marked_subtotal_usd)}</b>.
+      <p>Fresh book values cover ${km.length} of ${kh?.length||0} positions.
+      ${kcomplete?'Position total':'Marked subtotal'}: <b>${usd(ksubtotal)}</b>.
       Venue portfolio total: <b>${usd(b.accounts?.kalshi?.positions_value_usd)}</b>.</p>
-      <p>${kr.complete?`Book values minus venue total: <b>${usd(kr.difference_usd)}</b>.`:'Full comparison unavailable until every position has a fresh quote.'}</p>
+      <p>${kcomplete?`Book values minus venue total: <b>${usd(ksubtotal-Number(accounts.kalshi?.positions_value_usd))}</b>.`:'Full comparison unavailable until every position has a fresh quote.'}</p>
       <p class="sub">YES holdings use the bid; NO holdings use one minus the ask. Differences can reflect spreads, valuation methods, or reads taken at different times. Account equity uses the venue portfolio total.</p></section>`));
-    return `${b.fresh?'Auto-updating':'Stale snapshot'} &middot; equity ${usd(t.equity_usd)} &middot; available ${usd(t.available_cash_usd)}`;
+    return `${fresh?'Auto-updating':'Stale snapshot'} &middot; equity ${usd(t.equity_usd)} &middot; available ${usd(t.available_cash_usd)}`;
   },
   '/recording': (f) => {
     const iv = S.data.integrity;
@@ -1902,6 +1929,9 @@ function connect(){
 render();
 refresh();
 connect();
+// Re-evaluate time-based capital freshness even if SSE or a fetch stalls. This
+// only redraws the capital view; it does not create a second polling path.
+setInterval(() => { if(page()==='/'&&S.data.books) render(); }, 5000);
 </script>
 </body>
 </html>

@@ -54,11 +54,13 @@ pub fn pmus_fill_line(raw: &str) -> Option<String> {
     }
     let order = ex.get("order")?;
     let oid = order.get("id").and_then(|x| x.as_str())?;
-    // cumQuantity arrives as a number or a string depending on the frame.
+    // cumQuantity arrives as a number or a string depending on the frame, and
+    // can be fractional; whole contracts only, as `resp::PmOrder` reads it.
     let cum = order
         .get("cumQuantity")
-        .and_then(|q| q.as_i64().or_else(|| q.as_str().and_then(|s| s.parse().ok())))
-        .unwrap_or(0);
+        .and_then(|q| q.as_f64().or_else(|| q.as_str().and_then(|s| s.trim().parse().ok())))
+        .filter(|q: &f64| q.is_finite())
+        .map_or(0, |q| q.trunc() as i64);
     if oid.is_empty() || cum < 1 {
         return None;
     }
@@ -206,6 +208,17 @@ mod tests {
     #[test]
     fn a_zero_cum_is_not_a_fill() {
         assert!(pmus_fill_line(&frame("EXECUTION_TYPE_FILL", "0")).is_none());
+    }
+
+    /// PM-US fills in fractions; the whole contracts are the fill, and a frame
+    /// with less than one is not one yet.
+    #[test]
+    fn a_fractional_cum_counts_its_whole_contracts() {
+        for (cum, want) in [("1.6", 1), ("\"2.4\"", 2)] {
+            let line = pmus_fill_line(&frame("EXECUTION_TYPE_PARTIAL_FILL", cum)).expect("a fill");
+            assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["cum"], want);
+        }
+        assert!(pmus_fill_line(&frame("EXECUTION_TYPE_PARTIAL_FILL", "0.6")).is_none());
     }
 
     #[test]

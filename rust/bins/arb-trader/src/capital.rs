@@ -7,7 +7,7 @@ use std::{
     time::Instant,
 };
 type Sink = Arc<dyn crate::sink::OrderSink>;
-type Quotes = BTreeMap<String, (String, String)>;
+type Quotes = BTreeMap<String, (String, String, u64)>;
 static MARKS: Mutex<Option<(Instant, Quotes, Quotes)>> = Mutex::new(None);
 
 pub fn publish_marks(books: &BookBuilder) {
@@ -29,7 +29,10 @@ pub fn publish_marks(books: &BookBuilder) {
                 continue;
             }
             if let (Some(bid), Some(ask)) = (b.bids.first(), b.asks.first()) {
-                quotes.insert(market, (bid.price.clone(), ask.price.clone()));
+                let Ok(source_at) = u64::try_from(b.ts_local_ns / 1_000_000_000) else {
+                    continue;
+                };
+                quotes.insert(market, (bid.price.clone(), ask.price.clone(), source_at));
             }
         }
     }
@@ -50,7 +53,12 @@ fn apply_marks(a: &mut AccountCapital, quotes: &Quotes, revalue: bool) {
     let mut total = cx.zero();
     let mut fresh = 0;
     for h in &mut a.holdings {
-        if let (Some((bid, ask)), Some(q)) = (quotes.get(&h.market), cx.parse(&h.quantity)) {
+        // Venue values remain useful for account valuation, but only this poll's
+        // book marks may be advertised as executable.
+        h.executable_mark_at = None;
+        if let (Some((bid, ask, source_at)), Some(q)) =
+            (quotes.get(&h.market), cx.parse(&h.quantity))
+        {
             let signed = h.quantity.parse::<f64>().unwrap_or(0.);
             let price = cx.parse(if signed < 0. { ask } else { bid });
             if let Some(p) = price.filter(|p| {
@@ -66,7 +74,8 @@ fn apply_marks(a: &mut AccountCapital, quotes: &Quotes, revalue: bool) {
                 };
                 let value = cx.mul(qty, price);
                 h.value_usd = Some(cx.emit_6dp(value));
-                h.mark_updated_at = Some(format!("live book at {}", arb_core::clock::now_secs()));
+                h.mark_updated_at = Some(format!("live book at {source_at}"));
+                h.executable_mark_at = Some(*source_at);
                 fresh += 1;
             }
         }
@@ -157,14 +166,15 @@ mod tests {
                     quantity: quantity.into(),
                     value_usd: None,
                     mark_updated_at: None,
+                    executable_mark_at: None,
                 })
                 .collect(),
         };
         apply_marks(
             &mut a,
             &BTreeMap::from([
-                ("long".into(), ("0.20".into(), "0.30".into())),
-                ("short".into(), ("0.40".into(), "0.60".into())),
+                ("long".into(), ("0.20".into(), "0.30".into(), 10)),
+                ("short".into(), ("0.40".into(), "0.60".into(), 10)),
             ]),
             false,
         );
@@ -188,11 +198,12 @@ mod tests {
                 quantity: "-10.5".into(),
                 value_usd: Some("2".into()),
                 mark_updated_at: Some("old".into()),
+                executable_mark_at: None,
             }],
         };
         apply_marks(
             &mut a,
-            &BTreeMap::from([("m".into(), ("0.29".into(), "0.30".into()))]),
+            &BTreeMap::from([("m".into(), ("0.29".into(), "0.30".into(), 10))]),
             true,
         );
         assert_eq!(a.positions_value_usd, "7.350000");
@@ -201,5 +212,7 @@ mod tests {
         apply_marks(&mut a, &BTreeMap::new(), true);
         assert!(a.valuation.starts_with("0/1"));
         assert_eq!(a.equity_usd, "108.350000");
+        assert_eq!(a.holdings[0].value_usd.as_deref(), Some("7.350000"));
+        assert_eq!(a.holdings[0].executable_mark_at, None);
     }
 }
