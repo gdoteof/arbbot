@@ -1380,9 +1380,15 @@ impl Engine {
         // The engine's book is the ONLY PM-US price read in this process —
         // `PmusGateway` has no `market_quote` — so an exit priced without it
         // would be a two-leg trade with one leg valued.
-        let fresh = self.books.maker_exit_books(
-            (arb_core::clock::now_secs() as i64).saturating_mul(1_000_000_000),
-        );
+        // While the feed gate has quotes pulled, no book is evidence of an
+        // executable price, however recently it last moved.
+        let fresh = if self.feed_reason.is_some() {
+            Vec::new()
+        } else {
+            self.books.maker_exit_books(
+                (arb_core::clock::now_secs() as i64).saturating_mul(1_000_000_000),
+            )
+        };
         let mut pm_ask = std::collections::BTreeMap::new();
         let mut pm_ask_depth = std::collections::BTreeMap::new();
         let mut pm_bid_depth = std::collections::BTreeMap::new();

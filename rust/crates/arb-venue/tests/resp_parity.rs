@@ -314,3 +314,22 @@ fn an_order_with_no_money_fields_reports_no_cost() {
     let o = arb_venue::resp::kalshi_created_order(create).expect("a create response parses");
     assert_eq!(o.filled_cost(), None, "nothing filled, so there is no price");
 }
+
+/// PM-US fills in fractions. This is the body that stalled every maker exit for
+/// days: `cumQuantity: 1.6` failed the `i64` field, the envelope parse failed,
+/// and the bare-order fallback reported "missing field id" on a body that has one.
+#[test]
+fn pmus_fractional_fill_is_read_as_whole_contracts() {
+    let body = r#"{"order":{"id":"CKPDBG4MJWPE","marketSlug":"tpoyc-2026-zohmam",
+        "side":"ORDER_SIDE_BUY","quantity":8,"cumQuantity":1.6,"leavesQuantity":0,
+        "state":"ORDER_STATE_CANCELED","avgPx":{"value":"0.3000","currency":"USD"}}}"#;
+    let o = resp::pmus_order(body).expect("a fractional fill parses");
+    assert_eq!(o.id, "CKPDBG4MJWPE");
+    assert_eq!(o.try_filled_qty(), Some(1), "1.6 is one hedgeable contract");
+    assert_eq!(o.quantity, Some(8));
+    let s = r#"{"id":"pm-1","cumQuantity":"2.9"}"#;
+    assert_eq!(resp::pmus_order(s).unwrap().try_filled_qty(), Some(2));
+    let bad = r#"{"order":{"id":"pm-1","cumQuantity":[1]}}"#;
+    let err = resp::pmus_order(bad).unwrap_err().to_string();
+    assert!(!err.contains("missing field `id`"), "report the enveloped order's own error: {err}");
+}

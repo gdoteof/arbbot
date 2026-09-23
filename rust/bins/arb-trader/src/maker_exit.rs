@@ -355,6 +355,40 @@ pub fn outstanding() -> u64 {
     unresolved().saturating_sub(healed())
 }
 
+/// Kalshi market -> lots latched unresolved on it. A doubtful fill on one
+/// basket makes THAT basket's ledger untrustworthy, not every other one's.
+static LATCHED: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::new(BTreeMap::new());
+
+pub(crate) fn latch_market(market: &str) {
+    UNRESOLVED.fetch_add(1, AtomicOrd::Relaxed);
+    *LATCHED.lock().expect("latched markets").entry(market.to_owned()).or_default() += 1;
+}
+
+pub(crate) fn unlatch_market(market: &str) {
+    HEALED.fetch_add(1, AtomicOrd::Relaxed);
+    let mut latched = LATCHED.lock().expect("latched markets");
+    if let Some(n) = latched.get_mut(market) {
+        *n -= 1;
+        if *n == 0 {
+            latched.remove(market);
+        }
+    }
+}
+
+/// What pauses fresh exits on `market`: its own latched lots, plus anything
+/// outstanding that no market claimed. The unattributed remainder still pauses
+/// every market, so an alarm raised without a market fails closed.
+pub fn outstanding_for(market: Option<&str>) -> u64 {
+    let latched = LATCHED.lock().expect("latched markets");
+    let attributed: u64 = latched.values().sum();
+    let own = market.and_then(|m| latched.get(m)).copied().unwrap_or(0);
+    let unattributed = outstanding().saturating_sub(attributed);
+    match market {
+        Some(_) => own + unattributed,
+        None => outstanding(),
+    }
+}
+
 fn refuse(why: String) -> String {
     REFUSED.fetch_add(1, AtomicOrd::Relaxed);
     why
@@ -799,16 +833,7 @@ fn inverse_inputs(cx: &mut Cx, quote: &Quote, view: &EngineView) -> Result<(Quot
     q.yes_bid = quote.yes_ask.as_deref().and_then(|p| complement(cx, p));
     q.yes_ask = quote.yes_bid.as_deref().and_then(|p| complement(cx, p));
     q.ladder = complement_ladder(cx, &quote.ladder).ok_or("Kalshi tick ladder does not parse")?;
-    let mut v = view.clone();
-    v.pm_ask = view.pm_bid.iter().filter_map(|(m,p)| complement(cx,p).map(|x|(m.clone(),x))).collect();
-    v.pm_bid = view.pm_ask.iter().filter_map(|(m,p)| complement(cx,p).map(|x|(m.clone(),x))).collect();
-    v.pm_ask_depth = view.pm_bid_depth.iter().filter_map(|(m,l)| complement_levels(cx,l).map(|x| (m.clone(),x))).collect();
-    v.pm_bid_depth = view.pm_ask_depth.iter().filter_map(|(m,l)| complement_levels(cx,l).map(|x| (m.clone(),x))).collect();
-    v.k_bid = view.k_ask.iter().filter_map(|(m,p)| complement(cx,p).map(|x|(m.clone(),x))).collect();
-    v.k_bid_depth = view.k_ask_depth.iter().filter_map(|(m,l)| complement_levels(cx,l).map(|x| (m.clone(),x))).collect();
-    v.k_ask = view.k_bid.iter().filter_map(|(m,p)| complement(cx,p).map(|x|(m.clone(),x))).collect();
-    v.k_ask_depth = view.k_bid_depth.iter().filter_map(|(m,l)| complement_levels(cx,l).map(|x| (m.clone(),x))).collect();
-    Ok((q, v))
+    Ok((q, inverse_view(cx, view)))
 }
 
 fn inverse_view(cx: &mut Cx, view: &EngineView) -> EngineView {
@@ -1808,11 +1833,10 @@ pub fn decide(
             // would hit our own resting quote, so an unyielded side does not
             // make the cross wrong, it makes it a no-op that reads as "the book
             // moved". Same settle window as the rest guard, for the same reason.
-            let lift = match (cand.direction, shape) {
-                (Direction::Standard, Shape::RestKalshi) | (Direction::Inverse, Shape::RestKalshi) =>
-                    cross_keys_for(&cand.market_id, pm_market, cand.direction)[0].clone(),
-                _ => cross_keys_for(&cand.market_id, pm_market, cand.direction)[1].clone(),
-            };
+            let [kalshi_lift, pm_lift]: [_; 2] = cross_keys_for(&cand.market_id, pm_market, cand.direction)
+                .try_into()
+                .expect("one key per venue");
+            let lift = if shape == Shape::RestKalshi { kalshi_lift } else { pm_lift };
             match view.suppressed_at.get(&lift) {
                 Some(since)
                     if now.saturating_duration_since(*since).as_secs_f64()
@@ -2821,7 +2845,7 @@ async fn cycle(
         }
     };
     let now = wall_now();
-    let target = match live.target(&exits, now, outstanding()) {
+    let target = match live.target(&exits, now, outstanding_for(live.scope_market.as_deref())) {
         Ok(e) => e.clone(),
         Err(why) => {
             let scope = live.scope_market.as_deref().unwrap_or("unscoped");
@@ -7493,4 +7517,105 @@ mod tests {
         assert!(why.contains("sibling exits already claim"), "{why}");
     }
 
+    /// A four-price view for the mirror test. Every side is yielded and THIN,
+    /// each a different size, so a ladder read from the wrong side changes the
+    /// quantity rather than hiding behind depth nothing exhausts.
+    fn full_view(sides: [(&str, &str); 4]) -> EngineView {
+        let [(pm_bid, pb), (pm_ask, pa), (k_bid, kb), (k_ask, ka)] = sides;
+        let mut v = view_with(pm_ask, pm_bid, k_bid);
+        let thin = |p: &str, n: &str| vec![Level { price: p.into(), size: n.into() }];
+        v.pm_bid_depth.insert("p-a".into(), thin(pm_bid, pb));
+        v.pm_ask_depth.insert("p-a".into(), thin(pm_ask, pa));
+        v.k_bid_depth.insert("K-a".into(), thin(k_bid, kb));
+        v.k_ask.insert("K-a".into(), k_ask.into());
+        v.k_ask_depth.insert("K-a".into(), thin(k_ask, ka));
+        v
+    }
+
+    /// AN INVERSE BASKET IS THE STANDARD ONE READ ON THE NO AXIS. The same
+    /// position spelled both ways — every wire price complemented, bids and asks
+    /// swapped — must pick the same shape and size, lock the same amount, and
+    /// put the complement of the same price on the wire. Pinned for every
+    /// normalizing path, not just `decide`.
+    #[tokio::test]
+    async fn an_inverse_basket_decides_exactly_as_its_standard_mirror() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        // Mirror: pm_bid <-> 1-pm_ask, k_bid <-> 1-k_ask, each size travelling
+        // with its price. The first pair's wide PM-US book wins rest-pmus, the
+        // second's wide Kalshi book wins rest-kalshi, so both close ladders are
+        // read.
+        let pairs = [
+            ([("0.2000", "7"), ("0.2400", "3"), ("0.2200", "4"), ("0.2500", "6")],
+             [("0.7600", "3"), ("0.8000", "7"), ("0.7500", "6"), ("0.7800", "4")],
+             (Some("0.22"), Some("0.25")), (Some("0.75"), Some("0.78"))),
+            ([("0.2300", "7"), ("0.2400", "3"), ("0.1800", "4"), ("0.2500", "6")],
+             [("0.7600", "3"), ("0.7700", "7"), ("0.7500", "6"), ("0.8200", "4")],
+             (Some("0.18"), Some("0.25")), (Some("0.75"), Some("0.82"))),
+        ];
+        let mut inv_c = cand(9, 1.0);
+        inv_c.direction = Direction::Inverse;
+        let one = |cx: &mut Cx, p: &str| { let d = cx.parse(p).unwrap(); cx.one_minus(d).to_standard_notation_string() };
+        let same_px = |cx: &mut Cx, a: &str, b: &str| {
+            let (a, b) = (cx.parse(a).unwrap(), cx.parse(b).unwrap());
+            cx.cmp(a, b) == Ordering::Equal
+        };
+        let mut shapes = BTreeSet::new();
+        for ((std_sides, inv_sides, sq, iq), take) in pairs.iter()
+            .flat_map(|p| [false, true].map(|t| (p, t)))
+        {
+            let (std_view, inv_view) = (full_view(*std_sides), full_view(*inv_sides));
+            let (std_q, inv_q) = (quote(sq.0, sq.1), quote(iq.0, iq.1));
+            let s = decide(&mut cx, &fees, &[open_basket(1.0, 9, "0.24", "0.19")], &cand(9, 1.0),
+                "p-a", &std_q, &std_view, Instant::now(), take, DepthClaims::default())
+                .expect("the standard basket exits");
+            let i = decide(&mut cx, &fees, &[inverse_basket(1.0, 9, "0.76", "0.81")], &inv_c,
+                "p-a", &inv_q, &inv_view, Instant::now(), take, DepthClaims::default())
+                .expect("its mirror exits");
+            assert!(s.qty < 9, "depth, not the lot, must bind: {}", s.qty);
+            shapes.insert(s.shape.tag());
+            assert_eq!((i.shape, i.qty, &i.lock_ct), (s.shape, s.qty, &s.lock_ct), "take={take}");
+            assert_eq!((&i.k_basis, &i.pm_basis), (&s.k_basis, &s.pm_basis));
+            let mirrored = one(&mut cx, &s.limit);
+            assert!(same_px(&mut cx, &i.limit, &mirrored), "{} vs 1-{}", i.limit, s.limit);
+            assert_eq!(i.cross.is_some(), s.cross.is_some());
+            if let (Some(ic), Some(sc)) = (&i.cross, &s.cross) {
+                let mirrored = one(&mut cx, &sc.limit);
+                assert!(same_px(&mut cx, &ic.limit, &mirrored), "cross {} vs 1-{}", ic.limit, sc.limit);
+                assert_eq!(ic.lock_ct, sc.lock_ct);
+            }
+            // The resting checks and the close pricing normalize too.
+            assert_eq!(still_pays(&mut cx, &fees, &i, &inv_view).is_ok(),
+                still_pays(&mut cx, &fees, &s, &std_view).is_ok());
+            if s.cross.is_none() {
+                let (sp, ip) = (price_close(&mut cx, &fees, &s, s.qty, &std_view),
+                    price_close(&mut cx, &fees, &i, i.qty, &inv_view));
+                assert_eq!(sp.is_ok(), ip.is_ok(), "{sp:?} / {ip:?}");
+                if let (Ok(sp), Ok(ip)) = (sp, ip) {
+                    let mirrored = one(&mut cx, &sp);
+                    assert!(same_px(&mut cx, &ip, &mirrored), "close {ip} vs 1-{sp}");
+                }
+            }
+        }
+        assert_eq!(shapes.len(), 2, "both shapes exercised: {shapes:?}");
+    }
+
+    /// One doubtful lot pauses its own market, not the book. The stuck PM-US
+    /// read on one Mamdani lot held every other market's exits off for days.
+    #[tokio::test]
+    async fn an_unresolved_lot_pauses_only_its_own_market() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let (a, b) = (outstanding_for(Some("K-a")), outstanding_for(Some("K-b")));
+        latch_market("K-a");
+        assert_eq!(outstanding_for(Some("K-a")), a + 1);
+        assert_eq!(outstanding_for(Some("K-b")), b, "another market keeps exiting");
+        assert_eq!(outstanding_for(None), outstanding(), "unscoped sees everything");
+        // An alarm no market claimed pauses every market.
+        UNRESOLVED.fetch_add(1, AtomicOrd::Relaxed);
+        assert_eq!(outstanding_for(Some("K-b")), b + 1);
+        HEALED.fetch_add(1, AtomicOrd::Relaxed);
+        unlatch_market("K-a");
+        assert_eq!(outstanding_for(Some("K-a")), a);
+        assert_eq!(outstanding_for(Some("K-b")), b);
+    }
 }

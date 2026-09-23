@@ -158,13 +158,13 @@ pub(super) async fn run(template: Live, cfg: Cfg, k: Sink, p: Sink) {
                 }
                 continue;
             }
-            if outstanding() != 0 {
-                break;
+            let first = &members[0];
+            if outstanding_for(Some(&first.market)) != 0 {
+                continue;
             }
             let Ok(view) = engine_view() else {
                 break;
             };
-            let first = &members[0];
             let key = lot::lot_key(&first.rel_id, first.closes_ts.to_bits());
             let live = workers.get_mut(&key).unwrap();
             if members.iter().any(|o| {

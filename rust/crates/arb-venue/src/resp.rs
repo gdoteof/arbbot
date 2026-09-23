@@ -447,8 +447,30 @@ pub struct MoneyVal {
     pub currency: Option<String>,
 }
 
-/// A PM-US order. Quantities are wire NUMBERS (int); money is nested string
-/// `MoneyVal`. On CREATE the response omits execution data entirely
+/// Whole contracts from a PM-US quantity. The wire sends integers, strings and
+/// fractions (`"cumQuantity": 1.6` on a partially filled rest); like
+/// [`KalshiOrder::try_filled_qty`] the sub-contract remainder is truncated,
+/// because nothing downstream can hedge a fraction and recon's deadband
+/// already treats it as dust.
+fn whole_contracts<'de, D>(d: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let n = match Option::<serde_json::Value>::deserialize(d)? {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(serde_json::Value::Number(n)) => n.as_f64(),
+        Some(serde_json::Value::String(s)) => s.trim().parse::<f64>().ok(),
+        Some(other) => return Err(D::Error::custom(format!("expected a quantity, got {other}"))),
+    };
+    match n {
+        Some(n) if n.is_finite() => Ok(Some(n.trunc() as i64)),
+        _ => Err(D::Error::custom("quantity is not a finite number")),
+    }
+}
+
+/// A PM-US order. Quantities are wire NUMBERS, possibly fractional; money is
+/// nested string `MoneyVal`. On CREATE the response omits execution data entirely
 /// (`{"id": ..., "executions": []}`) — `cum_quantity`/`avg_px` are then `None`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -460,11 +482,11 @@ pub struct PmOrder {
     pub side: Option<String>,
     #[serde(default)]
     pub state: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "whole_contracts")]
     pub quantity: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "whole_contracts")]
     pub cum_quantity: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "whole_contracts")]
     pub leaves_quantity: Option<i64>,
     #[serde(default)]
     pub avg_px: Option<MoneyVal>,
@@ -542,10 +564,17 @@ pub fn pmus_order(body: &str) -> Result<PmOrder, VenueError> {
         order: PmOrder,
     }
     // Try the envelope first; fall back to a bare order (create response shape).
-    if let Ok(env) = serde_json::from_str::<Envelope>(body) {
-        return Ok(env.order);
+    // A body that HAS an `order` object is enveloped, so its own parse error is
+    // the one to report — the bare fallback would only say "missing field id".
+    match serde_json::from_str::<Envelope>(body) {
+        Ok(env) => Ok(env.order),
+        Err(e) if serde_json::from_str::<serde_json::Value>(body)
+            .is_ok_and(|v| v.get("order").is_some_and(serde_json::Value::is_object)) =>
+        {
+            Err(from_serde("pmus:order", &e))
+        }
+        Err(_) => parse("pmus:order", body),
     }
-    parse("pmus:order", body)
 }
 
 /// GET /v1/portfolio/positions — a dict KEYED BY SLUG with string netPosition.

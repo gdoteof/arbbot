@@ -247,13 +247,13 @@ impl State {
     }
     fn latch(&mut self) {
         if !self.latched {
-            UNRESOLVED.fetch_add(1, AtomicOrd::Relaxed);
+            latch_market(&self.market);
             self.latched = true;
         }
     }
     fn unlatch(&mut self) {
         if self.latched {
-            HEALED.fetch_add(1, AtomicOrd::Relaxed);
+            unlatch_market(&self.market);
             self.latched = false;
         }
     }
