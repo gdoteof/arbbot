@@ -14,7 +14,7 @@ mod lot;
 mod batch;
 
 use crate::ledger;
-use crate::naked_act::{ceil_to_tick, lot_at, Held};
+use crate::naked_act::{ceil_to_tick, kalshi_step, lot_at, rung_below, Held};
 pub use crate::naked_act::MIN_LOCK;
 use arb_core::fees::{FeeSchedule, Role};
 use arb_core::clock::now_s as wall_now;
@@ -267,9 +267,10 @@ pub const HANDOVER_CYCLES: u32 = 3;
 
 pub const SUPPRESS_SETTLE_S: f64 = 30.0;
 
-/// The price increment both legs quote in, for the tick THROUGH the PM ask.
-/// `mark_positions.py` steps PM in `Decimal("0.01")`; this is the resolution of
-/// the venue, not a modelling choice.
+/// The PM-US price increment, for the tick THROUGH the PM ask. Kalshi prices
+/// step on the market's own ladder. `mark_positions.py` steps PM in
+/// `Decimal("0.01")`; this is the resolution of the venue, not a modelling
+/// choice.
 const TICK: &str = "0.01";
 
 /// The wire spellings of the two book sides, which is how [`EngineView::
@@ -455,6 +456,9 @@ pub struct EngineView {
     pub k_bid_depth: BTreeMap<String, Vec<Level>>,
     pub k_ask: BTreeMap<String, String>,
     pub k_ask_depth: BTreeMap<String, Vec<Level>>,
+    /// Kalshi market -> its tick ladder, where the engine has fetched one. Every
+    /// Kalshi price stepped off this view steps on it; absent is the flat cent.
+    pub k_ladder: BTreeMap<String, Vec<(String, String, String)>>,
     /// (market, side) pairs the quoters have been told to yield, and the instant
     /// that was installed. Absent means NOT yielded. The side is the WIRE
     /// spelling and not [`arb_core::model::BookSide`], which is deliberately not
@@ -846,6 +850,7 @@ fn inverse_view(cx: &mut Cx, view: &EngineView) -> EngineView {
     v.k_bid_depth = view.k_ask_depth.iter().filter_map(|(m,l)| complement_levels(cx,l).map(|x|(m.clone(),x))).collect();
     v.k_ask = view.k_bid.iter().filter_map(|(m,p)| complement(cx,p).map(|x|(m.clone(),x))).collect();
     v.k_ask_depth = view.k_bid_depth.iter().filter_map(|(m,l)| complement_levels(cx,l).map(|x|(m.clone(),x))).collect();
+    v.k_ladder = view.k_ladder.iter().filter_map(|(m,l)| complement_ladder(cx,l).map(|x|(m.clone(),x))).collect();
     v
 }
 
@@ -1706,13 +1711,14 @@ pub fn decide(
                 cand.market_id
             ));
         };
-        let k_take = cx.sub(k_bid, tick);
-        if !cx.is_pos(k_take) {
+        // One rung under on the venue's ladder, which below $0.10 is a tenth
+        // of a cent, not the flat cent.
+        let Some(k_take) = rung_below(cx, &quote.ladder, k_bid) else {
             return Err(format!(
                 "the Kalshi bid is {} — one tick under it is not a price to sell at",
                 cx.emit_6dp(k_bid)
             ));
-        }
+        };
         for sized in (1..=qty).rev() {
             let ceiling = close_limit(cx, fees, k_take, k_basis, pm_basis, sized,
                 Role::Taker, Role::Maker, &min_lock)?;
@@ -1721,9 +1727,10 @@ pub fn decide(
             let limit = cx.quantize_4dp(limit);
             let floor = exit_limit(cx, fees, &quote.ladder, k_basis, pm_basis, limit, sized,
                 Role::Taker, Role::Maker, &min_lock)?;
-            // Mirror of A: the close is priced one tick UNDER each bid level.
+            // Mirror of A: the close is priced one rung UNDER each bid level.
             let depth = executable_depth(cx, levels,
-                |cx, price| { let close = cx.sub(price, tick); cx.cmp(close, floor) != Ordering::Less })
+                |cx, price| rung_below(cx, &quote.ladder, price)
+                    .is_some_and(|close| cx.cmp(close, floor) != Ordering::Less))
                 .saturating_sub(claims.k_bid);
             if depth >= sized {
                 let lock = lock_per_ct(cx, fees, Shape::RestPmUs.roles(), k_take, limit,
@@ -1847,10 +1854,7 @@ pub fn decide(
                 _ => return None,
             }
             let k_bid = quote.yes_bid.as_deref().and_then(|x| cx.parse(x))?;
-            let k_take = cx.sub(k_bid, tick);
-            if !cx.is_pos(k_take) {
-                return None;
-            }
+            let k_take = rung_below(cx, &quote.ladder, k_bid)?;
             let pm_take = cx.add(pm_ask_d, tick);
             let lock = lock_per_ct(
                 cx,
@@ -3581,6 +3585,7 @@ fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> 
         return Err("a price on the resting exit does not parse".into());
     };
     let tick = cx.parse_exact(TICK);
+    let k_ladder = view.k_ladder.get(&o.market).map(Vec::as_slice);
     let (k_sell, pm_buy) = match o.shape {
         Shape::RestKalshi => {
             let ask = view.pm_ask.get(&o.pm_market)
@@ -3592,7 +3597,9 @@ fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> 
             let bid = view.k_bid.get(&o.market)
                 .ok_or_else(|| format!("the Kalshi book for {} has gone dark", o.market))?;
             let bid = cx.parse(bid).ok_or("the Kalshi bid does not parse")?;
-            (cx.sub(bid, tick), resting)
+            let take = kalshi_step(cx, k_ladder, bid, true)
+                .ok_or("the Kalshi bid has no legal price under it")?;
+            (take, resting)
         }
     };
     for price in [k_sell, pm_buy] {
@@ -3630,7 +3637,7 @@ fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> 
             let levels = view.k_bid_depth.get(&o.market)
                 .ok_or_else(|| format!("the Kalshi depth for {} has gone dark", o.market))?;
             executable_depth(cx, levels, |cx, price| {
-                let close = cx.sub(price, tick);
+                let Some(close) = kalshi_step(cx, k_ladder, price, true) else { return false };
                 let got = lock_per_ct(cx, fees, o.shape.roles(), close, resting,
                     k_basis, pm_basis, o.qty);
                 cx.cmp(got, floor) != Ordering::Less
@@ -3872,16 +3879,20 @@ async fn heal(
                 live.pending = Some(p);
                 return out;
             };
-            let tick = live.cx.parse_exact(TICK);
-            let through = if selling { live.cx.sub(touch_d, tick) } else { live.cx.add(touch_d, tick) };
-            if !live.cx.is_pos(through) {
+            // A Kalshi touch steps on its own ladder; PM-US on the flat cent.
+            let ladder = match open_venue {
+                Venue::Kalshi => view.k_ladder.get(&open_leg).map(Vec::as_slice),
+                _ => None,
+            };
+            let through = kalshi_step(&mut live.cx, ladder, touch_d, selling);
+            let Some(through) = through.filter(|x| live.cx.is_pos(*x)) else {
                 out.push(format!(
                     "[maker-exit] HEAL {open_leg} — the touch is {touch} and one tick through \
                      it is not a price. Still latched; retrying next cycle."
                 ));
                 live.pending = Some(p);
                 return out;
-            }
+            };
             let through = live.cx.quantize_4dp(through);
             out.push(format!(
                 "[maker-exit] HEAL {open_leg} — CROSSING OUT. {owed} contract(s) still owed \
@@ -4084,7 +4095,8 @@ fn price_close(
         // may sell at and still lock MIN_LOCK. Mirror image, and `exit_limit`
         // is the same solver run with the other leg pinned.
         Shape::RestPmUs => {
-            let ladder = vec![("0.0000".to_string(), "1.0000".to_string(), "0.0100".to_string())];
+            let ladder = view.k_ladder.get(&o.market).cloned().unwrap_or_else(||
+                vec![("0.0000".to_string(), "1.0000".to_string(), "0.0100".to_string())]);
             let limit = exit_limit(
                 cx, fees, &ladder, k_basis, pm_basis, fill, filled, Role::Taker, Role::Maker,
                 MIN_LOCK,
@@ -4391,6 +4403,7 @@ mod tests {
             k_ask_depth: [("K-a".to_string(), vec![Level {
                 price: "0.2100".into(), size: "10000".into(),
             }])].into_iter().collect(),
+            k_ladder: BTreeMap::new(),
             // ALL FOUR sides yielded, which is what `cycle` publishes once
             // `--maker-exit-take` is on: it cannot know which shape will win
             // until it has priced both books, nor whether the winner will rest
@@ -4436,6 +4449,64 @@ mod tests {
             o.runner_up_ct.is_some(),
             "shape A was priced too, and the log line must be able to show it: {o:?}"
         );
+    }
+
+    fn rungs(r: &[(&str, &str, &str)]) -> Vec<(String, String, String)> {
+        r.iter().map(|(s, e, st)| (s.to_string(), e.to_string(), st.to_string())).collect()
+    }
+
+    /// A SUB-DIME KALSHI BID IS A PRICE. `KXFRENCHPRES-27-BRET` sat at 0.002 /
+    /// 0.009 on a ladder that steps a tenth of a cent there; a flat cent under
+    /// the bid is negative, so rest-pmus refused and the lot could never exit.
+    /// The inverse basket on the mirrored ladder must decide identically, which
+    /// only holds if every step is taken on the NO axis's own ladder — the
+    /// ladders are deliberately asymmetric so a step on the wrong axis shows.
+    #[tokio::test]
+    async fn a_sub_dime_kalshi_bid_prices_rest_pmus_on_the_tapered_ladder() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let bottom = rungs(&[("0.0000", "0.1000", "0.0010"), ("0.1000", "1.0000", "0.0100")]);
+        let top = rungs(&[("0.0000", "0.9000", "0.0100"), ("0.9000", "1.0000", "0.0010")]);
+        let mut std_q = quote(Some("0.002"), Some("0.009"));
+        std_q.ladder = bottom.clone();
+        let mut std_view = full_view([("0.01", "100"), ("0.03", "100"), ("0.002", "100"), ("0.009", "100")]);
+        std_view.k_ladder.insert("K-a".into(), bottom.clone());
+        let std_recs = [open_basket(1.0, 5, "0.06", "0.005")];
+        let s = decide(&mut cx, &fees, &std_recs, &cand(5, 1.0), "p-a", &std_q, &std_view,
+            Instant::now(), false, DepthClaims::default())
+            .expect("the tapered ladder has a rung under 0.002");
+        assert_eq!(s.shape, Shape::RestPmUs, "{s:?}");
+        assert_eq!(s.limit, "0.0200", "one tick inside the PM-US bid: {s:?}");
+        still_pays(&mut cx, &fees, &s, &std_view).expect("and it still pays at rest");
+
+        // On the flat cent the same book has no Kalshi price to sell into:
+        // rest-pmus is not priced at all (no runner-up), only the cent-rounded
+        // rest-kalshi ask is.
+        let flat_q = quote(Some("0.002"), Some("0.009"));
+        let f = decide(&mut cx, &fees, &std_recs, &cand(5, 1.0), "p-a", &flat_q, &std_view,
+            Instant::now(), false, DepthClaims::default())
+            .expect("rest-kalshi still prices on the cent");
+        assert_eq!((f.shape, &f.runner_up_ct), (Shape::RestKalshi, &None), "{f:?}");
+
+        // The mirror: YES book 0.991 / 0.998 is a NO book 0.002 / 0.009.
+        let mut inv_q = quote(Some("0.991"), Some("0.998"));
+        inv_q.ladder = top.clone();
+        let mut inv_view = full_view([("0.97", "100"), ("0.99", "100"), ("0.991", "100"), ("0.998", "100")]);
+        inv_view.k_ladder.insert("K-a".into(), top);
+        let mut inv_c = cand(5, 1.0);
+        inv_c.direction = Direction::Inverse;
+        let i = decide(&mut cx, &fees, &[inverse_basket(1.0, 5, "0.94", "0.995")], &inv_c, "p-a",
+            &inv_q, &inv_view, Instant::now(), false, DepthClaims::default())
+            .expect("its mirror exits");
+        assert_eq!((i.shape, i.qty, &i.lock_ct), (s.shape, s.qty, &s.lock_ct));
+        assert_eq!(i.limit, "0.9800", "the complement of the standard limit");
+        still_pays(&mut cx, &fees, &i, &inv_view).expect("the mirror still pays at rest");
+        let (sp, ip) = (price_close(&mut cx, &fees, &s, s.qty, &std_view),
+            price_close(&mut cx, &fees, &i, i.qty, &inv_view));
+        let (sp, ip) = (sp.expect("standard close prices"), ip.expect("mirror close prices"));
+        let (sd, id) = (cx.parse(&sp).unwrap(), cx.parse(&ip).unwrap());
+        let mirrored = cx.one_minus(sd);
+        assert_eq!(cx.cmp(id, mirrored), Ordering::Equal, "close {ip} vs 1-{sp}");
     }
 
     /// **THE CROSS IS OFF UNLESS ASKED FOR.** `--maker-exit-take` defaults false,

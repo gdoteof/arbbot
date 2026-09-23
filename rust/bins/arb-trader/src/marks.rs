@@ -147,8 +147,9 @@ const YEAR_S: f64 = 31_557_600.0;
 /// position does not annualize to infinity.
 const MIN_HELD_S: f64 = 3600.0;
 
-/// One tick, both legs. Kalshi quotes whole cents and `mark_positions.py` steps
-/// PM by `Decimal("0.01")` on both sides of the exit.
+/// The PM-US tick: `mark_positions.py` steps PM by `Decimal("0.01")` on both
+/// sides of the exit. Kalshi steps on its own ladder, the flat cent only when
+/// that is unknown (`k_below` in [`compute_row`]).
 const TICK: &str = "0.01";
 
 /// Per-contract profit the maker exit must show to be `maker_exit_eligible` —
@@ -577,6 +578,7 @@ pub fn compute_row(
     p_bid: Option<D>,
     p_ask: Option<D>,
     now: f64,
+    k_ladder: Option<&[(String, String, String)]>,
 ) -> Row {
     let rel = str_of(t, "relationship_id").unwrap_or_default().to_string();
     let legs = t.get("legs").and_then(|v| v.as_array()).map_or(&[][..], Vec::as_slice);
@@ -747,6 +749,20 @@ pub fn compute_row(
     let tick = cx.parse_exact(TICK);
     let one = cx.one;
     let basis = cx.div(cost, qty);
+    // One rung under a Kalshi price on the market's own ladder, which below
+    // $0.10 is a tenth of a cent: a flat cent under a 0.009 ask is negative and
+    // made a sub-dime position unexitable. The prices here are complemented for
+    // an inverted basket but the ladder is not, so "below" on the NO axis is one
+    // rung ABOVE the original YES price. Unknown ladder: the flat cent, as ever.
+    let k_below = |cx: &mut Cx, p: D| -> Option<D> {
+        if inverted && k_ladder.is_some() {
+            let yes = cx.one_minus(p);
+            let up = crate::naked_act::kalshi_step(cx, k_ladder, yes, false)?;
+            Some(cx.one_minus(up))
+        } else {
+            crate::naked_act::kalshi_step(cx, k_ladder, p, true)
+        }
+    };
 
     // ------------------------------------------------ shape A: rest on Kalshi ---
     // Net of BOTH legs' fees (card b83b0449): the Kalshi ask rests as a MAKER
@@ -754,15 +770,13 @@ pub fn compute_row(
     // TAKER. That is 1.2-1.9c/ct, so the fee-free version of this number called
     // exits "profitable" at 0.5c/ct that were net losers, and a placer would
     // rest real orders off this flag.
-    let k_exit_px = cx.sub(ka, tick);
+    let k_exit_px = k_below(cx, ka);
     let p_close_px = cx.add(pa, tick);
     // Divergence 2: an out-of-band price is refused, not fed to a fee curve that
     // has no domain check.
-    let mx_a = if cx.cmp(k_exit_px, zero) == Ordering::Less
-        || cx.cmp(p_close_px, one) == Ordering::Greater
-    {
-        None
-    } else {
+    let mx_a = if let Some(k_exit_px) = k_exit_px.filter(|k| {
+        cx.cmp(*k, zero) != Ordering::Less && cx.cmp(p_close_px, one) != Ordering::Greater
+    }) {
         let t = maker_exit_fees_usd(cx, fees, k_exit_px, p_close_px, qty);
         let fee = cx.div(t, qty);
         let p_no = cx.one_minus(p_close_px);
@@ -770,6 +784,8 @@ pub fn compute_row(
         v = cx.sub(v, basis);
         v = cx.sub(v, fee);
         Some(v)
+    } else {
+        None
     };
 
     // ------------------------------------------------- shape B: rest on PM-US ---
@@ -798,7 +814,7 @@ pub fn compute_row(
     };
     let mx_b = match (k_bid, p_bid) {
         (Some(kb), Some(pb)) if !crossed => {
-            let k_take_px = cx.sub(kb, tick);
+            let k_take_px = k_below(cx, kb).unwrap_or(zero);
             let inside = cx.add(pb, tick);
             let under_ask = cx.sub(pa, tick);
             let p_rest_px =
@@ -944,6 +960,7 @@ pub fn build(
     records: Vec<Value>,
     books: &BookBuilder,
     now: f64,
+    k_ladders: &std::collections::BTreeMap<String, Vec<(String, String, String)>>,
 ) -> Marked {
     let open = open_baskets(records);
     let n_open = open.len() as u64;
@@ -1002,7 +1019,8 @@ pub fn build(
         }
         let (k_bid, k_ask) = top(cx, books, Venue::Kalshi, km, now);
         let (p_bid, p_ask) = top(cx, books, Venue::PolymarketUs, pm, now);
-        let row = compute_row(cx, fees, &t, k_bid, k_ask, p_bid, p_ask, now);
+        let row = compute_row(cx, fees, &t, k_bid, k_ask, p_bid, p_ask, now,
+            k_ladders.get(km).map(Vec::as_slice));
         if let Some(m) = row.mark_pnl_usd {
             tot_mark += m;
         }
@@ -1197,7 +1215,7 @@ mod tests {
         let now = at("2026-07-31", 18, 24, 49);
         let (kb, ka, pb, pa) =
             (q(&mut cx, "0.05"), q(&mut cx, "0.08"), q(&mut cx, "0.08"), q(&mut cx, "0.09"));
-        let row = compute_row(&mut cx, &fees, &kuleba(), kb, ka, pb, pa, now);
+        let row = compute_row(&mut cx, &fees, &kuleba(), kb, ka, pb, pa, now, None);
 
         assert_eq!(row.relationship_id, "xvus-nobel-peace-26-mykolakuleba");
         assert_eq!(row.ts, Some(1_785_402_005.539_014));
@@ -1264,7 +1282,7 @@ mod tests {
         let now = at("2026-07-31", 18, 24, 49);
         let (kb, ka, pb, pa) =
             (q(&mut cx, "0.05"), q(&mut cx, "0.08"), q(&mut cx, "0.08"), q(&mut cx, "0.09"));
-        let row = compute_row(&mut cx, &fees, &kuleba(), kb, ka, pb, pa, now);
+        let row = compute_row(&mut cx, &fees, &kuleba(), kb, ka, pb, pa, now, None);
         let got = keys_in_order(&serde_json::to_string(&row).expect("ser"), 1);
         assert_eq!(got, want, "a priced row's keys, in order");
 
@@ -1272,7 +1290,7 @@ mod tests {
         // every one of the five must be ABSENT rather than null. The shape
         // contest added three of them and they obey the same rule: a row with
         // no book does not get to claim a shape.
-        let dark = compute_row(&mut cx, &fees, &kuleba(), None, None, None, None, now);
+        let dark = compute_row(&mut cx, &fees, &kuleba(), None, None, None, None, now, None);
         let dark_keys = keys_in_order(&serde_json::to_string(&dark).expect("ser"), 1);
         assert_eq!(
             dark_keys,
@@ -1280,7 +1298,7 @@ mod tests {
             "an unpriced row omits all five maker_exit fields entirely"
         );
 
-        let marked = build(&mut cx, &fees, vec![kuleba()], &BookBuilder::new(), now);
+        let marked = build(&mut cx, &fees, vec![kuleba()], &BookBuilder::new(), now, &Default::default());
         let body = marked.doc.to_json();
         assert_eq!(
             keys_in_order(&serde_json::to_string(&marked.doc.totals).expect("ser"), 1),
@@ -1328,6 +1346,7 @@ mod tests {
             vec![kuleba(), engine_written],
             &bk,
             at("2026-07-31", 18, 24, 49),
+            &Default::default(),
         );
         assert_eq!(m.doc.positions.len(), 1, "only the priced basket is marked");
         assert_eq!(m.doc.totals.unpriced_positions, 1, "and the other is COUNTED, not dropped");
@@ -1370,7 +1389,7 @@ mod tests {
         let mut cx = Cx::default();
         let fees = FeeSchedule::new(&mut cx);
         let bk = books((&[lv("0.05", "9")], &[lv("0.08", "9")]), (&[], &[lv("0.09", "9")]));
-        let m = build(&mut cx, &fees, vec![engine_written()], &bk, at("2026-07-31", 18, 24, 49));
+        let m = build(&mut cx, &fees, vec![engine_written()], &bk, at("2026-07-31", 18, 24, 49), &Default::default());
 
         assert_eq!(m.doc.positions.len(), 1, "the engine's own basket is marked");
         assert_eq!(m.doc.totals.unpriced_positions, 0, "and nothing is left uncounted");
@@ -1497,7 +1516,7 @@ mod tests {
             (&[lv("0.32", "9")], &[lv("0.36", "9")]),
             (&[lv("0.30", "9")], &[lv("0.34", "9")]),
         );
-        let m = build(&mut cx, &fees, vec![sudan], &bk, at("2026-07-31", 18, 24, 49));
+        let m = build(&mut cx, &fees, vec![sudan], &bk, at("2026-07-31", 18, 24, 49), &Default::default());
         let row = &m.doc.positions[0];
 
         // Short YES at 0.34 costs 0.66 plus ceil_cents(0.0175*5*0.34*0.66) =
@@ -1530,7 +1549,7 @@ mod tests {
         let mut same_way = engine_written();
         same_way["legs"][0]["side"] = v("\"bid\"");
         let bk = books((&[lv("0.05", "9")], &[lv("0.08", "9")]), (&[], &[lv("0.09", "9")]));
-        let m = build(&mut cx, &fees, vec![same_way], &bk, at("2026-07-31", 18, 24, 49));
+        let m = build(&mut cx, &fees, vec![same_way], &bk, at("2026-07-31", 18, 24, 49), &Default::default());
         assert!(m.doc.positions.is_empty(), "no row, and no invented dollar of payoff");
         assert_eq!(m.doc.totals.unpriced_positions, 1, "counted, like every other refusal");
         assert_eq!(m.doc.totals.n_open, 1);
@@ -1559,7 +1578,7 @@ mod tests {
             "legs":[{"venue":"kalshi","market_id":"K","side":"yes"},
                     {"venue":"polymarket","market_id":"Q","side":"no"}]}"#);
         let bk = books((&[lv("0.05", "9")], &[lv("0.08", "9")]), (&[], &[lv("0.09", "9")]));
-        let t = build(&mut cx, &fees, vec![kuleba(), single, no_basis, intl], &bk, 1.0).doc.totals;
+        let t = build(&mut cx, &fees, vec![kuleba(), single, no_basis, intl], &bk, 1.0, &Default::default()).doc.totals;
         assert_eq!(t.n_open, 4);
         assert_eq!(t.unpriced_positions, 2, "no cost basis, and no PM-US leg");
         // n_open - rows - unpriced == the single-leg records, in both writers.
@@ -1580,7 +1599,7 @@ mod tests {
         let now = at("2026-07-31", 18, 24, 49);
         // Kalshi with no BID at all: a standard basket liquidates on that bid.
         let bk = books((&[], &[lv("0.08", "9")]), (&[lv("0.08", "9")], &[lv("0.09", "9")]));
-        let m = build(&mut cx, &fees, vec![kuleba()], &bk, now);
+        let m = build(&mut cx, &fees, vec![kuleba()], &bk, now, &Default::default());
         let row = &m.doc.positions[0];
         assert_eq!(row.liq_value_usd, None, "no bid is no liquidation value, not a zero one");
         assert_eq!(row.mark_pnl_usd, None);
@@ -1612,7 +1631,7 @@ mod tests {
             (at("2026-07-31", 18, 24, 49) * 1e9) as i64,
             None,
         );
-        let m = build(&mut cx, &fees, vec![kuleba()], &bk, at("2026-07-31", 18, 24, 49));
+        let m = build(&mut cx, &fees, vec![kuleba()], &bk, at("2026-07-31", 18, 24, 49), &Default::default());
         assert_eq!(m.doc.positions.len(), 1, "the row is still published");
         assert_eq!(m.doc.positions[0].liq_value_usd, None, "...unpriced");
         assert_eq!(
@@ -1635,7 +1654,7 @@ mod tests {
         inv["legs"][0]["side"] = v("\"no\"");
         let (kb, ka, pb, pa) =
             (q(&mut cx, "0.05"), q(&mut cx, "0.08"), q(&mut cx, "0.40"), q(&mut cx, "0.42"));
-        let row = compute_row(&mut cx, &fees, &inv, kb, ka, pb, pa, now);
+        let row = compute_row(&mut cx, &fees, &inv, kb, ka, pb, pa, now, None);
         // Sell the Kalshi NO at 1 - 0.08 = 0.92, sell the PM YES at 0.40.
         // 1.32/ct gross, less ceil_cents(0.07*0.08*0.92) = 0.01 Kalshi taker and
         // 0.06*0.40*0.60 = 0.0144 PM-US taker. Both legs' fees are priced off
@@ -1648,7 +1667,7 @@ mod tests {
 
         // The SAME quotes read as a standard basket give the other answer
         // entirely — which is why the flag is load-bearing.
-        let std_row = compute_row(&mut cx, &fees, &kuleba(), kb, ka, pb, pa, now);
+        let std_row = compute_row(&mut cx, &fees, &kuleba(), kb, ka, pb, pa, now, None);
         assert_eq!(std_row.reverse_edge_c, Some(-37.0));
         assert!(!std_row.reverse_signal);
     }
@@ -1669,7 +1688,7 @@ mod tests {
                     {"venue":"polymarket_us","market_id":"P","side":"no"}]}"#);
         let (kb, ka, pb, pa) =
             (q(&mut cx, "0.60"), q(&mut cx, "0.62"), q(&mut cx, "0.20"), q(&mut cx, "0.22"));
-        let row = compute_row(&mut cx, &fees, &sport, kb, ka, pb, pa, now);
+        let row = compute_row(&mut cx, &fees, &sport, kb, ka, pb, pa, now, None);
         assert!(row.mark_pnl_usd.expect("priced") >= 0.02, "it HAS converged");
         assert!(row.reverse_edge_c.expect("edge") >= 3.0, "and the reverse IS on");
         assert!(!row.unwind_signal, "sports stay dark");
@@ -1713,7 +1732,7 @@ mod tests {
         // Neither shape prices, so the row is refused by name.
         let (kb, ka, pb, pa) =
             (q(&mut cx, "0.05"), q(&mut cx, "0.00"), q(&mut cx, "0.08"), q(&mut cx, "0.09"));
-        let row = compute_row(&mut cx, &fees, &kuleba(), kb, ka, pb, pa, now);
+        let row = compute_row(&mut cx, &fees, &kuleba(), kb, ka, pb, pa, now, None);
         assert!(row.liq_value_usd.is_some(), "the LIQUIDATION side is still priceable");
         assert_eq!(row.maker_exit_ct, Some(None), "but the maker exit is refused, by name");
         assert_eq!(row.maker_exit_ct_rest_kalshi, Some(None), "out of band");
@@ -1728,13 +1747,110 @@ mod tests {
         // under the single old shape this row reported nothing at all.
         let pa1 = q(&mut cx, "1.00");
         let ka1 = q(&mut cx, "0.08");
-        let row = compute_row(&mut cx, &fees, &kuleba(), kb, ka1, pb, pa1, now);
+        let row = compute_row(&mut cx, &fees, &kuleba(), kb, ka1, pb, pa1, now, None);
         assert_eq!(row.maker_exit_ct_rest_kalshi, Some(None), "shape A is still refused");
         assert!(
             row.maker_exit_ct_rest_pmus.expect("present").is_some(),
             "and shape B prices it: {row:?}"
         );
         assert_eq!(row.maker_exit_shape.as_deref(), Some("rest-pmus"));
+    }
+
+    fn ladder(rungs: &[(&str, &str, &str)]) -> Vec<(String, String, String)> {
+        rungs.iter().map(|(s, e, st)| (s.to_string(), e.to_string(), st.to_string())).collect()
+    }
+
+    /// Kalshi's tapered ladder: a tenth of a cent in both tails.
+    fn tapered() -> Vec<(String, String, String)> {
+        ladder(&[("0", "0.10", "0.001"), ("0.10", "0.90", "0.01"), ("0.90", "1", "0.001")])
+    }
+
+    /// `KXFRENCHPRES-27-BRET`'s shape: 84 contracts on a ~$0.95 basis against
+    /// a Kalshi book of 0.002 / 0.009. A flat cent under either side is
+    /// negative, so both shapes refused and the position could never exit.
+    fn bret(side: &str) -> Value {
+        v(&format!(r#"{{"ts":1785402005.539014,"relationship_id":"xvus-france-pres-27-brunoretailleau",
+            "qty":84,"status":"open","cost_usd":79.8,"profit_usd":4.2,
+            "legs":[{{"venue":"kalshi","market_id":"K","side":"{side}"}},
+                    {{"venue":"polymarket_us","market_id":"P","side":"{}"}}]}}"#,
+            if side == "yes" { "no" } else { "yes" }))
+    }
+
+    #[test]
+    fn a_sub_dime_kalshi_book_prices_its_maker_exit_on_the_tapered_ladder() {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let now = at("2026-07-31", 18, 24, 49);
+        let (kb, ka, pb, pa) =
+            (q(&mut cx, "0.002"), q(&mut cx, "0.009"), q(&mut cx, "0.01"), q(&mut cx, "0.02"));
+        let grid = tapered();
+        let row = compute_row(&mut cx, &fees, &bret("yes"), kb, ka, pb, pa, now, Some(&grid));
+        // A rests at 0.008 (one rung under 0.009) and closes PM at 0.03:
+        // 0.008 + 0.97 - 0.95 = 2.8c less fees. B sells Kalshi at 0.001 and
+        // rests PM at 0.01: 0.001 + 0.99 - 0.95 = 4.1c less fees.
+        let a = row.maker_exit_ct_rest_kalshi.flatten().expect("shape A prices");
+        let b = row.maker_exit_ct_rest_pmus.flatten().expect("shape B prices");
+        assert!(a > 0.02 && a < 0.028, "{a}");
+        assert!(b > 0.03 && b < 0.041, "{b}");
+        assert_eq!(row.maker_exit_ct, Some(Some(b)));
+        assert_eq!(row.maker_exit_shape.as_deref(), Some("rest-pmus"));
+
+        // THE LADDER IS WHAT CHANGED IT: the same row on the flat cent is null.
+        let flat = compute_row(&mut cx, &fees, &bret("yes"), kb, ka, pb, pa, now, None);
+        assert_eq!(flat.maker_exit_ct, Some(None));
+        assert_eq!(flat.maker_exit_ct_rest_kalshi, Some(None));
+        assert_eq!(flat.maker_exit_ct_rest_pmus, Some(None));
+    }
+
+    /// Mid-ladder, every rung is a cent, so a known ladder — tapered or flat —
+    /// prices a penny book exactly as the unknown-ladder fallback does.
+    #[test]
+    fn a_mid_range_penny_row_is_unchanged_by_the_ladder() {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let now = at("2026-07-31", 18, 24, 49);
+        let (kb, ka, pb, pa) =
+            (q(&mut cx, "0.40"), q(&mut cx, "0.42"), q(&mut cx, "0.30"), q(&mut cx, "0.35"));
+        let t = v(r#"{"ts":1785402005.539014,"relationship_id":"r","qty":10,"status":"open",
+            "cost_usd":8.5,"profit_usd":1.5,
+            "legs":[{"venue":"kalshi","market_id":"K","side":"yes"},
+                    {"venue":"polymarket_us","market_id":"P","side":"no"}]}"#);
+        let base = compute_row(&mut cx, &fees, &t, kb, ka, pb, pa, now, None);
+        assert!(base.maker_exit_ct_rest_kalshi.flatten().is_some(), "{base:?}");
+        assert!(base.maker_exit_ct_rest_pmus.flatten().is_some(), "{base:?}");
+        let cents = ladder(&[("0", "1", "0.01")]);
+        for grid in [tapered(), cents] {
+            let row = compute_row(&mut cx, &fees, &t, kb, ka, pb, pa, now, Some(&grid));
+            assert_eq!(row, base, "{grid:?}");
+        }
+    }
+
+    /// AN INVERTED TAIL ROW. Holding the Kalshi NO, a YES book of 0.991 / 0.998
+    /// is a NO book of 0.002 / 0.009, and "one rung under" on the NO axis is one
+    /// rung ABOVE on the YES ladder. The ladder here is fine only at the TOP, so
+    /// stepping the complemented price on the YES ladder as if it were its own
+    /// would find no rung and refuse; the right answer is the standard basket's
+    /// on the mirrored ladder, field for field.
+    #[test]
+    fn an_inverted_tail_row_steps_the_yes_ladder_through_the_complement() {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let now = at("2026-07-31", 18, 24, 49);
+        let top = ladder(&[("0", "0.90", "0.01"), ("0.90", "1", "0.001")]);
+        let bottom = ladder(&[("0", "0.10", "0.001"), ("0.10", "1", "0.01")]);
+        let (kb, ka, pb, pa) =
+            (q(&mut cx, "0.991"), q(&mut cx, "0.998"), q(&mut cx, "0.98"), q(&mut cx, "0.99"));
+        let inv = compute_row(&mut cx, &fees, &bret("no"), kb, ka, pb, pa, now, Some(&top));
+        let (skb, ska, spb, spa) =
+            (q(&mut cx, "0.002"), q(&mut cx, "0.009"), q(&mut cx, "0.01"), q(&mut cx, "0.02"));
+        let std = compute_row(&mut cx, &fees, &bret("yes"), skb, ska, spb, spa, now, Some(&bottom));
+        assert_eq!(inv.maker_exit_direction.as_deref(), Some("inverse"));
+        assert!(inv.maker_exit_ct.flatten().is_some(), "{inv:?}");
+        assert_eq!(inv.maker_exit_ct_rest_kalshi, std.maker_exit_ct_rest_kalshi);
+        assert_eq!(inv.maker_exit_ct_rest_pmus, std.maker_exit_ct_rest_pmus);
+        assert_eq!(inv.maker_exit_ct, std.maker_exit_ct);
+        let flat = compute_row(&mut cx, &fees, &bret("no"), kb, ka, pb, pa, now, None);
+        assert_eq!(flat.maker_exit_ct, Some(None), "and the flat cent still cannot price it");
     }
 
     /// A partial unwind reduces the basket rather than dropping it, and scales
@@ -1785,7 +1901,7 @@ mod tests {
         let mut cx = Cx::default();
         let fees = FeeSchedule::new(&mut cx);
         let bk = books((&[lv("0.05", "9")], &[lv("0.08", "9")]), (&[], &[lv("0.09", "9")]));
-        let doc = build(&mut cx, &fees, vec![kuleba()], &bk, at("2026-07-31", 18, 24, 49)).doc;
+        let doc = build(&mut cx, &fees, vec![kuleba()], &bk, at("2026-07-31", 18, 24, 49), &Default::default()).doc;
         let body = doc.to_json();
         assert!(body.starts_with("{\n\"generated_at\": \""), "indent=0, not 2: {:?}", &body[..40]);
         assert!(!body.contains("\n  "), "no indentation anywhere");

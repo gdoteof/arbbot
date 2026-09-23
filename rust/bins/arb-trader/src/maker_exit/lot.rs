@@ -727,8 +727,13 @@ async fn advance(
                 }
                 .and_then(|s| cx.parse(s))
                 .ok_or("no executable hedge book")?;
-                let tick = cx.parse_exact(TICK);
-                let limit = if selling { cx.sub(touch, tick) } else { cx.add(touch, tick) };
+                // A Kalshi hedge steps on its own ladder; PM-US on the flat cent.
+                let ladder = match venue {
+                    Venue::Kalshi => view.k_ladder.get(a.order.close_market()).map(Vec::as_slice),
+                    _ => None,
+                };
+                let limit = kalshi_step(cx, ladder, touch, selling)
+                    .ok_or("no legal hedge price through the touch")?;
                 if !cx.is_pos(limit) || cx.cmp(limit, cx.one) != Ordering::Less {
                     return Err("hedge price outside (0, 1)".into());
                 }
@@ -809,7 +814,8 @@ fn hedge_limit(
             limit
         }
         Shape::RestPmUs => {
-            let ladder = vec![("0".into(), "1".into(), "0.01".into())];
+            let ladder = v.k_ladder.get(&o.market).cloned()
+                .unwrap_or_else(|| vec![("0".into(), "1".into(), "0.01".into())]);
             let limit = exit_limit(
                 cx,
                 fees,
