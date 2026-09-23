@@ -494,9 +494,17 @@ async fn cancel(sink: &Sink, receipt: &Receipt, order: &Order) -> Vec<String> {
         order: order.clone(),
         venue_order_id: receipt.id.clone().unwrap(),
         client_order_id: receipt.client.clone(),
-        since: Instant::now(),
+        since: placed_at(receipt.book_ts),
     };
     cancel_at_venue(sink, &r).await.0
+}
+
+/// The monotonic instant a lot order was placed, from its persisted wall-clock
+/// id (`book_ts`), so the "pulled after Ns resting" line reports the order's
+/// real age — including across a restart — rather than 0s.
+fn placed_at(book_ts: f64) -> Instant {
+    let age = (wall_now() - book_ts).max(0.0);
+    Instant::now().checked_sub(std::time::Duration::from_secs_f64(age)).unwrap_or_else(Instant::now)
 }
 
 pub(super) async fn manage(
@@ -1532,6 +1540,15 @@ mod tests {
         let why = out.iter().find(|l| l.contains("PULLING")).unwrap_or_else(|| panic!("{out:?}"));
         assert!(why.contains("depth fell to 7"), "{why}");
         assert_eq!(a.lot.as_ref().unwrap().passive_claim(), None, "nothing rests, nothing is claimed");
+    }
+
+    /// The cancel log reports the order's age from its persisted id, not 0s.
+    #[test]
+    fn a_pulled_lot_order_reports_its_real_resting_age() {
+        let age = placed_at(wall_now() - 300.0).elapsed().as_secs_f64();
+        assert!((299.0..=301.0).contains(&age), "{age}");
+        let future = placed_at(wall_now() + 60.0).elapsed().as_secs_f64();
+        assert!(future < 1.0, "a clock-skewed id clamps to now: {future}");
     }
 
 }
