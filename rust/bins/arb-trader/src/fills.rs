@@ -116,17 +116,31 @@ pub async fn pmus_fill_feed(key_id: String, secret_b64: String, tx: Sender<FeedM
             .map_err(|e| format!("subscribe: {e}"))?;
             eprintln!("[fills] polymarket_us private WS connected");
 
+            // The subscribe is fire-and-forget, so "connected" above proves
+            // only the handshake. Echo the first frame (the venue's answer to
+            // the subscribe) and any error frame, and count frames per
+            // connection: a drop "after 0 frame(s)" is a feed that never
+            // delivered, which otherwise looks exactly like a quiet book.
+            let mut frames: u64 = 0;
             while let Some(frame) = ws.next().await {
-                let msg = frame.map_err(|e| format!("read: {e}"))?;
+                let msg = frame.map_err(|e| format!("read after {frames} frame(s): {e}"))?;
                 let Message::Text(raw) = msg else { continue };
-                if let Some(line) = pmus_fill_line(&raw) {
+                frames += 1;
+                let fill = pmus_fill_line(&raw);
+                if frames == 1 || (fill.is_none() && raw.to_ascii_lowercase().contains("error")) {
+                    eprintln!(
+                        "[fills] polymarket_us frame {frames}: {}",
+                        raw.chars().take(300).collect::<String>()
+                    );
+                }
+                if let Some(line) = fill {
                     eprintln!("[fills] {line}");
                     if tx.send(FeedMsg { line, t_read: Instant::now() }).await.is_err() {
                         return Ok::<(), String>(()); // engine gone
                     }
                 }
             }
-            Err("stream ended".to_string())
+            Err(format!("stream ended after {frames} frame(s)"))
         };
 
         match attempt.await {
