@@ -1856,33 +1856,64 @@ pub fn decide(
             let k_bid = quote.yes_bid.as_deref().and_then(|x| cx.parse(x))?;
             let k_take = rung_below(cx, &quote.ladder, k_bid)?;
             let pm_take = cx.add(pm_ask_d, tick);
-            let lock = lock_per_ct(
-                cx,
-                fees,
-                (Role::Taker, Role::Taker),
-                k_take,
-                pm_take,
-                k_basis,
-                pm_basis,
-                sized_qty,
-            );
             let floor = cx.parse_exact(&min_lock);
-            if cx.cmp(lock, floor) == Ordering::Less {
-                return None;
+            // SIZED TO THE CLOSE LEG'S DEPTH AT THE CROSS'S OWN PRICES, not the
+            // rest's. The resting shapes' depth check admits levels against the
+            // rest ceiling, which is looser by the spread; a cross planned on it
+            // priced 21 lots off a 0.99-share PM-US top of book, filled 18 on
+            // Kalshi, and left them naked when the hedge found nothing inside its
+            // ceiling.
+            for n in (1..=sized_qty).rev() {
+                let lock = lock_per_ct(
+                    cx,
+                    fees,
+                    (Role::Taker, Role::Taker),
+                    k_take,
+                    pm_take,
+                    k_basis,
+                    pm_basis,
+                    n,
+                );
+                if cx.cmp(lock, floor) == Ordering::Less {
+                    continue;
+                }
+                let depth = match shape {
+                    Shape::RestKalshi => {
+                        let ceiling = close_limit(cx, fees, k_take, k_basis, pm_basis, n,
+                            Role::Taker, Role::Taker, &min_lock).ok()?;
+                        executable_depth(cx, view.pm_ask_depth.get(pm_market)?,
+                            |cx, price| { let close = cx.add(price, tick); cx.cmp(close, ceiling) != Ordering::Greater })
+                            .saturating_sub(claims.pm_ask)
+                    }
+                    Shape::RestPmUs => {
+                        let close_floor = exit_limit(cx, fees, &quote.ladder, k_basis, pm_basis, pm_take, n,
+                            Role::Taker, Role::Taker, &min_lock).ok()?;
+                        executable_depth(cx, view.k_bid_depth.get(&cand.market_id)?,
+                            |cx, price| rung_below(cx, &quote.ladder, price)
+                                .is_some_and(|close| cx.cmp(close, close_floor) != Ordering::Less))
+                            .saturating_sub(claims.k_bid)
+                    }
+                };
+                if depth < n {
+                    continue;
+                }
+                // The leg that would have rested is the one crossed FIRST, at its
+                // marketable price; the other is closed by `close_leg` exactly as it
+                // is after a resting fill, re-priced against the book at that moment.
+                let first = match shape {
+                    Shape::RestKalshi => k_take,
+                    Shape::RestPmUs => pm_take,
+                };
+                return Some((Cross {
+                    limit: cx.quantize_4dp(first).to_standard_notation_string(),
+                    lock_ct: cx.emit_6dp(lock),
+                }, n));
             }
-            // The leg that would have rested is the one crossed FIRST, at its
-            // marketable price; the other is closed by `close_leg` exactly as it
-            // is after a resting fill, re-priced against the book at that moment.
-            let first = match shape {
-                Shape::RestKalshi => k_take,
-                Shape::RestPmUs => pm_take,
-            };
-            Some(Cross {
-                limit: cx.quantize_4dp(first).to_standard_notation_string(),
-                lock_ct: cx.emit_6dp(lock),
-            })
+            None
         })
         .flatten();
+    let sized_qty = cross.as_ref().map_or(sized_qty, |(_, n)| *n);
+    let cross = cross.map(|(c, _)| c);
 
     let wire = |cx: &mut Cx, p: D| if cand.direction.inverted() { cx.one_minus(p) } else { p };
     let limit = wire(cx, limit);
@@ -4613,6 +4644,48 @@ mod tests {
             .expect("the resting shape still pays");
         assert!(o.cross.is_none(), "crossing does not clear the floor, so it rests: {o:?}");
         assert_eq!(o.limit, "0.2300", "and rests where it always did: {o:?}");
+    }
+
+    /// **A CROSS IS SIZED TO THE CLOSE DEPTH INSIDE ITS OWN CEILING.** The
+    /// 2026-09-24 `xvus-tsla-q3-deliv-q3-above-470k` exit: the PM-US top of book
+    /// was 0.99 shares, the next level deep but a spread worse. That level
+    /// clears the REST ceiling, so the resting shape sized 5 against it; the
+    /// cross must not inherit that size, because its hedge cannot fill there.
+    #[tokio::test]
+    async fn a_cross_on_a_fractional_top_of_book_rests_instead() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 5, "0.57", "0.43")];
+        let q = quote(Some("0.16"), Some("0.24"));
+        let mut vw = wide_pm_view("0.22", "0.20", "0.16");
+        vw.pm_ask_depth.insert("p-a".into(), vec![
+            Level { price: "0.22".into(), size: "0.99".into() },
+            Level { price: "0.28".into(), size: "100".into() },
+        ]);
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true, DepthClaims::default())
+            .expect("the resting shape still pays against the deeper level");
+        assert_eq!(o.shape, Shape::RestKalshi, "{o:?}");
+        assert_eq!(o.qty, 5, "the rest is sized on its own ceiling: {o:?}");
+        assert!(o.cross.is_none(), "no whole contract clears the cross's ceiling: {o:?}");
+    }
+
+    /// ...and a top of book with SOME whole contracts crosses exactly those.
+    #[tokio::test]
+    async fn a_cross_is_cut_to_the_whole_contracts_inside_its_ceiling() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 5, "0.57", "0.43")];
+        let q = quote(Some("0.16"), Some("0.24"));
+        let mut vw = wide_pm_view("0.22", "0.20", "0.16");
+        vw.pm_ask_depth.insert("p-a".into(), vec![
+            Level { price: "0.22".into(), size: "2.5".into() },
+            Level { price: "0.28".into(), size: "100".into() },
+        ]);
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true, DepthClaims::default())
+            .expect("the resting shape pays");
+        let c = o.cross.as_ref().expect("two whole contracts clear: {o:?}");
+        assert_eq!(o.qty, 2, "the order carries the cross's size: {o:?}");
+        assert_eq!(c.limit, "0.1500", "{o:?}");
     }
 
     /// The regression in the other direction, and the reason `view()` is tight
