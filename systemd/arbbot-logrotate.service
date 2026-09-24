@@ -1,0 +1,7 @@
+[Unit]
+Description=arbbot daily log rotation + zstd (engine WAL rolls, health.jsonl)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/claude/arbbot
+ExecStart=%h/claude/arbbot/scripts/rotate_logs.sh
