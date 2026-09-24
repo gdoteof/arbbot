@@ -18,3 +18,43 @@ allow:
   - xvus-time-poty-26-samaltman
   - xvus-brazil-pres-26-flaviobolsonaro
   - xvus-fedcut-26-usfed-2026-cut
+  # 2026-09-23 (Geoff, in conversation: "you can mark it as vetted if you cant
+  # show they aren't equivalent"). Claude reviewed the 23 agent-vetted xvus
+  # pairs against both venues' rule texts recorded in config/registry.yaml.
+  # Listed here, not stamped `vetted_by: human`, so the registry keeps saying
+  # who did the reading.
+  #
+  # ALLOWED (no demonstrated divergence; residuals are timing/naming only):
+  #  - TIME ChatGPT: same announcement on both venues; same caveat as the
+  #    already-allowed artificialintelligence pair.
+  #  - bestai x8: both resolve on the COMPANY holding Arena text #1, style
+  #    control off on both. Residuals: ~2h snapshot gap on Dec 31, tiebreak
+  #    only after an exact unrounded score tie. Dated in resolve.rs (same PR)
+  #    so they carry the APR hurdle.
+  #  - france x7: same "next election" vs "2027 election" caveat as the three
+  #    France pairs Geoff already allowed; topic is in run-off with a 0.5 util
+  #    gate, so this is inert at today's utilization.
+  #
+  # EXCLUDED (divergence shown in the rule text):
+  #  - gpt6 ladder x4: PM US also counts any OpenAI "new generation successor
+  #    to GPT-5"; Kalshi is a pure name test ("GPT-6 or greater"). PM US is a
+  #    strict superset, so the basket is short that gap.
+  #  - btcmax 100k/110k/120k: window start differs (market creation vs Jan 1)
+  #    and Kalshi's text allows a whole-period-average reading vs PM US's
+  #    any-60s trigger. With strikes near spot, both paths are live.
+  - xvus-time-poty-26-chatgpt
+  - xvus-bestai-26dec-anthropic
+  - xvus-bestai-26dec-openai
+  - xvus-bestai-26dec-moonshot
+  - xvus-bestai-26dec-meta
+  - xvus-bestai-26dec-google
+  - xvus-bestai-26dec-alibaba
+  - xvus-bestai-26dec-xai
+  - xvus-bestai-26dec-baidu
+  - xvus-france-pres-27-marinelepen
+  - xvus-france-pres-27-edouardphilippe
+  - xvus-france-pres-27-jordanbardella
+  - xvus-france-pres-27-gabrielattal
+  - xvus-france-pres-27-dominiquedevillepin
+  - xvus-france-pres-27-sarahknafo
+  - xvus-france-pres-27-davidlisnard
