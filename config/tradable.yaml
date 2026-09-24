@@ -58,3 +58,26 @@ allow:
   - xvus-france-pres-27-dominiquedevillepin
   - xvus-france-pres-27-sarahknafo
   - xvus-france-pres-27-davidlisnard
+  #
+  # 2026-09-24 (Claude, same delegation). Geoff: "fed stuff has done well so
+  # far ... before the fed chair comes out to talk or when a governor makes
+  # some new statement prices go wacky for a little blip and we benefit." The
+  # ledger agrees: xvus-fedcut-26 closed 54 round trips for +$8.07, mostly
+  # 0.1-5 day holds. These are the per-meeting FOMC decisions, one pair per
+  # outcome, rule text read from both venues' public APIs on 2026-09-24:
+  # Kalshi "If the Federal Reserve does a Cut of 25bps on October 28, 2026"
+  # vs PM-US "decreases the upper bound of the target federal funds rate by
+  # 25 basis points at the October 2026 FOMC". Residuals, both off the
+  # reachable path: PM-US rounds off-grid moves (a 30bp cut is PM "25" but
+  # Kalshi ">25"), and a cancelled meeting is Kalshi "maintains" by rule with
+  # PM-US silent. Registry entries carry the full citations.
+  - xvus-fedmtg-26oct-nochng
+  - xvus-fedmtg-26oct-cut25
+  - xvus-fedmtg-26oct-cut50
+  - xvus-fedmtg-26oct-hike25
+  - xvus-fedmtg-26oct-hike50
+  - xvus-fedmtg-26dec-nochng
+  - xvus-fedmtg-26dec-cut25
+  - xvus-fedmtg-26dec-cut50
+  - xvus-fedmtg-26dec-hike25
+  - xvus-fedmtg-26dec-hike50
