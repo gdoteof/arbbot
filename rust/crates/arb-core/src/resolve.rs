@@ -83,6 +83,12 @@ const RULES: &[(&str, &str, bool)] = &[
     ("xvus-oscars-bestpic-27", "2027-03-16", true),
     ("xvus-tsla-q3-deliv", "2026-10-05", true),
     ("xvus-aliens-26-12-31", "2027-01-01", false),
+    // Added 2026-09-23 with the bestai pairs' allowlisting (Geoff delegated the
+    // equivalence call). PM US snapshots the Arena leaderboard Dec 31 12:00 PM
+    // ET; Kalshi closes trading 2026-12-31T15:00Z but its expiration runs to
+    // 2027-01-31. Dated a few days past the snapshot, so APR errs low: an
+    // undated pair would quote with NO hurdle at all.
+    ("xvus-bestai-26dec", "2027-01-05", true),
 ];
 
 /// `-> (YYYY-MM-DD, estimated)`. `None` when the family is unknown, which
@@ -241,6 +247,7 @@ mod tests {
         assert_eq!(resolve_date("xvus-oscars-bestpic-27-theodyssey"), Some(("2027-03-16", true)));
         assert_eq!(resolve_date("xvus-tsla-q3-deliv-q3-above-480k"), Some(("2026-10-05", true)));
         assert_eq!(resolve_date("xvus-aliens-26-12-31-2026"), Some(("2027-01-01", false)));
+        assert_eq!(resolve_date("xvus-bestai-26dec-anthropic"), Some(("2027-01-05", true)));
         assert_eq!(resolve_date("xvus-btc150k-ladder-07-31-2026"), None);
     }
 
