@@ -61,6 +61,28 @@ const RULES: &[(&str, &str, bool)] = &[
     // kalshi + polymarket_us pair DOES widen it and is a separate decision —
     // see `the_dated_families_that_were_quoting_unhurdled_now_resolve`.
     ("kalshi-fed-dec26", "2026-12-31", false),
+    // Added 2026-09-23 (Claude, chaperone mandate). These four families were
+    // the whole `[other]` topic — 77 human-vetted pairs quoting with NO maker
+    // hurdle, held back only by the $30 default topic budget, which cannot be
+    // raised safely while nothing prices their hold. Each date is read off
+    // the pair's own legs, set a day or two after the event so it errs toward
+    // understating APR:
+    //
+    // * Heisman: PM-US slug `tec-cfb-heisman-2026-12-13`, the ceremony; Kalshi
+    //   (`KXHEISMAN-27`, "the 2026-2027 season") closes at year end.
+    // * Oscars: PM-US slug `tac-oscars-03-14-2027`, the 99th Academy Awards;
+    //   Kalshi `KXOSCARPIC-27` closes 2027-12-31 as a conservative bound.
+    // * TSLA Q3 deliveries: Tesla reports Q3 deliveries in the first days of
+    //   October; Kalshi `KXTSLA-26OCTDELIV` closes 2027-01-30 as a bound.
+    // * Aliens: both legs' own deadline, "before Jan 1, 2027" — not estimated.
+    //
+    // Like the btc150k rung above, dating a kalshi + polymarket_us family also
+    // admits it to armed take-take. Taken knowingly: every one is vetted, and
+    // they remain inside the `[other]` topic budget.
+    ("xvus-heisman-26", "2026-12-15", true),
+    ("xvus-oscars-bestpic-27", "2027-03-16", true),
+    ("xvus-tsla-q3-deliv", "2026-10-05", true),
+    ("xvus-aliens-26-12-31", "2027-01-01", false),
 ];
 
 /// `-> (YYYY-MM-DD, estimated)`. `None` when the family is unknown, which
@@ -209,6 +231,17 @@ mod tests {
     fn the_two_btc_families_stay_separate() {
         assert_eq!(resolve_date("xvus-btcmax-26-31-2026-150k"), Some(("2026-12-31", false)));
         assert_eq!(resolve_date("xvus-btc150k-ladder-01-31-2027"), None, "an undated rung is undated");
+    }
+
+    /// The families that made up the undated `[other]` topic now price a hold,
+    /// and the two expired btc150k rungs they sit beside stay undated.
+    #[test]
+    fn the_other_topic_families_resolve() {
+        assert_eq!(resolve_date("xvus-heisman-26-archmanning"), Some(("2026-12-15", true)));
+        assert_eq!(resolve_date("xvus-oscars-bestpic-27-theodyssey"), Some(("2027-03-16", true)));
+        assert_eq!(resolve_date("xvus-tsla-q3-deliv-q3-above-480k"), Some(("2026-10-05", true)));
+        assert_eq!(resolve_date("xvus-aliens-26-12-31-2026"), Some(("2027-01-01", false)));
+        assert_eq!(resolve_date("xvus-btc150k-ladder-07-31-2026"), None);
     }
 
     #[test]
