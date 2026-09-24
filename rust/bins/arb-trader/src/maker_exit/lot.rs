@@ -444,15 +444,26 @@ pub(super) async fn place_group(
     out
 }
 
+/// How long after a lost place answer Kalshi's "no order carries this
+/// client id" becomes proof the place never landed. The order list's lag is
+/// the gateway's `Settle` window — seconds — so five minutes is far past it.
+/// Without this a 503'd place (Kalshi's Thursday maintenance, 2026-09-24:
+/// 14 lots) latched its lot for good: the checkpoint persists the latch, so
+/// a restart reloaded it, and every pass walked the whole order list again.
+const ABSENT_IS_PROOF_AFTER_S: f64 = 300.0;
+
+/// `Ok(false)`: the REST place was lost and Kalshi, long after its list could
+/// lag, has no order under our client id — it never landed. Never returned for
+/// a hedge: a hedge's rest leg already filled, and releasing it could hedge twice.
 async fn recover(
     sink: &Sink,
     receipt: &mut Receipt,
     order: &Order,
     hedge: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if let Some(id) = &receipt.id {
         crate::engine::fill::note_sidecar_order(id);
-        return Ok(());
+        return Ok(true);
     }
     let venue = if hedge {
         order.shape.close_venue()
@@ -470,7 +481,12 @@ async fn recover(
         Ok(Ok(Some(id))) => {
             crate::engine::fill::note_sidecar_order(&id);
             receipt.id = Some(id);
-            Ok(())
+            Ok(true)
+        }
+        Ok(Err(arb_venue::VenueError::Status { endpoint: "kalshi recover_place", status: 0, .. }))
+            if !hedge && wall_now() - receipt.book_ts > ABSENT_IS_PROOF_AFTER_S =>
+        {
+            Ok(false)
         }
         other => Err(format!(
             "client {} is still unconfirmed ({other:?}); no replacement will be sent",
@@ -576,7 +592,17 @@ async fn advance(
 ) -> Result<(), String> {
     let a = state.active.as_mut().expect("active lot");
     let (rest_sink, hedge_sink) = sinks(a.order.shape, k, p);
-    recover(rest_sink, &mut a.rest, &a.order, false).await?;
+    if !recover(rest_sink, &mut a.rest, &a.order, false).await? {
+        out.push(format!(
+            "[maker-exit] lot={}:{}: client {} never reached Kalshi (absent {:.0}s after the lost place); releasing the reservation",
+            a.order.rel_id,
+            a.order.closes_ts,
+            a.rest.client,
+            wall_now() - a.rest.book_ts
+        ));
+        state.active = None;
+        return Ok(());
+    }
     // Receipt recovery must be durable even if the next read fails.
     checkpoint(state, ledger);
     let a = state.active.as_mut().unwrap();
@@ -890,6 +916,8 @@ mod tests {
         unreadable: Mutex<bool>,
         cancel_blocked: Mutex<bool>,
         lose_ack: Mutex<bool>,
+        // A 503 before the venue took the order; recovery then answers like Kalshi.
+        drop_place: Mutex<bool>,
         // Terminal IOC proof may lag its fill count.
         ioc_pending: Mutex<bool>,
     }
@@ -912,6 +940,13 @@ mod tests {
     }
     impl crate::sink::OrderSink for Venue {
         fn place(&self, req: &PlaceRequest) -> Result<String, arb_venue::VenueError> {
+            if *self.drop_place.lock().unwrap() {
+                return Err(arb_venue::VenueError::Status {
+                    endpoint: "kalshi place",
+                    status: 503,
+                    body: "service_unavailable".into(),
+                });
+            }
             let mut orders = self.orders.lock().unwrap();
             let id = format!("order-{}", orders.len());
             let filled = if req.post_only {
@@ -969,13 +1004,21 @@ mod tests {
             req: &PlaceRequest,
             _: &std::collections::HashSet<String>,
         ) -> Result<Option<String>, arb_venue::VenueError> {
-            Ok(self
+            let found = self
                 .orders
                 .lock()
                 .unwrap()
                 .iter()
                 .find(|(_, o)| o.req.client_order_id == req.client_order_id)
-                .map(|(id, _)| id.clone()))
+                .map(|(id, _)| id.clone());
+            if found.is_none() && *self.drop_place.lock().unwrap() {
+                return Err(arb_venue::VenueError::Status {
+                    endpoint: "kalshi recover_place",
+                    status: 0,
+                    body: "no order on this account carries client_order_id".into(),
+                });
+            }
+            Ok(found)
         }
         fn cancel_all_open(&self) -> Result<(), arb_venue::VenueError> {
             unreachable!()
@@ -1405,6 +1448,26 @@ mod tests {
             .is_none());
         assert_eq!(f.p.orders.lock().unwrap().len(), 1);
         b.lot.as_mut().unwrap().unlatch();
+    }
+
+    #[tokio::test]
+    async fn kalshi_absence_releases_a_503_place_only_after_the_list_could_lag() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let _v = test_serial();
+        let f = Fixture::new();
+        let mut a = f.owner(1., 12);
+        *f.k.drop_place.lock().unwrap() = true;
+        f.place(&mut a, 1., 12, Shape::RestKalshi).await;
+        let out = f.manage(&mut a).await.join("\n");
+        assert!(out.contains("still unconfirmed"), "{out}");
+        assert!(a.lot.as_ref().unwrap().latched);
+        a.lot.as_mut().unwrap().active.as_mut().unwrap().rest.book_ts -= ABSENT_IS_PROOF_AFTER_S + 1.0;
+        let out = f.manage(&mut a).await.join("\n");
+        assert!(out.contains("never reached Kalshi"), "{out}");
+        let lot = a.lot.as_ref().unwrap();
+        assert!(!lot.busy() && !lot.latched);
+        assert!(f.k.orders.lock().unwrap().is_empty());
+        assert!(f.closes().is_empty());
     }
 
     #[tokio::test]
