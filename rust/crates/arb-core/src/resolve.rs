@@ -89,6 +89,16 @@ const RULES: &[(&str, &str, bool)] = &[
     // 2027-01-31. Dated a few days past the snapshot, so APR errs low: an
     // undated pair would quote with NO hurdle at all.
     ("xvus-bestai-26dec", "2027-01-05", true),
+    // Added 2026-09-24 (Claude; Geoff delegated equivalence and asked for the
+    // Fed markets, whose basis blips around Fed speakers). One pair per outcome
+    // of each FOMC decision, Kalshi `KXFEDDECISION-26OCT/-26DEC` against PM-US
+    // `rdc-usfed-fomc-2026-10-28-*` / `-12-09-*`. Kalshi settles on the
+    // decision; PM-US's endDate (2026-11-12 for October) is a settlement-report
+    // bound. Dated two days past the decision, so APR is estimated. Like
+    // every kalshi + polymarket_us family here, dating admits these to armed
+    // take-take, and here that is the point.
+    ("xvus-fedmtg-26oct", "2026-10-30", true),
+    ("xvus-fedmtg-26dec", "2026-12-11", true),
 ];
 
 /// `-> (YYYY-MM-DD, estimated)`. `None` when the family is unknown, which
@@ -248,6 +258,8 @@ mod tests {
         assert_eq!(resolve_date("xvus-tsla-q3-deliv-q3-above-480k"), Some(("2026-10-05", true)));
         assert_eq!(resolve_date("xvus-aliens-26-12-31-2026"), Some(("2027-01-01", false)));
         assert_eq!(resolve_date("xvus-bestai-26dec-anthropic"), Some(("2027-01-05", true)));
+        assert_eq!(resolve_date("xvus-fedmtg-26oct-cut25"), Some(("2026-10-30", true)));
+        assert_eq!(resolve_date("xvus-fedmtg-26dec-nochng"), Some(("2026-12-11", true)));
         assert_eq!(resolve_date("xvus-btc150k-ladder-07-31-2026"), None);
     }
 
