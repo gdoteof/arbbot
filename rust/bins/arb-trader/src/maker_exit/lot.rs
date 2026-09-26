@@ -531,12 +531,7 @@ pub(super) async fn manage(
 ) -> Vec<String> {
     live.publish_working(live.working_set(None));
     if let Some(a) = live.lot.as_ref().and_then(|s| s.active.as_ref()) {
-        live.request_suppress(
-            candidate_keys_for(&a.order.market, &a.order.pm_market, a.order.direction)
-                .into_iter()
-                .chain(cross_keys_for(&a.order.market, &a.order.pm_market, a.order.direction))
-                .collect(),
-        );
+        live.request_suppress(working_keys(&a.order));
     }
     let mut state = live.lot.take().expect("lot owner");
     let mut out = Vec::new();
@@ -566,12 +561,7 @@ pub(super) async fn manage(
     let suppress = state
         .active
         .as_ref()
-        .map(|a| {
-            candidate_keys_for(&a.order.market, &a.order.pm_market, a.order.direction)
-                .into_iter()
-                .chain(cross_keys_for(&a.order.market, &a.order.pm_market, a.order.direction))
-                .collect()
-        })
+        .map(|a| working_keys(&a.order))
         .unwrap_or_default();
     live.lot = Some(state);
     live.request_suppress(suppress);
@@ -900,6 +890,45 @@ mod tests {
             assert_eq!(first.side, rest.side);
             assert_eq!(first.tif, Tif::Ioc);
             assert!(!first.post_only);
+        }
+    }
+
+    /// A PLACED EXIT HOLDS THE SIDE IT RESTS ON AND THE SIDES ITS ORDERS LIFT,
+    /// read here off the requests that actually go to the wire, and gives the
+    /// entry quoter back the rest. Each side it gives back hedges, on the other
+    /// venue, into that same side, which is never the one the exit rests on.
+    #[test]
+    fn a_placed_exit_yields_only_the_sides_its_own_orders_touch() {
+        let book = |s: Side| if s == Side::Ask { "ask" } else { "bid" }.to_string();
+        let lifts = |s: Side| book(if s == Side::Ask { Side::Bid } else { Side::Ask });
+        for direction in [Direction::Standard, Direction::Inverse] {
+            for shape in [Shape::RestKalshi, Shape::RestPmUs] {
+                for cross in [false, true] {
+                    let mut order = resting_exit(3).order;
+                    (order.direction, order.shape) = (direction, shape);
+                    order.cross =
+                        cross.then(|| Cross { limit: "0.4000".into(), lock_ct: "0.02".into() });
+                    let first = Receipt::new("0.4000".into(), 3).request(&order, false);
+                    let hedge = Receipt::new("0.5000".into(), 3).request(&order, true);
+                    let rests = (first.market.clone(), book(first.side));
+                    let mut touched = BTreeSet::from([rests.clone(), (hedge.market, lifts(hedge.side))]);
+                    if cross {
+                        touched.insert((first.market, lifts(first.side)));
+                    }
+                    let held = working_keys(&order);
+                    let case = format!("{direction:?} {shape:?} cross={cross}");
+                    assert_eq!(held, touched, "{case}");
+                    let all: BTreeSet<_> = candidate_keys_for("K-a", "p-a", direction)
+                        .into_iter()
+                        .chain(cross_keys_for("K-a", "p-a", direction))
+                        .collect();
+                    assert!(held.is_subset(&all), "{case}");
+                    for (market, side) in all.difference(&held) {
+                        let other = if market == "K-a" { "p-a" } else { "K-a" };
+                        assert_ne!((other.to_string(), side.clone()), rests, "{case}: {market} {side}");
+                    }
+                }
+            }
         }
     }
 
@@ -1280,6 +1309,33 @@ mod tests {
         assert!(a.lot.as_ref().unwrap().reserved_keys().is_empty());
         assert_eq!(f.closes()[0]["qty"], 3);
         assert_eq!(f.closes()[1]["qty"], 1);
+    }
+
+    /// ONCE ITS ORDER IS OUT, A LOT STOPS HOLDING ALL FOUR SIDES. The two it
+    /// gives back are the market's entry quotes, which on 2026-09-25 went dark
+    /// on every TSLA-Q3 rung within four minutes of its first fill.
+    #[tokio::test]
+    async fn a_resting_lot_hands_the_sides_it_does_not_touch_back_to_the_entry_quoter() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let _v = test_serial();
+        let f = Fixture::new();
+        let mut a = f.owner(1., 5);
+        f.place(&mut a, 1., 5, Shape::RestKalshi).await;
+        a.request_suppress(
+            candidate_keys_for("K-a", "p-a", Direction::Standard)
+                .into_iter()
+                .chain(cross_keys_for("K-a", "p-a", Direction::Standard))
+                .collect(),
+        );
+        let out = f.manage(&mut a).await;
+        assert!(a.lot.as_ref().unwrap().busy(), "still resting: {out:?}");
+        let held: BTreeSet<_> =
+            f.owners.lock().unwrap().values().flat_map(|o| o.suppress.iter().cloned()).collect();
+        assert_eq!(
+            held,
+            BTreeSet::from([("K-a".into(), "ask".into()), ("p-a".into(), "ask".into())]),
+            "the ask it rests on and the PM-US ask its close buys from"
+        );
     }
 
     #[tokio::test]
