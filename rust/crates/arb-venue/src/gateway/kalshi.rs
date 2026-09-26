@@ -45,9 +45,14 @@ const K_FILLS_MAX_PAGES: usize = 5;
 /// An ERROR, not a truncated list, for the same reason as
 /// [`K_FILLS_MAX_PAGES`]: a caller cannot tell a prefix from the whole account,
 /// and `resting_order_ids` answering `Ok(vec![])` over a prefix is "PROVEN
-/// clean" over a book nobody read. 50 pages is 5,000 rows against a history in
-/// the hundreds, so reaching it means the cursor is not terminating.
+/// clean" over a book nobody read. 50 pages is 50,000 rows at
+/// [`K_ORDERS_PAGE_LIMIT`], so reaching it means the cursor is not terminating.
 const K_ORDERS_MAX_PAGES: usize = 50;
+/// Rows per page of that walk. At 100 the history OUTGREW the cap: 6,982 rows
+/// back to 2026-08-11 on 2026-09-26 is 70 pages, so every sweep failed closed
+/// and the trader could neither stop clean nor start. Kalshi serves 1,000 a
+/// page (7 pages, the cursor terminating, measured the same day).
+const K_ORDERS_PAGE_LIMIT: usize = 1000;
 /// The PUBLIC market listing. Unsigned in the Python (`kalshi_ask` sends a bare
 /// GET), signed here because [`KalshiGateway::call`] signs everything and a
 /// signed request to a public endpoint is accepted — one code path rather than a
@@ -165,7 +170,7 @@ impl<T: Transport> KalshiGateway<T> {
         self.transport.send(method, path, query, &headers, body)
     }
 
-    /// ALL orders across pages. `/portfolio/orders` is paginated (100/page +
+    /// ALL orders across pages. `/portfolio/orders` is paginated (1,000/page +
     /// cursor) and `?status=resting` returns NOTHING, so page the full list and
     /// filter status client-side. Skipping pagination orphans older resting
     /// orders — that is naked-leg risk, not a cosmetic bug.
@@ -206,8 +211,8 @@ impl<T: Transport> KalshiGateway<T> {
     /// resting.
     ///
     /// The sweep needs the account; [`Self::find_ours`] needs one row, and
-    /// `/portfolio/orders` is the full HISTORY — hundreds of finished rows on
-    /// this account, 100 to a page, every page a signed request on the order
+    /// `/portfolio/orders` is the full HISTORY — thousands of finished rows on
+    /// this account, 1,000 to a page, every page a signed request on the order
     /// path's own priority. Paging the remainder after the answer is already in
     /// hand buys nothing and spends exactly the requests a 429 mid-cancel would
     /// cost us (quirk `xv-shared-api-budget`).
@@ -250,12 +255,15 @@ impl<T: Transport> KalshiGateway<T> {
                     ),
                 });
             }
-            let q = cursor.as_ref().map(|c| format!("limit=100&cursor={c}"));
+            let q = match &cursor {
+                Some(c) => format!("limit={K_ORDERS_PAGE_LIMIT}&cursor={c}"),
+                None => format!("limit={K_ORDERS_PAGE_LIMIT}"),
+            };
             let r = self.call(
                 Priority::Critical,
                 "GET",
                 K_ORDERS,
-                q.as_deref().or(Some("limit=100")),
+                Some(&q),
                 None,
             )?;
             pages += 1;
