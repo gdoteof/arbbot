@@ -135,7 +135,7 @@ fn the_signature_covers_the_path_and_never_the_query() {
     g.all_orders().unwrap();
     let s = &g.transport.sent()[0];
     assert_eq!(s.path, "/trade-api/v2/portfolio/orders");
-    assert_eq!(s.query.as_deref(), Some("limit=100"), "query rides the URL");
+    assert_eq!(s.query.as_deref(), Some("limit=1000"), "query rides the URL");
 
     let ts = s.headers.iter().find(|(k, _)| k == "KALSHI-ACCESS-TIMESTAMP").unwrap().1.clone();
     let sig = s.headers.iter().find(|(k, _)| k == "KALSHI-ACCESS-SIGNATURE").unwrap().1.clone();
@@ -151,7 +151,7 @@ fn the_signature_covers_the_path_and_never_the_query() {
         "signature must cover the bare path"
     );
     assert!(
-        !verifier.verify(&ts, "GET", "/trade-api/v2/portfolio/orders?limit=100", &raw),
+        !verifier.verify(&ts, "GET", "/trade-api/v2/portfolio/orders?limit=1000", &raw),
         "signing the query would be a 401 in production"
     );
 }
@@ -329,8 +329,8 @@ fn cancel_all_open_pages_the_full_history_and_cancels_only_resting() {
     g.cancel_all_open().unwrap();
 
     let sent = g.transport.sent();
-    assert_eq!(sent[0].query.as_deref(), Some("limit=100"));
-    assert_eq!(sent[1].query.as_deref(), Some("limit=100&cursor=CUR"), "follows the cursor");
+    assert_eq!(sent[0].query.as_deref(), Some("limit=1000"));
+    assert_eq!(sent[1].query.as_deref(), Some("limit=1000&cursor=CUR"), "follows the cursor");
     let cancelled: Vec<&str> = sent[2..].iter().map(|s| s.path.as_str()).collect();
     assert_eq!(
         cancelled,
