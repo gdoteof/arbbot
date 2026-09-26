@@ -1455,6 +1455,42 @@ pub fn candidate_keys_for(market_id: &str, pm_market: &str, direction: Direction
     ]
 }
 
+/// The sides a PLACED exit still needs yielded: the one it rests on and the
+/// one its fill-time close lifts, which is the SAME side on the other venue
+/// (sell the Kalshi YES into the ask, buy the PM-US YES from the ask). A cross
+/// adds the side its first leg lifts.
+///
+/// NOT ALL FOUR. Before the shape is known the cycle must hold
+/// [`candidate_keys_for`] and [`cross_keys_for`] together; once an order is
+/// out, the other two are entry quotes that collide with nothing of ours. An
+/// entry resting on the other side hedges on the other side too, so its
+/// taker never meets this ask. Holding all four for the order's whole life
+/// took every held market out of the entry quoter: on 2026-09-25 each
+/// TSLA-Q3 rung went dark within four minutes of its first fill.
+pub fn working_keys(o: &Order) -> BTreeSet<(String, String)> {
+    let [k_lift, pm_lift]: [_; 2] = cross_keys_for(&o.market, &o.pm_market, o.direction)
+        .try_into()
+        .expect("one key per venue");
+    let mut keys = BTreeSet::from([rest_key(o)]);
+    match (o.cross.is_some(), o.shape) {
+        (true, _) => keys.extend([k_lift, pm_lift]),
+        (false, Shape::RestKalshi) => keys.extend([pm_lift]),
+        (false, Shape::RestPmUs) => keys.extend([k_lift]),
+    }
+    keys
+}
+
+/// [`decide`]'s refusal while the engine owes a hedge on `market`. Read before
+/// any book, so no yielding can cure it.
+fn owes_no_hedge(market: &str) -> Result<(), String> {
+    crate::naked_act::inflight_check(market).map_err(|why| {
+        refuse(format!(
+            "not resting an exit on {market}: {why}. Our ask would be the maker in that collision \
+             and the engine's hedge IOC the taker, which is the order taker_at_cross cancels"
+        ))
+    })
+}
+
 /// What one contract of this exit locks, net of both legs' fees, against both
 /// legs' ledger basis. The one arithmetic every shape is scored on.
 ///
@@ -1592,13 +1628,7 @@ pub fn decide(
     // hedge silently does not happen and the leg it was covering stays naked.
     // An ordinary refusal, on the ordinary gauge: this is "not now", not
     // "halted", and the obligation is discharged within seconds.
-    crate::naked_act::inflight_check(&cand.market_id).map_err(|why| {
-        refuse(format!(
-            "not resting an exit on {}: {why}. Our ask would be the maker in that collision \
-             and the engine's hedge IOC the taker, which is the order taker_at_cross cancels",
-            cand.market_id
-        ))
-    })?;
+    owes_no_hedge(&cand.market_id)?;
     // Price both basket directions through one set of equations. For inverse
     // inventory the complementary contract is the held asset on each venue, so
     // bid/ask and ladders swap and prices are complemented. Fee curves are
@@ -2925,6 +2955,15 @@ async fn cycle(
         live.publish_working(live.working_set(None));
         live.request_suppress(want);
         out.push(format!("[maker-exit] {pm} is owned by another exit; keeping one owner per venue market"));
+        return out;
+    }
+    // NOT WHILE THE ENGINE OWES A HEDGE HERE. `decide` refuses that before it
+    // reads a book, so yielding cannot cure it, and asking anyway takes the
+    // market from the entry quoter for nothing: TSLA-Q3 480k was refused on it
+    // 3,219 times in the day to 2026-09-26 with all four of its sides held.
+    if let Err(why) = owes_no_hedge(&target.market_id) {
+        out.push(format!("[maker-exit] NO — {}: {why}", target.rel_id));
+        live.request_suppress(want);
         return out;
     }
     // BOTH sides this candidate might rest, published before the decision — the
@@ -7256,6 +7295,22 @@ mod tests {
         assert!(e.contains("double hedge"), "the registry's own words: {e}");
         assert!(e.contains("taker_at_cross"), "and why it matters here: {e}");
         assert_eq!(refused(), before + 1, "'not now' is a refusal, not a halt");
+        crate::naked_act::publish_inflight(BTreeSet::new());
+    }
+
+    /// THE SAME REFUSAL, ASKED BEFORE THE CYCLE TAKES A SIDE FROM THE ENTRY
+    /// QUOTER. It reads no book, so no amount of yielding would let `decide`
+    /// pass it, and a market held for it is dark to entries for nothing.
+    #[tokio::test]
+    async fn an_owed_hedge_is_known_before_any_side_is_asked_for() {
+        let _g = allow_all().await;
+        assert_eq!(owes_no_hedge("K-a"), Ok(()));
+        crate::naked_act::publish_inflight(BTreeSet::from(["K-a".to_string()]));
+        let before = refused();
+        let e = owes_no_hedge("K-a").expect_err("the engine owes a hedge on this market");
+        assert!(e.contains("double hedge") && e.contains("taker_at_cross"), "{e}");
+        assert_eq!(refused(), before + 1);
+        assert_eq!(owes_no_hedge("K-b"), Ok(()), "another market is not held up");
         crate::naked_act::publish_inflight(BTreeSet::new());
     }
 
