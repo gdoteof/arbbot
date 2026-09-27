@@ -18,6 +18,27 @@ use std::time::Duration;
 pub const GATEWAY_BASE: &str = "https://gateway.polymarket.us/v1";
 pub const WS_MARKETS_URL: &str = "wss://api.polymarket.us/v1/ws/markets";
 pub const WS_MARKETS_PATH: &str = "/v1/ws/markets";
+/// PM-US's market-data WS streams books for the first 750 subscribed markets
+/// and silently ignores the rest: they get one `[pmus-seed]` REST snapshot and
+/// never move again. Measured, not documented — exactly 750 distinct markets
+/// on the tape on 09-21 and 09-26 against 1,689 subscribed, and the 09-24 boot
+/// logged "939 of 1689 … have no book after 45s". Order therefore decides who
+/// is live; see `registry_first`.
+pub const WS_MARKET_CAP: usize = 750;
+
+/// Registry markets first, then the tag listing's remainder in its own order.
+/// Before this the registry extras were APPENDED, i.e. past the cap by
+/// construction, and the tag listing's order decided the rest: 53 registry
+/// markets (all of Brazil, France and Heisman) sat frozen for up to 8 days
+/// while the engine quoted against the stale snapshot.
+pub fn registry_first(registry: &[String], tagged: &[String]) -> Vec<String> {
+    let reg: std::collections::HashSet<&str> = registry.iter().map(String::as_str).collect();
+    registry
+        .iter()
+        .chain(tagged.iter().filter(|s| !reg.contains(s.as_str())))
+        .cloned()
+        .collect()
+}
 
 /// Unwrap PM-US's money type, `{"currency":"USD","value":"5.0000"}`.
 ///
@@ -521,5 +542,21 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn registry_markets_are_subscribed_before_the_cap() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // 800 tag-listed markets, one of which is also a registry leg, and one
+        // registry leg the listing never returns (the 09-24 shape, scaled).
+        let mut tagged: Vec<String> = (0..800).map(|i| format!("tag-{i}")).collect();
+        tagged[790] = "reg-listed".into();
+        let registry = s(&["reg-listed", "reg-untagged"]);
+        let out = registry_first(&registry, &tagged);
+        assert_eq!(&out[..2], &registry[..], "registry first, in registry order");
+        assert_eq!(out.len(), 801, "each market exactly once");
+        assert_eq!(out.iter().filter(|x| *x == "reg-listed").count(), 1);
+        assert_eq!(out[2], "tag-0", "tag remainder keeps the listing's order");
+        assert!(out[..WS_MARKET_CAP].iter().any(|x| x == "reg-untagged"));
     }
 }
