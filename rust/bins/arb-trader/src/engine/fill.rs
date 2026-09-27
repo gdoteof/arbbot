@@ -332,6 +332,9 @@ impl Engine {
                     }
                     if let Some(p) = self.pending_hedges.get_mut(&h.chain_id) {
                         p.filled += c.delta;
+                        // The book this attempt was priced off was telling
+                        // the truth; the lie count starts over.
+                        p.dry_tries = 0;
                     }
                     if c.book > 0 {
                         match self.order_rel.get(&h.maker_order_id) {
@@ -504,6 +507,7 @@ impl Engine {
                                 last_try_at: at,
                                 latest_attempt: None,
                                 tries: 0,
+                                dry_tries: 0,
                                 alarmed: false,
                                 hold_logged: false,
                                 parked_until: None,
@@ -523,6 +527,7 @@ impl Engine {
                         if acceptable {
                             if let Some(p) = self.pending_hedges.get_mut(&hoid) {
                                 p.tries = 1;
+                                p.dry_tries = 1;
                                 p.latest_attempt = Some(hoid.clone());
                             }
                             self.hedge_orders.insert(
@@ -1034,6 +1039,7 @@ mod attribute_fill_tests {
             last_try_at: at,
             latest_attempt: Some("h1".into()),
             tries: 1,
+            dry_tries: 1,
             alarmed: false,
             hold_logged: false,
             parked_until: None,
@@ -1218,6 +1224,21 @@ mod attribute_fill_tests {
         assert_eq!(e.n_fill, 1, "a foreign fill is not ours to count");
         assert_eq!(e.last_now, 10.0);
         assert_eq!(e.unclaimed_fills.len(), 1, "it is held for the ack that might name it");
+    }
+
+    /// ANY FILL ENDS A RUN OF MISSES. A partial is still proof the book it was
+    /// priced off was real, and a chain that keeps landing partials against a
+    /// thin book must never read as a lying one (`hedge::distrusted_rels`).
+    #[test]
+    fn a_hedge_fill_resets_the_run_of_dry_attempts() {
+        let mut e = test_engine(test_cfg());
+        e.order_rel.insert("m1".into(), maker_order());
+        e.hedge_orders.insert("h1".into(), hedge_order(5));
+        e.pending_hedges
+            .insert("h1".into(), PendingHedge { dry_tries: 12, ..pending(5) });
+        e.on_fill(&json!({"order_id": "h1", "cum": 2}), Venue::PolymarketUs, "P", 9_000_000_000);
+        let p = &e.pending_hedges["h1"];
+        assert_eq!((p.filled, p.dry_tries, p.tries), (2, 0, 1), "tries is history, dry_tries is the run");
     }
 
     /// RELEASE ON FILL, through the engine rather than through `RiskView`.

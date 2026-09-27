@@ -117,6 +117,12 @@ pub(super) struct PendingHedge {
     /// still be in flight.
     pub(super) latest_attempt: Option<String>,
     pub(super) tries: u32,
+    /// Attempts placed since this obligation last received a fill — the
+    /// in-flight one included. Every attempt is an IOC at a price the book
+    /// SHOWED within budget (`HedgePlan::Wait` places nothing), so a run of
+    /// these is a run of books claiming liquidity that was not there. Reset by
+    /// any fill credited to the chain (`fill.rs`); read by `distrusted_rels`.
+    pub(super) dry_tries: u32,
     pub(super) alarmed: bool,
     /// Whether the ack-hold has already been logged for this obligation. One
     /// line per obligation: the decision is re-taken every second.
@@ -644,6 +650,47 @@ pub(super) fn naked_worst_usd(
     total
 }
 
+/// Consecutive dry attempts after which an obligation's book is presumed to be
+/// LYING, and its relationship stops quoting new entries.
+///
+/// Not "the hedge has not filled". A hedge that is waiting for its price
+/// places nothing and never counts; Geoff 2026-09-26 is content to hold that
+/// tail and wait for the exit or the hedge. This counts IOCs sent at a price
+/// the book showed inside budget that came back empty — the book said the
+/// liquidity was there and it was not. Once the book cannot be believed,
+/// neither can any quote priced off it: an entry that fills now adds to a leg
+/// whose way out is exactly the book that just lied.
+///
+/// 10 against the live record: 198 hedges on live books took at most 2
+/// attempts, while frozen books (the PM-US 750-stream cap, fixed by #126) ran
+/// to 38k and the 2026-09 KXNOBELPEACE-27-MKUL chain to 336. At the 5s retry
+/// interval it is ~50s of misses — long enough that a race for one level is
+/// never mistaken for a lie, short enough to stop entries within a minute.
+pub(super) const HEDGE_DISTRUST_TRIES: u32 = 10;
+
+/// The relationships whose hedge (or sell-back) book has lied: any live
+/// obligation with `HEDGE_DISTRUST_TRIES` or more dry attempts in a row.
+///
+/// RELEASE IS IMPLICIT. The set is recomputed from the obligations every tick,
+/// so it empties when the chain fills anything (`dry_tries` resets) or is
+/// discharged, and a restart starts clean because adoption resets the counter
+/// — the same clean slate a restart gives the retry itself.
+///
+/// An obligation whose maker order is unknown to `order_rel` has no
+/// relationship to name, so it pauses nothing; `order_rel` is never pruned and
+/// adoption registers the original id, so that is a construction error, not a
+/// state the live engine reaches.
+pub(super) fn distrusted_rels(
+    pending: &HashMap<String, PendingHedge>,
+    order_rel: &HashMap<String, MakerOrder>,
+) -> std::collections::BTreeSet<String> {
+    pending
+        .values()
+        .filter(|p| p.dry_tries >= HEDGE_DISTRUST_TRIES && p.owed > p.filled)
+        .filter_map(|p| order_rel.get(&p.maker_order_id).map(|m| m.rel_id.clone()))
+        .collect()
+}
+
 /// Quote-time hedge anchor for a maker order resting on `rel`'s
 /// `market_id`/`side`: the top of the book on the OTHER leg, on the side the
 /// hedge would TAKE. A maker bid that fills leaves us long, so the hedge sells
@@ -897,6 +944,7 @@ impl Engine {
                     last_try_at: mono,
                     latest_attempt: None,
                     tries: 0,
+                    dry_tries: 0,
                     alarmed: false,
                     hold_logged: false,
                     parked_until: None,
@@ -1107,6 +1155,7 @@ impl Engine {
             (p.anchor.venue, p.anchor.market_id.clone(), p.anchor.side)
         };
         p.tries += 1;
+        p.dry_tries += 1;
         p.last_try_at = mono;
         // The attempt this one supersedes, captured BEFORE
         // `latest_attempt` moves on. Every retry gets a FRESH
@@ -2246,6 +2295,7 @@ mod hedge_tick_tests {
             last_try_at: at,
             latest_attempt: attempt.map(str::to_string),
             tries: u32::from(attempt.is_some()),
+            dry_tries: u32::from(attempt.is_some()),
             alarmed: false,
             hold_logged: false,
             parked_until: None,
@@ -2881,6 +2931,7 @@ mod sell_back_tests {
             last_try_at: t,
             latest_attempt: Some("h1".into()),
             tries: 1,
+            dry_tries: 1,
             alarmed: false,
             hold_logged: false,
             parked_until: None,
@@ -3019,6 +3070,7 @@ mod sell_back_tests {
         assert_eq!((e.n_sell_back, e.n_retry), (1, 0));
         let p = &e.pending_hedges["h1"];
         assert_eq!((p.tries, p.latest_attempt.as_deref()), (2, Some("h2")));
+        assert_eq!(p.dry_tries, 2, "a sell-back is a claim on a book like any hedge");
 
         // The executor on KALSHI must ask PM-US about h1, on h1's market.
         assert_eq!(
@@ -3107,6 +3159,7 @@ mod naked_worst_tests {
             last_try_at: t,
             latest_attempt: None,
             tries: 0,
+            dry_tries: 0,
             alarmed: false,
             hold_logged: false,
             parked_until: None,
