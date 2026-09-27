@@ -12,7 +12,10 @@
 //! from.
 
 use super::cancel::{settle, CancelWork};
-use super::hedge::{first_attempt_acceptable, hedge_credit, taking_side, HedgeOrder, PendingHedge};
+use super::hedge::{
+    first_attempt_acceptable, hedge_credit, taking_side, EntryLeg, HedgeOrder, PendingHedge,
+};
+use arb_core::fees::Role;
 use super::Engine;
 use arb_core::intent::{self, Intent, Tag};
 use arb_core::model::{BookSide, Venue};
@@ -58,6 +61,18 @@ impl MakerOrder {
     fn rested(&self) -> bool {
         self.strategy != "take-take"
     }
+
+    /// The leg a sell-back would take back — `None` only for a venue string
+    /// this build cannot parse, which leaves that obligation hedge-only.
+    pub(super) fn entry_leg(&self) -> Option<EntryLeg> {
+        Some(EntryLeg {
+            venue: Venue::parse(&self.venue)?,
+            market_id: self.market_id.clone(),
+            side: self.side,
+            price: self.price.clone(),
+            role: if self.role() == "taker" { Role::Taker } else { Role::Maker },
+        })
+    }
 }
 
 /// Book a completed basket: the maker leg filled and its hedge filled, so the
@@ -79,13 +94,23 @@ pub(super) fn book_basket(
     qty: i64,
     ts: f64,
 ) {
-    let rec = json!({
+    // A SELL-BACK is not a basket: leg 2 took leg 1 back on its own market,
+    // so the pair is flat at the venue and the record is `realized`, never
+    // `open` — it must count as no exposure on the next restart. Its P&L is
+    // left for the dash to derive from the legs (a same-market bid + ask),
+    // for the reason `fees_pending` gives above.
+    let (strategy, status) = if hedge.sell_back {
+        ("naked-sellback", "realized")
+    } else {
+        (maker.strategy, "open")
+    };
+    let mut rec = json!({
         "ts": ts,
         "relationship_id": maker.rel_id,
-        "title": format!("{} (rust {})", maker.rel_id, maker.strategy),
+        "title": format!("{} (rust {strategy})", maker.rel_id),
         "qty": qty,
-        "strategy": maker.strategy,
-        "status": "open",
+        "strategy": strategy,
+        "status": status,
         "source": crate::ledger::SOURCE,
         "fees_pending": true,
         "legs": [
@@ -97,6 +122,14 @@ pub(super) fn book_basket(
              "order_id": hedge_order_id},
         ],
     });
+    if hedge.sell_back {
+        rec["note"] = json!(
+            "naked sell-back: the hedge venue offered nothing inside the slip budget, \
+             so the entry was taken back on its own venue at a profit after both \
+             modelled fees. Both legs are the same market and net flat. Leg 2 \
+             yes_price is the IOC LIMIT, not the fill price."
+        );
+    }
     match crate::ledger::append_basket(path, rec.clone()) {
         Ok(crate::ledger::Booking::Booked) => {}
         Ok(crate::ledger::Booking::AlreadyBooked) => eprintln!(
@@ -306,10 +339,26 @@ impl Engine {
                                 if let Some(lp) = self.cfg.ledger_path.as_deref() {
                                     book_basket(lp, mo, &h, oid, c.book, now);
                                 }
-                                eprintln!(
-                                    "[ledger] booked {} x{} ({} maker / {} hedge)",
-                                    mo.rel_id, c.book, mo.market_id, h.market_id
-                                );
+                                if h.sell_back {
+                                    // The maker fill charged `record_open`;
+                                    // taking it back closes that exposure,
+                                    // and no `unwound` record will ever
+                                    // release it (see `record_close`).
+                                    if let Some(rv) = self.cfg.risk.as_ref() {
+                                        rv.record_close(&mo.rel_id, mo.class, c.book as f64);
+                                    }
+                                    eprintln!(
+                                        "[ledger] booked SELL-BACK {} x{} ({} {} @ {} against \
+                                         entry {})",
+                                        mo.rel_id, c.book, h.venue.as_str(), mo.market_id,
+                                        h.price, mo.price
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[ledger] booked {} x{} ({} maker / {} hedge)",
+                                        mo.rel_id, c.book, mo.market_id, h.market_id
+                                    );
+                                }
                             }
                             // Without the maker order there is no relationship
                             // id, so there is no honest ledger record to write
@@ -450,6 +499,7 @@ impl Engine {
                                 owed: qty,
                                 filled: 0,
                                 anchor: a.clone(),
+                                entry: self.order_rel.get(&f_oid).and_then(MakerOrder::entry_leg),
                                 first_at: at,
                                 last_try_at: at,
                                 latest_attempt: None,
@@ -489,6 +539,7 @@ impl Engine {
                                     // The first attempt of a chain supersedes
                                     // nothing, so there is nothing to verify.
                                     supersedes: None,
+                                    sell_back: false,
                                 },
                             );
                             self.intents.push(Intent::Place(intent::Place {
@@ -760,6 +811,7 @@ mod ledger_write_tests {
             qty: 5,
             cum_filled: 0,
             supersedes: None,
+            sell_back: false,
         };
         book_basket(p, &maker, &hedge, "h1", 5, 1_700_000_000.0);
         book_basket(p, &maker, &hedge, "h1", 3, 1_700_000_100.0);
@@ -822,6 +874,7 @@ mod ledger_write_tests {
             qty: 5,
             cum_filled: 0,
             supersedes: None,
+            sell_back: false,
         };
         book_basket(p, &maker, &hedge, "h1", 5, 1_700_000_000.0);
 
@@ -895,6 +948,7 @@ mod ledger_write_tests {
             qty: 1,
             cum_filled: 0,
             supersedes: None,
+            sell_back: false,
         };
         book_basket(p, &maker, &hedge, "h1785351000336", 1, 1785402003.8191998);
 
@@ -964,6 +1018,7 @@ mod attribute_fill_tests {
             qty,
             cum_filled: 0,
             supersedes: None,
+            sell_back: false,
         }
     }
 
@@ -974,6 +1029,7 @@ mod attribute_fill_tests {
             owed,
             filled: 0,
             anchor: anchor(),
+            entry: None,
             first_at: at,
             last_try_at: at,
             latest_attempt: Some("h1".into()),
@@ -1222,6 +1278,190 @@ mod attribute_fill_tests {
             (rv.open_ct("synth-attribution-rel"), rv.reserved_ct()),
             (5.0, 0.0),
             "and the whole clip has moved from committed to spent, once"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A SELL-BACK fill discharges its obligation exactly as a hedge fill does,
+    /// but what it books is a CLOSE, and three readers must all agree on that:
+    /// the ledger (a `realized` record, so the next restart seeds nothing), the
+    /// caps (the exposure `record_open` charged is released now, not at the
+    /// next restart), and the orphan census (which credits it, or a restart
+    /// would re-seed the sold-back contracts as a naked leg).
+    #[test]
+    fn a_sell_back_fill_books_a_close_and_releases_its_exposure() {
+        let dir = std::env::temp_dir().join(format!("arb-fill-sellback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exec = dir.join("exec.yaml");
+        std::fs::write(&exec, "bankroll_usd: 980\nper_class_cap: 0.35\n").unwrap();
+        let ledger = dir.join("trades.jsonl");
+        let lp = ledger.to_str().unwrap();
+        let rv = std::sync::Arc::new(crate::risk::RiskView::load(
+            exec.to_str().unwrap(),
+            "/nonexistent/topics.yaml",
+            vec![
+                ("kalshi".to_string(), "1000".to_string()),
+                ("polymarket_us".to_string(), "1000".to_string()),
+            ],
+            HashMap::from([("synth-attribution-rel".to_string(), "low".to_string())]),
+        ));
+        let mut cfg = test_cfg();
+        cfg.risk = Some(rv.clone());
+        cfg.ledger_path = Some(lp.to_string());
+        let mut e = test_engine(cfg);
+        e.fills.register_order("m1", "K", 5, Some(anchor()));
+        e.order_rel.insert("m1".into(), maker_order());
+
+        e.attribute_fill("m1", 5, Venue::Kalshi, "K", 1.0, Instant::now());
+        assert_eq!(rv.open_ct("synth-attribution-rel"), 5.0);
+        let (chain, p) = e.pending_hedges.iter().next().expect("an obligation");
+        assert_eq!(
+            p.entry,
+            Some(EntryLeg {
+                venue: Venue::Kalshi,
+                market_id: "K".into(),
+                side: BookSide::Bid,
+                price: "0.31".into(),
+                role: Role::Maker,
+            }),
+            "the obligation knows the leg it could take back"
+        );
+        let chain = chain.clone();
+
+        // The attempt the tick places on a `SellBack`: Kalshi's bid, sold into.
+        e.hedge_orders.insert(
+            "h9".into(),
+            HedgeOrder {
+                maker_order_id: "m1".into(),
+                chain_id: chain.clone(),
+                market_id: "K".into(),
+                venue: Venue::Kalshi,
+                side: BookSide::Ask,
+                price: "0.36".into(),
+                qty: 5,
+                cum_filled: 0,
+                supersedes: Some(chain.clone()),
+                sell_back: true,
+            },
+        );
+        let arm = e.attribute_fill("h9", 5, Venue::Kalshi, "K", 2.0, Instant::now());
+        assert!(matches!(arm, FillArm::Hedge));
+        assert!(!e.pending_hedges.contains_key(&chain), "the obligation is discharged");
+        assert_eq!(rv.open_ct("synth-attribution-rel"), 0.0, "and the caps see it closed now");
+
+        let recs = crate::ledger::read(lp).unwrap();
+        assert_eq!(recs.len(), 1);
+        let r = &recs[0];
+        assert_eq!((r["status"].as_str(), r["strategy"].as_str()), (Some("realized"), Some("naked-sellback")));
+        assert_eq!(r["legs"][0]["side"], "bid");
+        assert_eq!(r["legs"][0]["order_id"], "m1");
+        assert_eq!(r["legs"][1]["venue"], "kalshi", "the same venue");
+        assert_eq!(r["legs"][1]["market_id"], "K", "the same market");
+        assert_eq!(r["legs"][1]["side"], "ask");
+        assert_eq!(r["legs"][1]["yes_price"], "0.36");
+        assert_eq!(r["legs"][1]["order_id"], "h9");
+        assert!(
+            !crate::ledger::open_exposure(recs.clone()).contains_key("synth-attribution-rel"),
+            "a restart seeds no exposure from a close"
+        );
+
+        let minted = serde_json::json!({"hedge_needed": "P", "order_id": "m1", "qty": 5,
+                                        "anchor_price": "0.40", "ts": 1.0})
+        .to_string();
+        assert_eq!(crate::orphan::undischarged(&minted, vec![]).len(), 1, "uncredited, an orphan");
+        assert!(
+            crate::orphan::undischarged(&minted, recs).is_empty(),
+            "the census credits the sell-back, so no restart re-seeds it as naked"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A previous run's naked leg, ADOPTED at boot and sold back, closes the
+    /// loop the same way: the close names the ORIGINAL maker order, so the next
+    /// boot's census credits it, and it releases the exposure the census seeded
+    /// this boot (the adopted entry was never `record_open`ed by this process).
+    #[test]
+    fn an_adopted_sell_back_closes_what_the_census_seeded() {
+        let dir = std::env::temp_dir().join(format!("arb-fill-adopt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exec = dir.join("exec.yaml");
+        std::fs::write(&exec, "bankroll_usd: 980\nper_class_cap: 0.35\n").unwrap();
+        let ledger = dir.join("trades.jsonl");
+        let lp = ledger.to_str().unwrap();
+        let rv = std::sync::Arc::new(crate::risk::RiskView::load(
+            exec.to_str().unwrap(),
+            "/nonexistent/topics.yaml",
+            vec![
+                ("kalshi".to_string(), "1000".to_string()),
+                ("polymarket_us".to_string(), "1000".to_string()),
+            ],
+            HashMap::from([("heisman-jsmit".to_string(), "low".to_string())]),
+        ));
+        // What `seed_exposure_from_census` books at boot, adopted or not.
+        rv.record_open("heisman-jsmit", "cross-venue-equivalent", 8.0);
+        let mut cfg = test_cfg();
+        cfg.risk = Some(rv.clone());
+        cfg.ledger_path = Some(lp.to_string());
+        let mut e = test_engine(cfg);
+        e.next_hedge_oid = 41;
+        e.adopt_obligations(vec![crate::orphan::Adopted {
+            maker_order_id: "m1790405158370".into(),
+            rel_id: "heisman-jsmit".into(),
+            class: "cross-venue-equivalent",
+            strategy: "maker-hedge",
+            entry: intent::Place {
+                count: 8,
+                old_price: None,
+                order_id: "m1790405158370".into(),
+                place: "K".into(),
+                price: "0.2500".into(),
+                replaces: None,
+                retry: None,
+                side: BookSide::Ask,
+                tag: None,
+                taker: false,
+                ts: 1790458125.497612,
+                venue: Venue::Kalshi,
+            },
+            hedge_venue: Venue::PolymarketUs,
+            hedge_market: "P".into(),
+            anchor_price: "0.1300".into(),
+            qty: 8,
+            first_ts: 1790458158.8566701,
+        }]);
+
+        // The attempt the tick places on a `SellBack`: Kalshi's ask, lifted.
+        e.hedge_orders.insert(
+            "h43".into(),
+            HedgeOrder {
+                maker_order_id: "m1790405158370".into(),
+                chain_id: "h42".into(),
+                market_id: "K".into(),
+                venue: Venue::Kalshi,
+                side: BookSide::Bid,
+                price: "0.22".into(),
+                qty: 8,
+                cum_filled: 0,
+                supersedes: None,
+                sell_back: true,
+            },
+        );
+        let arm = e.attribute_fill("h43", 8, Venue::Kalshi, "K", 2.0, Instant::now());
+        assert!(matches!(arm, FillArm::Hedge));
+        assert!(e.pending_hedges.is_empty(), "the adopted obligation is discharged");
+        assert_eq!(rv.open_ct("heisman-jsmit"), 0.0, "and the census seed is released");
+
+        let recs = crate::ledger::read(lp).unwrap();
+        assert_eq!(recs.len(), 1);
+        let r = &recs[0];
+        assert_eq!((r["status"].as_str(), r["strategy"].as_str()), (Some("realized"), Some("naked-sellback")));
+        assert_eq!(r["legs"][0]["order_id"], "m1790405158370", "the ORIGINAL maker order");
+        assert_eq!((r["legs"][0]["side"].as_str(), r["legs"][0]["yes_price"].as_str()), (Some("ask"), Some("0.2500")));
+        assert_eq!((r["legs"][1]["side"].as_str(), r["legs"][1]["yes_price"].as_str()), (Some("bid"), Some("0.22")));
+        let minted = r#"{"anchor_price":"0.1300","hedge_needed":"P","order_id":"m1790405158370","qty":8,"ts":1790458158.8566701}"#;
+        assert!(
+            crate::orphan::undischarged(minted, recs).is_empty(),
+            "the next boot's census credits it, so it is neither re-adopted nor re-seeded"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

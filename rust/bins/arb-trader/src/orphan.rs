@@ -83,9 +83,29 @@
 //! LEDGER, so an obligation that never booked a basket has no cost basis for
 //! either of them to act on. See `naked_act`, which refuses exactly that case by
 //! name.
+//!
+//! SECOND UPDATE (2026-09-26): the engine now ADOPTS an undischarged obligation
+//! back into its own hedge loop (`adopt`), and none of the objections above
+//! applies to what it adopts:
+//!
+//!   * the anchor comes from the census, and the cost basis comes from the
+//!     entry's own `Place` intent in the same stream (`entry_places`);
+//!   * the engine is the owner already working its live obligations, and it
+//!     publishes them to `--positions-recon-act` as in flight;
+//!   * `arbbot-hedge.timer` is stopped.
+//!
+//! The venue is read, but only as a VETO, never as a source. An obligation is
+//! adopted only when the pair's venue imbalance still shows at least what the
+//! census claims, in the entry's direction. That is the one thing the census
+//! cannot know: whether a previous process's hedge filled after the process
+//! stopped recording, or a human closed the leg by hand. Anything the veto
+//! cannot vouch for is reported exactly as before.
 
+use arb_core::intent::{Place, Tag};
+use arb_core::model::{BookSide, Venue};
+use arb_core::scan::Rel;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One maker order whose hedge obligations were not all booked.
 ///
@@ -95,7 +115,7 @@ use std::collections::BTreeMap;
 /// captured once per ORDER (`drain_intents` registers it on the place, and
 /// every obligation minted from that order's fills carries the same one), so
 /// the anchor below is exact however many obligations the order minted.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Undischarged {
     /// The maker (or take-take leg 1) order the obligations were minted from.
     pub maker_order_id: String,
@@ -137,10 +157,18 @@ pub fn undischarged(intents: &str, ledger: Vec<Value>) -> Vec<Undischarged> {
     // An `unwound` record does NOT reduce `booked`. Unwinding closes a
     // position that was hedged; the hedge still happened. Netting it out here
     // would resurrect every closed basket as an orphan.
+    //
+    // A `naked-sellback` record is the one `realized` record that DOES credit:
+    // the engine discharged that obligation by taking the entry back on its
+    // own venue instead of hedging it, so the contracts are closed, not naked.
+    // Skipping it would seed them back as exposure on the next restart.
     let mut booked: BTreeMap<String, i64> = BTreeMap::new();
     let mut unjoined: Vec<Unjoined> = Vec::new();
     for r in &ledger {
-        if r.get("status").and_then(|v| v.as_str()) != Some("open") {
+        let field = |k: &str| r.get(k).and_then(|v| v.as_str());
+        let sold_back = field("status") == Some("realized")
+            && field("strategy") == Some("naked-sellback");
+        if field("status") != Some("open") && !sold_back {
             continue;
         }
         // Read as f64 and truncate, because `ledger::open_exposure` reads this
@@ -382,8 +410,8 @@ pub fn report(
     // Said once, after the list: the reason is the same for all of them, and a
     // repeated paragraph is a paragraph nobody reads.
     out.push(
-        "[hedge] This engine's HEDGE RETRY will not touch these — the obligations belong to \
-         a previous process and nothing here can re-mint them. Naked-leg completion from \
+        "[hedge] This engine's HEDGE RETRY will not touch these — they are the obligations \
+         it could NOT adopt (each `NOT ADOPTED` line above says why). Naked-leg completion from \
          venue truth belongs to exactly one owner, and there are now two spellings of it: \
          arbbot-hedge.timer (every 5 minutes, profitable-only) and this binary's own \
          --positions-recon-act. RUNNING BOTH IS A DOUBLE HEDGE, not a backup — both IOCs \
@@ -396,6 +424,203 @@ pub fn report(
             .to_string(),
     );
     out
+}
+
+/// Each census order's ENTRY, read back off the `Place` intent that opened it.
+///
+/// The census knows the hedge leg (market and anchor) but not the leg that
+/// filled, and a sell-back cannot be priced without that leg's side and price.
+/// Both are in the same append-only stream, on the order's own `Place`.
+///
+/// Only lines naming one of `ids` are parsed. The stream is the file
+/// `undischarged` has just parsed in full, and it is millions of lines.
+pub fn entry_places(intents: &str, ids: &BTreeSet<String>) -> BTreeMap<String, Place> {
+    const KEY: &str = "\"order_id\":\"";
+    let mut out = BTreeMap::new();
+    if ids.is_empty() {
+        return out;
+    }
+    for l in intents.lines() {
+        let Some(at) = l.find(KEY) else { continue };
+        let rest = &l[at + KEY.len()..];
+        let Some(end) = rest.find('"') else { continue };
+        if !ids.contains(&rest[..end]) {
+            continue;
+        }
+        // A cancel names the same order and does not parse as a place. A hedge
+        // is never an entry.
+        let Ok(p) = serde_json::from_str::<Place>(l) else { continue };
+        if p.tag == Some(Tag::Hedge) {
+            continue;
+        }
+        out.entry(p.order_id.clone()).or_insert(p);
+    }
+    out
+}
+
+/// A previous run's obligation, taken back into this run's hedge loop.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Adopted {
+    pub maker_order_id: String,
+    pub rel_id: String,
+    /// `RelType::as_str`: the class the engine's `MakerOrder` books under.
+    pub class: &'static str,
+    /// `take-take` or `maker-hedge`, off the entry's tag.
+    pub strategy: &'static str,
+    /// The entry exactly as it was placed. Its `side` is the ORDER side, and
+    /// it is also the anchor's BOOK side: `hedge_anchor` is called with the
+    /// entry's own side.
+    pub entry: Place,
+    pub hedge_venue: Venue,
+    pub hedge_market: String,
+    pub anchor_price: String,
+    /// `Undischarged::missing`.
+    pub qty: i64,
+    pub first_ts: f64,
+}
+
+/// Which of `found` this run takes back into its hedge loop, and a line for
+/// each one it does not.
+///
+/// `rels` are the relationships this run quotes. `venue` is Kalshi's and
+/// PM-US's net positions (the PM-US map a consensus read), or why they could
+/// not be read.
+///
+/// THE VETO is per Kalshi/PM-US PAIR, because the venue holds one net
+/// imbalance per pair, not one per obligation. Every census obligation on the
+/// pair is a claim on that imbalance: long for an entry bid, short for an entry
+/// ask. They are adopted together only if the imbalance, in their direction,
+/// is at least their sum. Anything else refuses the whole pair:
+///   * less than claimed: something closed part of it where the census cannot
+///     see, and which obligation that was is unknowable;
+///   * claims both ways: the venue shows only their net;
+///   * a claim with no readable entry: its direction is unknown;
+///   * no venue read at all.
+///
+/// Refusing is the status quo (the obligation is reported and seeded as
+/// before). Adopting wrongly would hedge or sell back contracts that are not
+/// naked, which OPENS exposure the other way.
+///
+/// An absent row reads as 0, unlike in `positions::find`, which skips a pair
+/// whose PM-US row is missing. That rule guards against a dropped row faking a
+/// naked leg out of nothing; here the census has already claimed the leg, and
+/// the read can only confirm up to what it claimed.
+pub fn adopt(
+    found: &[Undischarged],
+    places: &BTreeMap<String, Place>,
+    rels: &[&Rel],
+    venue: Result<(&crate::positions::NetMap, &crate::positions::NetMap), &str>,
+) -> (Vec<Adopted>, Vec<String>) {
+    struct Claim<'a> {
+        u: &'a Undischarged,
+        entry: &'a Place,
+        rel: Option<&'a Rel>,
+        hedge_venue: Venue,
+        sign: f64,
+    }
+    let refuse = |u: &Undischarged, why: &str| {
+        format!(
+            "[hedge] NOT ADOPTED {}x {} (order {}): {why}",
+            u.missing(),
+            u.hedge_market,
+            u.maker_order_id
+        )
+    };
+    let mut refused = Vec::new();
+    let mut no_entry: BTreeSet<&str> = BTreeSet::new();
+    let mut pairs: BTreeMap<(String, String), Vec<Claim>> = BTreeMap::new();
+    for u in found {
+        let Some(entry) = places.get(&u.maker_order_id) else {
+            no_entry.insert(&u.hedge_market);
+            refused.push(refuse(
+                u,
+                "no `Place` intent in --out names this order, so the entry's side and \
+                 price are unknown",
+            ));
+            continue;
+        };
+        let (key, hedge_venue) = match entry.venue {
+            Venue::Kalshi => ((entry.place.clone(), u.hedge_market.clone()), Venue::PolymarketUs),
+            Venue::PolymarketUs => ((u.hedge_market.clone(), entry.place.clone()), Venue::Kalshi),
+            Venue::Polymarket => {
+                refused.push(refuse(u, "the entry is not on Kalshi or PM-US"));
+                continue;
+            }
+        };
+        let rel = rels.iter().copied().find(|r| {
+            r.legs.len() == 2
+                && r.legs.iter().any(|l| l.venue == entry.venue && l.market_id == entry.place)
+                && r.legs.iter().any(|l| l.venue == hedge_venue && l.market_id == u.hedge_market)
+        });
+        let sign = match entry.side {
+            BookSide::Bid => 1.0,
+            BookSide::Ask => -1.0,
+        };
+        pairs.entry(key).or_default().push(Claim { u, entry, rel, hedge_venue, sign });
+    }
+
+    let mut adopted = Vec::new();
+    for ((kalshi, pmus), claims) in pairs {
+        let need: i64 = claims.iter().map(|c| c.u.missing()).sum();
+        let sign = claims[0].sign;
+        let veto = if no_entry.contains(kalshi.as_str()) || no_entry.contains(pmus.as_str()) {
+            Some("another obligation on this pair has no readable entry, so the venue's \
+                  imbalance cannot be split between them"
+                .to_string())
+        } else if claims.iter().any(|c| c.sign != sign) {
+            Some("the census owes hedges BOTH ways on this pair, and the venue shows only \
+                  their net"
+                .to_string())
+        } else {
+            match venue {
+                Err(e) => Some(format!("venue positions could not be read ({e})")),
+                Ok((k, p)) => {
+                    let kq = k.get(&kalshi).copied().unwrap_or(0.0);
+                    let pq = p.get(&pmus).copied().unwrap_or(0.0);
+                    let have = (sign * (kq + pq)).round() as i64;
+                    let at = format!("kalshi {kalshi} {kq:+}, pmus {pmus} {pq:+}");
+                    if have <= 0 {
+                        Some(format!(
+                            "the venue shows no naked leg in the entry's direction on this \
+                             pair ({at})"
+                        ))
+                    } else {
+                        (have < need).then(|| {
+                            format!(
+                                "the venue shows {have} naked in the entry's direction on this \
+                                 pair ({at}) against {need} claimed, so something closed part \
+                                 of it where the census cannot see"
+                            )
+                        })
+                    }
+                }
+            }
+        };
+        for c in claims {
+            if let Some(why) = veto.as_deref() {
+                refused.push(refuse(c.u, why));
+                continue;
+            }
+            let Some(rel) = c.rel else {
+                refused.push(refuse(c.u, "not a two-leg relationship this run quotes"));
+                continue;
+            };
+            adopted.push(Adopted {
+                maker_order_id: c.u.maker_order_id.clone(),
+                rel_id: rel.id.clone(),
+                class: rel.rtype.as_str(),
+                strategy: if c.entry.tag == Some(Tag::TakeTake) { "take-take" } else { "maker-hedge" },
+                entry: c.entry.clone(),
+                hedge_venue: c.hedge_venue,
+                hedge_market: c.u.hedge_market.clone(),
+                anchor_price: c.u.anchor_price.clone(),
+                qty: c.u.missing(),
+                first_ts: c.u.first_ts,
+            });
+        }
+    }
+    adopted.sort_by(|a, b| a.first_ts.total_cmp(&b.first_ts));
+    (adopted, refused)
 }
 
 #[cfg(test)]
@@ -707,4 +932,195 @@ mod tests {
             "and the OLDER obligation is credited first, deterministically"
         );
     }
+
+    // ---------------------------------------------------------- adoption ---
+
+    use crate::positions::NetMap;
+    use arb_core::scan::{RelLeg, RelType};
+
+    /// The jersmi entries exactly as the live m3 stream holds them: amends,
+    /// the cancels that name the same orders, and the obligations they minted
+    /// (2026-09-26, 109 naked, Kalshi YES sold, owed on PM-US).
+    const JERSMI: &str = concat!(
+        r#"{"count":25,"order_id":"m1790405158260","place":"KXHEISMAN-27-JSMIT","price":"0.2100","side":"ask","ts":1790450311.7996716,"venue":"kalshi"}"#, "\n",
+        r#"{"count":25,"old_price":"0.2100","order_id":"m1790405158268","place":"KXHEISMAN-27-JSMIT","price":"0.2200","replaces":"m1790405158260","side":"ask","ts":1790450765.9260356,"venue":"kalshi"}"#, "\n",
+        r#"{"count":25,"old_price":"0.2200","order_id":"m1790405158272","place":"KXHEISMAN-27-JSMIT","price":"0.2100","replaces":"m1790405158268","side":"ask","ts":1790450950.1797247,"venue":"kalshi"}"#, "\n",
+        r#"{"cancel":"KXHEISMAN-27-JSMIT","order_id":"m1790405158272","price":"0.2100","side":"ask","ts":1790451001.439151,"venue":"kalshi"}"#, "\n",
+        r#"{"count":21,"order_id":"m1790405158275","place":"KXHEISMAN-27-JSMIT","price":"0.2100","side":"ask","ts":1790451001.7156053,"venue":"kalshi"}"#, "\n",
+        r#"{"count":5,"order_id":"m1790405158347","place":"KXHEISMAN-27-JSMIT","price":"0.2300","side":"ask","ts":1790454993.0915456,"venue":"kalshi"}"#, "\n",
+        r#"{"count":8,"order_id":"m1790405158370","place":"KXHEISMAN-27-JSMIT","price":"0.2500","side":"ask","ts":1790458125.497612,"venue":"kalshi"}"#, "\n",
+        r#"{"anchor_price":"0.1300","hedge_needed":"tec-cfb-heisman-2026-12-13-w-jersmi","order_id":"m1790405158260","qty":25,"ts":1790450514.9450998}"#, "\n",
+        r#"{"anchor_price":"0.1300","hedge_needed":"tec-cfb-heisman-2026-12-13-w-jersmi","order_id":"m1790405158268","qty":25,"ts":1790450948.9841676}"#, "\n",
+        r#"{"anchor_price":"0.1300","hedge_needed":"tec-cfb-heisman-2026-12-13-w-jersmi","order_id":"m1790405158272","qty":25,"ts":1790450970.6412802}"#, "\n",
+        r#"{"anchor_price":"0.1300","hedge_needed":"tec-cfb-heisman-2026-12-13-w-jersmi","order_id":"m1790405158275","qty":18,"ts":1790451007.2941551}"#, "\n",
+        r#"{"anchor_price":"0.1300","hedge_needed":"tec-cfb-heisman-2026-12-13-w-jersmi","order_id":"m1790405158275","qty":3,"ts":1790451023.9008741}"#, "\n",
+        r#"{"anchor_price":"0.1300","hedge_needed":"tec-cfb-heisman-2026-12-13-w-jersmi","order_id":"m1790405158347","qty":5,"ts":1790455344.568315}"#, "\n",
+        r#"{"anchor_price":"0.1300","hedge_needed":"tec-cfb-heisman-2026-12-13-w-jersmi","order_id":"m1790405158370","qty":8,"ts":1790458158.8566701}"#, "\n",
+    );
+    const JK: &str = "KXHEISMAN-27-JSMIT";
+    const JP: &str = "tec-cfb-heisman-2026-12-13-w-jersmi";
+
+    fn rel(id: &str, k: &str, p: &str) -> Rel {
+        Rel {
+            id: id.into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: k.into() },
+                RelLeg { venue: Venue::PolymarketUs, market_id: p.into() },
+            ],
+        }
+    }
+
+    fn net(rows: &[(&str, f64)]) -> NetMap {
+        rows.iter().map(|(m, q)| (m.to_string(), *q)).collect()
+    }
+
+    /// Census, entries and adoption, the way boot runs them.
+    fn run(
+        intents: &str,
+        rels: &[&Rel],
+        venue: Result<(&NetMap, &NetMap), &str>,
+    ) -> (Vec<Adopted>, Vec<String>) {
+        let found = undischarged(intents, vec![]);
+        let ids = found.iter().map(|u| u.maker_order_id.clone()).collect();
+        adopt(&found, &entry_places(intents, &ids), rels, venue)
+    }
+
+    /// Every entry is recovered from its own `Place`: the amend's new price,
+    /// not the price it replaced, and not the cancel that names the same id.
+    #[test]
+    fn entry_places_reads_each_orders_own_place() {
+        let ids: BTreeSet<String> =
+            ["m1790405158268", "m1790405158272", "m1790405158370"].map(String::from).into();
+        let got = entry_places(JERSMI, &ids);
+        assert_eq!(got.len(), 3);
+        let p = &got["m1790405158268"];
+        assert_eq!((p.place.as_str(), p.price.as_str(), p.side, p.count), (JK, "0.2200", BookSide::Ask, 25));
+        assert_eq!(got["m1790405158272"].price, "0.2100", "the cancel line is not read as the entry");
+        assert_eq!(got["m1790405158370"].price, "0.2500");
+    }
+
+    /// A hedge `Place` is never an entry, even if it names a census id.
+    #[test]
+    fn entry_places_skips_hedges() {
+        let line = r#"{"count":5,"order_id":"h7","place":"P","price":"0.30","side":"bid","tag":"hedge","taker":true,"ts":1.0,"venue":"polymarket_us"}"#;
+        let ids: BTreeSet<String> = ["h7".to_string()].into();
+        assert!(entry_places(line, &ids).is_empty());
+    }
+
+    /// THE CASE THIS WAS BUILT FOR. On 2026-09-26 the venue showed Kalshi
+    /// −104 and PM-US −5 on this pair: 109 short, exactly what the census
+    /// claims. All 7 obligations come back, oldest first, with the entry each
+    /// was minted from and the anchor it was proven at.
+    #[test]
+    fn jersmi_is_adopted_whole() {
+        let r = rel("heisman-jsmit", JK, JP);
+        let (k, p) = (net(&[(JK, -104.0)]), net(&[(JP, -5.0)]));
+        let (got, refused) = run(JERSMI, &[&r], Ok((&k, &p)));
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!(got.len(), 6, "one per maker order; 275's two obligations are one");
+        assert_eq!(got.iter().map(|a| a.qty).sum::<i64>(), 109);
+        assert_eq!(got[0].maker_order_id, "m1790405158260");
+        let a = got.iter().find(|a| a.maker_order_id == "m1790405158275").unwrap();
+        assert_eq!(a.qty, 21);
+        assert_eq!(a.first_ts, 1790451007.2941551, "the EARLIER of its two obligations");
+        assert_eq!((a.entry.venue, a.entry.side, a.entry.price.as_str()), (Venue::Kalshi, BookSide::Ask, "0.2100"));
+        assert_eq!((a.hedge_venue, a.hedge_market.as_str(), a.anchor_price.as_str()), (Venue::PolymarketUs, JP, "0.1300"));
+        assert_eq!((a.rel_id.as_str(), a.class, a.strategy), ("heisman-jsmit", "cross-venue-equivalent", "maker-hedge"));
+    }
+
+    /// One contract less on the venue than claimed, and NONE is adopted: which
+    /// obligation was closed is unknowable, and hedging all of them would open
+    /// one contract the other way.
+    #[test]
+    fn a_venue_short_of_the_claim_refuses_the_whole_pair() {
+        let r = rel("heisman-jsmit", JK, JP);
+        let (k, p) = (net(&[(JK, -103.0)]), net(&[(JP, -5.0)]));
+        let (got, refused) = run(JERSMI, &[&r], Ok((&k, &p)));
+        assert!(got.is_empty());
+        assert_eq!(refused.len(), 6);
+        assert!(refused[0].contains("NOT ADOPTED") && refused[0].contains("108 naked"), "{}", refused[0]);
+        assert!(refused[0].contains("108 naked in the entry's direction"), "{}", refused[0]);
+    }
+
+    /// A position the other way is not the census's naked leg, however large.
+    #[test]
+    fn a_venue_imbalance_the_other_way_refuses() {
+        let r = rel("heisman-jsmit", JK, JP);
+        let (k, p) = (net(&[(JK, 200.0)]), net(&[]));
+        let (got, refused) = run(JERSMI, &[&r], Ok((&k, &p)));
+        assert!(got.is_empty());
+        assert!(refused.iter().all(|l| l.contains("no naked leg in the entry's direction")), "{refused:?}");
+    }
+
+    /// No venue read is no adoption.
+    #[test]
+    fn an_unreadable_venue_refuses() {
+        let r = rel("heisman-jsmit", JK, JP);
+        let (got, refused) = run(JERSMI, &[&r], Err("pmus: positions unstable"));
+        assert!(got.is_empty());
+        assert!(refused.iter().all(|l| l.contains("pmus: positions unstable")));
+    }
+
+    /// Claims both ways on one pair cannot be told apart by a net position.
+    #[test]
+    fn claims_in_both_directions_refuse_the_pair() {
+        let intents = concat!(
+            r#"{"count":5,"order_id":"m1","place":"K","price":"0.40","side":"bid","ts":1.0,"venue":"kalshi"}"#, "\n",
+            r#"{"count":5,"order_id":"m2","place":"P","price":"0.60","side":"ask","ts":2.0,"venue":"polymarket_us"}"#, "\n",
+            r#"{"anchor_price":"0.45","hedge_needed":"P","order_id":"m1","qty":5,"ts":3.0}"#, "\n",
+            r#"{"anchor_price":"0.35","hedge_needed":"K","order_id":"m2","qty":2,"ts":4.0}"#, "\n",
+        );
+        let r = rel("r", "K", "P");
+        let (k, p) = (net(&[("K", 5.0)]), net(&[("P", -2.0)]));
+        let (got, refused) = run(intents, &[&r], Ok((&k, &p)));
+        assert!(got.is_empty());
+        assert!(refused.iter().all(|l| l.contains("BOTH ways")), "{refused:?}");
+    }
+
+    /// A PM-US entry keys the same pair from the other side, and its sign
+    /// follows its own book side: a PM-US bid is long.
+    #[test]
+    fn a_pmus_entry_is_adopted_against_kalshi() {
+        let intents = concat!(
+            r#"{"count":4,"order_id":"t9","place":"P","price":"0.30","side":"bid","tag":"take-take","taker":true,"ts":1.0,"venue":"polymarket_us"}"#, "\n",
+            r#"{"anchor_price":"0.33","hedge_needed":"K","order_id":"t9","qty":4,"ts":2.0}"#, "\n",
+        );
+        let r = rel("r", "K", "P");
+        let (k, p) = (net(&[]), net(&[("P", 4.0)]));
+        let (got, refused) = run(intents, &[&r], Ok((&k, &p)));
+        assert!(refused.is_empty(), "{refused:?}");
+        assert_eq!((got[0].hedge_venue, got[0].hedge_market.as_str(), got[0].strategy), (Venue::Kalshi, "K", "take-take"));
+    }
+
+    /// An obligation whose entry cannot be read poisons its pair: its
+    /// direction is unknown, so the venue imbalance cannot vouch for the rest.
+    #[test]
+    fn a_missing_entry_poisons_the_pair() {
+        let intents = concat!(
+            r#"{"count":5,"order_id":"m1","place":"K","price":"0.40","side":"bid","ts":1.0,"venue":"kalshi"}"#, "\n",
+            r#"{"anchor_price":"0.45","hedge_needed":"P","order_id":"m1","qty":5,"ts":3.0}"#, "\n",
+            r#"{"anchor_price":"0.45","hedge_needed":"P","order_id":"m0","qty":2,"ts":2.0}"#, "\n",
+        );
+        let r = rel("r", "K", "P");
+        let (k, p) = (net(&[("K", 50.0)]), net(&[]));
+        let (got, refused) = run(intents, &[&r], Ok((&k, &p)));
+        assert!(got.is_empty());
+        assert_eq!(refused.len(), 2);
+        assert!(refused.iter().any(|l| l.contains("m0") && l.contains("no `Place`")));
+        assert!(refused.iter().any(|l| l.contains("m1") && l.contains("no readable entry")));
+    }
+
+    /// A pair this run does not quote is reported, not adopted: without the
+    /// relationship there is no class to book under and no rel to hedge in.
+    #[test]
+    fn an_unquoted_relationship_is_not_adopted() {
+        let r = rel("other", "K2", "P2");
+        let (k, p) = (net(&[(JK, -109.0)]), net(&[]));
+        let (got, refused) = run(JERSMI, &[&r], Ok((&k, &p)));
+        assert!(got.is_empty());
+        assert!(refused.iter().all(|l| l.contains("not a two-leg relationship")));
+    }
 }
+

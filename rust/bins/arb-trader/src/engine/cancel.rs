@@ -1386,7 +1386,12 @@ mod cancel_addressing_tests {
         let retry = intent(
             r#"{"count":5,"order_id":"h2","place":"KXTEST","price":"0.30","side":"ask","tag":"hedge","retry":2,"taker":true,"ts":1.0,"venue":"kalshi"}"#,
         );
-        let want = crate::exec::Superseded { venue_order_id: "venue-h1".into(), credited: 0 };
+        let want = crate::exec::Superseded {
+            venue: Venue::Kalshi,
+            market_id: "KXTEST".into(),
+            venue_order_id: "venue-h1".into(),
+            credited: 0,
+        };
         let acts =
             intent_actions(&retry, true, &HashMap::new(), &mut parked, t0(), Some(want.clone()));
         let Action::Place { supersedes, .. } = &acts[0] else { panic!("expected a place") };

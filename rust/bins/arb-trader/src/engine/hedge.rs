@@ -8,9 +8,10 @@
 //! through a `tokio::select!` arm over live channels when all four of those
 //! defects were written.
 
-use super::fill::{UnclaimedFill, FILL_ACK_GRACE};
+use super::fill::{MakerOrder, UnclaimedFill, FILL_ACK_GRACE};
 use super::{Engine, HedgeRetry};
 use arb_core::book::BookBuilder;
+use arb_core::fees::{FeeSchedule, Role};
 use arb_core::fill::HedgeAnchor;
 use arb_core::intent::{self, Intent, Tag};
 use arb_core::model::{BookSide, Venue};
@@ -89,6 +90,11 @@ pub(super) struct PendingHedge {
     /// for the LIFE of the obligation: it is the only price `max_slip` may be
     /// measured against, and it also carries the hedge leg's venue/market/side.
     pub(super) anchor: HedgeAnchor,
+    /// The leg whose fill created this obligation — the book a SELL-BACK
+    /// takes. `None` only if the maker order is unknown to `order_rel`, which
+    /// is never pruned; such an obligation can still be hedged, but it cannot
+    /// be sold back, because nothing says what the entry cost.
+    pub(super) entry: Option<EntryLeg>,
     /// MONOTONIC time the obligation was created — how long we have been naked.
     ///
     /// NOT tape time, for exactly the reason `ParkedCancel::since` is not: tape
@@ -137,6 +143,26 @@ pub(super) struct PendingHedge {
     /// the backoff step (see `venue_reopen_park`), and is what makes this a
     /// BACKOFF rather than a second fixed interval.
     pub(super) paused_strikes: u32,
+}
+
+/// The leg an obligation's maker fill opened: everything a SELL-BACK needs to
+/// take it back on its own venue, and to prove that doing so is profitable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct EntryLeg {
+    pub(super) venue: Venue,
+    pub(super) market_id: String,
+    /// The ORDER side the entry was placed with. A sell-back takes the SAME
+    /// side of that book — an entry bid that filled left us long, so we sell
+    /// into the bid; an entry ask left us short, so we lift the ask — which is
+    /// the same rule `hedge_anchor` applies to the other leg.
+    pub(super) side: BookSide,
+    /// The entry's limit. A resting maker fills at exactly this; a take-take
+    /// leg 1 can fill better, so for it this UNDERSTATES the edge a sell-back
+    /// has to beat — the safe direction.
+    pub(super) price: String,
+    /// The fee role the entry paid: `Maker` for a rested quote, `Taker` for a
+    /// take-take leg 1.
+    pub(super) role: Role,
 }
 
 /// The first park after a halted refusal, and the ceiling the doubling stops at.
@@ -243,6 +269,11 @@ pub(super) struct HedgeOrder {
     /// because the obligation outlives its attempts and this is a fact about
     /// ONE attempt; `drain_intents` reads it back out by the place's order id.
     pub(super) supersedes: Option<String>,
+    /// This attempt takes the ENTRY back on its own venue rather than hedging
+    /// on the other one. Its fill discharges the obligation exactly as a hedge
+    /// fill does, but it books a round trip instead of a basket and releases
+    /// the exposure the entry opened — see `book_basket`.
+    pub(super) sell_back: bool,
 }
 
 /// The attempt a hedge place must reconcile against venue truth before it is
@@ -273,10 +304,20 @@ pub(super) fn superseded(
     oid_venue: &HashMap<String, String>,
     order_id: &str,
 ) -> Option<crate::exec::Superseded> {
-    let mut at = hedge_orders.get(order_id)?.supersedes.clone();
+    let this = hedge_orders.get(order_id)?;
+    let mut at = this.supersedes.clone();
     while let Some(prior) = at {
+        let ph = hedge_orders.get(&prior);
         if let Some(vid) = oid_venue.get(&prior) {
             return Some(crate::exec::Superseded {
+                // WHERE that attempt is, which since the sell-back need not be
+                // where this one goes: a chain can hedge on one venue and sell
+                // back on the other, and asking a venue about an id it never
+                // issued answers nothing. Falls back to THIS attempt's venue —
+                // the only one there was before sell-backs — on the same
+                // unreachable path as `credited` below.
+                venue: ph.map_or(this.venue, |h| h.venue),
+                market_id: ph.map_or_else(|| this.market_id.clone(), |h| h.market_id.clone()),
                 venue_order_id: vid.clone(),
                 // What we have ALREADY booked for that attempt. The executor
                 // compares the venue's total against this, never against zero:
@@ -288,10 +329,10 @@ pub(super) fn superseded(
                 // the fail-CLOSED reading — anything the venue reports then
                 // exceeds it and the retry is withheld. Entries are never
                 // removed from that map, so this should be unreachable.
-                credited: hedge_orders.get(&prior).map_or(0, |h| h.cum_filled),
+                credited: ph.map_or(0, |h| h.cum_filled),
             });
         }
-        at = hedge_orders.get(&prior).and_then(|h| h.supersedes.clone());
+        at = ph.and_then(|h| h.supersedes.clone());
     }
     None
 }
@@ -369,6 +410,11 @@ enum HedgePlan {
     Wait,
     /// Re-place exactly what is still missing, at `price`.
     Retry { qty: i64, price: String },
+    /// The hedge would `Wait`, but the ENTRY can be taken back on its own
+    /// venue at `price` for a profit — so take exactly what is still missing
+    /// there instead. Geoff 2026-09-26: "we should be happy to either sell it
+    /// back or hedge on other venue". Never at a loss: see `sell_back_acceptable`.
+    SellBack { qty: i64, price: String },
 }
 
 /// How long an obligation defers to an unattributed fill on its market before
@@ -483,6 +529,48 @@ pub(super) fn first_attempt_acceptable(
     }
 }
 
+/// May a SELL-BACK of `qty` take `touch` on the entry leg's own book?
+///
+/// Only if the round trip clears `naked_act::MIN_LOCK` per contract after BOTH
+/// fees — the one the entry paid and the taker fee this pays — which is the
+/// standing policy for naked legs: work them out at a profit, never dump them.
+/// An entry bid at `m` sold back into the bid at `t` makes `t - m`; an entry
+/// ask bought back off the ask makes `m - t`.
+///
+/// Fees are charged on `qty` for both legs even though the entry may have
+/// filled as a larger order. Kalshi rounds each order UP to the cent, so the
+/// fee on the smaller size is never less per contract than the share the
+/// entry actually paid — the conservative reading.
+///
+/// No slip budget, because nothing here is measured against an anchor: the
+/// entry's own price IS the bar, and the IOC's limit is `touch`, so a phantom
+/// touch on a stale or crossed book can only fail to fill, never fill worse.
+pub(super) fn sell_back_acceptable(
+    cx: &mut Cx,
+    fees: &FeeSchedule,
+    entry: &EntryLeg,
+    touch: &str,
+    qty: i64,
+) -> bool {
+    if qty <= 0 {
+        return false;
+    }
+    let (Some(m), Some(t)) = (cx.parse(&entry.price), cx.parse(touch)) else { return false };
+    let q = cx.from_i64(qty);
+    let per_ct = match entry.side {
+        BookSide::Bid => cx.sub(t, m),
+        BookSide::Ask => cx.sub(m, t),
+    };
+    let gross = cx.mul(per_ct, q);
+    let fee_in = fees.fee(cx, entry.venue, entry.role, m, q, "");
+    let fee_out = fees.fee(cx, entry.venue, Role::Taker, t, q, "");
+    let net = cx.sub(gross, fee_in);
+    let net = cx.sub(net, fee_out);
+    let min = cx.parse_exact(crate::naked_act::MIN_LOCK);
+    let floor = cx.mul(min, q);
+    cx.cmp(net, floor) != std::cmp::Ordering::Less
+}
+
 /// The naked-position alarm: fires ONCE per obligation, on the age of its FIRST
 /// attempt, and independently of whether the retry is placing or waiting —
 /// because waiting is the policy, and waiting must never be silent.
@@ -548,9 +636,11 @@ pub(super) fn hedge_anchor(
 ///
 /// Returns `(chain id, plan, alarm line)`, sorted by chain id: the dispatch
 /// that follows must not depend on `HashMap` iteration order.
+#[allow(clippy::too_many_arguments)]
 fn hedge_tick_plans(
     cx: &mut Cx,
     pol: &HedgeRetry,
+    fees: &FeeSchedule,
     pending: &HashMap<String, PendingHedge>,
     books: &BookBuilder,
     oid_venue: &HashMap<String, String>,
@@ -595,11 +685,16 @@ fn hedge_tick_plans(
         // fill on its market plausibly be its own. An obligation whose
         // first attempt the slip gate refused has nothing at the venue,
         // so holding it would be added naked time bought for nothing.
+        //
+        // On EITHER leg's market: since the sell-back, that attempt may have
+        // been placed on the entry's own book rather than the hedge leg's.
+        let on_our_legs = |u: &UnclaimedFill| {
+            (u.venue == p.anchor.venue && u.market_id == p.anchor.market_id)
+                || p.entry.as_ref().is_some_and(|e| u.venue == e.venue && u.market_id == e.market_id)
+        };
         let ack_outstanding = p.latest_attempt.as_ref().is_some_and(|a| !oid_venue.contains_key(a))
-            && unclaimed.values().any(|u| {
-                u.market_id == p.anchor.market_id && p.anchor.venue == u.venue
-            });
-        let plan = hedge_plan(
+            && unclaimed.values().any(on_our_legs);
+        let mut plan = hedge_plan(
             cx,
             pol,
             p.owed,
@@ -612,6 +707,29 @@ fn hedge_tick_plans(
             ack_outstanding,
             p.parked_until,
         );
+        // THE SECOND WAY OUT, and only when the first is closed. A `Wait` has
+        // already cleared every hold above it — the retry interval, a halted
+        // venue's park, a fill that may be our own — so a sell-back is paced
+        // and guarded exactly as a hedge retry is. Hedging stays FIRST: it is
+        // the basket the entry was quoted for, and every decision it made
+        // before this existed is unchanged.
+        if plan == HedgePlan::Wait {
+            if let Some(e) = p.entry.as_ref() {
+                let qty = p.owed - p.filled;
+                let entry_touch = books
+                    .get(e.venue, &e.market_id)
+                    .and_then(|b| match e.side {
+                        BookSide::Bid => b.bids.first(),
+                        BookSide::Ask => b.asks.first(),
+                    })
+                    .map(|l| l.price.clone());
+                if let Some(t) = entry_touch {
+                    if sell_back_acceptable(cx, fees, e, &t, qty) {
+                        plan = HedgePlan::SellBack { qty, price: t };
+                    }
+                }
+            }
+        }
         // The alarm is independent of the plan: waiting is the policy
         // (Geoff 2026-07-22, "hedge only if profitable; otherwise find
         // a profitable hedge in the future"), and waiting must never be
@@ -652,6 +770,82 @@ fn hedge_tick_plans(
 }
 
 impl Engine {
+    /// Take a previous run's naked legs back into this run's hedge loop.
+    ///
+    /// Each becomes an ordinary obligation, with the same chain id scheme, plan,
+    /// sell-back and alarm as one minted by a fill this run. What differs is only
+    /// where its fields come from: the entry from its own `Place` in `--out`,
+    /// the anchor and quantity from the census (`orphan::adopt`, which also
+    /// holds the venue veto that decides what gets here at all).
+    ///
+    /// The maker order is registered in `order_rel` under its ORIGINAL id,
+    /// because that is the id the hedge's basket must name: the next startup's
+    /// census credits a basket to an obligation by it. That is also why no
+    /// `HedgeNeeded` is emitted. The obligation is already in `--out` once, and
+    /// a second copy would double what the census says is owed.
+    ///
+    /// `first_at` is backdated to the first obligation's tape time, so the naked
+    /// alarm reports the leg's real age. A leg older than the host's monotonic
+    /// clock can express falls back to now.
+    pub(super) fn adopt_obligations(&mut self, adopted: Vec<crate::orphan::Adopted>) {
+        let mono = std::time::Instant::now();
+        let now_s = arb_core::clock::now_s();
+        for a in adopted {
+            let mo = MakerOrder {
+                rel_id: a.rel_id,
+                class: a.class,
+                venue: a.entry.venue.as_str().to_string(),
+                market_id: a.entry.place.clone(),
+                side: a.entry.side,
+                price: a.entry.price.clone(),
+                strategy: a.strategy,
+            };
+            let entry = mo.entry_leg();
+            self.order_rel.entry(a.maker_order_id.clone()).or_insert(mo);
+            let age = std::time::Duration::try_from_secs_f64(now_s - a.first_ts).ok();
+            let first_at = age.and_then(|d| mono.checked_sub(d)).unwrap_or(mono);
+            self.next_hedge_oid += 1;
+            let chain = format!("h{}", self.next_hedge_oid);
+            eprintln!(
+                "[hedge] ADOPTED {}x {} {} (order {}, entry {} {} {} @ {}, anchor {}, naked \
+                 {:.1}h) as obligation {chain}",
+                a.qty,
+                a.hedge_venue.as_str(),
+                a.hedge_market,
+                a.maker_order_id,
+                a.entry.venue.as_str(),
+                a.entry.place,
+                a.entry.side.as_str(),
+                a.entry.price,
+                a.anchor_price,
+                age.map_or(0.0, |d| d.as_secs_f64() / 3600.0),
+            );
+            self.pending_hedges.insert(
+                chain,
+                PendingHedge {
+                    maker_order_id: a.maker_order_id,
+                    owed: a.qty,
+                    filled: 0,
+                    anchor: HedgeAnchor {
+                        venue: a.hedge_venue,
+                        market_id: a.hedge_market,
+                        side: a.entry.side,
+                        price: a.anchor_price,
+                    },
+                    entry,
+                    first_at,
+                    last_try_at: mono,
+                    latest_attempt: None,
+                    tries: 0,
+                    alarmed: false,
+                    hold_logged: false,
+                    parked_until: None,
+                    paused_strikes: 0,
+                },
+            );
+        }
+    }
+
     /// The hedge deadline.
     pub(super) fn hedge_tick(&mut self) {
         let pol = self.cfg.hedge_retry.as_ref().expect("guarded above");
@@ -669,6 +863,7 @@ impl Engine {
         let plans = hedge_tick_plans(
             &mut self.cx,
             pol,
+            &self.fees,
             &self.pending_hedges,
             &self.books,
             &self.oid_venue,
@@ -690,8 +885,20 @@ impl Engine {
         // Unconditional, and that matters: an EMPTY set has to be published as
         // eagerly as a full one, or the reader's staleness guard fails closed on
         // an idle engine and no naked leg is ever completed.
+        //
+        // BOTH legs' markets, because this engine may now trade either one: a
+        // sell-back takes the entry's own book. Publishing only the hedge leg
+        // left the entry market looking unowned, and the completer would price
+        // an action there off some OTHER ledger lot while this obligation was
+        // still live.
         crate::naked_act::publish_inflight(
-            self.pending_hedges.values().map(|p| p.anchor.market_id.clone()).collect(),
+            self.pending_hedges
+                .values()
+                .flat_map(|p| {
+                    std::iter::once(p.anchor.market_id.clone())
+                        .chain(p.entry.as_ref().map(|e| e.market_id.clone()))
+                })
+                .collect(),
         );
         self.apply_hedge_plans(plans, mono);
     }
@@ -795,64 +1002,108 @@ impl Engine {
                     // cannot explain.
                     self.pending_hedges.remove(&chain);
                 }
-                HedgePlan::Retry { qty, price } => {
-                    self.next_hedge_oid += 1;
-                    let hoid = format!("h{}", self.next_hedge_oid);
-                    let Some(p) = self.pending_hedges.get_mut(&chain) else { continue };
-                    p.tries += 1;
-                    p.last_try_at = mono;
-                    // The attempt this one supersedes, captured BEFORE
-                    // `latest_attempt` moves on. Every retry gets a FRESH
-                    // client_order_id, so the venue sees two unrelated orders
-                    // and would happily fill both — its `409
-                    // order_already_exists` cannot save us here.
-                    let supersedes = p.latest_attempt.clone();
-                    // This attempt becomes the one whose `order_ack` the
-                    // ack-hold waits for, and it gets its own hold line:
-                    // a new attempt is a new ack that can go missing.
-                    p.latest_attempt = Some(hoid.clone());
-                    p.hold_logged = false;
-                    let (tries, owed, filled) = (p.tries, p.owed, p.filled);
-                    let ho = HedgeOrder {
-                        maker_order_id: p.maker_order_id.clone(),
-                        chain_id: chain.clone(),
-                        market_id: p.anchor.market_id.clone(),
-                        venue: p.anchor.venue,
-                        side: taking_side(p.anchor.side),
-                        price: price.clone(),
-                        qty,
-                        cum_filled: 0,
-                        supersedes,
-                    };
-                    self.n_retry += 1;
-                    eprintln!(
-                        "[hedge] retry {hoid} {qty}x {} @ {price} (try {tries}; \
-                         obligation {chain} owed {owed}, {filled} hedged)",
-                        ho.market_id
-                    );
-                    self.intents.push(Intent::Place(intent::Place {
-                        count: ho.qty,
-                        old_price: None,
-                        order_id: hoid.clone(),
-                        place: ho.market_id.clone(),
-                        price: ho.price.clone(),
-                        replaces: None,
-                        retry: Some(tries),
-                        side: ho.side,
-                        tag: Some(Tag::Hedge),
-                        taker: true,
-                        ts: self.last_now,
-                        venue: ho.venue,
-                    }));
-                    // EVERY attempt stays in `hedge_orders`, superseded
-                    // ones included: an IOC that filled late still has to
-                    // credit its obligation, and the obligation's key does
-                    // not move, so the credit lands on the right one.
-                    self.hedge_orders.insert(hoid, ho);
-                    self.drain_intents(Option::<&Rel>::None);
+                HedgePlan::Retry { qty, price } => self.place_attempt(&chain, qty, price, false, mono),
+                HedgePlan::SellBack { qty, price } => {
+                    self.place_attempt(&chain, qty, price, true, mono)
                 }
             }
         }
+    }
+
+    /// Put one attempt on the wire for obligation `chain`: a hedge retry on the
+    /// other leg, or (`sell_back`) a take-back on the entry's own book. Both
+    /// are one chain — same obligation, same attempt counter, same supersede
+    /// link — because both discharge the same `owed`, and an attempt of either
+    /// kind that filled unseen is exactly as dangerous to the next one.
+    fn place_attempt(
+        &mut self,
+        chain: &str,
+        qty: i64,
+        price: String,
+        sell_back: bool,
+        mono: std::time::Instant,
+    ) {
+        self.next_hedge_oid += 1;
+        let hoid = format!("h{}", self.next_hedge_oid);
+        let Some(p) = self.pending_hedges.get_mut(chain) else { return };
+        // Which book this attempt takes. `side` is the BOOK side on both
+        // branches, and `taking_side` turns it into the order side below.
+        let (venue, market_id, book_side) = if sell_back {
+            // Planned only off an obligation that has an entry, so this is
+            // unreachable; declining is the safe answer if it is not.
+            let Some(e) = p.entry.as_ref() else { return };
+            (e.venue, e.market_id.clone(), e.side)
+        } else {
+            (p.anchor.venue, p.anchor.market_id.clone(), p.anchor.side)
+        };
+        p.tries += 1;
+        p.last_try_at = mono;
+        // The attempt this one supersedes, captured BEFORE
+        // `latest_attempt` moves on. Every retry gets a FRESH
+        // client_order_id, so the venue sees two unrelated orders
+        // and would happily fill both — its `409
+        // order_already_exists` cannot save us here.
+        let supersedes = p.latest_attempt.clone();
+        // This attempt becomes the one whose `order_ack` the
+        // ack-hold waits for, and it gets its own hold line:
+        // a new attempt is a new ack that can go missing.
+        p.latest_attempt = Some(hoid.clone());
+        p.hold_logged = false;
+        let (tries, owed, filled) = (p.tries, p.owed, p.filled);
+        let entry_px = p.entry.as_ref().map(|e| e.price.clone()).unwrap_or_default();
+        let ho = HedgeOrder {
+            maker_order_id: p.maker_order_id.clone(),
+            chain_id: chain.to_string(),
+            market_id,
+            venue,
+            side: taking_side(book_side),
+            price: price.clone(),
+            qty,
+            cum_filled: 0,
+            supersedes,
+            sell_back,
+        };
+        if sell_back {
+            self.n_sell_back += 1;
+            eprintln!(
+                "[hedge] SELL-BACK {hoid} {qty}x {} on {} @ {price} (try {tries}; obligation \
+                 {chain} owed {owed}, {filled} discharged) — the hedge leg's book offers \
+                 nothing inside the budget, and taking the entry back at this price clears \
+                 the round trip against its {entry_px} after both fees",
+                ho.market_id,
+                ho.venue.as_str()
+            );
+        } else {
+            self.n_retry += 1;
+            eprintln!(
+                "[hedge] retry {hoid} {qty}x {} @ {price} (try {tries}; \
+                 obligation {chain} owed {owed}, {filled} hedged)",
+                ho.market_id
+            );
+        }
+        self.intents.push(Intent::Place(intent::Place {
+            count: ho.qty,
+            old_price: None,
+            order_id: hoid.clone(),
+            place: ho.market_id.clone(),
+            price: ho.price.clone(),
+            replaces: None,
+            retry: Some(tries),
+            side: ho.side,
+            // `Hedge` for a sell-back too, and that is load-bearing: a Hedge
+            // place is never registered in the `FillLedger`, so its fill
+            // discharges this obligation instead of minting a new one.
+            tag: Some(Tag::Hedge),
+            taker: true,
+            ts: self.last_now,
+            venue: ho.venue,
+        }));
+        // EVERY attempt stays in `hedge_orders`, superseded
+        // ones included: an IOC that filled late still has to
+        // credit its obligation, and the obligation's key does
+        // not move, so the credit lands on the right one.
+        self.hedge_orders.insert(hoid, ho);
+        self.drain_intents(Option::<&Rel>::None);
     }
 }
 
@@ -996,6 +1247,7 @@ mod hedge_deadline_tests {
             marks_out: None,
             armed: false,
             hedges_undischarged: 0,
+            adopt: Vec::new(),
         };
         // No executors: nothing can reach a venue from this test by construction.
         let handle = tokio::spawn(run(
@@ -1113,6 +1365,7 @@ mod hedge_deadline_tests {
             marks_out: None,
             armed: false,
             hedges_undischarged: 0,
+            adopt: Vec::new(),
         };
         let handle = tokio::spawn(run(
             vec![q],
@@ -1860,6 +2113,7 @@ mod hedge_accounting_tests {
             qty: 10,
             cum_filled: 0,
             supersedes: None,
+            sell_back: false,
         };
         let f1 = hedge_credit(4, 10, 0, Some((10, 0)));
         let f2 = hedge_credit(10, 10, 4, Some((10, 4)));
@@ -1917,6 +2171,7 @@ mod hedge_tick_tests {
                 side: BookSide::Bid,
                 price: "0.40".into(),
             },
+            entry: None,
             first_at: at,
             last_try_at: at,
             latest_attempt: attempt.map(str::to_string),
@@ -1977,13 +2232,13 @@ mod hedge_tick_tests {
         // an attempt of ours is out and its ack has not landed: this fill may be
         // that attempt's own, so do not re-place over it
         let mut pend = HashMap::from([("h1".to_string(), pending(Some("h1"), t))]);
-        let plans = hedge_tick_plans(&mut cx, &p, &pend, &bk, &no_acks, &park, due);
+        let plans = hedge_tick_plans(&mut cx, &p, &FeeSchedule::new(&mut Cx::default()), &pend, &bk, &no_acks, &park, due);
         assert_eq!(plans[0].1, HedgePlan::HoldForAck);
 
         // the SAME fill, but this obligation's first attempt was refused, so it
         // has nothing at the venue that could have produced it
         pend.insert("h1".to_string(), pending(None, t));
-        let plans = hedge_tick_plans(&mut cx, &p, &pend, &bk, &no_acks, &park, due);
+        let plans = hedge_tick_plans(&mut cx, &p, &FeeSchedule::new(&mut Cx::default()), &pend, &bk, &no_acks, &park, due);
         assert_eq!(
             plans[0].1,
             HedgePlan::Retry { qty: 5, price: "0.40".into() },
@@ -1994,13 +2249,13 @@ mod hedge_tick_tests {
         // either: we would have recognised it.
         pend.insert("h1".to_string(), pending(Some("h1"), t));
         let acked = HashMap::from([("h1".to_string(), "venue-side-id".to_string())]);
-        let plans = hedge_tick_plans(&mut cx, &p, &pend, &bk, &acked, &park, due);
+        let plans = hedge_tick_plans(&mut cx, &p, &FeeSchedule::new(&mut Cx::default()), &pend, &bk, &acked, &park, due);
         assert_eq!(plans[0].1, HedgePlan::Retry { qty: 5, price: "0.40".into() });
 
         // ...and a fill on a DIFFERENT market was never ambiguous at all
         pend.insert("h1".to_string(), pending(Some("h1"), t));
         let elsewhere = unclaimed("SOME-OTHER-MARKET", t);
-        let plans = hedge_tick_plans(&mut cx, &p, &pend, &bk, &no_acks, &elsewhere, due);
+        let plans = hedge_tick_plans(&mut cx, &p, &FeeSchedule::new(&mut Cx::default()), &pend, &bk, &no_acks, &elsewhere, due);
         assert_eq!(plans[0].1, HedgePlan::Retry { qty: 5, price: "0.40".into() });
     }
 
@@ -2019,6 +2274,7 @@ mod hedge_tick_tests {
         let plans = hedge_tick_plans(
             &mut cx,
             &pol(),
+            &FeeSchedule::new(&mut Cx::default()),
             &pend,
             &bk,
             &HashMap::new(),
@@ -2038,6 +2294,7 @@ mod hedge_tick_tests {
         let plans = hedge_tick_plans(
             &mut cx,
             &pol(),
+            &FeeSchedule::new(&mut Cx::default()),
             &pend,
             &sane,
             &HashMap::new(),
@@ -2099,6 +2356,7 @@ mod hedge_tick_tests {
         let plans = hedge_tick_plans(
             &mut cx,
             &pol(),
+            &FeeSchedule::new(&mut Cx::default()),
             &pend,
             &books("0.40", "0.41"),
             &HashMap::new(),
@@ -2210,6 +2468,7 @@ mod hedge_tick_tests {
                 qty: 5,
                 cum_filled: 0,
                 supersedes: None,
+                sell_back: false,
             },
         );
         e.oid_venue.insert("h1".into(), "venue-h1".into());
@@ -2228,7 +2487,12 @@ mod hedge_tick_tests {
 
         assert_eq!(
             superseded(&e.hedge_orders, &e.oid_venue, "h3"),
-            Some(crate::exec::Superseded { venue_order_id: "venue-h1".into(), credited: 0 }),
+            Some(crate::exec::Superseded {
+                venue: Venue::Kalshi,
+                market_id: "SYNTH-K-YES".into(),
+                venue_order_id: "venue-h1".into(),
+                credited: 0
+            }),
             "h2 never reached the venue, so h3 must verify h1 — the attempt still outstanding"
         );
 
@@ -2266,6 +2530,7 @@ mod hedge_tick_tests {
         let plans = hedge_tick_plans(
             &mut e.cx,
             &pol(),
+            &e.fees,
             &e.pending_hedges,
             &books("0.30", "0.31"),
             &HashMap::new(),
@@ -2298,6 +2563,7 @@ mod hedge_tick_tests {
         let plans = hedge_tick_plans(
             &mut cx,
             &pol(),
+            &FeeSchedule::new(&mut Cx::default()),
             &HashMap::from([("h1".to_string(), p)]),
             // A book that WOULD be taken — the anchor exactly. So the only
             // reason not to place is the park.
@@ -2322,6 +2588,7 @@ mod hedge_tick_tests {
         let plans = hedge_tick_plans(
             &mut cx,
             &pol(),
+            &FeeSchedule::new(&mut Cx::default()),
             &HashMap::from([("h1".to_string(), p)]),
             &books("0.40", "0.41"),
             &HashMap::new(),
@@ -2370,6 +2637,7 @@ mod hedge_tick_tests {
                 qty: 5,
                 cum_filled: 0,
                 supersedes: Some("h1".into()),
+                sell_back: false,
             },
         );
 
@@ -2415,6 +2683,7 @@ mod hedge_tick_tests {
                 qty: 5,
                 cum_filled: 0,
                 supersedes: None,
+                sell_back: false,
             },
         );
         let halted = serde_json::json!({"kind":"place_result","venue":"polymarket_us",
@@ -2429,5 +2698,441 @@ mod hedge_tick_tests {
             second.saturating_duration_since(first) >= VENUE_REOPEN_PARK_FIRST,
             "strike 2 parks a full step longer than strike 1"
         );
+    }
+}
+
+/// The SELL-BACK: a naked leg's second way out, taken back on its own venue
+/// when the hedge leg's book will not offer a price inside the budget.
+///
+/// Geoff 2026-09-26: "we should be happy to either sell it back or hedge on
+/// other venue". The case that asked for it was jersmi — 109 Kalshi YES sold
+/// as maker asks at 0.21–0.25 with the PM-US anchor at 0.13, unreachable for
+/// hours, while the Kalshi ask came back through the entry prices.
+#[cfg(test)]
+mod sell_back_tests {
+    use super::*;
+    use crate::engine::{test_cfg, test_engine, RunCfg};
+    use arb_core::model::Level;
+
+    fn entry(venue: Venue, side: BookSide, price: &str, role: Role) -> EntryLeg {
+        EntryLeg { venue, market_id: "K".into(), side, price: price.into(), role }
+    }
+
+    fn ok(e: &EntryLeg, touch: &str, qty: i64) -> bool {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        sell_back_acceptable(&mut cx, &fees, e, touch, qty)
+    }
+
+    /// The jersmi lots, priced by hand. A short entry (a maker ASK filled) is
+    /// bought back off the ask, and clears only once the spread pays BOTH
+    /// Kalshi fees — each rounded up to the cent — plus `MIN_LOCK` a contract.
+    #[test]
+    fn a_short_entry_buys_back_below_its_price_after_both_fees() {
+        let lot8 = entry(Venue::Kalshi, BookSide::Ask, "0.25", Role::Maker);
+        // 8 x 0.03 = 0.24 gross, fees 0.03 + 0.10, net 0.11 >= 8 x 0.005
+        assert!(ok(&lot8, "0.22", 8));
+
+        let lot25 = entry(Venue::Kalshi, BookSide::Ask, "0.21", Role::Maker);
+        // 25 x 0.02 = 0.50 gross, fees 0.08 + 0.27, net 0.15 >= 0.125
+        assert!(ok(&lot25, "0.19", 25));
+        // 25 x 0.01 = 0.25 gross, fees 0.08 + 0.28: a LOSS once fees are paid
+        assert!(!ok(&lot25, "0.20", 25), "a one-tick spread does not pay two fees");
+        assert!(!ok(&lot25, "0.21", 25), "flat is a loss after fees");
+        // 5 x 0.02 = 0.10 gross, fees 0.02 + 0.06: +0.02, under 5 x 0.005
+        assert!(!ok(&lot25, "0.19", 5), "a profit under MIN_LOCK is not worth the trade");
+    }
+
+    /// A long entry (a maker BID filled) is sold into the bid, so the same
+    /// touch that clears a short is a loss for a long.
+    #[test]
+    fn the_direction_is_the_entrys() {
+        let long = entry(Venue::Kalshi, BookSide::Bid, "0.40", Role::Maker);
+        // 5 x 0.05 = 0.25 gross, fees 0.03 + 0.09, net 0.13
+        assert!(ok(&long, "0.45", 5));
+        assert!(!ok(&long, "0.40", 5));
+        assert!(!ok(&long, "0.35", 5), "selling a 0.40 long at 0.35 is a loss");
+        let short = entry(Venue::Kalshi, BookSide::Ask, "0.40", Role::Maker);
+        assert!(ok(&short, "0.35", 5), "...and a gain for the matching short");
+    }
+
+    /// The fee the entry paid is its OWN role's: a take-take leg 1 crossed the
+    /// book, so it paid the taker fee and needs the wider spread to clear.
+    #[test]
+    fn a_take_take_entry_pays_the_taker_fee_it_actually_paid() {
+        let maker = entry(Venue::Kalshi, BookSide::Bid, "0.40", Role::Maker);
+        let taker = entry(Venue::Kalshi, BookSide::Bid, "0.40", Role::Taker);
+        // 5 x 0.03 = 0.15 gross; maker 0.03 + 0.09 = +0.03, taker 0.09 + 0.09
+        assert!(ok(&maker, "0.43", 5));
+        assert!(!ok(&taker, "0.43", 5));
+        assert!(ok(&taker, "0.45", 5));
+    }
+
+    /// PM-US charges no maker fee and an unrounded taker fee.
+    #[test]
+    fn a_pmus_entry_prices_its_own_venues_fees() {
+        let e = entry(Venue::PolymarketUs, BookSide::Ask, "0.30", Role::Maker);
+        // 10 x 0.02 = 0.20 gross, fees 0 + 0.12096, net 0.07904 >= 0.05
+        assert!(ok(&e, "0.28", 10));
+        assert!(!ok(&e, "0.29", 10));
+    }
+
+    #[test]
+    fn nothing_to_sell_and_an_unreadable_touch_are_refusals() {
+        let e = entry(Venue::Kalshi, BookSide::Ask, "0.25", Role::Maker);
+        assert!(!ok(&e, "0.10", 0));
+        assert!(!ok(&e, "0.10", -3));
+        assert!(!ok(&e, "not-a-price", 8));
+    }
+
+    fn pol() -> HedgeRetry {
+        HedgeRetry { interval_s: 5.0, max_slip: "0.01".into(), alarm_after_s: 60.0 }
+    }
+
+    fn after(t: std::time::Instant, secs: f64) -> std::time::Instant {
+        t + std::time::Duration::from_secs_f64(secs)
+    }
+
+    /// 5 owed on the PM-US bid at 0.40 — the maker leg bought YES on Kalshi
+    /// "K" at 0.38, so the hedge sells PM-US and a sell-back sells Kalshi.
+    fn pending(t: std::time::Instant) -> PendingHedge {
+        PendingHedge {
+            maker_order_id: "m1".into(),
+            owed: 5,
+            filled: 0,
+            anchor: HedgeAnchor {
+                venue: Venue::PolymarketUs,
+                market_id: "P".into(),
+                side: BookSide::Bid,
+                price: "0.40".into(),
+            },
+            entry: Some(entry(Venue::Kalshi, BookSide::Bid, "0.38", Role::Maker)),
+            first_at: t,
+            last_try_at: t,
+            latest_attempt: Some("h1".into()),
+            tries: 1,
+            alarmed: false,
+            hold_logged: false,
+            parked_until: None,
+            paused_strikes: 0,
+        }
+    }
+
+    fn books(p_bid: &str, k_bid: &str) -> BookBuilder {
+        let mut b = BookBuilder::new();
+        let lv = |p: &str| vec![Level { price: p.into(), size: "50".into() }];
+        b.apply_snapshot(Venue::PolymarketUs, "P", lv(p_bid), lv("0.99"), 1, 0, None);
+        b.apply_snapshot(Venue::Kalshi, "K", lv(k_bid), lv("0.99"), 1, 0, None);
+        b
+    }
+
+    fn plan_for(
+        p: PendingHedge,
+        bk: &BookBuilder,
+        acked: bool,
+        unclaimed: &HashMap<String, UnclaimedFill>,
+        mono: std::time::Instant,
+    ) -> HedgePlan {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let pend = HashMap::from([("h1".to_string(), p)]);
+        let oid_venue = if acked {
+            HashMap::from([("h1".to_string(), "venue-h1".to_string())])
+        } else {
+            HashMap::new()
+        };
+        hedge_tick_plans(&mut cx, &pol(), &fees, &pend, bk, &oid_venue, unclaimed, mono)
+            .remove(0)
+            .1
+    }
+
+    /// The sell-back replaces `Wait` and nothing else.
+    #[test]
+    fn a_sell_back_is_taken_only_where_the_hedge_would_wait() {
+        let t = std::time::Instant::now();
+        let none = HashMap::new();
+        let due = after(t, 6.0);
+
+        // hedge unreachable (bid 0.30 vs anchor 0.40), entry bid clears: sell back
+        assert_eq!(
+            plan_for(pending(t), &books("0.30", "0.45"), true, &none, due),
+            HedgePlan::SellBack { qty: 5, price: "0.45".into() }
+        );
+        // ...unless the entry book does not clear either
+        assert_eq!(plan_for(pending(t), &books("0.30", "0.39"), true, &none, due), HedgePlan::Wait);
+        // the hedge is FIRST whenever it is reachable, however good the sell-back
+        assert_eq!(
+            plan_for(pending(t), &books("0.40", "0.45"), true, &none, due),
+            HedgePlan::Retry { qty: 5, price: "0.40".into() }
+        );
+        // not due: the retry interval paces a sell-back exactly as a retry
+        let early = after(t, 1.0);
+        assert_eq!(plan_for(pending(t), &books("0.30", "0.45"), true, &none, early), HedgePlan::Hold);
+        // parked (a halted venue): parked, not sold
+        let parked = PendingHedge { parked_until: Some(after(t, 60.0)), ..pending(t) };
+        assert_eq!(plan_for(parked, &books("0.30", "0.45"), true, &none, due), HedgePlan::Parked);
+        // no entry leg known: hedge-only, as before this existed
+        let blind = PendingHedge { entry: None, ..pending(t) };
+        assert_eq!(plan_for(blind, &books("0.30", "0.45"), true, &none, due), HedgePlan::Wait);
+        // sized to what is still owed, not to the original obligation
+        let part = PendingHedge { filled: 2, ..pending(t) };
+        assert_eq!(
+            plan_for(part, &books("0.30", "0.45"), true, &none, due),
+            HedgePlan::SellBack { qty: 3, price: "0.45".into() }
+        );
+    }
+
+    /// The ack-hold covers the ENTRY market too: the attempt still waiting for
+    /// its ack may have been a sell-back, whose fill lands on Kalshi "K".
+    #[test]
+    fn an_unattributed_fill_on_the_entry_market_holds_an_unacked_chain() {
+        let t = std::time::Instant::now();
+        let fill = HashMap::from([(
+            "KX-VENUE-ID".to_string(),
+            UnclaimedFill { venue: Venue::Kalshi, market_id: "K".into(), cum: 5, since: t },
+        )]);
+        let bk = books("0.30", "0.45");
+        let due = after(t, 6.0);
+        assert_eq!(plan_for(pending(t), &bk, false, &fill, due), HedgePlan::HoldForAck);
+        assert_eq!(
+            plan_for(pending(t), &bk, true, &fill, due),
+            HedgePlan::SellBack { qty: 5, price: "0.45".into() },
+            "once acked the fill is provably not ours"
+        );
+    }
+
+    /// The act half: a SellBack places a taker IOC on the ENTRY's own market,
+    /// in the chain, verifying the hedge attempt it supersedes ON ITS VENUE.
+    #[test]
+    fn a_sell_back_places_on_the_entry_venue_and_verifies_the_prior_hedge_venue() {
+        let dir = std::env::temp_dir().join(format!("arb-sellback-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("intents.jsonl");
+        let mut e = test_engine(RunCfg {
+            hedge_retry: Some(pol()),
+            out_path: Some(out.to_string_lossy().into_owned()),
+            bench: false,
+            ..test_cfg()
+        });
+        let t = std::time::Instant::now();
+        e.next_hedge_oid = 1;
+        e.pending_hedges.insert("h1".into(), pending(t));
+        e.hedge_orders.insert(
+            "h1".into(),
+            HedgeOrder {
+                maker_order_id: "m1".into(),
+                chain_id: "h1".into(),
+                market_id: "P".into(),
+                venue: Venue::PolymarketUs,
+                side: BookSide::Ask,
+                price: "0.40".into(),
+                qty: 5,
+                cum_filled: 2,
+                supersedes: None,
+                sell_back: false,
+            },
+        );
+        e.oid_venue.insert("h1".into(), "venue-h1".into());
+
+        e.apply_hedge_plans(
+            vec![("h1".into(), HedgePlan::SellBack { qty: 5, price: "0.45".into() }, None)],
+            after(t, 6.0),
+        );
+
+        let ho = &e.hedge_orders["h2"];
+        assert_eq!((ho.venue, ho.market_id.as_str()), (Venue::Kalshi, "K"), "the entry's book");
+        assert_eq!(ho.side, BookSide::Ask, "a long entry is SOLD back: taking the bid");
+        assert_eq!((ho.qty, ho.price.as_str()), (5, "0.45"));
+        assert!(ho.sell_back);
+        assert_eq!(ho.chain_id, "h1", "the same obligation");
+        assert_eq!(ho.supersedes.as_deref(), Some("h1"));
+        assert_eq!((e.n_sell_back, e.n_retry), (1, 0));
+        let p = &e.pending_hedges["h1"];
+        assert_eq!((p.tries, p.latest_attempt.as_deref()), (2, Some("h2")));
+
+        // The executor on KALSHI must ask PM-US about h1, on h1's market.
+        assert_eq!(
+            superseded(&e.hedge_orders, &e.oid_venue, "h2"),
+            Some(crate::exec::Superseded {
+                venue: Venue::PolymarketUs,
+                market_id: "P".into(),
+                venue_order_id: "venue-h1".into(),
+                credited: 2,
+            })
+        );
+
+        let txt = std::fs::read_to_string(&out).unwrap();
+        let place: serde_json::Value = txt
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["order_id"] == "h2")
+            .expect("the sell-back reached the intent stream");
+        assert_eq!(place["tag"], "hedge", "never registered as a maker order");
+        assert_eq!(place["taker"], true, "an IOC, not a resting quote");
+        assert_eq!(place["venue"], "kalshi");
+        assert_eq!(place["place"], "K");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The chain walk stays FAIL-CLOSED when a link it passes through is not in
+    /// `hedge_orders`: it still names the acked venue id, on this attempt's own
+    /// venue and market — never `None`, which would place with no read at all.
+    #[test]
+    fn a_missing_prior_record_still_verifies() {
+        let mut orders = HashMap::new();
+        orders.insert(
+            "h2".to_string(),
+            HedgeOrder {
+                maker_order_id: "m1".into(),
+                chain_id: "h1".into(),
+                market_id: "K".into(),
+                venue: Venue::Kalshi,
+                side: BookSide::Ask,
+                price: "0.45".into(),
+                qty: 5,
+                cum_filled: 0,
+                supersedes: Some("h1".into()),
+                sell_back: true,
+            },
+        );
+        let oid_venue = HashMap::from([("h1".to_string(), "venue-h1".to_string())]);
+        assert_eq!(
+            superseded(&orders, &oid_venue, "h2"),
+            Some(crate::exec::Superseded {
+                venue: Venue::Kalshi,
+                market_id: "K".into(),
+                venue_order_id: "venue-h1".into(),
+                credited: 0,
+            })
+        );
+    }
+}
+
+#[cfg(test)]
+mod adopt_tests {
+    use super::*;
+    use crate::engine::{test_cfg, test_engine, RunCfg};
+    use crate::orphan::Adopted;
+    use arb_core::model::Level;
+
+    fn pol() -> HedgeRetry {
+        HedgeRetry { interval_s: 5.0, max_slip: "0.01".into(), alarm_after_s: 60.0 }
+    }
+
+    fn after(t: std::time::Instant, secs: f64) -> std::time::Instant {
+        t + std::time::Duration::from_secs_f64(secs)
+    }
+
+    /// The jersmi 8-lot, as boot hands it over: Kalshi YES SOLD at 0.25 (an
+    /// entry ask), hedge owed on PM-US at 0.13, naked for `age_s`.
+    fn adopted(age_s: f64) -> Adopted {
+        Adopted {
+            maker_order_id: "m1790405158370".into(),
+            rel_id: "heisman-jsmit".into(),
+            class: "cross-venue-equivalent",
+            strategy: "maker-hedge",
+            entry: intent::Place {
+                count: 8,
+                old_price: None,
+                order_id: "m1790405158370".into(),
+                place: "K".into(),
+                price: "0.2500".into(),
+                replaces: None,
+                retry: None,
+                side: BookSide::Ask,
+                tag: None,
+                taker: false,
+                ts: 1790458125.497612,
+                venue: Venue::Kalshi,
+            },
+            hedge_venue: Venue::PolymarketUs,
+            hedge_market: "P".into(),
+            anchor_price: "0.1300".into(),
+            qty: 8,
+            first_ts: arb_core::clock::now_s() - age_s,
+        }
+    }
+
+    /// PM-US's ask (the side a short entry's hedge lifts) and Kalshi's ask
+    /// (the side its sell-back lifts).
+    fn quote(e: &mut Engine, p_ask: &str, k_ask: &str) {
+        let lv = |p: &str| vec![Level { price: p.into(), size: "50".into() }];
+        e.books.apply_snapshot(Venue::PolymarketUs, "P", lv("0.05"), lv(p_ask), 1, 0, None);
+        e.books.apply_snapshot(Venue::Kalshi, "K", lv("0.05"), lv(k_ask), 1, 0, None);
+    }
+
+    /// An adopted obligation is indistinguishable from one a fill minted this
+    /// run, except that it remembers how long it has really been naked.
+    #[test]
+    fn an_adopted_obligation_is_an_ordinary_one() {
+        let mut e = test_engine(RunCfg { hedge_retry: Some(pol()), ..test_cfg() });
+        e.next_hedge_oid = 41;
+        let before = std::time::Instant::now();
+        e.adopt_obligations(vec![adopted(600.0)]);
+
+        let p = &e.pending_hedges["h42"];
+        assert_eq!(
+            (p.maker_order_id.as_str(), p.owed, p.filled, p.tries, p.latest_attempt.as_deref()),
+            ("m1790405158370", 8, 0, 0, None),
+            "owed in full, nothing at the venue"
+        );
+        assert_eq!(
+            p.anchor,
+            HedgeAnchor {
+                venue: Venue::PolymarketUs,
+                market_id: "P".into(),
+                side: BookSide::Ask,
+                price: "0.1300".into(),
+            },
+            "anchored on the book side the entry was PLACED on, as `hedge_anchor` does"
+        );
+        assert_eq!(
+            p.entry,
+            Some(EntryLeg {
+                venue: Venue::Kalshi,
+                market_id: "K".into(),
+                side: BookSide::Ask,
+                price: "0.2500".into(),
+                role: Role::Maker,
+            })
+        );
+        let age = before.duration_since(p.first_at).as_secs_f64();
+        assert!((age - 600.0).abs() < 5.0, "backdated to the leg's real age, got {age}");
+        assert!(e.order_rel.contains_key("m1790405158370"), "registered under its ORIGINAL id");
+        assert!(e.intents.is_empty(), "no second `HedgeNeeded`: the census would count it twice");
+    }
+
+    /// ...so the planner treats it as one: hedge first at the anchor, sell back
+    /// when the hedge is out of reach, and alarm from its first minute naked.
+    #[test]
+    fn an_adopted_obligation_is_planned_like_a_live_one() {
+        let mut e = test_engine(RunCfg { hedge_retry: Some(pol()), ..test_cfg() });
+        e.next_hedge_oid = 41;
+        e.adopt_obligations(vec![adopted(600.0)]);
+        let due = after(std::time::Instant::now(), 6.0);
+        let plan = |e: &mut Engine| {
+            hedge_tick_plans(
+                &mut e.cx,
+                &pol(),
+                &e.fees,
+                &e.pending_hedges,
+                &e.books,
+                &e.oid_venue,
+                &e.unclaimed_fills,
+                due,
+            )
+            .remove(0)
+        };
+
+        quote(&mut e, "0.13", "0.22");
+        let (chain, first, alarm) = plan(&mut e);
+        assert_eq!(chain, "h42");
+        assert_eq!(first, HedgePlan::Retry { qty: 8, price: "0.13".into() }, "the hedge comes first");
+        assert!(alarm.is_some(), "10 minutes naked against a 60s alarm");
+
+        // The PM-US ask is 0.07 past the anchor; 0.22 against a 0.25 entry
+        // clears both Kalshi fees (the hand-worked jersmi lot).
+        quote(&mut e, "0.20", "0.22");
+        assert_eq!(plan(&mut e).1, HedgePlan::SellBack { qty: 8, price: "0.22".into() });
     }
 }
