@@ -1180,7 +1180,7 @@ function page(){
 }
 
 const NEEDS = {
-  '/':              () => ({books:    '/api/books'}),
+  '/':              () => ({books:    '/api/books', equity: '/api/equity'}),
   '/recording':     () => ({integrity:'/api/integrity'}),
   '/opportunities': () => ({opps:     '/api/opportunities' + location.search}),
   '/pairs':         () => ({pairs:    '/api/pairs'}),
@@ -1296,6 +1296,25 @@ function positionComparison(pc){
   </section>`);
 }
 
+function equityDays(e){
+  const head='<h2>Daily equity</h2>';
+  if(!e) return $(`<section class="wide">${head}<div class="dim">loading…</div></section>`);
+  if(e.error) return $(`<section class="wide">${head}<div class="dim">${esc(e.error)}</div></section>`);
+  const today=new Date().toLocaleDateString('en-CA');
+  const rows=(e.days||[]).slice().reverse().map(d=>`<tr data-k="${esc(d.day)}">
+    <td>${esc(d.day)}${d.day===today?' <span class="sub">so far</span>':''}</td>
+    <td class="num">${usd(d.close_usd)}</td>
+    <td class="num ${usdSign(d.change_usd)}" title="from the ${esc(d.change_from)}">${usd(d.change_usd)}${d.change_from==='first sample'?'*':''}</td>
+    <td class="num ${usdSign(d.change_usd)}">${pctf(d.change_pct)}</td>
+    <td class="num">${usd(d.kalshi_usd)}</td><td class="num">${usd(d.polymarket_us_usd)}</td>
+    <td class="num">${usd(d.low_usd)} – ${usd(d.high_usd)}</td><td class="num">${d.samples}</td></tr>`).join('');
+  return $(`<section class="wide">${head}
+    <table><thead><tr><th>day</th><th class="num">close</th><th class="num">gain / loss</th><th class="num">%</th>
+      <th class="num">Kalshi</th><th class="num">Polymarket US</th><th class="num">intraday range</th><th class="num">samples</th></tr></thead>
+    <tbody>${rows||'<tr><td colspan="8" class="dim">No samples yet.</td></tr>'}</tbody></table>
+    <p class="sub" style="margin:12px 2px 0">Sampled every 15 minutes from the trader's venue capital reading; a day closes on its last sample and its gain / loss is measured from the previous day's close (* first recorded day: from its first sample). Equity is marked to market, so spread moves on hedged pairs show up as daily noise. Deposits and withdrawals are not netted out.${e.unreadable?` <span class="warn">${e.unreadable} unreadable line(s) skipped.</span>`:''}</p></section>`);
+}
+
 /* Each draw is PURE: reads S, appends to a fragment, returns the header text.
    No fetching, no awaiting, no reaching into the document. */
 const DRAW = {
@@ -1317,6 +1336,7 @@ const DRAW = {
       ${venueSummary('Kalshi',accounts.kalshi||{},'var(--kalshi)',accounts.kalshi?.valuation||'venue account')}
       ${venueSummary('Polymarket US',accounts.polymarket_us||{},'var(--pmus)',accounts.polymarket_us?.valuation||'venue account')}
       </div><p class="sub" style="margin:12px 2px 0">Equity = available cash + reserved cash + position value. Position marks estimate current holdings before liquidation fees; they are not guaranteed proceeds.</p></section>`));
+    f.append(equityDays(S.data.equity));
     f.append(positionComparison(b.position_comparison));
     f.append($(`<section><h2>Trading limits in force</h2>
       <p>Deployment ceiling: <b>${usd(p.deployment_cap_usd)}</b> (${Number(p.deployment_fraction)*100}% of venue-derived equity).</p>

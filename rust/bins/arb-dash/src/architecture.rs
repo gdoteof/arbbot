@@ -269,6 +269,14 @@ const NODES: &[Decl] = &[
         what: "Rematches the two venues' sports calendars into candidate pairs. Candidates \
                only: nothing here reaches the engine without a human vetting stamp.",
     },
+    Decl {
+        id: "equity", label: "equity history", sub: "arbbot-equity.timer · 15 min",
+        lane: 5, row: 7, kind: "timer", unit: Some("arbbot-equity.timer"),
+        probe: Probe::Timer, max_age_s: None, expect: Expect::Live,
+        what: "Appends the trader's venue-capital reading to data/exec/equity_history.jsonl, \
+               skipping any reading older than the gate's own freshness bound. The Capital \
+               view's daily equity table is built from it; nothing else keeps a history.",
+    },
 ];
 
 struct Edge {
@@ -309,6 +317,8 @@ const EDGES: &[Edge] = &[
     Edge { from: "health", to: "watchdog", label: "→ ntfy", kind: "read" },
     Edge { from: "settle", to: "ledger", label: "realized P&L", kind: "write" },
     Edge { from: "sportsmap", to: "scan", label: "candidate pairs", kind: "write" },
+    Edge { from: "trader_m3", to: "equity", label: "capital.json", kind: "read" },
+    Edge { from: "equity", to: "dash_rs", label: "daily equity", kind: "read" },
 ];
 
 // ---------------------------------------------------------------------------
