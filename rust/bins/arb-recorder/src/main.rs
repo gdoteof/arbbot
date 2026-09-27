@@ -235,7 +235,23 @@ async fn main() -> Result<()> {
                 untagged.iter().take(6).cloned().collect::<Vec<_>>().join(", "),
                 if untagged.len() > 6 { " …" } else { "" }
             );
-            pmus_slugs.extend(untagged);
+        }
+        pmus_slugs = pmus::registry_first(&universe.pmus_slugs, &pmus_slugs);
+        if pmus_slugs.len() > pmus::WS_MARKET_CAP {
+            eprintln!(
+                "[recorder] WARNING polymarket_us: {} markets subscribed but the venue streams \
+                 only the first {}; the last {} get one REST seed and then FREEZE. The {} \
+                 registry market(s) are subscribed first{}",
+                pmus_slugs.len(),
+                pmus::WS_MARKET_CAP,
+                pmus_slugs.len() - pmus::WS_MARKET_CAP,
+                universe.pmus_slugs.len(),
+                if universe.pmus_slugs.len() > pmus::WS_MARKET_CAP {
+                    " — and THEY EXCEED THE CAP, so registry markets will freeze"
+                } else {
+                    ""
+                }
+            );
         }
     }
 
