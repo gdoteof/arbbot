@@ -137,10 +137,18 @@ pub fn undischarged(intents: &str, ledger: Vec<Value>) -> Vec<Undischarged> {
     // An `unwound` record does NOT reduce `booked`. Unwinding closes a
     // position that was hedged; the hedge still happened. Netting it out here
     // would resurrect every closed basket as an orphan.
+    //
+    // A `naked-sellback` record is the one `realized` record that DOES credit:
+    // the engine discharged that obligation by taking the entry back on its
+    // own venue instead of hedging it, so the contracts are closed, not naked.
+    // Skipping it would seed them back as exposure on the next restart.
     let mut booked: BTreeMap<String, i64> = BTreeMap::new();
     let mut unjoined: Vec<Unjoined> = Vec::new();
     for r in &ledger {
-        if r.get("status").and_then(|v| v.as_str()) != Some("open") {
+        let field = |k: &str| r.get(k).and_then(|v| v.as_str());
+        let sold_back = field("status") == Some("realized")
+            && field("strategy") == Some("naked-sellback");
+        if field("status") != Some("open") && !sold_back {
             continue;
         }
         // Read as f64 and truncate, because `ledger::open_exposure` reads this

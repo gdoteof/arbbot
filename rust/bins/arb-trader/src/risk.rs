@@ -752,6 +752,23 @@ impl RiskView {
         *e.by_topic.entry(topic).or_default() += qty;
     }
 
+    /// A fill CLOSED `qty` contracts this relationship's exposure was charged
+    /// for — the exact mirror of [`Self::record_open`], for the one close that
+    /// never reaches the ledger as an `unwound` record: an unhedged entry taken
+    /// back on its own venue (the engine's sell-back), whose record is
+    /// `realized` because it names no open basket to close.
+    ///
+    /// FLOORED AT ZERO per map, for [`Self::release_closed`]'s reason: negative
+    /// exposure hands out headroom that does not exist.
+    pub fn record_close(&self, rel_id: &str, rtype: &str, qty: f64) {
+        let mut e = self.exposure.lock().expect("exposure");
+        let topic = topic_of(rel_id, &self.topics);
+        let drain = |slot: &mut f64| *slot = (*slot - qty).max(0.0);
+        drain(e.by_rel.entry(rel_id.to_string()).or_default());
+        drain(e.by_class.entry(rtype.to_string()).or_default());
+        drain(e.by_topic.entry(topic).or_default());
+    }
+
     /// Declare the closes already reflected in the seeded exposure, so
     /// [`Self::release_closed`] does not subtract them a second time.
     ///
@@ -1661,6 +1678,23 @@ mod tests {
         v.record_open("unknown-rel", "cross-venue-equivalent", 30.0);
         let d = v.check(&rel("unknown-rel"), Venue::Kalshi, 10, None);
         assert!(!d.allowed, "unknown => high risk => 0.25x cap: {:?}", d.reasons);
+    }
+
+    /// A sell-back closes what `record_open` charged, so the headroom comes
+    /// back in-session — and a close larger than what is open floors at zero
+    /// rather than handing out headroom no position backs.
+    #[test]
+    fn a_close_gives_back_the_headroom_and_floors_at_zero() {
+        let v = funded("low");
+        v.record_open("r1", "cross-venue-equivalent", 150.0);
+        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
+        v.record_close("r1", "cross-venue-equivalent", 150.0);
+        assert_eq!(v.open_ct("r1"), 0.0);
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed, "the cap is free again");
+        v.record_close("r1", "cross-venue-equivalent", 40.0);
+        assert_eq!(v.open_ct("r1"), 0.0, "never negative");
+        v.record_open("r1", "cross-venue-equivalent", 150.0);
+        assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed, "no phantom headroom");
     }
 
     #[test]

@@ -76,8 +76,15 @@ pub enum Action {
 /// the way past, so the next retry is `Accounted` and goes out. The opposite
 /// error — a snapshot reading high, and so waving through a fill nobody saw —
 /// is not reachable.
+///
+/// `venue`/`market_id` are the PRIOR attempt's, and need not be this place's:
+/// a sell-back takes the entry back on its own venue, so the attempt it
+/// supersedes can be a hedge IOC on the OTHER venue. The executor asks that
+/// venue, and a lost fill it finds is reported on that venue's market.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Superseded {
+    pub venue: Venue,
+    pub market_id: String,
     pub venue_order_id: String,
     pub credited: i64,
 }
@@ -1026,13 +1033,19 @@ pub fn spawn_executors(
         recovered: AtomicU64::new(0),
     });
     let mut txs = HashMap::new();
+    // Every executor can READ every venue: a hedge chain crosses venues once
+    // a sell-back supersedes a hedge IOC, and the verification below has to
+    // ask the venue the prior attempt went to. Reads only — each venue's
+    // places still go through its own executor and its own token bucket.
+    let peers: Arc<HashMap<Venue, Arc<dyn OrderSink>>> = Arc::new(sinks.clone());
     for venue in [Venue::Kalshi, Venue::Polymarket, Venue::PolymarketUs] {
         let sink = sinks.remove(&venue);
         let acks = acks.clone();
         let (tx, rx) = mpsc::channel::<ExecCmd>(1024);
         let st = stats.clone();
         let h = halt().clone();
-        tokio::spawn(run_executor(venue, rate_per_s, sink, rx, st, h, acks));
+        let peers = peers.clone();
+        tokio::spawn(run_executor(venue, rate_per_s, sink, peers, rx, st, h, acks));
         txs.insert(venue, tx);
     }
     (txs, stats)
@@ -1041,10 +1054,12 @@ pub fn spawn_executors(
 /// One venue's executor loop. A free function rather than an inline closure so
 /// the tests can drive it with their own [`Halt`] and their own sink — the audit
 /// found this file had ZERO tests, which is why finding #0 shipped.
+#[allow(clippy::too_many_arguments)]
 async fn run_executor(
     venue: Venue,
     rate_per_s: f64,
     sink: Option<Arc<dyn OrderSink>>,
+    peers: Arc<HashMap<Venue, Arc<dyn OrderSink>>>,
     mut rx: mpsc::Receiver<ExecCmd>,
     st: Arc<ExecStats>,
     halt: Arc<Halt>,
@@ -1147,20 +1162,36 @@ async fn run_executor(
         // all. `Unreadable` sends nothing and places nothing.
         if let Action::Place { req, supersedes: Some(prior) } = &cmd.action {
             let pid = &prior.venue_order_id;
-            match crate::sink::prior_attempt(sink.clone(), pid.clone(), prior.credited).await {
+            // The prior's OWN venue, which a sell-back makes a different one.
+            // No sink for it reads as `Unreadable`: fail closed, like any
+            // other answer we could not get.
+            let asked = if prior.venue == venue {
+                Some(sink.clone())
+            } else {
+                peers.get(&prior.venue).cloned()
+            };
+            let answer = match asked {
+                Some(s) => crate::sink::prior_attempt(s, pid.clone(), prior.credited).await,
+                None => crate::sink::PriorAttempt::Unreadable(format!(
+                    "no order sink for {} to ask",
+                    prior.venue.as_str()
+                )),
+            };
+            match answer {
                 crate::sink::PriorAttempt::Accounted => {}
                 crate::sink::PriorAttempt::Unaccounted(n) => {
                     HEDGE_RETRIES_REFUSED.fetch_add(1, Ordering::Relaxed);
                     eprintln!(
                         "[exec] {venue:?}: NOT re-placing hedge {} ({} x{} @{}) — the venue \
-                         says the attempt it supersedes ({pid}) has FILLED {n} against the {} \
-                         this process has booked. The fill frame for the difference never \
-                         reached us; re-placing would have left us long against our own \
-                         short. Crediting it now. hedge_retries_refused={}",
+                         says the attempt it supersedes ({pid} on {}) has FILLED {n} against \
+                         the {} this process has booked. The fill frame for the difference \
+                         never reached us; re-placing would have left us long against our \
+                         own short. Crediting it now. hedge_retries_refused={}",
                         req.client_order_id,
                         req.market,
                         req.qty,
                         req.price,
+                        prior.venue.as_str(),
                         prior.credited,
                         hedge_retries_refused()
                     );
@@ -1168,8 +1199,8 @@ async fn run_executor(
                         &acks,
                         serde_json::json!({
                             "kind": "fill",
-                            "venue": venue.as_str(),
-                            "market_id": req.market,
+                            "venue": prior.venue.as_str(),
+                            "market_id": prior.market_id,
                             "order_id": pid,
                             "cum": n,
                             "ts_local_ns": now_ns(),
@@ -1558,7 +1589,12 @@ mod tests {
         let mut c = hedge_retry(oid, None);
         if let Action::Place { supersedes, .. } = &mut c.action {
             *supersedes =
-                Some(Superseded { venue_order_id: prior.into(), credited });
+                Some(Superseded {
+                    venue: Venue::Kalshi,
+                    market_id: "KXTEST".into(),
+                    venue_order_id: prior.into(),
+                    credited,
+                });
         }
         c
     }
@@ -1641,7 +1677,7 @@ mod tests {
         }
         drop(tx); // the loop ends when the channel closes
         let st = stats();
-        run_executor(Venue::Kalshi, 0.0, Some(sink), rx, st.clone(), halt, None).await;
+        run_executor(Venue::Kalshi, 0.0, Some(sink), Arc::default(), rx, st.clone(), halt, None).await;
         st
     }
 
@@ -1656,6 +1692,17 @@ mod tests {
         sink: Arc<Recorder>,
         cmds: Vec<ExecCmd>,
     ) -> (Arc<ExecStats>, Vec<serde_json::Value>) {
+        drain_reporting_with_peers(venue, sink, HashMap::new(), cmds).await
+    }
+
+    /// [`drain_reporting`], with the OTHER venues' sinks this executor may
+    /// read — a sell-back's supersede check asks the venue its prior went to.
+    async fn drain_reporting_with_peers(
+        venue: Venue,
+        sink: Arc<Recorder>,
+        peers: HashMap<Venue, Arc<dyn OrderSink>>,
+        cmds: Vec<ExecCmd>,
+    ) -> (Arc<ExecStats>, Vec<serde_json::Value>) {
         let (tx, rx) = mpsc::channel::<ExecCmd>(1024);
         for c in cmds {
             tx.try_send(c).expect("test queue fits");
@@ -1663,7 +1710,8 @@ mod tests {
         drop(tx);
         let (atx, mut arx) = mpsc::channel::<crate::feed::FeedMsg>(64);
         let st = stats();
-        run_executor(venue, 0.0, Some(sink), rx, st.clone(), Arc::new(Halt::default()), Some(atx))
+        let halt = Arc::new(Halt::default());
+        run_executor(venue, 0.0, Some(sink), Arc::new(peers), rx, st.clone(), halt, Some(atx))
             .await;
         let mut told = Vec::new();
         while let Ok(m) = arx.try_recv() {
@@ -1739,6 +1787,76 @@ mod tests {
     /// that read it. Both refusal arms increment the same static, so without
     /// this the two assertions below can each be satisfied by the other's work.
     static REFUSED_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A SELL-BACK's prior: the hedge IOC it supersedes went to PM-US market
+    /// "P", while the sell-back itself goes out on Kalshi.
+    fn prior_on_pmus(credited: i64) -> Superseded {
+        Superseded {
+            venue: Venue::PolymarketUs,
+            market_id: "P".into(),
+            venue_order_id: "venue-h1".into(),
+            credited,
+        }
+    }
+
+    /// The chain crosses venues once a sell-back supersedes a hedge, and the
+    /// question has to go to the venue that can ANSWER it. Asked of Kalshi, a
+    /// PM-US id is unknown, so a lost PM-US fill would read as "nothing filled"
+    /// or as unreadable — and the first of those takes the entry back while the
+    /// hedge it superseded also stands: flat on one venue, short on the other.
+    #[tokio::test]
+    async fn a_sell_back_asks_the_venue_its_prior_hedge_went_to() {
+        let _g = REFUSED_TURN.lock();
+        let before = hedge_retries_refused();
+        let own = Arc::new(Recorder { prior_filled: Some(0), ..Recorder::default() });
+        let pmus = Arc::new(Recorder { prior_filled: Some(5), ..Recorder::default() });
+        let peers = HashMap::from([(Venue::PolymarketUs, pmus.clone() as Arc<dyn OrderSink>)]);
+        let cmd = hedge_retry("h2", Some(prior_on_pmus(0)));
+        let (st, told) = drain_reporting_with_peers(Venue::Kalshi, own.clone(), peers, vec![cmd]).await;
+
+        assert!(own.placed.lock().unwrap().is_empty(), "the hedge filled: nothing to sell back");
+        assert!(own.status_reads.lock().unwrap().is_empty(), "Kalshi cannot answer for PM-US");
+        assert_eq!(*pmus.status_reads.lock().unwrap(), vec!["venue-h1"]);
+        assert_eq!(st.sent.load(Ordering::Relaxed), 0);
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert_eq!(told[0]["kind"], "fill");
+        assert_eq!(told[0]["venue"], "polymarket_us", "the lost fill is the PRIOR's");
+        assert_eq!(told[0]["market_id"], "P");
+        assert_eq!(told[0]["order_id"], "venue-h1");
+        assert_eq!(told[0]["cum"], 5);
+        assert_eq!(hedge_retries_refused() - before, 1);
+    }
+
+    /// ...and once PM-US confirms the hedge filled nothing, the sell-back goes.
+    #[tokio::test]
+    async fn a_sell_back_goes_once_the_prior_venue_says_its_hedge_filled_nothing() {
+        let own = Arc::new(Recorder { prior_filled: Some(5), ..Recorder::default() });
+        let pmus = Arc::new(Recorder { prior_filled: Some(0), ..Recorder::default() });
+        let peers = HashMap::from([(Venue::PolymarketUs, pmus.clone() as Arc<dyn OrderSink>)]);
+        let cmd = hedge_retry("h2", Some(prior_on_pmus(0)));
+        drain_reporting_with_peers(Venue::Kalshi, own.clone(), peers, vec![cmd]).await;
+
+        assert_eq!(*own.placed.lock().unwrap(), vec!["h2"]);
+        assert_eq!(*pmus.status_reads.lock().unwrap(), vec!["venue-h1"]);
+    }
+
+    /// No sink for the prior's venue is an answer we could not get: withheld,
+    /// like every other unreadable prior.
+    #[tokio::test]
+    async fn a_sell_back_with_no_sink_for_its_priors_venue_is_withheld() {
+        let _g = REFUSED_TURN.lock();
+        let before = hedge_retries_refused();
+        let own = Arc::new(Recorder { prior_filled: Some(0), ..Recorder::default() });
+        let cmd = hedge_retry("h2", Some(prior_on_pmus(0)));
+        let (st, told) =
+            drain_reporting_with_peers(Venue::Kalshi, own.clone(), HashMap::new(), vec![cmd]).await;
+
+        assert!(own.placed.lock().unwrap().is_empty());
+        assert!(own.status_reads.lock().unwrap().is_empty(), "never asked the wrong venue");
+        assert_eq!(st.sent.load(Ordering::Relaxed), 0);
+        assert!(told.is_empty(), "{told:?}");
+        assert_eq!(hedge_retries_refused() - before, 1);
+    }
 
     /// The control, and it is what stops the fix from being "never hedge
     /// again": once the venue CONFIRMS the superseded attempt filled nothing,
@@ -2187,6 +2305,7 @@ mod tests {
             Venue::Kalshi,
             0.0,
             Some(sink.clone()),
+            Arc::default(),
             rx,
             stats(),
             halt.clone(),
@@ -2473,7 +2592,8 @@ mod tests {
         // `None` is the whole point: this is the posture arb-recorder runs in,
         // and the one INTL is in for the life of every armed session.
         let halt = Arc::new(Halt::default());
-        run_executor(Venue::Polymarket, 0.0, None, rx, st.clone(), halt, Some(atx)).await;
+        run_executor(Venue::Polymarket, 0.0, None, Arc::default(), rx, st.clone(), halt, Some(atx))
+            .await;
 
         assert_eq!(st.sent.load(Ordering::Relaxed), 0, "a dry run reaches no venue, ever");
         let m = arx.try_recv().expect("the engine is answered even so");
@@ -2716,7 +2836,9 @@ mod tests {
         drop(tx);
         let st = stats();
         let (atx, mut arx) = mpsc::channel::<crate::feed::FeedMsg>(8);
-        run_executor(Venue::PolymarketUs, 0.0, Some(lost), rx, st.clone(), halt, Some(atx)).await;
+        let peers = Arc::default();
+        run_executor(Venue::PolymarketUs, 0.0, Some(lost), peers, rx, st.clone(), halt, Some(atx))
+            .await;
 
         assert_eq!(st.failed.load(Ordering::Relaxed), 1, "the place did go, and did fail");
         assert_eq!(st.recovered.load(Ordering::Relaxed), 0, "but the sweep owns this now");
@@ -2746,7 +2868,7 @@ mod tests {
         tx.send(taker_place("t123")).await.unwrap();
         drop(tx);
         let (atx, mut arx) = mpsc::channel(8);
-        run_executor(Venue::Kalshi, 0.0, Some(sink), rx, stats(),
+        run_executor(Venue::Kalshi, 0.0, Some(sink), Arc::default(), rx, stats(),
             Arc::new(Halt::default()), Some(atx)).await;
         let ack: serde_json::Value = serde_json::from_str(&arx.recv().await.unwrap().line).unwrap();
         assert_eq!(ack["kind"], "order_ack");

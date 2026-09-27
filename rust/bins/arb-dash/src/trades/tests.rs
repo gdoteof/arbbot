@@ -915,3 +915,20 @@ fn verified_entry_and_exit_fees_are_each_charged_once() {
     assert_eq!(r["entry_fees_settled"],false);
     assert_eq!(r["round_trip_fees_settled"],false);
 }
+
+/// A naked SELL-BACK (arb-trader): the entry taken back on its own market
+/// when the hedge venue offered nothing inside the budget. The engine books it
+/// `realized` with both legs on ONE market — the entry bid and the taker ask
+/// that sold it — so it derives exactly as a hedged pair does: the spread less
+/// both modelled fees, banked rather than open.
+#[test]
+fn a_naked_sell_back_prices_as_the_spread_less_both_fees() {
+    let rec = r#"{"ts":1785250000.0,"relationship_id":"xvus-synth","qty":5,"strategy":"naked-sellback","status":"realized","source":"arb-trader","fees_pending":true,"legs":[{"venue":"kalshi","market_id":"K","side":"bid","role":"maker","qty":5,"yes_price":"0.38","order_id":"m1"},{"venue":"kalshi","market_id":"K","side":"ask","role":"taker","qty":5,"yes_price":"0.45","order_id":"h9"}]}"#;
+    let out = build(rec, "default", 1785250000.0);
+    let r = &out["rows"][0];
+    assert_eq!(r["hedged"], true, "{r}");
+    // 5 x (0.45 - 0.38) = 0.35, less Kalshi maker 0.03 and taker 0.09
+    assert!((r["net_usd"].as_f64().unwrap() - 0.23).abs() < 1e-9, "{}", r["net_usd"]);
+    assert_eq!(out["totals"]["realized_trades"], 1);
+    assert_eq!(out["totals"]["open_trades"], 0, "a close is not a working position");
+}

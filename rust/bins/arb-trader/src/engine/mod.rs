@@ -625,6 +625,11 @@ struct Engine {
     /// `UnclaimedFill`: held for their ack, alarmed if it never comes.
     unclaimed_fills: HashMap<String, UnclaimedFill>,
     n_retry: u64,
+    /// Sell-back attempts DECIDED on — an obligation taken back on its entry's
+    /// own venue because the hedge leg offered nothing inside the budget and
+    /// the round trip cleared a profit. Counted apart from `n_retry` so the two
+    /// ways out of a naked leg can be told apart.
+    n_sell_back: u64,
     n_naked: u64,
     /// Times an obligation was parked because the venue refused the place with
     /// the market halted. Rises WITHOUT `n_naked` rising is the shape to read:
@@ -889,6 +894,7 @@ impl Engine {
             pending_hedges: HashMap::new(),
             unclaimed_fills: HashMap::new(),
             n_retry: 0,
+            n_sell_back: 0,
             n_naked: 0,
             n_parked: 0,
             n_unattributed: 0,
@@ -1597,6 +1603,7 @@ impl Engine {
             // arbbot-hedge.timer is what completes them (see `orphan`).
             "hedges_undischarged": self.cfg.hedges_undischarged,
             "hedges_retried": self.n_retry,
+            "hedges_sold_back": self.n_sell_back,
             // ...which counts retries the engine DECIDED on, and can therefore
             // run ahead of the places that reached a venue: the executor
             // withholds one whose superseded attempt turns out to have filled,
