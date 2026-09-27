@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 type EntryBasis = BTreeMap<String, (f64, f64)>; // relationship -> (qty, all-in cost)
 const EXECUTABLE_MARK_MAX_AGE_S: u64 = 180;
-fn number(v: &Value) -> Option<f64> {
+pub(crate) fn number(v: &Value) -> Option<f64> {
     let n = v.as_f64().or_else(|| v.as_str()?.parse().ok())?;
     n.is_finite().then_some(n)
 }

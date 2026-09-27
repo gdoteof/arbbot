@@ -2,6 +2,7 @@
 
 pub mod books;
 pub mod capital;
+pub mod equity;
 pub mod now;
 pub mod opportunities;
 pub mod pairs;
