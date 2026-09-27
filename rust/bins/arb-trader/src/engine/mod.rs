@@ -545,6 +545,13 @@ struct Engine {
     /// re-stamped while the request stands, because the reader's settle window
     /// measures how long the quoter has been out of the side.
     maker_exit_suppressed: std::collections::BTreeMap<(String, String), std::time::Instant>,
+    /// The sides `crate::maker_exit` last asked to be yielded, parsed. Kept so
+    /// that the distrust pause, which runs every hedge tick, can re-install the
+    /// whole suppress set without dropping them until the next 60s exit tick.
+    maker_exit_asked: std::collections::HashSet<(String, BookSide)>,
+    /// Relationships whose hedge book has lied (`hedge::distrusted_rels`); every
+    /// entry quote on them is suppressed until the obligation is discharged.
+    distrusted: std::collections::BTreeSet<String>,
     /// Each Kalshi market's latest valid tick ladder from the `price_grid` feed,
     /// for exit pricing (`marks`, `maker_exit`). Absent = unknown = the flat cent.
     kalshi_ladders: std::collections::BTreeMap<String, Vec<(String, String, String)>>,
@@ -871,6 +878,8 @@ impl Engine {
             n_unwind_near_miss: 0,
             unwind_near_miss_usd: 0.0,
             maker_exit_suppressed: std::collections::BTreeMap::new(),
+            maker_exit_asked: std::collections::HashSet::new(),
+            distrusted: std::collections::BTreeSet::new(),
             kalshi_ladders: std::collections::BTreeMap::new(),
             unwind_seen: None,
             unwind_refused: None,
@@ -1341,6 +1350,61 @@ impl Engine {
         self.apr_asof = asof;
     }
 
+    /// The ONE writer of every quoter's suppress set: the operator's
+    /// `--suppress`, the sides `crate::maker_exit` asked for, and all four sides
+    /// of each distrusted relationship. `Quoter::set_suppress` replaces
+    /// wholesale, so two writers would each revoke the other's sides.
+    pub(super) fn install_suppress(&self, quoters: &mut [Quoter]) {
+        let mut want = self.cfg.suppress.clone();
+        want.extend(self.maker_exit_asked.iter().cloned());
+        for q in quoters.iter().filter(|q| self.distrusted.contains(&q.rel.id)) {
+            for leg in &q.rel.legs {
+                want.insert((leg.market_id.clone(), BookSide::Bid));
+                want.insert((leg.market_id.clone(), BookSide::Ask));
+            }
+        }
+        for q in quoters.iter_mut() {
+            q.set_suppress(want.clone());
+        }
+    }
+
+    /// Pause new entries on every relationship whose hedge book has LIED — see
+    /// `hedge::HEDGE_DISTRUST_TRIES` for what counts as a lie and why a hedge
+    /// that is merely waiting for its price never does.
+    ///
+    /// Edge-triggered: recomputed every hedge tick, acted on only when the set
+    /// changes, so a steady state costs one pass over the obligations. On
+    /// ENTRY the relationship's resting quotes are pulled at once rather than
+    /// left to the next book event, because the book that would trigger it may
+    /// be the one that stopped moving. Release needs no pull: the quoter comes
+    /// back on its own next book event.
+    ///
+    /// Entry quoting only. The hedge and the sell-back keep running — they are
+    /// the way out — and `crate::maker_exit` is not asked to stand down.
+    pub(super) fn distrust_tick(&mut self, quoters: &mut [Quoter]) {
+        let now = hedge::distrusted_rels(&self.pending_hedges, &self.order_rel);
+        if now == self.distrusted {
+            return;
+        }
+        let entered: Vec<String> = now.difference(&self.distrusted).cloned().collect();
+        for rel in &entered {
+            eprintln!(
+                "[hedge] DISTRUST {rel}: {} hedge attempts in a row filled nothing at prices \
+                 the book showed — its entry quotes are pulled until the obligation fills or clears",
+                hedge::HEDGE_DISTRUST_TRIES
+            );
+        }
+        for rel in self.distrusted.difference(&now) {
+            eprintln!("[hedge] distrust lifted on {rel}: its obligation filled or cleared — quoting resumes");
+        }
+        self.distrusted = now;
+        self.install_suppress(quoters);
+        for q in quoters.iter_mut().filter(|q| entered.contains(&q.rel.id)) {
+            q.cancel_all(&mut self.cx, self.last_now, &mut self.intents);
+            self.drain_intents(Some(&q.rel));
+        }
+    }
+
     /// Publish what `crate::maker_exit` cannot derive, and install what it asks
     /// for.
     ///
@@ -1371,18 +1435,16 @@ impl Engine {
         // `Shape::RestPmUs` exit rests a PM-US BID, and hardcoding `Ask` here
         // would yield a quote it does not collide with while leaving the one it
         // does collide with live.
-        let mut want = self.cfg.suppress.clone();
+        self.maker_exit_asked.clear();
         for (m, side) in &asked {
             // The request carries the wire spelling; `BookSide` is what the
             // quoter's set is keyed on. An unparseable side is dropped rather
             // than defaulted — defaulting it to `Ask` is precisely the bug this
             // whole key change exists to remove.
             let Some(s) = BookSide::parse(side) else { continue };
-            want.insert((m.clone(), s));
+            self.maker_exit_asked.insert((m.clone(), s));
         }
-        for q in quoters.iter_mut() {
-            q.set_suppress(want.clone());
-        }
+        self.install_suppress(quoters);
         let now = std::time::Instant::now();
         // FIRST installed, not most recently confirmed: the settle window the
         // reader applies is "how long has the quoter been out of this side",
@@ -1608,6 +1670,10 @@ impl Engine {
             // since. Nothing reads it automatically.
             "sweeps_owed": self.sweeps_owed.len(),
             "hedges_pending": self.pending_hedges.len(),
+            // Relationships whose entry quoting is paused because their hedge
+            // book lied: `hedge::HEDGE_DISTRUST_TRIES` attempts in a row at
+            // prices the book showed, none filled. 0 on healthy books.
+            "hedge_books_distrusted": self.distrusted.len(),
             // ...of which THIS process knows nothing: contracts a previous run
             // owed a hedge for and never booked. `hedges_pending` counts only
             // what is live in memory, so it read 0 after the 01:34 restart on
@@ -2776,7 +2842,7 @@ pub async fn run(
             // "blocked or merely idle-then-busy" ambiguity this loop could not
             // answer about itself.
             _ = kill_iv.tick() => { let t = std::time::Instant::now(); eng.kill_tick(&mut quoters); eng.record_tick("kill", t); }
-            _ = hedge_iv.tick(), if hedge_retry && !bench => { let t = std::time::Instant::now(); eng.hedge_tick(); eng.record_tick("hedge", t); }
+            _ = hedge_iv.tick(), if hedge_retry && !bench => { let t = std::time::Instant::now(); eng.hedge_tick(); eng.distrust_tick(&mut quoters); eng.record_tick("hedge", t); }
             // Fills held for an `order_ack` that has not come. Bench has no live
             // ack path at all and must stay byte-deterministic, so it relies on
             // the flush after the loop instead of this deadline.
@@ -4501,7 +4567,7 @@ mod maker_exit_seam_tests {
     /// that have nothing to do with suppression. Selling Kalshi YES at 0.98
     /// leaves 0.02 of NO against a PM YES at 0.20 — 0.22 for a dollar — which it
     /// quotes without hesitation.
-    fn books_where_the_kalshi_ask_pays() -> BookBuilder {
+    pub(super) fn books_where_the_kalshi_ask_pays() -> BookBuilder {
         let lvl = |p: &str, s: &str| Level { price: p.into(), size: s.into() };
         let mut bb = BookBuilder::new();
         bb.apply_snapshot(Venue::Kalshi, "K", vec![lvl("0.60", "500")], vec![lvl("0.99", "500")],
@@ -4517,7 +4583,7 @@ mod maker_exit_seam_tests {
     /// `Quoter::target`, which is private — and that is the better question
     /// anyway: what matters is whether a Place reaches the executor, not what an
     /// internal helper returned.
-    fn quotes_kalshi_ask(quoters: &mut [Quoter], books: &BookBuilder) -> bool {
+    pub(super) fn quotes_kalshi_ask(quoters: &mut [Quoter], books: &BookBuilder) -> bool {
         let mut cx = Cx::default();
         let fees = FeeSchedule::new(&mut cx);
         let (mut oid, mut intents) = (0u64, Vec::new());
@@ -5192,5 +5258,159 @@ mod marks_wiring_tests {
         assert_eq!(s["marks_unpriced_rows"], json!(0), "{s}");
         assert_eq!(s["marks_no_book"], json!(0), "{s}");
         assert!(eng.marks_no_book.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod hedge_distrust_tests {
+    use super::*;
+    use crate::engine::fill::MakerOrder;
+    use crate::engine::maker_exit_seam_tests::{books_where_the_kalshi_ask_pays, quotes_kalshi_ask};
+    use crate::engine::toxgate_reload_tests::quoter_and_books;
+    use arb_core::fill::HedgeAnchor;
+
+    const REL: &str = "xvus-france-pres-27-test";
+
+    /// An obligation on the fixture's relationship, `dry` attempts into a run
+    /// of misses.
+    fn owing(eng: &mut Engine, dry: u32) {
+        let t = std::time::Instant::now();
+        eng.order_rel.insert(
+            "m1".into(),
+            MakerOrder {
+                rel_id: REL.into(),
+                class: "cross-venue-equivalent",
+                venue: "kalshi".into(),
+                market_id: "K".into(),
+                side: BookSide::Ask,
+                price: "0.98".into(),
+                strategy: "maker-hedge",
+            },
+        );
+        eng.pending_hedges.insert(
+            "h1".into(),
+            PendingHedge {
+                maker_order_id: "m1".into(),
+                owed: 5,
+                filled: 0,
+                anchor: HedgeAnchor {
+                    venue: Venue::PolymarketUs,
+                    market_id: "P".into(),
+                    side: BookSide::Ask,
+                    price: "0.20".into(),
+                },
+                entry: None,
+                first_at: t,
+                last_try_at: t,
+                latest_attempt: Some("h1".into()),
+                tries: dry,
+                dry_tries: dry,
+                alarmed: false,
+                hold_logged: false,
+                parked_until: None,
+                paused_strikes: 0,
+            },
+        );
+    }
+
+    /// Does the entry quoter place ANYTHING, on either leg, either side?
+    fn places_anything(quoters: &mut [Quoter], books: &BookBuilder) -> bool {
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        quoters[0].on_book(&mut cx, &fees, books, wall_now(), &mut oid, &mut intents);
+        intents.iter().any(|i| matches!(i, Intent::Place(_)))
+    }
+
+    /// One run short of the threshold is a race for a level; at the threshold
+    /// the book is lying and the relationship stops opening anything, on
+    /// either leg. Clearing the obligation gives quoting back without a
+    /// restart.
+    #[test]
+    fn a_book_that_lies_ten_times_pauses_entries_until_its_obligation_clears() {
+        let books = books_where_the_kalshi_ask_pays();
+
+        // THE CONTROL: nine misses change nothing, and the fixture does quote.
+        let (mut quoters, _) = quoter_and_books();
+        let mut eng = test_engine(test_cfg());
+        owing(&mut eng, hedge::HEDGE_DISTRUST_TRIES - 1);
+        eng.distrust_tick(&mut quoters);
+        assert!(eng.distrusted.is_empty());
+        assert!(quotes_kalshi_ask(&mut quoters, &books), "the fixture must quote");
+
+        // The tenth.
+        let (mut quoters, _) = quoter_and_books();
+        let mut eng = test_engine(test_cfg());
+        owing(&mut eng, hedge::HEDGE_DISTRUST_TRIES);
+        eng.distrust_tick(&mut quoters);
+        assert_eq!(eng.distrusted.iter().collect::<Vec<_>>(), [REL]);
+        assert!(!places_anything(&mut quoters, &books), "no leg, no side may open");
+
+        // Discharged: the next tick lifts it and the same quoter quotes again.
+        eng.pending_hedges.clear();
+        eng.distrust_tick(&mut quoters);
+        assert!(eng.distrusted.is_empty());
+        assert!(quotes_kalshi_ask(&mut quoters, &books), "release needs no restart");
+    }
+
+    /// A fill proves the book told the truth, whatever came before it; and an
+    /// obligation fully hedged is not a reason to pause even while it lingers.
+    #[test]
+    fn a_fill_or_a_discharged_obligation_is_not_a_lie() {
+        let mut eng = test_engine(test_cfg());
+        owing(&mut eng, 40);
+        assert_eq!(hedge::distrusted_rels(&eng.pending_hedges, &eng.order_rel).len(), 1);
+        eng.pending_hedges.get_mut("h1").unwrap().filled = 5;
+        assert!(hedge::distrusted_rels(&eng.pending_hedges, &eng.order_rel).is_empty());
+    }
+
+    /// The pause and the other two suppress writers share ONE installer: the
+    /// operator's `--suppress` and the maker exit's yielded side survive both
+    /// the pause going on and it coming off. `set_suppress` replaces the whole
+    /// set, which is how a second writer would silently revoke them.
+    #[test]
+    fn lifting_the_pause_keeps_the_sides_the_operator_and_the_exit_declared() {
+        let books = books_where_the_kalshi_ask_pays();
+        for (operator, exit) in [(true, false), (false, true)] {
+            let mut cfg = test_cfg();
+            if operator {
+                cfg.suppress = [("K".to_string(), BookSide::Ask)].into_iter().collect();
+            }
+            let mut eng = test_engine(cfg);
+            if exit {
+                eng.maker_exit_asked.insert(("K".to_string(), BookSide::Ask));
+            }
+            let (mut quoters, _) = quoter_and_books();
+            owing(&mut eng, hedge::HEDGE_DISTRUST_TRIES);
+            eng.distrust_tick(&mut quoters);
+            eng.pending_hedges.clear();
+            eng.distrust_tick(&mut quoters);
+            assert!(eng.distrusted.is_empty());
+            assert!(
+                !quotes_kalshi_ask(&mut quoters, &books),
+                "operator={operator} exit={exit}: the declared side must stay yielded"
+            );
+        }
+    }
+
+    /// Entry pulls what is already resting, at once: the book event that would
+    /// otherwise cancel it may be the one that stopped arriving. A steady state
+    /// emits nothing.
+    #[test]
+    fn going_distrusted_pulls_the_relationships_resting_quotes_at_once() {
+        let (mut quoters, _) = quoter_and_books();
+        let mut eng = test_engine(test_cfg());
+        eng.books = books_where_the_kalshi_ask_pays();
+        eng.quote(&mut quoters, &[0], wall_now());
+        let placed = eng.n_int;
+        assert!(placed > 0, "the fixture must rest something to pull");
+
+        owing(&mut eng, hedge::HEDGE_DISTRUST_TRIES);
+        eng.distrust_tick(&mut quoters);
+        assert!(eng.n_int > placed, "entering distrust must cancel what rests");
+        let pulled = eng.n_int;
+        eng.distrust_tick(&mut quoters);
+        eng.quote(&mut quoters, &[0], wall_now());
+        assert_eq!(eng.n_int, pulled, "nothing re-placed, nothing re-cancelled");
     }
 }
