@@ -111,11 +111,13 @@ pub struct RunCfg {
     /// log-based monitor would say NOT TRADING while it placed real orders.
     pub armed: bool,
     /// Contracts this unit's PREVIOUS run owed a hedge for and never booked,
-    /// counted at startup by `orphan::undischarged`. Carried to be REPORTED:
-    /// the standing gauge is the half of that census a monitor sees, and it is
-    /// what makes `hedges_pending: 0` honest after a restart that forgot an
-    /// obligation (2026-07-29 01:34). The engine never HEDGES it — `orphan`
-    /// documents why the second hedger would be a double hedge.
+    /// counted at startup by `orphan::undischarged`, LESS what this run
+    /// adopted (`adopt`). Carried to be REPORTED: the standing gauge is the
+    /// half of that census a monitor sees, and it is what makes
+    /// `hedges_pending: 0` honest after a restart that forgot an obligation
+    /// (2026-07-29 01:34). The engine never hedges what is counted here —
+    /// `orphan` documents why a second hedger would be a double hedge, and
+    /// what it takes for the engine to be the one hedger instead.
     ///
     /// It is no longer the only thing done with the census: those contracts are
     /// also seeded into `risk` at startup (`seed_exposure_from_census`), because
@@ -123,6 +125,10 @@ pub struct RunCfg {
     /// While this field WAS the only consumer, a restart re-authorised the full
     /// per-relationship cap on top of an unhedged position.
     pub hedges_undischarged: u64,
+    /// A previous run's obligations that the venue still shows naked, taken
+    /// into `pending_hedges` before the first event (`adopt_obligations`).
+    /// Empty in bench/replay and unarmed.
+    pub adopt: Vec<crate::orphan::Adopted>,
 }
 
 /// Immediately-executable crossings, tested on the book event that creates
@@ -2700,13 +2706,15 @@ pub async fn run(
     mut rx: mpsc::Receiver<FeedMsg>,
     exec_txs: HashMap<Venue, mpsc::Sender<ExecCmd>>,
     exec_stats: Arc<ExecStats>,
-    cfg: RunCfg,
+    mut cfg: RunCfg,
 ) -> serde_json::Value {
     let bench = cfg.bench;
     let armed = cfg.armed;
     let hedge_retry = cfg.hedge_retry.is_some();
     let stats_every_s = cfg.stats_every_s;
+    let adopt = std::mem::take(&mut cfg.adopt);
     let mut eng = Engine::new(cfg, exec_txs, exec_stats, &by_market, &quoters);
+    eng.adopt_obligations(adopt);
     if !bench {
         eng.apr_tick(&mut quoters);
     }
@@ -2838,6 +2846,7 @@ fn test_cfg() -> RunCfg {
         marks_out: None,
         armed: false,
         hedges_undischarged: 0,
+        adopt: Vec::new(),
     }
 }
 
@@ -3034,6 +3043,7 @@ mod feed_wiring_tests {
             marks_out: None,
             armed: false,
             hedges_undischarged: 0,
+            adopt: Vec::new(),
         }
     }
 

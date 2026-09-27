@@ -8,7 +8,7 @@
 //! through a `tokio::select!` arm over live channels when all four of those
 //! defects were written.
 
-use super::fill::{UnclaimedFill, FILL_ACK_GRACE};
+use super::fill::{MakerOrder, UnclaimedFill, FILL_ACK_GRACE};
 use super::{Engine, HedgeRetry};
 use arb_core::book::BookBuilder;
 use arb_core::fees::{FeeSchedule, Role};
@@ -770,6 +770,82 @@ fn hedge_tick_plans(
 }
 
 impl Engine {
+    /// Take a previous run's naked legs back into this run's hedge loop.
+    ///
+    /// Each becomes an ordinary obligation, with the same chain id scheme, plan,
+    /// sell-back and alarm as one minted by a fill this run. What differs is only
+    /// where its fields come from: the entry from its own `Place` in `--out`,
+    /// the anchor and quantity from the census (`orphan::adopt`, which also
+    /// holds the venue veto that decides what gets here at all).
+    ///
+    /// The maker order is registered in `order_rel` under its ORIGINAL id,
+    /// because that is the id the hedge's basket must name: the next startup's
+    /// census credits a basket to an obligation by it. That is also why no
+    /// `HedgeNeeded` is emitted. The obligation is already in `--out` once, and
+    /// a second copy would double what the census says is owed.
+    ///
+    /// `first_at` is backdated to the first obligation's tape time, so the naked
+    /// alarm reports the leg's real age. A leg older than the host's monotonic
+    /// clock can express falls back to now.
+    pub(super) fn adopt_obligations(&mut self, adopted: Vec<crate::orphan::Adopted>) {
+        let mono = std::time::Instant::now();
+        let now_s = arb_core::clock::now_s();
+        for a in adopted {
+            let mo = MakerOrder {
+                rel_id: a.rel_id,
+                class: a.class,
+                venue: a.entry.venue.as_str().to_string(),
+                market_id: a.entry.place.clone(),
+                side: a.entry.side,
+                price: a.entry.price.clone(),
+                strategy: a.strategy,
+            };
+            let entry = mo.entry_leg();
+            self.order_rel.entry(a.maker_order_id.clone()).or_insert(mo);
+            let age = std::time::Duration::try_from_secs_f64(now_s - a.first_ts).ok();
+            let first_at = age.and_then(|d| mono.checked_sub(d)).unwrap_or(mono);
+            self.next_hedge_oid += 1;
+            let chain = format!("h{}", self.next_hedge_oid);
+            eprintln!(
+                "[hedge] ADOPTED {}x {} {} (order {}, entry {} {} {} @ {}, anchor {}, naked \
+                 {:.1}h) as obligation {chain}",
+                a.qty,
+                a.hedge_venue.as_str(),
+                a.hedge_market,
+                a.maker_order_id,
+                a.entry.venue.as_str(),
+                a.entry.place,
+                a.entry.side.as_str(),
+                a.entry.price,
+                a.anchor_price,
+                age.map_or(0.0, |d| d.as_secs_f64() / 3600.0),
+            );
+            self.pending_hedges.insert(
+                chain,
+                PendingHedge {
+                    maker_order_id: a.maker_order_id,
+                    owed: a.qty,
+                    filled: 0,
+                    anchor: HedgeAnchor {
+                        venue: a.hedge_venue,
+                        market_id: a.hedge_market,
+                        side: a.entry.side,
+                        price: a.anchor_price,
+                    },
+                    entry,
+                    first_at,
+                    last_try_at: mono,
+                    latest_attempt: None,
+                    tries: 0,
+                    alarmed: false,
+                    hold_logged: false,
+                    parked_until: None,
+                    paused_strikes: 0,
+                },
+            );
+        }
+    }
+
     /// The hedge deadline.
     pub(super) fn hedge_tick(&mut self) {
         let pol = self.cfg.hedge_retry.as_ref().expect("guarded above");
@@ -1171,6 +1247,7 @@ mod hedge_deadline_tests {
             marks_out: None,
             armed: false,
             hedges_undischarged: 0,
+            adopt: Vec::new(),
         };
         // No executors: nothing can reach a venue from this test by construction.
         let handle = tokio::spawn(run(
@@ -1288,6 +1365,7 @@ mod hedge_deadline_tests {
             marks_out: None,
             armed: false,
             hedges_undischarged: 0,
+            adopt: Vec::new(),
         };
         let handle = tokio::spawn(run(
             vec![q],
@@ -2927,5 +3005,134 @@ mod sell_back_tests {
                 credited: 0,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod adopt_tests {
+    use super::*;
+    use crate::engine::{test_cfg, test_engine, RunCfg};
+    use crate::orphan::Adopted;
+    use arb_core::model::Level;
+
+    fn pol() -> HedgeRetry {
+        HedgeRetry { interval_s: 5.0, max_slip: "0.01".into(), alarm_after_s: 60.0 }
+    }
+
+    fn after(t: std::time::Instant, secs: f64) -> std::time::Instant {
+        t + std::time::Duration::from_secs_f64(secs)
+    }
+
+    /// The jersmi 8-lot, as boot hands it over: Kalshi YES SOLD at 0.25 (an
+    /// entry ask), hedge owed on PM-US at 0.13, naked for `age_s`.
+    fn adopted(age_s: f64) -> Adopted {
+        Adopted {
+            maker_order_id: "m1790405158370".into(),
+            rel_id: "heisman-jsmit".into(),
+            class: "cross-venue-equivalent",
+            strategy: "maker-hedge",
+            entry: intent::Place {
+                count: 8,
+                old_price: None,
+                order_id: "m1790405158370".into(),
+                place: "K".into(),
+                price: "0.2500".into(),
+                replaces: None,
+                retry: None,
+                side: BookSide::Ask,
+                tag: None,
+                taker: false,
+                ts: 1790458125.497612,
+                venue: Venue::Kalshi,
+            },
+            hedge_venue: Venue::PolymarketUs,
+            hedge_market: "P".into(),
+            anchor_price: "0.1300".into(),
+            qty: 8,
+            first_ts: arb_core::clock::now_s() - age_s,
+        }
+    }
+
+    /// PM-US's ask (the side a short entry's hedge lifts) and Kalshi's ask
+    /// (the side its sell-back lifts).
+    fn quote(e: &mut Engine, p_ask: &str, k_ask: &str) {
+        let lv = |p: &str| vec![Level { price: p.into(), size: "50".into() }];
+        e.books.apply_snapshot(Venue::PolymarketUs, "P", lv("0.05"), lv(p_ask), 1, 0, None);
+        e.books.apply_snapshot(Venue::Kalshi, "K", lv("0.05"), lv(k_ask), 1, 0, None);
+    }
+
+    /// An adopted obligation is indistinguishable from one a fill minted this
+    /// run, except that it remembers how long it has really been naked.
+    #[test]
+    fn an_adopted_obligation_is_an_ordinary_one() {
+        let mut e = test_engine(RunCfg { hedge_retry: Some(pol()), ..test_cfg() });
+        e.next_hedge_oid = 41;
+        let before = std::time::Instant::now();
+        e.adopt_obligations(vec![adopted(600.0)]);
+
+        let p = &e.pending_hedges["h42"];
+        assert_eq!(
+            (p.maker_order_id.as_str(), p.owed, p.filled, p.tries, p.latest_attempt.as_deref()),
+            ("m1790405158370", 8, 0, 0, None),
+            "owed in full, nothing at the venue"
+        );
+        assert_eq!(
+            p.anchor,
+            HedgeAnchor {
+                venue: Venue::PolymarketUs,
+                market_id: "P".into(),
+                side: BookSide::Ask,
+                price: "0.1300".into(),
+            },
+            "anchored on the book side the entry was PLACED on, as `hedge_anchor` does"
+        );
+        assert_eq!(
+            p.entry,
+            Some(EntryLeg {
+                venue: Venue::Kalshi,
+                market_id: "K".into(),
+                side: BookSide::Ask,
+                price: "0.2500".into(),
+                role: Role::Maker,
+            })
+        );
+        let age = before.duration_since(p.first_at).as_secs_f64();
+        assert!((age - 600.0).abs() < 5.0, "backdated to the leg's real age, got {age}");
+        assert!(e.order_rel.contains_key("m1790405158370"), "registered under its ORIGINAL id");
+        assert!(e.intents.is_empty(), "no second `HedgeNeeded`: the census would count it twice");
+    }
+
+    /// ...so the planner treats it as one: hedge first at the anchor, sell back
+    /// when the hedge is out of reach, and alarm from its first minute naked.
+    #[test]
+    fn an_adopted_obligation_is_planned_like_a_live_one() {
+        let mut e = test_engine(RunCfg { hedge_retry: Some(pol()), ..test_cfg() });
+        e.next_hedge_oid = 41;
+        e.adopt_obligations(vec![adopted(600.0)]);
+        let due = after(std::time::Instant::now(), 6.0);
+        let plan = |e: &mut Engine| {
+            hedge_tick_plans(
+                &mut e.cx,
+                &pol(),
+                &e.fees,
+                &e.pending_hedges,
+                &e.books,
+                &e.oid_venue,
+                &e.unclaimed_fills,
+                due,
+            )
+            .remove(0)
+        };
+
+        quote(&mut e, "0.13", "0.22");
+        let (chain, first, alarm) = plan(&mut e);
+        assert_eq!(chain, "h42");
+        assert_eq!(first, HedgePlan::Retry { qty: 8, price: "0.13".into() }, "the hedge comes first");
+        assert!(alarm.is_some(), "10 minutes naked against a 60s alarm");
+
+        // The PM-US ask is 0.07 past the anchor; 0.22 against a 0.25 entry
+        // clears both Kalshi fees (the hand-worked jersmi lot).
+        quote(&mut e, "0.20", "0.22");
+        assert_eq!(plan(&mut e).1, HedgePlan::SellBack { qty: 8, price: "0.22".into() });
     }
 }

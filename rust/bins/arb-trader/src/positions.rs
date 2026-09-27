@@ -433,7 +433,7 @@ pub fn pairs_from_registry(path: &str) -> Vec<Pair> {
 /// should stop retrying and back off rather than spend three attempts. Nothing
 /// here is unsafe without it — the failure path already refuses — it just
 /// spends more of a shared budget than it needs to.
-async fn read_net(sink: &Arc<dyn crate::sink::OrderSink>, venue: &str) -> Result<NetMap, String> {
+pub(crate) async fn read_net(sink: &Arc<dyn crate::sink::OrderSink>, venue: &str) -> Result<NetMap, String> {
     let mut last = String::new();
     for attempt in 0..RETRIES {
         let s = sink.clone();

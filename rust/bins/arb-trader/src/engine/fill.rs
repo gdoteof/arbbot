@@ -1376,6 +1376,96 @@ mod attribute_fill_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A previous run's naked leg, ADOPTED at boot and sold back, closes the
+    /// loop the same way: the close names the ORIGINAL maker order, so the next
+    /// boot's census credits it, and it releases the exposure the census seeded
+    /// this boot (the adopted entry was never `record_open`ed by this process).
+    #[test]
+    fn an_adopted_sell_back_closes_what_the_census_seeded() {
+        let dir = std::env::temp_dir().join(format!("arb-fill-adopt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exec = dir.join("exec.yaml");
+        std::fs::write(&exec, "bankroll_usd: 980\nper_class_cap: 0.35\n").unwrap();
+        let ledger = dir.join("trades.jsonl");
+        let lp = ledger.to_str().unwrap();
+        let rv = std::sync::Arc::new(crate::risk::RiskView::load(
+            exec.to_str().unwrap(),
+            "/nonexistent/topics.yaml",
+            vec![
+                ("kalshi".to_string(), "1000".to_string()),
+                ("polymarket_us".to_string(), "1000".to_string()),
+            ],
+            HashMap::from([("heisman-jsmit".to_string(), "low".to_string())]),
+        ));
+        // What `seed_exposure_from_census` books at boot, adopted or not.
+        rv.record_open("heisman-jsmit", "cross-venue-equivalent", 8.0);
+        let mut cfg = test_cfg();
+        cfg.risk = Some(rv.clone());
+        cfg.ledger_path = Some(lp.to_string());
+        let mut e = test_engine(cfg);
+        e.next_hedge_oid = 41;
+        e.adopt_obligations(vec![crate::orphan::Adopted {
+            maker_order_id: "m1790405158370".into(),
+            rel_id: "heisman-jsmit".into(),
+            class: "cross-venue-equivalent",
+            strategy: "maker-hedge",
+            entry: intent::Place {
+                count: 8,
+                old_price: None,
+                order_id: "m1790405158370".into(),
+                place: "K".into(),
+                price: "0.2500".into(),
+                replaces: None,
+                retry: None,
+                side: BookSide::Ask,
+                tag: None,
+                taker: false,
+                ts: 1790458125.497612,
+                venue: Venue::Kalshi,
+            },
+            hedge_venue: Venue::PolymarketUs,
+            hedge_market: "P".into(),
+            anchor_price: "0.1300".into(),
+            qty: 8,
+            first_ts: 1790458158.8566701,
+        }]);
+
+        // The attempt the tick places on a `SellBack`: Kalshi's ask, lifted.
+        e.hedge_orders.insert(
+            "h43".into(),
+            HedgeOrder {
+                maker_order_id: "m1790405158370".into(),
+                chain_id: "h42".into(),
+                market_id: "K".into(),
+                venue: Venue::Kalshi,
+                side: BookSide::Bid,
+                price: "0.22".into(),
+                qty: 8,
+                cum_filled: 0,
+                supersedes: None,
+                sell_back: true,
+            },
+        );
+        let arm = e.attribute_fill("h43", 8, Venue::Kalshi, "K", 2.0, Instant::now());
+        assert!(matches!(arm, FillArm::Hedge));
+        assert!(e.pending_hedges.is_empty(), "the adopted obligation is discharged");
+        assert_eq!(rv.open_ct("heisman-jsmit"), 0.0, "and the census seed is released");
+
+        let recs = crate::ledger::read(lp).unwrap();
+        assert_eq!(recs.len(), 1);
+        let r = &recs[0];
+        assert_eq!((r["status"].as_str(), r["strategy"].as_str()), (Some("realized"), Some("naked-sellback")));
+        assert_eq!(r["legs"][0]["order_id"], "m1790405158370", "the ORIGINAL maker order");
+        assert_eq!((r["legs"][0]["side"].as_str(), r["legs"][0]["yes_price"].as_str()), (Some("ask"), Some("0.2500")));
+        assert_eq!((r["legs"][1]["side"].as_str(), r["legs"][1]["yes_price"].as_str()), (Some("bid"), Some("0.22")));
+        let minted = r#"{"anchor_price":"0.1300","hedge_needed":"P","order_id":"m1790405158370","qty":8,"ts":1790458158.8566701}"#;
+        assert!(
+            crate::orphan::undischarged(minted, recs).is_empty(),
+            "the next boot's census credits it, so it is neither re-adopted nor re-seeded"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **A TAKE-TAKE FILL MUST NOT RELEASE THE MAKER'S RESERVATION.**
     ///
     /// The two share a slot key. A Kalshi-lead crossing places leg 1 as a BID

@@ -1146,11 +1146,20 @@ fn seed_exposure_from_ledger(
 /// leaves the ledger empty while the OTHER leg is real at the venue. That is
 /// exactly what happened at 00:53:50 on 2026-07-29 — see `orphan`, which also
 /// explains why the census reads this engine's own `--out` stream instead of a
-/// venue position, and why it reports rather than hedges.
+/// venue position, and why it reports what the engine does not adopt.
 ///
-/// Returns the contract count for the standing `hedges_undischarged` gauge, so
-/// this is visible to a monitor every stats tick and not only in the scrollback
-/// of a startup nobody was watching.
+/// ADOPTS WHAT THE VENUE VOUCHES FOR (2026-09-26). An obligation whose entry is
+/// in `--out` and whose pair's venue imbalance still shows it goes back into
+/// this run's hedge loop (`orphan::adopt`, `Engine::adopt_obligations`), where
+/// it is hedged, or sold back, like one minted this run. The rest is reported
+/// exactly as before. The venue is read only when there is something to adopt,
+/// and it is read before the executors take the sinks.
+///
+/// Returns the contract count the engine did NOT adopt, for the standing
+/// `hedges_undischarged` gauge, so this is visible to a monitor every stats
+/// tick and not only in the scrollback of a startup nobody was watching. What
+/// it did adopt is on `hedges_pending` from the first tick, like any other
+/// live obligation.
 ///
 /// AND SEEDS THE RISK VIEW WITH IT. The census was a display line and nothing
 /// else: its only consumer was `RunCfg::hedges_undischarged`, which `summary()`
@@ -1167,8 +1176,10 @@ fn seed_exposure_from_ledger(
 /// owns naked-leg completion at the time, which must never be both — a basket
 /// is appended and the NEXT startup's census reads `owed - booked = 0`, so the
 /// same contracts move from this seed to the ledger seed without ever being in
-/// both. Nothing in THIS process can book them: the maker order belongs to a
-/// previous run, so `book_basket`'s `order_rel` lookup misses and says so.
+/// both. An ADOPTED obligation completes the same way: this process books its
+/// hedge against the original maker order id, which is what the census joins
+/// on. What is NOT adopted this process cannot book: the maker order belongs to
+/// a previous run, so `book_basket`'s `order_rel` lookup misses and says so.
 ///
 /// THAT PARTITION HOLDS ONLY IF BOTH SEEDS FOLD OVER THE SAME SNAPSHOT, which
 /// is why the ledger is read ONCE in `main` and passed to both. It used to be
@@ -1182,38 +1193,40 @@ fn seed_exposure_from_ledger(
 /// the unlucky one of the two: census-first would have DOUBLE counted, which is
 /// merely conservative. Nor is it a low-correlation race — a restart carrying a
 /// naked leg is precisely the state in which that timer is trying to write.
-fn report_undischarged_hedges(
+#[allow(clippy::too_many_arguments)]
+async fn report_undischarged_hedges(
     args: &Args,
     quoters: &[Quoter],
     risk: Option<&risk::RiskView>,
     rel_meta: &HashMap<String, (String, String)>,
     ledger: &LedgerRead,
+    sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
     armed: bool,
     bench: bool,
-) -> u64 {
+) -> (u64, Vec<orphan::Adopted>) {
     // bench/replay reads no ledger and must stay byte-deterministic; an
     // offline tape has no previous run of its own to answer for.
     if bench {
-        return 0;
+        return (0, Vec::new());
     }
     // ONLY an armed run. `run_cfg` gives an unarmed engine `ledger_path: None`,
     // so a shadow books nothing at all — every obligation it has ever minted
     // would read as undischarged, forever, and the one line that matters would
     // drown in them.
     if !armed {
-        return 0;
+        return (0, Vec::new());
     }
     let Some(out) = args.out.as_deref() else {
         eprintln!(
             "[hedge] no --out: this run cannot record its own hedge obligations, so a \
              restart will not be able to see one it left naked. Pass --out."
         );
-        return 0;
+        return (0, Vec::new());
     };
     let Ok(ledger) = ledger else {
         // `place_preconditions` already refuses to arm on this and names the
         // damage; saying it twice here would only bury it.
-        return 0;
+        return (0, Vec::new());
     };
     // Every leg of every relationship this run quotes: an obligation is owed on
     // the OTHER leg, and either leg can be the other one.
@@ -1226,15 +1239,40 @@ fn report_undischarged_hedges(
             );
         }
     }
-    let found =
-        orphan::undischarged(&std::fs::read_to_string(out).unwrap_or_default(), ledger.clone());
-    for l in orphan::report(&found, &rel_of, arb_core::clock::now_s()) {
+    let intents = std::fs::read_to_string(out).unwrap_or_default();
+    let found = orphan::undischarged(&intents, ledger.clone());
+    let ids = found.iter().map(|u| u.maker_order_id.clone()).collect();
+    let places = orphan::entry_places(&intents, &ids);
+    drop(intents);
+    let (adopted, refused) = if found.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let venue = match (sinks.get(&Venue::Kalshi), sinks.get(&Venue::PolymarketUs)) {
+            (Some(k), Some(p)) if !places.is_empty() => {
+                match (positions::read_net(k, "kalshi").await, positions::pmus_consensus(p).await) {
+                    (Ok(k), Ok(p)) => Ok((k, p)),
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                }
+            }
+            _ => Err("this run has no Kalshi and PM-US sinks to read".to_string()),
+        };
+        let rels: Vec<&Rel> = quoters.iter().map(|q| &q.rel).collect();
+        orphan::adopt(&found, &places, &rels, venue.as_ref().map(|(k, p)| (k, p)).map_err(|e| e.as_str()))
+    };
+    for l in &refused {
         eprintln!("{l}");
     }
+    let mut left = found.clone();
+    left.retain(|u| !adopted.iter().any(|a| a.maker_order_id == u.maker_order_id));
+    for l in orphan::report(&left, &rel_of, arb_core::clock::now_s()) {
+        eprintln!("{l}");
+    }
+    // ALL of it, adopted or not: an adopted obligation is still a naked leg
+    // until its hedge fills, and a sell-back releases what this seeded.
     if let Some(rv) = risk {
         seed_exposure_from_census(rv, &found, &registry_class_of(&args.registry, rel_meta));
     }
-    found.iter().map(|u| u.missing() as u64).sum()
+    (left.iter().map(|u| u.missing() as u64).sum(), adopted)
 }
 
 /// Hedge market -> (relationship id, class) over the FULL registry.
@@ -1998,6 +2036,7 @@ fn run_cfg(
 ) -> engine::RunCfg {
     engine::RunCfg {
         hedges_undischarged: undischarged,
+        adopt: Vec::new(),
         out_path: args.out,
         kill_file: args.kill_file,
         stats_every_s: args.stats_every_s,
@@ -2235,19 +2274,22 @@ async fn main() {
     // ...and it does not merely REPORT it: an obligation the ledger cannot see
     // is still exposure, so it is seeded into the same risk view the ledger
     // seeded, before the first quote consults it.
-    let undischarged = report_undischarged_hedges(
+    let (undischarged, adopt) = report_undischarged_hedges(
         &args,
         &quoters,
         risk.as_deref(),
         &rel_meta,
         &ledger,
+        &sinks,
         armed,
         bench,
-    );
+    )
+    .await;
     let acks = if sinks.is_empty() { None } else { tx_acks.clone() };
     let (exec_txs, exec_stats) = exec::spawn_executors(rate, sinks, acks);
-    let cfg =
+    let mut cfg =
         run_cfg(args, bench, armed, !exec_txs.is_empty(), risk, undischarged, policy);
+    cfg.adopt = adopt;
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;
     println!("{summary}");
     if armed {
