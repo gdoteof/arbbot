@@ -100,7 +100,9 @@ pub struct RiskVerdict {
     /// Contracts still under this relationship's TOPIC budget, or `None` when
     /// no topic budget applies. Carried through from `arb_core::risk::Decision`
     /// so a refused quote can be re-priced at what the topic WILL take instead
-    /// of being dropped. See the resize in [`Quoter::on_book`].
+    /// of being dropped. See the resize in [`Quoter::on_book`]. The trader's
+    /// gate tightens it to the room under its per-event loss cap when that is
+    /// smaller.
     pub topic_headroom: Option<i64>,
 }
 
