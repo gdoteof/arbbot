@@ -158,8 +158,18 @@ static ACT_UNRESOLVED: AtomicU64 = AtomicU64::new(0);
 /// also 0 in that configuration.
 static ACT_UNACCOUNTED: AtomicI64 = AtomicI64::new(0);
 
+/// The naked legs themselves, from the same cycle `NAKED` counts. The engine's
+/// hedge loop values them for the book-wide naked limit
+/// (`engine::hedge::naked_worst_usd`): recon is the only reader of VENUE truth,
+/// so it is the only place a naked leg no obligation owns (a restart, a
+/// recon-act lot) shows up at all.
+static CONFIRMED: std::sync::Mutex<Vec<Finding>> = std::sync::Mutex::new(Vec::new());
+
 pub fn naked() -> i64 {
     NAKED.load(Ordering::Relaxed)
+}
+pub fn confirmed() -> Vec<Finding> {
+    CONFIRMED.lock().expect("confirmed").clone()
 }
 pub fn unconfirmed() -> i64 {
     UNCONFIRMED.load(Ordering::Relaxed)
@@ -963,6 +973,7 @@ async fn cycle(
     // Published only HERE, past every guard: the gauges are the reading of a
     // snapshot this cycle was willing to believe.
     NAKED.store(confirmed.len() as i64, Ordering::Relaxed);
+    *CONFIRMED.lock().expect("confirmed") = confirmed.clone();
     UNCONFIRMED.store(fresh.len() as i64, Ordering::Relaxed);
     LAST_OK_S.store(now_s(), Ordering::Relaxed);
     for f in &confirmed {

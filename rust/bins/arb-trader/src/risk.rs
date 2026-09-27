@@ -59,6 +59,27 @@ const GLOBAL_CAP: &str = "0.50";
 const TARGET_DEPLOY: &str = "0.85";
 const OVERFLOW_MIN_APR: &str = "0.12";
 const OVERFLOW_FRAC: &str = "0.10";
+/// The most one EVENT may lose, as a fraction of NAV. Geoff, 2026-09-26: "15%
+/// of nav for both per event max loss and naked limit seem fine to me."
+///
+/// An event is every relationship on one question (see [`event_of`]), and its
+/// loss is counted in contracts, the gate's ~$1 basket. A hedged basket loses
+/// roughly its whole cost if the two venues settle it differently, and every
+/// candidate in one event shares that settlement. So this bounds the tail, not
+/// the expected loss.
+///
+/// Applied in [`RiskView::check`] and not in `arb_core::risk::check_order`,
+/// whose decisions are pinned against the Python fixtures.
+const PER_EVENT_LOSS: f64 = 0.15;
+/// The most the unhedged legs may lose between them, book-wide, as a fraction
+/// of NAV. Same approval as [`PER_EVENT_LOSS`].
+///
+/// Over it, NOTHING new opens anywhere: every new basket is one more leg that
+/// can be left naked. Nothing is flattened to get back under, either. Geoff
+/// holds naked tails and waits for the hedge or the sell-back ("a 2c drift is
+/// the exact type of thing i would expect to drift back"), so the limit stops
+/// the tail from growing and leaves the ones we hold to the hedge loop.
+const NAKED_LIMIT: f64 = 0.15;
 
 #[derive(Default)]
 struct Exposure {
@@ -267,6 +288,12 @@ pub struct RiskView {
     /// Counts, for the stats line. Rejections are not errors — a gate that
     /// never fires is a gate nobody can see working.
     pub checked: Mutex<(u64, u64)>, // (allowed, rejected)
+    /// Worst-case loss of every naked leg, in dollars, as the engine's hedge
+    /// loop last computed it (`engine::hedge::naked_worst_usd`). `None` means
+    /// nothing has published one yet, and bench/replay never does, because it
+    /// has no hedge loop. So the naked limit is not checked at all there,
+    /// rather than checked against a zero nobody measured.
+    naked_worst: Mutex<Option<f64>>,
 }
 
 /// What BOTH cap loaders in this file accept as a number.
@@ -555,6 +582,7 @@ impl RiskView {
             released: Mutex::new(HashSet::new()),
             reserved: Mutex::new(HashMap::new()),
             checked: Mutex::new((0, 0)),
+            naked_worst: Mutex::new(None),
         }
     }
 
@@ -1022,6 +1050,27 @@ impl RiskView {
         *self.checked.lock().expect("checked")
     }
 
+    /// The hedge loop's reading of what the naked legs could lose, in dollars.
+    pub fn set_naked_worst(&self, usd: f64) {
+        *self.naked_worst.lock().expect("naked_worst") = Some(usd);
+    }
+
+    /// (worst case, limit) in dollars, for the stats line; `None` until the
+    /// hedge loop has published a reading. The limit is taken off the same
+    /// bankroll `check` uses.
+    pub fn naked_gauge(&self) -> Option<(f64, f64)> {
+        let w = (*self.naked_worst.lock().expect("naked_worst"))?;
+        let book: f64 = self.exposure.lock().expect("exposure").by_rel.values().sum();
+        let nav = self.config_over_book(book).bankroll.parse::<f64>().unwrap_or(0.0);
+        Some((w, nav * NAKED_LIMIT))
+    }
+
+    /// The per-event cap in dollars, for the stats line.
+    pub fn event_cap_usd(&self) -> f64 {
+        let book: f64 = self.exposure.lock().expect("exposure").by_rel.values().sum();
+        self.config_over_book(book).bankroll.parse::<f64>().unwrap_or(0.0) * PER_EVENT_LOSS
+    }
+
     /// The caps `arb_core::risk` actually gates on, over a book of `book`
     /// contracts.
     ///
@@ -1097,6 +1146,18 @@ fn topic_of(rel_id: &str, topics: &[(String, String, Option<String>)]) -> String
         }
     }
     if best.is_empty() { "other".to_string() } else { best.to_string() }
+}
+
+/// The event a relationship belongs to: its id without the last `-` segment,
+/// which the registry uses for the outcome. `xvus-time-poty-26-zohranmamdani`
+/// is event `xvus-time-poty-26`, and `xvus-tsla-q3-deliv-q3-above-440k` is
+/// `xvus-tsla-q3-deliv-q3-above`.
+///
+/// Taken from the relationship id and NOT from the Kalshi ticker, because the
+/// ticker prefix is not an event key: `KXNOBELPEACE-27-MKUL` sits in the 2026
+/// prize's event `KXNOBELPEACE-26`.
+fn event_of(rel_id: &str) -> &str {
+    rel_id.rsplit_once('-').map_or(rel_id, |(event, _)| event)
 }
 
 /// Every venue whose cash a basket on `rel` would spend, charged the full
@@ -1215,7 +1276,30 @@ impl RiskGate for RiskView {
             // everything rather than merely refusing new orders.
             kill: false,
         };
-        let d = check_order(&inp);
+        let mut d = check_order(&inp);
+        // The two tail limits, over the same post-reservation `by_rel` the
+        // topic budget reads, so a resting quote on one candidate spends the
+        // whole event's room the way it spends the topic's.
+        let nav = inp.config.bankroll.parse::<f64>().unwrap_or(0.0);
+        let event = event_of(&rel.id);
+        let event_open: f64 =
+            by_rel.iter().filter(|(r, _)| event_of(r) == event).map(|(_, q)| q).sum();
+        let event_cap = nav * PER_EVENT_LOSS;
+        if event_open + notional as f64 > event_cap {
+            d.reasons.push(format!(
+                "per-event loss cap [{event}]: {event_open:.2}+{notional} > {event_cap:.2}"
+            ));
+        }
+        if let Some(worst) = *self.naked_worst.lock().expect("naked_worst") {
+            let cap = nav * NAKED_LIMIT;
+            if worst > cap {
+                d.reasons.push(format!(
+                    "book-wide naked limit: worst case ${worst:.2} > ${cap:.2} — no new \
+                     entries until a naked leg is hedged or sold back"
+                ));
+            }
+        }
+        d.allowed = d.reasons.is_empty();
         // RESERVE. The quoter rests the order the instant this returns allowed
         // — there is no branch between them — so this is the moment the capital
         // is committed, and it stays committed until the quote fills or comes
@@ -1237,11 +1321,17 @@ impl RiskGate for RiskView {
         // Contracts, floored: the gate counts a prediction-market basket as
         // ~$1, and a fractional contract is not orderable. Floor rather than
         // round so the resize can never ask for more room than the topic has.
-        let topic_headroom = d
-            .topic_headroom
-            .as_deref()
-            .and_then(|h| h.parse::<f64>().ok())
-            .map(|h| h.floor().max(0.0) as i64);
+        //
+        // The event's room as well, whichever is tighter, so a clip the event
+        // cap refuses is re-priced at what the event will still take, exactly
+        // like one the topic budget refuses.
+        let event_room = (event_cap - event_open).floor().max(0.0) as i64;
+        let topic_headroom = Some(
+            d.topic_headroom
+                .as_deref()
+                .and_then(|h| h.parse::<f64>().ok())
+                .map_or(event_room, |h| (h.floor().max(0.0) as i64).min(event_room)),
+        );
         RiskVerdict { allowed: d.allowed, reasons: d.reasons, topic_headroom }
     }
 
@@ -1327,6 +1417,28 @@ mod tests {
         P.get_or_init(|| write_exec("exec-ok", "bankroll_usd: 980\nper_class_cap: 0.35\n"))
             .to_string_lossy()
             .into_owned()
+    }
+
+    /// For fixtures pinned to the per-relationship cap or a topic budget.
+    /// `valid_exec`'s $980 puts the per-event cap at $147, under the $150
+    /// per-relationship cap, so any fixture that loads one relationship past
+    /// 142 contracts is refused by the event cap first and tests the wrong
+    /// cap. $2,000 moves the event cap to $300. The per-relationship cap is
+    /// absolute, so it does not move.
+    fn wide_exec() -> String {
+        static P: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        P.get_or_init(|| write_exec("exec-wide", "bankroll_usd: 2000\nper_class_cap: 0.35\n"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn funded_wide() -> RiskView {
+        view_with_configs(
+            &wide_exec(),
+            "/nonexistent/topics.yaml",
+            vec![("kalshi", "1000"), ("polymarket_us", "1000")],
+            "low",
+        )
     }
 
     /// FAIL-CLOSED: an unconfigured venue balance reads as $0 cash, so the
@@ -1773,7 +1885,7 @@ mod tests {
     /// worse than the overshoot the reservation exists to stop.
     #[test]
     fn a_released_slot_gives_its_capital_back() {
-        let v = funded("low");
+        let v = funded_wide();
         v.record_open("r1", "cross-venue-equivalent", 145.0); // 5 of headroom left
         assert!(v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
         assert!(
@@ -1795,7 +1907,7 @@ mod tests {
     /// most dangerous — and would leak a reservation per reprice besides.
     #[test]
     fn repricing_is_not_charged_for_the_quote_it_replaces() {
-        let v = funded("low");
+        let v = funded_wide();
         v.record_open("r1", "cross-venue-equivalent", 145.0);
         assert!(v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
 
@@ -2366,12 +2478,16 @@ mod tests {
     /// different gate. `view_with_topics` registers only `r1`, and everything
     /// else defaults to `high` (tail cap 37.50).
     fn view_topics_low(topics: &str, rels: &[&str]) -> RiskView {
+        view_topics_low_on(&valid_exec(), topics, rels)
+    }
+
+    fn view_topics_low_on(exec: &str, topics: &str, rels: &[&str]) -> RiskView {
         let mut o = HashMap::new();
         for r in rels {
             o.insert((*r).to_string(), "low".to_string());
         }
         RiskView::load(
-            &valid_exec(),
+            exec,
             topics,
             vec![
                 ("kalshi".to_string(), "1000".to_string()),
@@ -2477,7 +2593,9 @@ mod tests {
             "xvus-time-poty-26-zohranmamdani",
             "xvus-time-poty-26-artificialintelligence",
         );
-        let v = view_topics_low(p.to_str().unwrap(), &[pope, mamdani, ai]);
+        // The wide bankroll, so the 185-contract event clears its own cap and
+        // the topic budget is what binds.
+        let v = view_topics_low_on(&wide_exec(), p.to_str().unwrap(), &[pope, mamdani, ai]);
         let meta = meta_for(pope, "cross-venue-equivalent");
         // 185 charged. 175 of it is real; the other 10 are two 5-lots this
         // process exited hours ago and went on being charged for.
@@ -2496,6 +2614,88 @@ mod tests {
         let d2 = v.check(&rel(pope), Venue::Kalshi, 5, None);
         assert!(d2.allowed, "175 + 5 fits under 185 — the order the phantom refused: {:?}", d2.reasons);
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    /// THE PER-EVENT CAP: every candidate on one question shares one settlement,
+    /// so together they may not put more than 15% of NAV at risk. $980 x 0.15 =
+    /// $147. Another event is untouched, and the refused quote is told how much
+    /// the event WILL take, so the quoter can re-size it the way it re-sizes to
+    /// a topic budget.
+    #[test]
+    fn one_event_may_not_risk_more_than_15pct_of_nav() {
+        let (a, b, c) = (
+            "xvus-time-poty-26-popeleoxiv",
+            "xvus-time-poty-26-zohranmamdani",
+            "xvus-time-poty-26-elonmusk",
+        );
+        let other = "xvus-nobel-peace-26-mykolakuleba";
+        let v = view_topics_low("/nonexistent/topics.yaml", &[a, b, c, other]);
+        v.record_open(a, "cross-venue-equivalent", 100.0);
+        v.record_open(b, "cross-venue-equivalent", 45.0);
+
+        let d = v.check(&rel(c), Venue::Kalshi, 5, None);
+        assert!(!d.allowed, "{:?}", d.reasons);
+        assert!(
+            d.reasons.iter().any(|r| r == "per-event loss cap [xvus-time-poty-26]: 145.00+5 > 147.00"),
+            "{:?}",
+            d.reasons
+        );
+        assert_eq!(d.topic_headroom, Some(2), "the room the event has left, floored");
+
+        let d = v.check(&rel(other), Venue::Kalshi, 5, None);
+        assert!(d.allowed, "a different event: {:?}", d.reasons);
+        assert!(d.topic_headroom.unwrap() >= 142, "{:?}", d.topic_headroom);
+    }
+
+    /// A quote RESTING on one candidate spends the event's room like one that
+    /// filled, for the reason it spends the topic's: the quoter rests the moment
+    /// the gate allows, so a second candidate checked before the first fills
+    /// must see it.
+    #[test]
+    fn a_resting_quote_on_a_sibling_candidate_spends_the_events_room() {
+        let (a, b) = ("xvus-tsla-q3-deliv-q3-above-440k", "xvus-tsla-q3-deliv-q3-above-460k");
+        let v = view_topics_low("/nonexistent/topics.yaml", &[a, b]);
+        v.record_open(a, "cross-venue-equivalent", 140.0);
+        assert!(v.check(&rel(a), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
+        let d = v.check(&rel(b), Venue::Kalshi, 5, Some(("K", BookSide::Bid)));
+        assert!(
+            d.reasons.iter().any(|r| r.starts_with("per-event loss cap [xvus-tsla-q3-deliv-q3-above]: 145.00+5")),
+            "{:?}",
+            d.reasons
+        );
+        v.release(a, "K", BookSide::Bid);
+        assert!(v.check(&rel(b), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
+    }
+
+    /// THE NAKED LIMIT: past 15% of NAV in worst-case naked loss, nothing new
+    /// opens on ANY event, and the refusal says what lifts it. Before the hedge
+    /// loop has published a reading there is no check at all (bench and replay
+    /// never publish one), rather than a check against a zero nobody measured.
+    #[test]
+    fn past_the_naked_limit_nothing_new_opens_anywhere() {
+        let v = funded("low");
+        assert_eq!(v.naked_gauge(), None);
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed, "no reading: no check");
+
+        v.set_naked_worst(140.0);
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed, "under $147");
+
+        v.set_naked_worst(150.0);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
+        assert!(!d.allowed);
+        assert_eq!(
+            d.reasons,
+            vec!["book-wide naked limit: worst case $150.00 > $147.00 — no new entries until \
+                  a naked leg is hedged or sold back"
+                .to_string()]
+        );
+        assert_eq!(v.reserved_ct(), 0.0, "a refusal reserves nothing");
+        let (w, cap) = v.naked_gauge().unwrap();
+        assert_eq!(w, 150.0);
+        assert!((cap - 147.0).abs() < 1e-9, "{cap}");
+
+        v.set_naked_worst(120.0);
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed, "hedged back under: open again");
     }
 
     /// An id the registry cannot classify was seeded under `unknown`

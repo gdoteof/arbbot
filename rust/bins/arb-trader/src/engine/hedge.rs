@@ -584,6 +584,66 @@ fn naked_alarm_due(
         && now.saturating_duration_since(first_at).as_secs_f64() >= pol.alarm_after_s
 }
 
+/// What every naked leg could lose, in dollars: the reading the book-wide
+/// naked limit (`risk::NAKED_LIMIT`) is checked against.
+///
+/// Two sources, because neither sees every naked leg:
+///   * this engine's obligations, `owed - filled` of each. The entry is known,
+///     so the loss is exact: a long entry (bid) loses its price if the market
+///     settles NO, a short entry (ask) loses one minus its price if it settles
+///     YES. An obligation with no entry is charged the full $1.
+///   * recon's confirmed findings, which are venue truth and include the legs
+///     nothing here owns (a previous run's, recon-act's). There is no entry
+///     price, so the leg is valued at the price we could have traded it at:
+///     net short (imb < 0) at one minus the best bid, net long at the best ask.
+///     Kalshi's book first, then PM-US's, then $1. Each fallback is the more
+///     pessimistic one.
+///
+/// Per relationship the LARGER of the two is taken, not the sum. Both describe
+/// the same contracts when both see them (jersmi 105 was on both lists), and
+/// adding them would count one tail twice.
+pub(super) fn naked_worst_usd(
+    pending: &HashMap<String, PendingHedge>,
+    order_rel: &HashMap<String, MakerOrder>,
+    findings: &[crate::positions::Finding],
+    books: &BookBuilder,
+) -> f64 {
+    let px = |s: &str| s.parse::<f64>().ok().filter(|p| (0.0..=1.0).contains(p));
+    let mut engine: HashMap<&str, f64> = HashMap::new();
+    for (chain, p) in pending {
+        let left = (p.owed - p.filled).max(0) as f64;
+        let per_ct = match &p.entry {
+            Some(e) => match (e.side, px(&e.price)) {
+                (BookSide::Bid, Some(m)) => m,
+                (BookSide::Ask, Some(m)) => 1.0 - m,
+                (_, None) => 1.0,
+            },
+            None => 1.0,
+        };
+        // An obligation whose maker order is unknown stands alone under its
+        // chain id: it cannot be matched to a finding, so it is never netted
+        // against one.
+        let rel = order_rel.get(&p.maker_order_id).map_or(chain.as_str(), |m| m.rel_id.as_str());
+        *engine.entry(rel).or_default() += left * per_ct;
+    }
+    let mut recon: HashMap<&str, f64> = HashMap::new();
+    for f in findings {
+        let short = f.imb < 0.0;
+        let touch = |venue: Venue, market: &str| {
+            let b = books.get(venue, market)?;
+            let lvl = if short { b.bids.first() } else { b.asks.first() }?;
+            px(&lvl.price)
+        };
+        let per_ct = touch(Venue::Kalshi, &f.kalshi)
+            .or_else(|| touch(Venue::PolymarketUs, &f.pmus))
+            .map_or(1.0, |p| if short { 1.0 - p } else { p });
+        *recon.entry(f.rel_id.as_str()).or_default() += f.imb.abs() * per_ct;
+    }
+    let mut total: f64 = recon.iter().map(|(r, v)| v.max(engine.get(r).copied().unwrap_or(0.0))).sum();
+    total += engine.iter().filter(|(r, _)| !recon.contains_key(*r)).map(|(_, v)| v).sum::<f64>();
+    total
+}
+
 /// Quote-time hedge anchor for a maker order resting on `rel`'s
 /// `market_id`/`side`: the top of the book on the OTHER leg, on the side the
 /// hedge would TAKE. A maker bid that fills leaves us long, so the hedge sells
@@ -900,6 +960,16 @@ impl Engine {
                 })
                 .collect(),
         );
+        // The naked limit's reading, from the same tick. Cheap: a pass over
+        // the obligations and recon's last findings.
+        if let Some(rv) = self.cfg.risk.as_ref() {
+            rv.set_naked_worst(naked_worst_usd(
+                &self.pending_hedges,
+                &self.order_rel,
+                &crate::positions::confirmed(),
+                &self.books,
+            ));
+        }
         self.apply_hedge_plans(plans, mono);
     }
 
@@ -3005,6 +3075,126 @@ mod sell_back_tests {
                 credited: 0,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod naked_worst_tests {
+    use super::*;
+    use crate::positions::{Finding, Leg};
+    use arb_core::model::Level;
+
+    fn owes(maker: &str, entry: Option<(BookSide, &str)>, owed: i64, filled: i64) -> PendingHedge {
+        let t = std::time::Instant::now();
+        PendingHedge {
+            maker_order_id: maker.into(),
+            owed,
+            filled,
+            anchor: HedgeAnchor {
+                venue: Venue::PolymarketUs,
+                market_id: "P".into(),
+                side: BookSide::Bid,
+                price: "0.40".into(),
+            },
+            entry: entry.map(|(side, price)| EntryLeg {
+                venue: Venue::Kalshi,
+                market_id: "K".into(),
+                side,
+                price: price.into(),
+                role: Role::Maker,
+            }),
+            first_at: t,
+            last_try_at: t,
+            latest_attempt: None,
+            tries: 0,
+            alarmed: false,
+            hold_logged: false,
+            parked_until: None,
+            paused_strikes: 0,
+        }
+    }
+
+    fn maker(rel: &str) -> MakerOrder {
+        MakerOrder {
+            rel_id: rel.into(),
+            class: "cross-venue-equivalent",
+            venue: "kalshi".into(),
+            market_id: "K".into(),
+            side: BookSide::Ask,
+            price: "0.21".into(),
+            strategy: "maker-hedge",
+        }
+    }
+
+    fn finding(rel: &str, kalshi: &str, pmus: &str, imb: f64) -> Finding {
+        Finding {
+            rel_id: rel.into(),
+            kalshi: kalshi.into(),
+            pmus: pmus.into(),
+            kq: imb,
+            pq: 0.0,
+            imb,
+            leg: if imb < 0.0 { Leg::PmShort } else { Leg::KalshiLong },
+            qty: imb.abs().round() as i64,
+        }
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    /// A long entry loses its price if the market settles NO; a short entry
+    /// loses one minus its price if it settles YES. Only what is still owed
+    /// counts, and an obligation with no entry is charged the whole dollar.
+    #[test]
+    fn an_obligation_loses_its_entry_price_long_and_one_minus_it_short() {
+        let pending = HashMap::from([
+            ("h1".to_string(), owes("m1", Some((BookSide::Bid, "0.38")), 5, 0)),
+            ("h2".to_string(), owes("m2", Some((BookSide::Ask, "0.25")), 10, 4)),
+            ("h3".to_string(), owes("m9", None, 3, 0)),
+        ]);
+        let rels = HashMap::from([
+            ("m1".to_string(), maker("xvus-e-a")),
+            ("m2".to_string(), maker("xvus-e-b")),
+        ]);
+        let w = naked_worst_usd(&pending, &rels, &[], &BookBuilder::new());
+        // 5 x 0.38 + 6 x 0.75 + 3 x 1.00
+        assert!(close(w, 1.90 + 4.50 + 3.00), "{w}");
+    }
+
+    /// jersmi on 2026-09-26 was on BOTH lists: the engine owed 105 and recon saw
+    /// the venue net short 105. That is one tail, so it counts once, at the larger
+    /// valuation. A leg only recon sees (zoh 20.3, owned by nothing after a
+    /// restart) is valued off whichever book exists, and at $1 if none does.
+    #[test]
+    fn a_recon_finding_is_valued_off_the_book_and_never_counts_an_obligation_twice() {
+        let pending = HashMap::from([(
+            "h1".to_string(),
+            owes("m1", Some((BookSide::Ask, "0.21")), 105, 0),
+        )]);
+        let rels = HashMap::from([("m1".to_string(), maker("xvus-heisman-26-jeremiahsmith"))]);
+        let mut books = BookBuilder::new();
+        let lv = |p: &str| vec![Level { price: p.into(), size: "50".into() }];
+        books.apply_snapshot(Venue::Kalshi, "JSMIT", lv("0.20"), lv("0.22"), 1, 0, None);
+        books.apply_snapshot(Venue::PolymarketUs, "zohmam", lv("0.25"), lv("0.27"), 1, 0, None);
+        let findings = [
+            finding("xvus-heisman-26-jeremiahsmith", "JSMIT", "jersmi", -105.0),
+            // No Kalshi book, so PM-US's bid.
+            finding("xvus-time-poty-26-zohranmamdani", "ZOH", "zohmam", -20.3),
+            // Net LONG, and no book anywhere: the whole dollar.
+            finding("xvus-nobel-peace-26-sudan", "SUD", "serr", 1.23),
+        ];
+        let w = naked_worst_usd(&pending, &rels, &findings, &books);
+        // max(105 x 0.79, 105 x 0.80) + 20.3 x 0.75 + 1.23 x 1.00
+        assert!(close(w, 84.00 + 15.225 + 1.23), "{w}");
+
+        // The engine's reading wins when it is the larger one.
+        let books = BookBuilder::new();
+        let w = naked_worst_usd(&pending, &rels, &findings[..1], &books);
+        assert!(close(w, 105.0), "no book: recon charges $1 x 105, above 82.95: {w}");
+        let smaller = [finding("xvus-heisman-26-jeremiahsmith", "JSMIT", "jersmi", -10.0)];
+        let w = naked_worst_usd(&pending, &rels, &smaller, &books);
+        assert!(close(w, 105.0 * 0.79), "{w}");
     }
 }
 

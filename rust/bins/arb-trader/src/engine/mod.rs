@@ -1548,6 +1548,13 @@ impl Engine {
             // and come back down: one that only ever rises is a reservation
             // leak, which ratchets the caps shut and stops all trading.
             "risk_reserved": self.cfg.risk.as_ref().map(|r| r.reserved_ct()).unwrap_or(0.0),
+            // The two tail limits (Geoff, 2026-09-26: 15% of NAV each). Over
+            // `naked_limit_usd`, the gate refuses every new entry. Null until
+            // the hedge loop has published a reading, and always in bench,
+            // which has no hedge loop and so no naked check.
+            "naked_worst_usd": self.cfg.risk.as_ref().and_then(|r| r.naked_gauge()).map(|g| g.0),
+            "naked_limit_usd": self.cfg.risk.as_ref().and_then(|r| r.naked_gauge()).map(|g| g.1),
+            "event_cap_usd": self.cfg.risk.as_ref().map(|r| r.event_cap_usd()),
             // Where the per-venue cash gate's numbers come from right now:
             // `declared` (--balance on a run that will never poll — bench and
             // the shadow), `seed` (--balance on an armed run whose first cycle
