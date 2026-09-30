@@ -199,7 +199,7 @@ impl Bar {
 /// pinned strictly so a format change reads as untrusted rather than as a
 /// guess. Local to the staleness guard: `arb_core::resolve` is deliberately
 /// date-only, and only this needs sub-day resolution.
-fn parse_iso8601_z(s: &str) -> Option<f64> {
+pub(crate) fn parse_iso8601_z(s: &str) -> Option<f64> {
     let b = s.as_bytes();
     if b.len() != 20 || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[19] != b'Z' {
         return None;

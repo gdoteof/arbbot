@@ -12,6 +12,8 @@
 
 mod lot;
 mod batch;
+mod react;
+pub use react::{book_changed, clear_live_books, wake_fill};
 
 use crate::ledger;
 use crate::naked_act::{ceil_to_tick, kalshi_step, lot_at, rung_below, Held};
@@ -485,14 +487,35 @@ static SUPPRESS_REQ: Mutex<Option<BTreeSet<(String, String)>>> = Mutex::new(None
 
 /// Publish the engine's view. Called from `Engine::maker_exit_tick` and nowhere
 /// else.
-pub fn publish_view(view: EngineView) {
+///
+/// The BOOKS move to the live map, which the engine also patches on every book
+/// event ([`book_changed`]); this publish re-seeds it with exactly the books the
+/// engine currently trusts. Everything else is the tick's.
+pub fn publish_view(mut view: EngineView) {
+    let books = react::take_books(&mut view);
+    react::replace_live(books);
     if let Ok(mut g) = VIEW.lock() {
         *g = Some(Published { view, at: Instant::now() });
     }
 }
 
-/// The engine's view, or why it may not be believed.
+/// The engine's view, or why it may not be believed. Its books are the live
+/// ones — as of the last book event, not the last tick.
 pub fn engine_view() -> Result<EngineView, String> {
+    let mut view = published_view()?;
+    react::overlay(&mut view, None);
+    Ok(view)
+}
+
+/// [`engine_view`] carrying only the books of `markets` — what a single lot's
+/// per-event check reads, without copying every ladder the engine holds.
+fn engine_view_of(markets: &[&str]) -> Result<EngineView, String> {
+    let mut view = published_view()?;
+    react::overlay(&mut view, Some(markets));
+    Ok(view)
+}
+
+fn published_view() -> Result<EngineView, String> {
     let g = VIEW.lock().map_err(|_| "the engine view registry is poisoned".to_string())?;
     let Some(p) = g.as_ref() else {
         return Err(
@@ -549,6 +572,7 @@ pub(crate) fn reset_view() {
     if let Ok(mut g) = VIEW.lock() {
         *g = None;
     }
+    react::reset();
     if let Ok(mut g) = SUPPRESS_REQ.lock() {
         *g = None;
     }
@@ -2824,6 +2848,10 @@ pub struct Cfg {
     /// `positions::pairs_from_registry` does, so the two cannot disagree about
     /// which PM-US market a basket's other leg is.
     pub pm_market: BTreeMap<String, String>,
+    /// `--exit-blackouts`: relationship families no exit may rest on from a
+    /// given instant (a scheduled announcement). Re-read every pass; missing
+    /// means none, damaged means no exit rests anywhere.
+    pub blackouts_path: String,
 }
 
 /// The armed loop.

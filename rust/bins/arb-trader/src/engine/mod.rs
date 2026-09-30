@@ -566,6 +566,12 @@ struct Engine {
     /// lookup and a bool store per book event, with the rebuild and the write on
     /// `marks_tick`'s deadline.
     marks_dirty: bool,
+    /// Books that moved since the maker-exit view last saw them, and when the
+    /// oldest of them moved. Flushed by `flush_exit_books` the moment the feed
+    /// channel is drained, so a burst costs one ladder copy per market rather
+    /// than one per delta, and the entry quoter reacts to the burst first.
+    exit_dirty: Vec<(Venue, String)>,
+    exit_dirty_at: Option<std::time::Instant>,
     /// Wall time of the last successful marks write. Drives both bounds.
     marks_written_at: f64,
     /// The open ledger records the last mark was built from, and the
@@ -884,6 +890,8 @@ impl Engine {
             unwind_seen: None,
             unwind_refused: None,
             marks_dirty: false,
+            exit_dirty: Vec::new(),
+            exit_dirty_at: None,
             // 0.0, not `wall_now()`: the first `marks_tick` must write
             // immediately, so a restart cannot leave the previous writer's file
             // aging while this one waits out a heartbeat.
@@ -1903,6 +1911,27 @@ impl Engine {
         let t_deq = std::time::Instant::now();
         self.on_feed_line(&m.line, quoters, by_market);
         self.decision.record(t_deq.elapsed().as_nanos() as u64);
+        if self.exit_dirty_at.is_some_and(|t| queued == 0 || t.elapsed() >= EXIT_FLUSH_MAX_DELAY) {
+            self.flush_exit_books();
+        }
+    }
+
+    /// Hand the maker-exit view every book that moved since the last flush.
+    fn flush_exit_books(&mut self) {
+        self.exit_dirty_at = None;
+        let dirty = std::mem::take(&mut self.exit_dirty);
+        if self.killed || self.feed_reason.is_some() {
+            return;
+        }
+        let now_ns = (arb_core::clock::now_secs() as i64).saturating_mul(1_000_000_000);
+        for (venue, market) in dirty {
+            let book = self
+                .books
+                .get(venue, &market)
+                .filter(|b| b.actionable_at(now_ns))
+                .map(|b| (b.bids.as_slice(), b.asks.as_slice()));
+            crate::maker_exit::book_changed(venue, &market, book);
+        }
     }
 
     /// Route one feed line to its handler. Split out of `on_feed` only so that
@@ -2086,12 +2115,24 @@ impl Engine {
         let now = ts_local_ns as f64 / 1e9;
         self.last_now = now;
         if !self.killed && self.feed_reason.is_none() {
-            if let Some(idxs) = by_market.get(&(venue, market_id)) {
+            if let Some(idxs) = by_market.get(&(venue, market_id.clone())) {
                 self.quote(quoters, idxs, now);
                 // Take-take on the SAME event that moved the book: the
                 // crossing exists for as long as the slower side takes
                 // to react, which is not minutes.
                 self.take_take_scan(quoters, idxs, now);
+            }
+            // ...and the exits, AFTER the entry quoter has already acted on
+            // this event. A resting exit is priced against the OTHER venue's
+            // book, so it has to see that book move on the event that moved
+            // it: on a timer it is a free option to whoever reacts first.
+            // Marked here, copied in `flush_exit_books` once the channel is
+            // drained.
+            if self.cfg.maker_exit_view {
+                if !self.exit_dirty.iter().any(|(v, m)| *v == venue && *m == market_id) {
+                    self.exit_dirty.push((venue, market_id));
+                }
+                self.exit_dirty_at.get_or_insert_with(std::time::Instant::now);
             }
         }
     }
@@ -2132,6 +2173,9 @@ impl Engine {
         );
         if entering {
             self.pull_quotes(quoters, "FEED DOWN");
+            if self.cfg.maker_exit_view {
+                crate::maker_exit::clear_live_books();
+            }
         }
     }
 
@@ -2372,6 +2416,9 @@ impl Engine {
         let kill_now = std::path::Path::new(&self.cfg.kill_file).exists();
         if kill_now && !self.killed {
             self.killed = true;
+            if self.cfg.maker_exit_view {
+                crate::maker_exit::clear_live_books();
+            }
             eprintln!(
                 "[engine] KILL switch on ({}) — cancelling all resting quotes",
                 self.cfg.kill_file
@@ -2731,6 +2778,12 @@ impl Engine {
         s
     }
 }
+
+/// The longest a moved book waits for the maker-exit view while the feed
+/// channel never drains. Normally it is handed over the moment the channel is
+/// empty — microseconds — and this bounds a sustained burst to well inside one
+/// venue round trip.
+const EXIT_FLUSH_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// How many feed events `run` may process before the deadline arms below are
 /// owed a turn.
@@ -4617,6 +4670,45 @@ mod maker_exit_seam_tests {
         on.maker_exit_tick(&mut quoters);
         let v = crate::maker_exit::engine_view().expect("published");
         assert_eq!(v.apr_bar, 14.5, "the hurdle in force, not a second derivation of it");
+        crate::maker_exit::reset_view();
+    }
+
+    /// THE BOOK THE EXITS READ MOVES ON THE BOOK EVENT, not on the tick. The
+    /// 2026-09-30 hedge was priced against a book at least 52s old; this is the
+    /// seam that makes that impossible — and that a feed pull empties at once.
+    #[test]
+    fn a_book_event_reaches_the_exit_view_without_a_tick() {
+        let _g = crate::maker_exit::test_serial();
+        crate::maker_exit::reset_view();
+        let (mut quoters, _) = quoter_and_books();
+        let snapshot = |market: &str, bid: &str, ask: &str| {
+            let ts = (arb_core::clock::now_secs() as i64).saturating_mul(1_000_000_000);
+            serde_json::json!({"kind": "snapshot", "venue": "kalshi", "market_id": market,
+                "bids": [{"price": bid, "size": "50"}], "asks": [{"price": ask, "size": "50"}],
+                "seq": 1, "ts_local_ns": ts})
+            .to_string()
+        };
+        let msg = |line: String| FeedMsg { line, t_read: std::time::Instant::now() };
+        let mut off = test_engine(test_cfg());
+        off.on_feed(msg(snapshot("KX", "0.55", "0.56")), 0, &mut [], &HashMap::new());
+        let mut on = test_engine(armed_cfg());
+        on.maker_exit_tick(&mut quoters);
+        assert!(!crate::maker_exit::engine_view().unwrap().k_bid.contains_key("KX"),
+            "an unflagged engine feeds the exits nothing");
+        // A burst: nothing is copied while more is queued behind it...
+        on.on_feed(msg(snapshot("KX", "0.58", "0.59")), 5, &mut [], &HashMap::new());
+        assert!(!crate::maker_exit::engine_view().unwrap().k_bid.contains_key("KX"));
+        // ...and the book as of the burst's end lands when the channel drains.
+        on.on_feed(msg(snapshot("KX", "0.60", "0.61")), 0, &mut [], &HashMap::new());
+        let v = crate::maker_exit::engine_view().unwrap();
+        assert_eq!(v.k_bid["KX"], "0.60");
+        assert_eq!(v.k_ask["KX"], "0.61");
+        on.feed_reason = Some("stale".into());
+        on.on_feed(msg(snapshot("KX", "0.70", "0.71")), 0, &mut [], &HashMap::new());
+        assert_eq!(crate::maker_exit::engine_view().unwrap().k_bid["KX"], "0.60",
+            "a pulled feed is not priced from");
+        crate::maker_exit::clear_live_books();
+        assert!(crate::maker_exit::engine_view().unwrap().k_bid.is_empty());
         crate::maker_exit::reset_view();
     }
 

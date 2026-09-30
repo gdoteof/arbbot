@@ -245,6 +245,19 @@ impl State {
     pub fn busy(&self) -> bool {
         self.active.is_some()
     }
+    /// The markets this lot's orders rest on or close on, and the venue ids of
+    /// those orders: what a book or fill event must name to wake it.
+    pub fn watch(&self) -> Option<(Vec<String>, Vec<String>)> {
+        let a = self.active.as_ref()?;
+        let ids = a
+            .rest
+            .id
+            .iter()
+            .chain(a.hedge.as_ref().and_then(|h| h.id.as_ref()))
+            .cloned()
+            .collect();
+        Some((vec![a.order.market.clone(), a.order.pm_market.clone()], ids))
+    }
     fn latch(&mut self) {
         if !self.latched {
             latch_market(&self.market);
@@ -523,11 +536,94 @@ fn placed_at(book_ts: f64) -> Instant {
     Instant::now().checked_sub(std::time::Duration::from_secs_f64(age)).unwrap_or_else(Instant::now)
 }
 
+/// What woke a lot. A PASS is the scheduler's cadence and is what
+/// [`HEAL_PROFITABLE_CYCLES`] counts; an EVENT is a book or fill the engine
+/// just saw, which may retry a profitable hedge as often as the book offers one
+/// but never advances the heal clock and never crosses at any price.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum Trigger {
+    Pass,
+    Event,
+}
+
 pub(super) async fn manage(
     live: &mut Live,
     view: Option<&EngineView>,
     k: &Sink,
     p: &Sink,
+) -> Vec<String> {
+    manage_with(live, view, k, p, Trigger::Pass).await
+}
+
+/// A book or fill event touched this lot. Everything that needs no venue call
+/// is decided here, against the book as it is now; the venue is asked only
+/// when something must be done — a fill to hedge, a rest that stopped paying,
+/// a hedge the book has just made profitable.
+pub(super) async fn react(live: &mut Live, filled: bool, k: &Sink, p: &Sink) -> Vec<String> {
+    let Some(a) = live.lot.as_ref().and_then(|s| s.active.clone()) else {
+        return Vec::new();
+    };
+    let markets = [a.order.market.as_str(), a.order.pm_market.as_str()];
+    let view = engine_view_of(&markets).ok();
+    let act = if filled {
+        true
+    } else if a.hedge.is_some() {
+        // An IOC is out; its own fill frame or the pass resolves it.
+        false
+    } else if let Some(done) = a.filled {
+        done > a.hedged
+            && view.as_ref().is_some_and(|v| {
+                group_hedge_limit(&mut live.cx, &live.fees, &a, done - a.hedged, v).is_ok()
+            })
+    } else if a.regroup || a.order.cross.is_some() {
+        false
+    } else {
+        match &view {
+            None => true,
+            Some(v) => {
+                a.members().iter().any(|o| react::blackout(&o.rel_id, wall_now()).is_some())
+                    || a.members()
+                        .iter()
+                        .chain(std::iter::once(&a.order))
+                        .any(|o| still_pays(&mut live.cx, &live.fees, o, v).is_err())
+            }
+        }
+    };
+    if !act {
+        return Vec::new();
+    }
+    let mut out = manage_with(live, view.as_ref(), k, p, Trigger::Event).await;
+    // A fill frame outruns the venue's order read by a few hundred ms at most.
+    // Re-read until the fill shows rather than leave it for the next pass.
+    let mut tries = 0;
+    while filled && tries < FILL_READ_RETRIES {
+        let still_resting = live
+            .lot
+            .as_ref()
+            .and_then(|s| s.active.as_ref())
+            .is_some_and(|a| a.filled.is_none() && a.hedge.is_none());
+        if !still_resting {
+            break;
+        }
+        tries += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(FILL_READ_RETRY_MS)).await;
+        let view = engine_view_of(&markets).ok();
+        out.extend(manage_with(live, view.as_ref(), k, p, Trigger::Event).await);
+    }
+    out
+}
+
+/// How many times [`react`] re-reads an order whose fill frame has arrived but
+/// whose venue read still shows none, and how far apart.
+const FILL_READ_RETRIES: u32 = 8;
+const FILL_READ_RETRY_MS: u64 = 250;
+
+async fn manage_with(
+    live: &mut Live,
+    view: Option<&EngineView>,
+    k: &Sink,
+    p: &Sink,
+    trigger: Trigger,
 ) -> Vec<String> {
     live.publish_working(live.working_set(None));
     if let Some(a) = live.lot.as_ref().and_then(|s| s.active.as_ref()) {
@@ -544,6 +640,7 @@ pub(super) async fn manage(
         k,
         p,
         &mut out,
+        trigger,
     )
     .await;
     if let Err(why) = result {
@@ -579,6 +676,7 @@ async fn advance(
     k: &Sink,
     p: &Sink,
     out: &mut Vec<String>,
+    trigger: Trigger,
 ) -> Result<(), String> {
     let a = state.active.as_mut().expect("active lot");
     let (rest_sink, hedge_sink) = sinks(a.order.shape, k, p);
@@ -613,6 +711,10 @@ async fn advance(
             // has to back.
             let stale = if a.regroup || a.order.cross.is_some() || filled != 0 {
                 None
+            } else if let Some(why) =
+                a.members().iter().find_map(|o| react::blackout(&o.rel_id, wall_now()))
+            {
+                Some(why)
             } else {
                 match view {
                     None => Some("no engine view to hold it against".to_string()),
@@ -735,10 +837,14 @@ async fn advance(
         let a = state.active.as_mut().unwrap();
         let view = view.ok_or("no fresh engine view to price the hedge")?;
         let owed = a.filled.unwrap() - a.hedged;
-        a.attempts += 1;
+        if trigger == Trigger::Pass {
+            a.attempts += 1;
+        }
         let price = match group_hedge_limit(cx, fees, a, owed, view) {
             Ok(limit) => limit,
-            Err(why) if a.attempts <= HEAL_PROFITABLE_CYCLES => return Err(why),
+            Err(why) if trigger == Trigger::Event || a.attempts <= HEAL_PROFITABLE_CYCLES => {
+                return Err(why)
+            }
             Err(_) => {
                 let venue = a.order.shape.close_venue();
                 let selling = a.order.direction.sells(venue);
@@ -1670,4 +1776,102 @@ mod tests {
         assert!(future < 1.0, "a clock-skewed id clamps to now: {future}");
     }
 
+    fn lv(p: &str) -> Level {
+        Level { price: p.into(), size: "10000".into() }
+    }
+
+    /// 2026-09-30 08:30: the hedge venue moved and our rest sat stale until a
+    /// faster trader lifted it six seconds later. The event that moves the
+    /// hedge book must pull the rest, with no pass in between.
+    #[tokio::test]
+    async fn a_hedge_book_move_pulls_the_rest_on_that_event() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let _v = test_serial();
+        reset_view();
+        let f = Fixture::new();
+        let mut a = f.owner(1., 3);
+        f.place(&mut a, 1., 3, Shape::RestKalshi).await;
+        publish_view(view("0.20"));
+        let k: Sink = f.k.clone();
+        let p: Sink = f.p.clone();
+        let rest = id(&a);
+        assert!(react(&mut a, false, &k, &p).await.is_empty(), "an unchanged book costs no venue call");
+        assert!(!f.k.orders.lock().unwrap()[&rest].terminal);
+        book_changed(arb_core::model::Venue::PolymarketUs, "p-a", Some((&[lv("0.59")], &[lv("0.60")])));
+        let out = react(&mut a, false, &k, &p).await;
+        assert!(out.iter().any(|l| l.contains("PULLING")), "{out:?}");
+        assert!(f.k.orders.lock().unwrap()[&rest].terminal, "cancelled at the venue");
+        assert!(!a.lot.as_ref().unwrap().busy(), "{out:?}");
+        assert!(f.p.iocs().is_empty(), "nothing filled, nothing hedged");
+        reset_view();
+    }
+
+    /// The fill frame is the trigger for the hedge, not the next pass's poll.
+    #[tokio::test]
+    async fn a_fill_frame_hedges_on_that_event() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let _v = test_serial();
+        reset_view();
+        let f = Fixture::new();
+        let mut a = f.owner(1., 3);
+        f.place(&mut a, 1., 3, Shape::RestKalshi).await;
+        publish_view(view("0.20"));
+        let k: Sink = f.k.clone();
+        let p: Sink = f.p.clone();
+        f.k.fill(&id(&a), 3, true);
+        let out = react(&mut a, true, &k, &p).await;
+        assert_eq!(f.p.iocs().len(), 1, "{out:?}");
+        assert_eq!(f.p.iocs()[0].qty, 3);
+        assert_eq!(f.closes().len(), 1, "{out:?}");
+        assert!(!a.lot.as_ref().unwrap().busy());
+        reset_view();
+    }
+
+    /// Events retry a profitable hedge whenever the book offers one, but only
+    /// the PASS advances the heal clock, and only the pass may cross at any
+    /// price. A flickering book must not burn [`HEAL_PROFITABLE_CYCLES`] in a
+    /// second and then cross at the worst touch.
+    #[tokio::test]
+    async fn events_retry_a_profitable_hedge_but_never_advance_or_force_the_heal() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let _v = test_serial();
+        reset_view();
+        let f = Fixture::new();
+        let mut a = f.owner(1., 3);
+        f.place(&mut a, 1., 3, Shape::RestKalshi).await;
+        publish_view(view("0.60"));
+        let k: Sink = f.k.clone();
+        let p: Sink = f.p.clone();
+        f.k.fill(&id(&a), 3, true);
+        for _ in 0..(HEAL_PROFITABLE_CYCLES + 5) {
+            react(&mut a, true, &k, &p).await;
+            react(&mut a, false, &k, &p).await;
+        }
+        let active = a.lot.as_ref().unwrap().active.as_ref().unwrap();
+        assert_eq!(active.filled, Some(3));
+        assert_eq!(active.attempts, 0, "events do not count heal attempts");
+        assert!(f.p.iocs().is_empty(), "no IOC at an unprofitable price");
+        book_changed(arb_core::model::Venue::PolymarketUs, "p-a", Some((&[lv("0.19")], &[lv("0.20")])));
+        let out = react(&mut a, false, &k, &p).await;
+        assert_eq!(f.p.iocs().len(), 1, "the book came back and the event took it: {out:?}");
+        assert_eq!(f.closes().len(), 1);
+        assert!(!a.lot.as_ref().unwrap().busy());
+        reset_view();
+    }
+
+    /// A scheduled announcement: the keep-check pulls what rests on the family.
+    #[tokio::test]
+    async fn a_blackout_pulls_a_resting_exit() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let _v = test_serial();
+        let f = Fixture::new();
+        let mut a = f.owner(1., 3);
+        f.place(&mut a, 1., 3, Shape::RestKalshi).await;
+        react::set_blackouts(Ok(vec![("r1".into(), 0.0, "announcement".into())]));
+        let out = f.manage(&mut a).await;
+        react::set_blackouts(Ok(Vec::new()));
+        let why = out.iter().find(|l| l.contains("PULLING")).unwrap_or_else(|| panic!("{out:?}"));
+        assert!(why.contains("exit blackout on `r1`: announcement"), "{why}");
+        assert!(!a.lot.as_ref().unwrap().busy());
+    }
 }

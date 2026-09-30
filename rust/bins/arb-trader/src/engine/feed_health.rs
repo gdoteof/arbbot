@@ -337,6 +337,9 @@ impl Engine {
         if t.sweep {
             self.pull_quotes(quoters, "FEED STALE");
         }
+        if t.reason.is_some() && self.feed_reason.is_none() && self.cfg.maker_exit_view {
+            crate::maker_exit::clear_live_books();
+        }
         self.feed_reason = t.reason;
     }
 }
