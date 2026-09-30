@@ -16,6 +16,12 @@ pub(super) struct State {
     active: Option<Active>,
     #[serde(skip)]
     latched: bool,
+    /// The lot as an event-driven action last left it UNCHANGED — a venue
+    /// call that failed. Events skip it until something else moves it, so a
+    /// refusing venue (a 403'd order read, a lost PM-US ack) is retried on the
+    /// pass's cadence, not once per book event.
+    #[serde(skip)]
+    event_parked: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -201,6 +207,7 @@ impl State {
             opened_bits: exit.opened_ts.to_bits(),
             active: None,
             latched: false,
+            event_parked: None,
         }
     }
     pub fn key(&self) -> String {
@@ -560,9 +567,16 @@ pub(super) async fn manage(
 /// when something must be done — a fill to hedge, a rest that stopped paying,
 /// a hedge the book has just made profitable.
 pub(super) async fn react(live: &mut Live, filled: bool, k: &Sink, p: &Sink) -> Vec<String> {
-    let Some(a) = live.lot.as_ref().and_then(|s| s.active.clone()) else {
+    let Some(state) = live.lot.as_ref() else {
         return Vec::new();
     };
+    let Some(a) = state.active.clone() else {
+        return Vec::new();
+    };
+    let before = fingerprint(&a);
+    if !filled && state.event_parked.as_ref() == Some(&before) {
+        return Vec::new();
+    }
     let markets = [a.order.market.as_str(), a.order.pm_market.as_str()];
     let view = engine_view_of(&markets).ok();
     let act = if filled {
@@ -610,7 +624,21 @@ pub(super) async fn react(live: &mut Live, filled: bool, k: &Sink, p: &Sink) -> 
         let view = engine_view_of(&markets).ok();
         out.extend(manage_with(live, view.as_ref(), k, p, Trigger::Event).await);
     }
+    // Only a BOOK event parks: it acted because the pure checks above said a
+    // venue call would change something, so an unchanged lot means the venue
+    // refused. A fill wake acts unconditionally, and on an owed hedge the book
+    // cannot yet pay that is a pricing refusal, not a venue one — parking it
+    // would miss the book event that makes the hedge pay.
+    if !filled {
+        if let Some(s) = live.lot.as_mut() {
+            s.event_parked = s.active.as_ref().map(fingerprint).filter(|now| *now == before);
+        }
+    }
     out
+}
+
+fn fingerprint(a: &Active) -> String {
+    serde_json::to_string(a).expect("an exit lot serializes")
 }
 
 /// How many times [`react`] re-reads an order whose fill frame has arrived but
@@ -1873,5 +1901,36 @@ mod tests {
         let why = out.iter().find(|l| l.contains("PULLING")).unwrap_or_else(|| panic!("{out:?}"));
         assert!(why.contains("exit blackout on `r1`: announcement"), "{why}");
         assert!(!a.lot.as_ref().unwrap().busy());
+    }
+
+    /// 2026-09-30 09:31: a lot whose PM-US order read 403s on every call was
+    /// re-driven by every book event on its market — 11x the pass's venue
+    /// calls, all refused. An event gets ONE try at a lot as it stands; after
+    /// that, only the pass, a fill frame, or a change of state wakes it.
+    #[tokio::test]
+    async fn an_event_that_fails_leaves_the_lot_to_the_pass() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let _v = test_serial();
+        reset_view();
+        let f = Fixture::new();
+        let mut a = f.owner(1., 3);
+        f.place(&mut a, 1., 3, Shape::RestKalshi).await;
+        publish_view(view("0.20"));
+        let k: Sink = f.k.clone();
+        let p: Sink = f.p.clone();
+        *f.k.unreadable.lock().unwrap() = true;
+        book_changed(arb_core::model::Venue::PolymarketUs, "p-a", Some((&[lv("0.59")], &[lv("0.60")])));
+        let out = react(&mut a, false, &k, &p).await;
+        assert!(!out.is_empty(), "the first event tries");
+        for _ in 0..5 {
+            assert!(react(&mut a, false, &k, &p).await.is_empty(), "then waits");
+        }
+        assert!(!f.manage(&mut a).await.is_empty(), "the pass still drives it");
+        assert!(!react(&mut a, true, &k, &p).await.is_empty(), "a fill frame always gets through");
+        *f.k.unreadable.lock().unwrap() = false;
+        let out = manage(&mut a, engine_view().ok().as_ref(), &k, &p).await;
+        assert!(out.iter().any(|l| l.contains("PULLING")), "{out:?}");
+        assert!(!a.lot.as_ref().unwrap().busy(), "{out:?}");
+        reset_view();
     }
 }
