@@ -544,13 +544,19 @@ fn placed_at(book_ts: f64) -> Instant {
 }
 
 /// What woke a lot. A PASS is the scheduler's cadence and is what
-/// [`HEAL_PROFITABLE_CYCLES`] counts; an EVENT is a book or fill the engine
+/// [`HEAL_PROFITABLE_CYCLES`] counts; a BOOK or FILL is an event the engine
 /// just saw, which may retry a profitable hedge as often as the book offers one
 /// but never advances the heal clock and never crosses at any price.
+///
+/// A BOOK wake that finds the rest no longer pays is racing whoever else saw
+/// the same move, so it cancels before it reads anything. A FILL wake knows
+/// something filled — if all of it did, a cancel is a wasted round trip in
+/// front of the hedge — so it reads first.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Trigger {
     Pass,
-    Event,
+    Book,
+    Fill,
 }
 
 pub(super) async fn manage(
@@ -606,7 +612,8 @@ pub(super) async fn react(live: &mut Live, filled: bool, k: &Sink, p: &Sink) -> 
     if !act {
         return Vec::new();
     }
-    let mut out = manage_with(live, view.as_ref(), k, p, Trigger::Event).await;
+    let trigger = if filled { Trigger::Fill } else { Trigger::Book };
+    let mut out = manage_with(live, view.as_ref(), k, p, trigger).await;
     // A fill frame outruns the venue's order read by a few hundred ms at most.
     // Re-read until the fill shows rather than leave it for the next pass.
     let mut tries = 0;
@@ -622,7 +629,7 @@ pub(super) async fn react(live: &mut Live, filled: bool, k: &Sink, p: &Sink) -> 
         tries += 1;
         tokio::time::sleep(std::time::Duration::from_millis(FILL_READ_RETRY_MS)).await;
         let view = engine_view_of(&markets).ok();
-        out.extend(manage_with(live, view.as_ref(), k, p, Trigger::Event).await);
+        out.extend(manage_with(live, view.as_ref(), k, p, trigger).await);
     }
     // Only a BOOK event parks: it acted because the pure checks above said a
     // venue call would change something, so an unchanged lot means the venue
@@ -639,6 +646,29 @@ pub(super) async fn react(live: &mut Live, filled: bool, k: &Sink, p: &Sink) -> 
 
 fn fingerprint(a: &Active) -> String {
     serde_json::to_string(a).expect("an exit lot serializes")
+}
+
+/// Why a resting group should be pulled, if it should. Each member must still
+/// pay at its own basis, and the GROUP must still have close depth for its
+/// whole quantity: members were sized within one shared budget, so the sum is
+/// what the ladder has to back.
+fn why_stale(
+    a: &Active,
+    cx: &mut Cx,
+    fees: &FeeSchedule,
+    view: Option<&EngineView>,
+) -> Option<String> {
+    if let Some(why) = a.members().iter().find_map(|o| react::blackout(&o.rel_id, wall_now())) {
+        return Some(why);
+    }
+    match view {
+        None => Some("no engine view to hold it against".to_string()),
+        Some(v) => a
+            .members()
+            .iter()
+            .chain(std::iter::once(&a.order))
+            .find_map(|o| still_pays(cx, fees, o, v).err()),
+    }
 }
 
 /// How many times [`react`] re-reads an order whose fill frame has arrived but
@@ -723,9 +753,20 @@ async fn advance(
     checkpoint(state, ledger);
     let a = state.active.as_mut().unwrap();
     if a.filled.is_none() {
-        let done = terminal(rest_sink, &a.rest).await?;
-        let done = if done.is_some() {
-            done
+        // The cancel is owed whatever the reads below would say, and they are
+        // two venue round trips while the move that made the rest stale is
+        // being taken by someone else. What filled is read after the cancel.
+        let pull = if trigger == Trigger::Book && !a.regroup && a.order.cross.is_none() {
+            why_stale(a, cx, fees, view)
+        } else {
+            None
+        };
+        let done = if let Some(why) = pull {
+            out.push(format!("[maker-exit] PULLING {} — {why}", a.order.rest_market()));
+            out.extend(cancel(rest_sink, &a.rest, &a.order).await);
+            terminal(rest_sink, &a.rest).await?
+        } else if let Some(done) = terminal(rest_sink, &a.rest).await? {
+            Some(done)
         } else {
             let s = rest_sink.clone();
             let id = a.rest.id.clone().unwrap();
@@ -733,25 +774,10 @@ async fn advance(
                 Ok(Ok(n)) if n >= 0 && n <= a.order.qty => n,
                 other => return Err(format!("cannot read resting fills: {other:?}")),
             };
-            // Each member must still pay at its own basis, and the GROUP must
-            // still have close depth for its whole quantity: members were
-            // sized within one shared budget, so the sum is what the ladder
-            // has to back.
             let stale = if a.regroup || a.order.cross.is_some() || filled != 0 {
                 None
-            } else if let Some(why) =
-                a.members().iter().find_map(|o| react::blackout(&o.rel_id, wall_now()))
-            {
-                Some(why)
             } else {
-                match view {
-                    None => Some("no engine view to hold it against".to_string()),
-                    Some(v) => a
-                        .members()
-                        .iter()
-                        .chain(std::iter::once(&a.order))
-                        .find_map(|o| still_pays(cx, fees, o, v).err()),
-                }
+                why_stale(a, cx, fees, view)
             };
             if let Some(why) = stale {
                 out.push(format!("[maker-exit] PULLING {} — {why}", a.order.rest_market()));
@@ -870,7 +896,7 @@ async fn advance(
         }
         let price = match group_hedge_limit(cx, fees, a, owed, view) {
             Ok(limit) => limit,
-            Err(why) if trigger == Trigger::Event || a.attempts <= HEAL_PROFITABLE_CYCLES => {
+            Err(why) if trigger != Trigger::Pass || a.attempts <= HEAL_PROFITABLE_CYCLES => {
                 return Err(why)
             }
             Err(_) => {
@@ -1920,8 +1946,10 @@ mod tests {
         let p: Sink = f.p.clone();
         *f.k.unreadable.lock().unwrap() = true;
         book_changed(arb_core::model::Venue::PolymarketUs, "p-a", Some((&[lv("0.59")], &[lv("0.60")])));
+        let rest = id(&a);
         let out = react(&mut a, false, &k, &p).await;
         assert!(!out.is_empty(), "the first event tries");
+        assert!(f.k.orders.lock().unwrap()[&rest].terminal, "and cancels before any read can fail");
         for _ in 0..5 {
             assert!(react(&mut a, false, &k, &p).await.is_empty(), "then waits");
         }
@@ -1929,8 +1957,38 @@ mod tests {
         assert!(!react(&mut a, true, &k, &p).await.is_empty(), "a fill frame always gets through");
         *f.k.unreadable.lock().unwrap() = false;
         let out = manage(&mut a, engine_view().ok().as_ref(), &k, &p).await;
-        assert!(out.iter().any(|l| l.contains("PULLING")), "{out:?}");
+        assert!(out.iter().any(|l| l.contains("order terminal, zero fills")), "{out:?}");
         assert!(!a.lot.as_ref().unwrap().busy(), "{out:?}");
+        reset_view();
+    }
+
+    /// 2026-09-30 10:14: the first live event pull read the order's status and
+    /// its fills — two PM-US round trips — before it sent the cancel, while the
+    /// Kalshi move that made the rest stale was there for anyone to take.
+    #[tokio::test]
+    async fn a_book_event_cancels_before_it_reads_and_a_fill_event_reads_first() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let _v = test_serial();
+        reset_view();
+        let f = Fixture::new();
+        let mut a = f.owner(1., 3);
+        f.place(&mut a, 1., 3, Shape::RestKalshi).await;
+        publish_view(view("0.20"));
+        let k: Sink = f.k.clone();
+        let p: Sink = f.p.clone();
+        let rest = id(&a);
+        // Reads fail, so only an order that cancels BEFORE reading gets out.
+        *f.k.unreadable.lock().unwrap() = true;
+        book_changed(arb_core::model::Venue::PolymarketUs, "p-a", Some((&[lv("0.59")], &[lv("0.60")])));
+        let out = react(&mut a, true, &k, &p).await;
+        assert!(!f.k.orders.lock().unwrap()[&rest].terminal, "a fill wake reads first: {out:?}");
+        let out = react(&mut a, false, &k, &p).await;
+        assert!(out.iter().any(|l| l.contains("PULLING")), "{out:?}");
+        assert!(f.k.orders.lock().unwrap()[&rest].terminal, "a book wake cancels first: {out:?}");
+        *f.k.unreadable.lock().unwrap() = false;
+        let out = f.manage(&mut a).await;
+        assert!(out.iter().any(|l| l.contains("order terminal, zero fills")), "{out:?}");
+        assert!(f.p.iocs().is_empty(), "nothing filled, nothing hedged");
         reset_view();
     }
 }
