@@ -1,0 +1,43 @@
+# Maker-exit blackouts: from `from` (UTC) on, no maker exit rests on a
+# relationship whose id contains `family`, and any exit already resting there is
+# pulled at the next pass or book event. Hedges that are already owed still
+# complete.
+#
+# Why: a scheduled announcement moves BOTH venues at the same instant. A resting
+# exit on the winning side is lifted at its pre-announcement price, and the leg
+# left to close is already at 0 or 1, so the loss per contract is up to
+# (1 - rest price). Reacting to book events cannot beat that, because there is
+# no lead venue to react to. Holding the basket to resolution pays $1 regardless.
+#
+# Read by arb-trader (`--exit-blackouts`, default this path) every pass. If the
+# file is missing there are no blackouts. If the file is DAMAGED, every exit
+# everywhere is blacked out until it is fixed. `from` must be exactly
+# YYYY-MM-DDTHH:MM:SSZ.
+#
+# A window has no end: after the announcement the market resolves and the
+# basket settles, so there is nothing left to exit. Delete the row once it has
+# settled.
+
+- family: tsla-q3-deliv
+  from: 2026-10-01T04:00:00Z   # 2026-10-01 00:00 ET
+  why: Tesla Q3 deliveries report, expected 2026-10-02 ~09:00 ET
+
+- family: brazil-pres-26
+  from: 2026-10-03T04:00:00Z   # 2026-10-03 00:00 ET (final polls on the 3rd)
+  why: Brazil presidential first round 2026-10-04, polls close 20:00Z
+
+- family: nobel-peace-26
+  from: 2026-10-08T04:00:00Z   # 2026-10-08 00:00 ET
+  why: Nobel Peace Prize announcement 2026-10-09 09:00Z (Kalshi expected expiry)
+
+- family: fedmtg-26oct
+  from: 2026-10-28T04:00:00Z   # 2026-10-28 00:00 ET
+  why: FOMC decision 2026-10-28 14:00 ET
+
+- family: fedmtg-26dec
+  from: 2026-12-09T05:00:00Z   # 2026-12-09 00:00 ET
+  why: FOMC decision 2026-12-09 14:00 ET
+
+- family: heisman-26
+  from: 2026-12-12T05:00:00Z   # 2026-12-12 00:00 ET
+  why: Heisman ceremony 2026-12-12
