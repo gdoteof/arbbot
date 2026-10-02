@@ -43,6 +43,8 @@ reality, and earns live trading stage by stage.
 ```bash
 uv venv && uv pip install -e '.[dev]'
 .venv/bin/pytest                                  # full suite
+(cd rust && cargo test --workspace)               # rust/ workspace tests
+(cd rust && cargo clippy --all-targets --workspace) # rust/ lint policy (must be clean)
 .venv/bin/python -m arbbot.record.main            # recorder (foreground)
 .venv/bin/python -m arbbot.report.daily           # daily report for today
 .venv/bin/python -m arbbot.report.daily --day 2026-07-20 --json
