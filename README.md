@@ -103,3 +103,13 @@ of accumulating data: feed health (calibration plate), crossings observed, per-
 relationship crossings/edge/lifetimes, and the full relationship ledger.
 Ranges: Today / 7d / All. Auto-refreshes every 10s; `?theme=light|dark` forces
 a theme. Read-only; binds 127.0.0.1 only.
+
+## Contributing
+
+Changes to this repository arrive as chuggy tickets, worked by an agent
+rather than by hand. The brief, constraints, and work/review instructions
+each ticket runs against live in `.chug/configurations/default.json`.
+Before a change lands, that configuration's evaluation runs
+`cargo test --workspace` (skipping the one test that needs the private,
+gitignored `config/registry.yaml`) and `.venv/bin/pytest`. Each change lands
+as a pull request.
