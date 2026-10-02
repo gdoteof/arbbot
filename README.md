@@ -76,6 +76,26 @@ replay gate passes and credentials are provisioned under `~/.arbbot-credentials/
 - `config/registry.yaml` — the universe. Human vetting flips `vetted_by`.
 - `config/registry-rejected.yaml` — documented traps (never scanned).
 
+## Data layout
+
+All recorder output lives under `data/` (gitignored), with paths configured in
+`config/recorder.yaml`:
+
+- `data/raw/<venue>-<utc_day>.jsonl` — one append-only JSONL file per venue per
+  UTC day (e.g. `data/raw/kalshi-2026-07-27.jsonl`), written by the recorder's
+  `BookBuilder` stage. `data_dir` in `config/recorder.yaml` sets the base dir.
+- `data/scan/<name>-<utc_day>.jsonl` — per-relationship-class opportunity and
+  lifetime streams from `ScanLoop`, plus `rewards.json` and
+  `probe-<utc_day>.json`. `scan_dir` in `config/recorder.yaml` sets the base dir.
+- `data/health.jsonl` — recorder health/heartbeat log (`health_path`).
+
+There is no standalone DuckDB database file: queries (reports, dashboard,
+replay) open an in-memory DuckDB connection and read the JSONL files above
+directly via `read_json`. Once a day is closed, `scripts/archive_to_parquet.py`
+converts its JSONL into columnar Parquet under `data/parquet/` and deletes the
+JSONL; DuckDB then reads whichever of the two (Parquet or JSONL) exists for
+that day, transparently to callers (`src/arbbot/record/archive.py`).
+
 ## Dashboard
 
 Instrument panel at **http://127.0.0.1:4748** (`arbbot-dash.service`) — live view
