@@ -104,6 +104,48 @@ relationship crossings/edge/lifetimes, and the full relationship ledger.
 Ranges: Today / 7d / All. Auto-refreshes every 10s; `?theme=light|dark` forces
 a theme. Read-only; binds 127.0.0.1 only.
 
+## Documentation
+
+One-line pointer to each note under `docs/`, so you can find the right one
+without opening them all:
+
+- [`bench-recorder-baseline.md`](docs/bench-recorder-baseline.md) — Python vs
+  Rust recorder hot-path benchmark baseline (2026-07-23).
+- [`kalshi-pm-pnl-asymmetry.md`](docs/kalshi-pm-pnl-asymmetry.md) — why
+  realised P&L splits unevenly across venues (one hedged basket, not a leak).
+- [`live-capital-2026-09-18.md`](docs/live-capital-2026-09-18.md) — live
+  capital/funding tracking, capital polling, and dashboard reporting changes.
+- [`migration-plan.md`](docs/migration-plan.md) — Rust migration plan:
+  cutover order, gates, and rollbacks.
+- [`p3-shell.md`](docs/p3-shell.md) — design and soak plan for the Rust
+  execution shell (`arb-trader`), dry-run only.
+- [`parity-pins.md`](docs/parity-pins.md) — multi-day byte-parity pins
+  between Python and Rust intent replay.
+- [`pmus-yes-premium.md`](docs/pmus-yes-premium.md) — why the PM-US YES
+  premium exists and why ~40% of booked edge cannot converge.
+- [`quality-campaign.md`](docs/quality-campaign.md) — the regression-gate
+  checklist (`scripts/gate.sh`) every code-quality-campaign PR must clear.
+- [`recent-exit-accounting-2026-09-18.md`](docs/recent-exit-accounting-2026-09-18.md)
+  — audit of exit accounting and fee corrections against the ledger.
+- [`recorder-cutover-runbook.md`](docs/recorder-cutover-runbook.md) — runbook
+  for making the Rust recorder authoritative: sequence, monitoring, rollback.
+- [`registry-rules-audit.md`](docs/registry-rules-audit.md) — audit log of
+  registry equivalence caveats against each venue's authoritative rule text.
+- [`strategy-contract.md`](docs/strategy-contract.md) — design-only v2 spec
+  for strategy vocabulary, families, the sole-executor engine, and the intent
+  gateway.
+- [`trader-recovery.md`](docs/trader-recovery.md) — trader outage retry/
+  backoff behavior and recovery semantics.
+- [`trading-policy-audit-2026-09-18.md`](docs/trading-policy-audit-2026-09-18.md)
+  — read-only audit of production quoting, admission, capital gates, and
+  maker exits.
+- [`venue-quirks-test-gaps.md`](docs/venue-quirks-test-gaps.md) — per-entry
+  inventory of which `venue-quirks.md` behaviors are test-pinned vs. gaps.
+- [`venue-quirks.md`](docs/venue-quirks.md) — registry of surprising venue-API
+  behaviors any reimplementation must reproduce.
+- [`xv-alpha-search.md`](docs/xv-alpha-search.md) — follow-up research on
+  exploitable cross-venue signals beyond hold time.
+
 ## Contributing
 
 Changes to this repository arrive as chuggy tickets, worked by an agent
