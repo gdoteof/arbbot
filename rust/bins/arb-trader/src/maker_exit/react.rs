@@ -230,6 +230,11 @@ struct Blackout {
     from: String,
     #[serde(default)]
     why: String,
+    /// The window also stops ENTRIES (`crate::engine`'s entry blackout): from
+    /// `from` on, no entry quote rests and no take-take fires on the family.
+    /// Exits read every row whatever this says.
+    #[serde(default)]
+    entries: bool,
 }
 
 /// Parsed windows `(family, from_epoch_s, why)`.
@@ -240,20 +245,41 @@ type Windows = Vec<(String, f64, String)>;
 static BLACKOUTS: Mutex<Result<Windows, String>> = Mutex::new(Ok(Vec::new()));
 
 pub(super) fn parse_blackouts(text: &str) -> Result<Windows, String> {
+    parse_rows(text, false)
+}
+
+/// Every row when `entries_only` is false; only the `entries: true` rows when
+/// it is. One parser, so the two readers cannot disagree about what a valid
+/// row is.
+fn parse_rows(text: &str, entries_only: bool) -> Result<Windows, String> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
     let rows: Vec<Blackout> = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
-    rows.into_iter()
-        .map(|b| {
-            if b.family.is_empty() {
-                return Err("a blackout with an empty family would match every relationship".into());
-            }
-            let from = crate::taketake::parse_iso8601_z(&b.from)
-                .ok_or_else(|| format!("{}: `from` must be YYYY-MM-DDTHH:MM:SSZ, got {:?}", b.family, b.from))?;
-            Ok((b.family, from, b.why))
-        })
-        .collect()
+    let mut out = Vec::new();
+    for b in rows {
+        if b.family.is_empty() {
+            return Err("a blackout with an empty family would match every relationship".into());
+        }
+        let from = crate::taketake::parse_iso8601_z(&b.from)
+            .ok_or_else(|| format!("{}: `from` must be YYYY-MM-DDTHH:MM:SSZ, got {:?}", b.family, b.from))?;
+        if b.entries || !entries_only {
+            out.push((b.family, from, b.why));
+        }
+    }
+    Ok(out)
+}
+
+/// The `entries: true` windows in `path`, for the engine's entry blackout.
+/// Read fresh on every call. Missing is "none"; a file that exists and cannot
+/// be read or parsed is `Err`, which the caller must treat as every entry
+/// blacked out — the same fail-closed rule the exit side applies.
+pub fn read_entry_blackouts(path: &str) -> Result<Windows, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_rows(&text, true).map_err(|e| format!("{path}: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("{path}: {e}")),
+    }
 }
 
 /// Re-read the blackout file. Missing is "none"; unreadable or unparseable
@@ -313,9 +339,45 @@ mod tests {
     /// every exit in the book.
     #[test]
     fn the_shipped_blackout_file_parses() {
-        let rows = parse_blackouts(include_str!("../../../../../config/exit-blackouts.yaml")).unwrap();
+        let text = include_str!("../../../../../config/exit-blackouts.yaml");
+        let rows = parse_blackouts(text).unwrap();
         assert!(rows.iter().any(|(f, _, _)| f == "tsla-q3-deliv"));
         assert!(rows.iter().any(|(f, _, _)| f == "nobel-peace-26"));
+        // Kalshi stops trading CPI at 08:25 ET and PM-US trades on past the
+        // 08:30 print, so these two families must never be quoted into it.
+        let entries = parse_rows(text, true).unwrap();
+        for family in ["cpi-26sep", "gdp-26q3"] {
+            assert!(entries.iter().any(|(f, _, _)| f == family), "{family} must black out entries");
+            assert!(rows.iter().any(|(f, _, _)| f == family), "{family} must black out exits too");
+        }
+    }
+
+    /// `entries` is opt-in per row and changes nothing about exits: a row
+    /// without it still holds every exit, and only rows with it stop entries.
+    #[test]
+    fn entry_windows_are_the_opted_in_rows_and_exits_still_read_every_row() {
+        let text = "- family: a\n  from: 2026-10-01T04:00:00Z\n\
+                    - family: b\n  from: 2026-10-02T04:00:00Z\n  entries: true\n  why: print\n";
+        let all = parse_blackouts(text).unwrap();
+        assert_eq!(all.iter().map(|(f, _, _)| f.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        let entries = parse_rows(text, true).unwrap();
+        assert_eq!(entries, [("b".to_string(), 1_790_913_600.0, "print".to_string())]);
+        // A bad row anywhere damages both readers, never just one.
+        let bad = format!("{text}- family: c\n  from: tomorrow\n");
+        assert!(parse_rows(&bad, true).is_err() && parse_blackouts(&bad).is_err());
+    }
+
+    #[test]
+    fn a_missing_entry_file_is_none_and_an_unreadable_one_fails_closed() {
+        let dir = std::env::temp_dir().join(format!("entry-blackouts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("exit-blackouts.yaml");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(read_entry_blackouts(p.to_str().unwrap()), Ok(Vec::new()));
+        std::fs::write(&p, "- family: [not a string]\n").unwrap();
+        assert!(read_entry_blackouts(p.to_str().unwrap()).is_err());
+        // A directory exists and cannot be read as text: not "missing".
+        assert!(read_entry_blackouts(dir.to_str().unwrap()).is_err());
     }
 
     #[test]

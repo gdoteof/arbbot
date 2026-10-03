@@ -2089,6 +2089,11 @@ fn run_cfg(
         // loop is not even spawned. Off in bench/replay, which read no wall
         // clock and must stay byte-deterministic.
         maker_exit_view: !bench && (args.maker_exit || args.maker_exit_shadow),
+        // The same file the exit loop reads, for its `entries: true` rows.
+        // Read whether or not maker exits are armed: an entry is an order
+        // either way. Off in bench/replay, which has no wall clock to hold a
+        // window against.
+        entry_blackouts: (!bench).then(|| args.exit_blackouts.clone()),
         unwind: (!bench && args.unwind_detect_only).then(|| engine::Unwind {
             marks_path: args.marks.clone(),
             // The SAME scope `load_quoters` filters the registry by, so the

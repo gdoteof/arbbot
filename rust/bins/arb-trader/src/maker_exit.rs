@@ -13,7 +13,7 @@
 mod lot;
 mod batch;
 mod react;
-pub use react::{book_changed, clear_live_books, wake_fill};
+pub use react::{book_changed, clear_live_books, read_entry_blackouts, wake_fill};
 
 use crate::ledger;
 use crate::naked_act::{ceil_to_tick, kalshi_step, lot_at, rung_below, Held};
