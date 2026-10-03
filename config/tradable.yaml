@@ -81,3 +81,64 @@ allow:
   - xvus-fedmtg-26dec-cut50
   - xvus-fedmtg-26dec-hike25
   - xvus-fedmtg-26dec-hike50
+  #
+  # 2026-10-02 (Claude, same delegation; Geoff: "lets onboard cpi and gdp").
+  # Strike-for-strike pairs on the September CPI prints and the Q3 GDP advance
+  # estimate, rule text and Kalshi contract terms read 2026-10-02 from both
+  # venues. Each pair is "above X" on both: Kalshi's terms make the payout
+  # "strictly greater than", and PM-US settles Yes if the figure "is above X".
+  # The underlying is the same published one-decimal value on both, revisions
+  # ignored: headline/core MoM = seasonally adjusted one-month CPI-U change,
+  # headline/core YoY = 12-month change before seasonal adjustment, GDP = the
+  # BEA advance estimate's SAAR. Residual, off the reachable path while the
+  # government is funded: if nothing is published within three months, PM-US
+  # uses the prior month (quarter) and Kalshi computes CPI from index levels.
+  # Kalshi stops trading these at 08:25-08:29 ET on release day and PM-US does
+  # not, so both families carry an `entries: true` row in exit-blackouts.yaml.
+  - xvus-cpi-26sep-yoy-gt3p0
+  - xvus-cpi-26sep-yoy-gt3p1
+  - xvus-cpi-26sep-yoy-gt3p2
+  - xvus-cpi-26sep-yoy-gt3p3
+  - xvus-cpi-26sep-yoy-gt3p4
+  - xvus-cpi-26sep-yoy-gt3p5
+  - xvus-cpi-26sep-yoy-gt3p6
+  - xvus-cpi-26sep-yoy-gt3p7
+  - xvus-cpi-26sep-yoy-gt3p8
+  - xvus-cpi-26sep-yoy-gt3p9
+  - xvus-cpi-26sep-yoy-gt4p0
+  - xvus-cpi-26sep-mom-gtn0p2
+  - xvus-cpi-26sep-mom-gtn0p1
+  - xvus-cpi-26sep-mom-gt0p0
+  - xvus-cpi-26sep-mom-gt0p1
+  - xvus-cpi-26sep-mom-gt0p2
+  - xvus-cpi-26sep-mom-gt0p3
+  - xvus-cpi-26sep-mom-gt0p4
+  - xvus-cpi-26sep-mom-gt0p5
+  - xvus-cpi-26sep-mom-gt0p6
+  - xvus-cpi-26sep-coreyoy-gt2p1
+  - xvus-cpi-26sep-coreyoy-gt2p2
+  - xvus-cpi-26sep-coreyoy-gt2p3
+  - xvus-cpi-26sep-coreyoy-gt2p4
+  - xvus-cpi-26sep-coreyoy-gt2p5
+  - xvus-cpi-26sep-coreyoy-gt2p6
+  - xvus-cpi-26sep-coreyoy-gt2p7
+  - xvus-cpi-26sep-coreyoy-gt2p8
+  - xvus-cpi-26sep-coreyoy-gt2p9
+  - xvus-cpi-26sep-coreyoy-gt3p0
+  - xvus-cpi-26sep-coreyoy-gt3p1
+  - xvus-cpi-26sep-coreyoy-gt3p2
+  - xvus-cpi-26sep-coreyoy-gt3p3
+  - xvus-cpi-26sep-coreyoy-gt3p4
+  - xvus-cpi-26sep-coreyoy-gt3p5
+  - xvus-cpi-26sep-coremom-gt0p0
+  - xvus-cpi-26sep-coremom-gt0p1
+  - xvus-cpi-26sep-coremom-gt0p2
+  - xvus-cpi-26sep-coremom-gt0p3
+  - xvus-cpi-26sep-coremom-gt0p4
+  - xvus-cpi-26sep-coremom-gt0p5
+  - xvus-gdp-26q3-gt0p0
+  - xvus-gdp-26q3-gt0p5
+  - xvus-gdp-26q3-gt1p0
+  - xvus-gdp-26q3-gt1p5
+  - xvus-gdp-26q3-gt2p0
+  - xvus-gdp-26q3-gt2p5

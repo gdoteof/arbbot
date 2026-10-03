@@ -17,6 +17,16 @@
 # A window has no end: after the announcement the market resolves and the
 # basket settles, so there is nothing left to exit. Delete the row once it has
 # settled.
+#
+# `entries: true` (optional, default false) makes the same window stop ENTRIES
+# too: arb-trader re-reads this file every second, pulls every resting entry
+# quote on a matching relationship the moment `from` passes, and take-take
+# passes those relationships over. An entry resting across the announcement is
+# the same pick-off as a resting exit, with the hedge already at 0 or 1. A
+# DAMAGED file stops every entry as well as every exit. Hedges and sell-backs
+# that are owed keep running. Only set it on a row whose announcement resolves
+# the market: the window has no end, so on a row like brazil-pres-26 (first
+# round, not resolution) it would stop entries until the row is deleted.
 
 - family: tsla-q3-deliv
   from: 2026-10-01T04:00:00Z   # 2026-10-01 00:00 ET
@@ -29,15 +39,34 @@
 - family: nobel-peace-26
   from: 2026-10-08T04:00:00Z   # 2026-10-08 00:00 ET
   why: Nobel Peace Prize announcement 2026-10-09 09:00Z (Kalshi expected expiry)
+  entries: true
 
 - family: fedmtg-26oct
   from: 2026-10-28T04:00:00Z   # 2026-10-28 00:00 ET
   why: FOMC decision 2026-10-28 14:00 ET
+  entries: true
 
 - family: fedmtg-26dec
   from: 2026-12-09T05:00:00Z   # 2026-12-09 00:00 ET
   why: FOMC decision 2026-12-09 14:00 ET
+  entries: true
 
 - family: heisman-26
   from: 2026-12-12T05:00:00Z   # 2026-12-12 00:00 ET
   why: Heisman ceremony 2026-12-12
+  entries: true
+
+# Kalshi stops trading the CPI ladders at 08:25 ET (YoY 08:29) on release day;
+# PM-US trades on until 23:59Z. A PM-US entry resting across the print has no
+# Kalshi leg to hedge into, so entries stop with exits, 8.5 h ahead.
+- family: cpi-26sep
+  from: 2026-10-14T04:00:00Z   # 2026-10-14 00:00 ET
+  why: BLS September CPI release 2026-10-14 08:30 ET
+  entries: true
+
+# PM-US says the advance estimate is due 2026-10-29; Kalshi closes 2026-10-30
+# 08:29 ET. Opened at the earlier of the two.
+- family: gdp-26q3
+  from: 2026-10-29T04:00:00Z   # 2026-10-29 00:00 ET
+  why: BEA Q3 GDP advance estimate, 2026-10-29 or -30 08:30 ET
+  entries: true

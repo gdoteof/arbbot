@@ -99,6 +99,16 @@ const RULES: &[(&str, &str, bool)] = &[
     // take-take, and here that is the point.
     ("xvus-fedmtg-26oct", "2026-10-30", true),
     ("xvus-fedmtg-26dec", "2026-12-11", true),
+    // Added 2026-10-02 (Claude; Geoff: "lets onboard cpi and gdp"). Strike-
+    // for-strike pairs on the September CPI prints (headline and core, MoM
+    // and YoY; BLS release 2026-10-14 08:30 ET) and the Q3 GDP advance
+    // estimate. Dated two days past the release like the FOMC pairs above,
+    // so APR errs low. GDP's venues disagree on the release day — PM-US
+    // "currently scheduled for October 29", Kalshi closes 2026-10-30 08:29 ET
+    // — so it is dated off the later one. PM-US endDates (10-29, 11-13) are
+    // settlement-report bounds, as with FOMC.
+    ("xvus-cpi-26sep", "2026-10-16", true),
+    ("xvus-gdp-26q3", "2026-11-01", true),
 ];
 
 /// `-> (YYYY-MM-DD, estimated)`. `None` when the family is unknown, which
@@ -260,6 +270,9 @@ mod tests {
         assert_eq!(resolve_date("xvus-bestai-26dec-anthropic"), Some(("2027-01-05", true)));
         assert_eq!(resolve_date("xvus-fedmtg-26oct-cut25"), Some(("2026-10-30", true)));
         assert_eq!(resolve_date("xvus-fedmtg-26dec-nochng"), Some(("2026-12-11", true)));
+        assert_eq!(resolve_date("xvus-cpi-26sep-coremom-gt0p3"), Some(("2026-10-16", true)));
+        assert_eq!(resolve_date("xvus-cpi-26sep-mom-gtn0p2"), Some(("2026-10-16", true)));
+        assert_eq!(resolve_date("xvus-gdp-26q3-gt1p5"), Some(("2026-11-01", true)));
         assert_eq!(resolve_date("xvus-btc150k-ladder-07-31-2026"), None);
     }
 
