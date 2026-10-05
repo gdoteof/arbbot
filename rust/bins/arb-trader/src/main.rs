@@ -138,7 +138,9 @@ struct Args {
     /// MAKER APR hurdle, %/yr: the extra per-contract lock a resting quote must
     /// carry so that a fill annualizes to at least this over the hold to
     /// resolution (`Quoter::set_apr`). `None` FLOATS it with capital
-    /// utilization, which is the policy; `Some(0.0)` disables it.
+    /// utilization, which is the policy; `Some(0.0)` disables it. When given it
+    /// is also the floor under the take-take bar (`engine::bar_in_force`), so
+    /// no entry of either kind is taken below it.
     min_apr: Option<f64>,
     /// The day the hold is measured FROM, `YYYY-MM-DD`. Defaults to today UTC,
     /// re-derived on every refresh; pin it to make a bench replay

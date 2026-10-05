@@ -102,23 +102,30 @@ pub fn open_exposure(records: Vec<Value>) -> HashMap<String, f64> {
     out
 }
 
-/// Every unwind the ledger records, as `(relationship, closes_ts, qty)`.
+/// Every unwind the ledger records, as `(relationship, ts, qty)` — `ts` being
+/// the UNWIND record's own, which with the relationship is that record's
+/// identity.
 ///
 /// [`open_exposure`] folds these records INTO a net position, because it
 /// answers "what is open". This answers the different question "which closes
 /// have happened", so a process whose counter was seeded from that same fold
 /// can go on applying each later close to it exactly once.
 ///
-/// Same `unwound` records and the same `closes_ts` identity as the fold, read
-/// two ways rather than defined twice: a close this returns is precisely a
-/// close `open_exposure` would have netted, so seeding from one and releasing
-/// from the other cannot drift.
+/// Same `unwound` records as the fold, read two ways rather than defined
+/// twice: a close this returns is precisely a close `open_exposure` would have
+/// netted — it names a lot with `closes_ts` — so seeding from one and
+/// releasing from the other cannot drift.
+///
+/// IDENTIFIED BY THE CLOSE, NOT BY THE LOT IT CLOSES. One lot is routinely
+/// closed in pieces, and every piece carries the same `closes_ts`: keyed on
+/// that, the second piece reads as a close already applied and its contracts
+/// stay charged until the next restart.
 pub fn closed_lots(records: Vec<Value>) -> Vec<(String, f64, f64)> {
     apply_corrections(records)
         .iter()
-        .filter(|r| status_of(r) == "unwound")
+        .filter(|r| status_of(r) == "unwound" && f64_of(r, "closes_ts").is_some())
         .filter_map(|r| {
-            Some((rel_of(r)?.to_string(), f64_of(r, "closes_ts")?, f64_of(r, "qty").unwrap_or(0.0)))
+            Some((rel_of(r)?.to_string(), f64_of(r, "ts")?, f64_of(r, "qty").unwrap_or(0.0)))
         })
         .collect()
 }
