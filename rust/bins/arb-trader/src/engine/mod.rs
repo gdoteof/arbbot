@@ -261,6 +261,15 @@ fn read_bar(path: &str) -> crate::taketake::Bar {
     crate::taketake::bar_from_marks(&std::fs::read_to_string(path).unwrap_or_default(), wall_now())
 }
 
+/// The take-take bar in force: what the marks support, and never below an
+/// explicit `--min-apr`, which is the operator's hurdle for EVERY entry and not
+/// only the resting ones. A floor, not a substitute — a bar the marks refuse
+/// stays refused.
+fn bar_in_force(bar: &crate::taketake::Bar, apr: Option<&AprCfg>) -> Option<f64> {
+    let floor = apr.and_then(|a| a.min_apr);
+    bar.tradable().map(|b| floor.map_or(b, |f| b.max(f)))
+}
+
 fn levels_of(v: Option<&serde_json::Value>) -> Option<Vec<Level>> {
     let mut out = Vec::new();
     for l in v?.as_array()? {
@@ -790,11 +799,17 @@ impl Engine {
         let mut tt_bar: Option<f64> = None;
         if let Some(tt) = cfg.take_take.as_ref() {
             let bar = read_bar(&tt.marks_path);
-            tt_bar = bar.tradable();
+            tt_bar = bar_in_force(&bar, cfg.apr.as_ref());
             eprintln!(
-                "[take-take] {} — {}, cap {}ct/rel, clip {}",
+                "[take-take] {} — {}{}, cap {}ct/rel, clip {}",
                 if tt.detect_only { "DETECT ONLY (places nothing)" } else { "ARMED" },
                 bar.describe(),
+                match (tt_bar, bar.tradable()) {
+                    (Some(held), Some(marks)) if held > marks => {
+                        format!(", held at {held}%/yr by --min-apr")
+                    }
+                    _ => String::new(),
+                },
                 tt.max_ct_per_rel,
                 tt.max_clip
             );
@@ -2556,7 +2571,7 @@ impl Engine {
         // let the engine trade against a stale definition of "good".
         if let Some(tt) = self.cfg.take_take.as_ref() {
             let bar = read_bar(&tt.marks_path);
-            let now_bar = bar.tradable();
+            let now_bar = bar_in_force(&bar, self.cfg.apr.as_ref());
             // Edge-triggered, like `feed_reason`: the four hours the
             // armed session spent firing against a frozen bar produced
             // not one line saying so, and a line every stats tick is a
@@ -4531,6 +4546,21 @@ mod apr_refresh_tests {
         cfg.apr_installed = (bar, asof);
         cfg.risk = Some(risk);
         test_engine(cfg)
+    }
+
+    /// Take-take clears an explicit minimum too, and the minimum does not
+    /// revive a bar the marks refuse.
+    #[test]
+    fn an_explicit_minimum_floors_the_take_take_bar() {
+        use crate::taketake::Bar;
+        let min = |min_apr| AprCfg { min_apr, asof: None };
+        let fresh = |apr| Bar::Fresh { apr, age_s: 1.0 };
+        assert_eq!(bar_in_force(&fresh(40.9), Some(&min(Some(50.0)))), Some(50.0));
+        assert_eq!(bar_in_force(&fresh(63.0), Some(&min(Some(50.0)))), Some(63.0));
+        assert_eq!(bar_in_force(&fresh(40.9), Some(&min(None))), Some(40.9));
+        assert_eq!(bar_in_force(&fresh(40.9), None), Some(40.9));
+        let refused = Bar::Untrusted { why: "stale".into() };
+        assert_eq!(bar_in_force(&refused, Some(&min(Some(50.0)))), None);
     }
 
     /// A taker hurdle can exceed the utilization ceiling, and can fall again.

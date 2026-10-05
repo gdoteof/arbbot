@@ -804,8 +804,8 @@ impl RiskView {
     /// records that seed folded. See the `released` field.
     pub fn seed_released(&self, closed: &[(String, f64, f64)]) {
         let mut seen = self.released.lock().expect("released");
-        for (rel, closes_ts, _) in closed {
-            seen.insert((rel.clone(), closes_ts.to_bits()));
+        for (rel, ts, _) in closed {
+            seen.insert((rel.clone(), ts.to_bits()));
         }
     }
 
@@ -830,8 +830,8 @@ impl RiskView {
         let mut seen = self.released.lock().expect("released");
         let mut e = self.exposure.lock().expect("exposure");
         let (mut lots, mut total) = (0usize, 0.0);
-        for (rel, closes_ts, qty) in closed {
-            if *qty <= 0.0 || !seen.insert((rel.clone(), closes_ts.to_bits())) {
+        for (rel, ts, qty) in closed {
+            if *qty <= 0.0 || !seen.insert((rel.clone(), ts.to_bits())) {
                 continue;
             }
             // `seed_exposure_from_ledger`'s rule, exactly: an id the registry
@@ -2520,6 +2520,27 @@ mod tests {
             assert_eq!(v.release_closed(&closed, &meta), (0, 0.0), "re-reads must be inert");
         }
         assert_eq!(v.open_ct("r1"), 15.0);
+    }
+
+    /// One lot, closed in two pieces by two records that name the same
+    /// `closes_ts`. Each is its own close: keyed on the lot they share, the
+    /// second read as already applied and stayed charged until a restart.
+    #[test]
+    fn a_lot_closed_in_pieces_releases_every_piece() {
+        let v = funded("low");
+        v.record_open("r1", "cross-venue-equivalent", 5.0);
+        let meta = meta_for("r1", "cross-venue-equivalent");
+        let rec = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        let mut ledger = vec![
+            rec(r#"{"status":"open","relationship_id":"r1","ts":1.0,"qty":5}"#),
+            rec(r#"{"status":"unwound","relationship_id":"r1","ts":2.0,"closes_ts":1.0,"qty":3}"#),
+        ];
+        assert_eq!(v.release_closed(&crate::ledger::closed_lots(ledger.clone()), &meta), (1, 3.0));
+        ledger.push(rec(
+            r#"{"status":"unwound","relationship_id":"r1","ts":3.0,"closes_ts":1.0,"qty":2}"#,
+        ));
+        assert_eq!(v.release_closed(&crate::ledger::closed_lots(ledger), &meta), (1, 2.0));
+        assert_eq!(v.open_ct("r1"), 0.0);
     }
 
     /// THE TRAP THIS FIELD EXISTS FOR. `seed_exposure_from_ledger` folds
