@@ -324,7 +324,7 @@ struct Unjoined {
 /// Going forward the population is narrower still. Of the enabled timers,
 /// `arbbot-hedge.timer` is the only writer of a NEW unjoined `open` basket, and
 /// completing these obligations is its entire job. `arbbot-settle.timer` is
-/// also enabled and also writes this file, but `scripts/settle_baskets.py`
+/// also enabled and also writes this file, but `arb-settle`
 /// emits `unwound` closing records, which the `status == "open"` filter above
 /// never collects. `arbbot-taketake.timer`, `arbbot-unwind.timer` and every
 /// Python trader unit are disabled.
