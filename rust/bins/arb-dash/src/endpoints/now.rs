@@ -230,7 +230,7 @@ struct Opp {
 /// detects it — the flags that arm an engine live in a drop-in that is not in
 /// this repo, so a configured unit name is a guess that goes stale the first
 /// time a slice is renamed or a second one is armed.
-fn armed_engine() -> Option<(String, crate::architecture::Proc)> {
+pub(crate) fn armed_engine() -> Option<(String, crate::architecture::Proc)> {
     let mut fallback = None;
     for (unit, p) in crate::architecture::procs_by_unit() {
         if !p.cmd.contains("arb-trader") {

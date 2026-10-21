@@ -9,7 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::process::exit;
 use std::sync::Arc;
 
-use crate::endpoints::{books, equity, now, opportunities, pairs, trades};
+use crate::endpoints::{alerts, books, equity, now, opportunities, pairs, trades};
 use crate::{integrity, stream, Args};
 
 const PAGE: &str = include_str!("index.html");
@@ -65,6 +65,7 @@ fn handle(s: TcpStream, a: &Args) {
         "/api/books/history" => respond(s, "200 OK", "application/json", &books::json(a)),
         "/api/equity" => respond(s, "200 OK", "application/json", &equity::json(a)),
         "/api/now" => respond(s, "200 OK", "application/json", &now::json(a)),
+        "/api/alerts" => respond(s, "200 OK", "application/json", &alerts::json()),
         // Built from /proc, the unit files and the artifacts on disk on every
         // request — it holds no picture of its own to go stale.
         "/api/architecture" => {
