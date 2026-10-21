@@ -167,6 +167,10 @@
   .banner{border:1px solid var(--warn);color:var(--warn);border-radius:6px;
     padding:9px 12px;margin-bottom:12px;font-size:12px;line-height:1.6}
   .banner code{color:inherit}
+  .banner.bad{border-color:var(--bad);color:var(--bad);font-size:13px}
+  #alerts{padding:12px 28px 0;max-width:1600px;margin:0 auto}
+  #alerts:empty{display:none}
+  #alerts .banner:last-child{margin-bottom:0}
   .stat{min-width:96px}
   .bar{height:7px;background:var(--line);border-radius:99px;overflow:hidden}
   .bar i{display:block;height:100%;background:var(--ok);border-radius:99px}
@@ -231,6 +235,7 @@
   <span class="sub" id="link" style="margin-left:auto">● connecting…</span>
 </header>
 <nav id="nav"></nav>
+<div id="alerts"></div>
 <main id="root"></main>
 
 <script>
@@ -1161,6 +1166,7 @@ const S = {
   pairQuery: '',
   trades:    {query:'', status:'all', strategy:'all', sort:'time:desc', page:1, pageSize:25},
   link:      {cls:'dim', text:'● connecting…', title:''},
+  alerts:    null,               // /api/alerts, polled on every view
 };
 
 let scheduled = false;
@@ -1876,9 +1882,35 @@ function renderNav(active){
     `<a href="${v.path}" class="${v.path===active?'on':''}">${v.label}</a>`).join('');
 }
 
+/* Orders a venue is refusing (endpoints/alerts.rs). Drawn above EVERY view,
+   because the view that is open is not the one that would say so: the Now
+   view counts a refused retry as a placement. */
+const VENUE = {kalshi:'Kalshi', pmus:'PM-US'};
+function alertsHtml(d){
+  if(!d) return '';
+  if(d.error) return `<div class="banner">The venue-refusal check could not run: ${esc(d.error)}</div>`;
+  return (d.rows||[]).map(r => {
+    const v = esc(VENUE[r.venue] || r.venue);
+    const seen = `${r.count} refused in the last ${dur(d.window_s)} (HTTP ${r.status}),
+      most recent ${dur(d.generated_at - r.last_ts)} ago. ${v} says:
+      <q>${esc(r.message)}</q>`;
+    return r.needs_human
+      ? `<div class="banner bad"><b>${v} is refusing orders, and only you can fix it.</b>
+           ${seen} A ${r.status} refuses the account, not the order: the engine
+           keeps retrying, and no retry will get through.</div>`
+      : `<div class="banner"><b>${v} is refusing orders.</b> ${seen}</div>`;
+  }).join('');
+}
+
 function render(){
   const p = page();
   renderNav(p);
+
+  const t = document.createElement('template');
+  t.innerHTML = alertsHtml(S.alerts);
+  apply(document.getElementById('alerts'), t.content);
+  const human = (S.alerts?.rows||[]).find(r => r.needs_human);
+  document.title = human ? `⚠ ${VENUE[human.venue]||human.venue} refusing orders — arbbot` : 'arbbot capital';
 
   const el = document.getElementById('link');
   el.className = 'sub ' + S.link.cls;
@@ -1949,6 +1981,10 @@ function connect(){
 render();
 refresh();
 connect();
+// Not tied to the stream: a refusal moves no file this page watches.
+const pollAlerts = () => fetchOr('/api/alerts').then(d => set(st => { st.alerts = d; }));
+pollAlerts();
+setInterval(pollAlerts, 30000);
 // Re-evaluate time-based capital freshness even if SSE or a fetch stalls. This
 // only redraws the capital view; it does not create a second polling path.
 setInterval(() => { if(page()==='/'&&S.data.books) render(); }, 5000);

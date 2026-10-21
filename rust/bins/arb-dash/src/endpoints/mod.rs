@@ -1,5 +1,6 @@
 //! The JSON behind each dashboard view.
 
+pub mod alerts;
 pub mod books;
 pub mod capital;
 pub mod equity;
