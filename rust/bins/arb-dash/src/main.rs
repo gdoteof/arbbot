@@ -69,7 +69,6 @@ pub struct Args {
     /// engine booked.
     ledger_path: String,
     registry: String,
-    tradable: String,
     /// The capital caps and per-topic budgets the ENGINE reads. Same files,
     /// same defaults as `arb-trader`'s own `--exec-config` / `--topics-config`,
     /// so the Now view cannot describe a budget the engine is not using.
@@ -99,7 +98,6 @@ impl Args {
             parquet_dir: "/nonexistent/data/parquet".into(),
             ledger_path: "/nonexistent/data/trades.jsonl".into(),
             registry: "/nonexistent/config/registry.yaml".into(),
-            tradable: "/nonexistent/config/tradable.yaml".into(),
             exec_config: "/nonexistent/config/exec.yaml".into(),
             topics_config: "/nonexistent/config/topics.yaml".into(),
             port: 0,
@@ -120,7 +118,6 @@ fn main() {
         parquet_dir: "data/parquet".into(),
         ledger_path: "data/exec/trades.jsonl".into(),
         registry: "config/registry.yaml".into(),
-        tradable: "config/tradable.yaml".into(),
         exec_config: "config/exec.yaml".into(),
         topics_config: "config/topics.yaml".into(),
         port: 4749,
@@ -143,8 +140,10 @@ fn main() {
             "--registry" => a.registry = v,
             "--exec-config" => a.exec_config = v,
             "--topics-config" => a.topics_config = v,
-            "--tradable" => a.tradable = v,
             "--port" => a.port = v.parse().unwrap_or(4749),
+            // Retired with config/tradable.yaml (the registry verdict is the
+            // gate); ignored so a unit that still passes it does not exit 2.
+            "--tradable" => eprintln!("[args] --tradable is retired and ignored"),
             other => {
                 eprintln!("unknown arg: {other}");
                 exit(2);

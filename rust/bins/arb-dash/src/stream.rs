@@ -46,7 +46,7 @@ fn state_json(a: &Args) -> String {
     let now_sig = armed
         ^ stat_sig(&format!("{}/exec/marks.json", a.data_dir)).rotate_left(23);
     let opps = stat_sig(&format!("{}/opportunities-{day}.jsonl", a.scan_dir));
-    let registry = stat_all(&[a.registry.clone(), a.tradable.clone()]);
+    let registry = stat_all(std::slice::from_ref(&a.registry));
     format!(
         "{{\"today\":\"{day}\",\"books\":{books},\"recording\":{recording},\
          \"opportunities\":{opps},\"pairs\":{registry},\"now\":{now_sig}}}"
