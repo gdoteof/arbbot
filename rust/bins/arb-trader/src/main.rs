@@ -774,7 +774,12 @@ async fn startup_sweep(
             Err(e) => eprintln!("[exec] {venue:?}: list task panicked ({e}) — sweeping anyway"),
         }
         match sink::cancel_all_and_verify_with(sink.clone(), pol.clone()).await {
-            Ok(()) => eprintln!("[exec] {venue:?}: book is clean"),
+            Ok(()) => {
+                if *venue == Venue::PolymarketUs {
+                    maker_exit::note_pmus_swept_clean(arb_core::clock::now_s());
+                }
+                eprintln!("[exec] {venue:?}: book is clean")
+            }
             // The cancel-all went in and NOTHING was ever observed resting — we
             // just could not read the confirmation. Arm, loudly.
             //

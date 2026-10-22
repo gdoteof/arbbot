@@ -485,6 +485,16 @@ struct Published {
 static VIEW: Mutex<Option<Published>> = Mutex::new(None);
 static SUPPRESS_REQ: Mutex<Option<BTreeSet<(String, String)>>> = Mutex::new(None);
 
+/// When this process's startup sweep proved the PM-US book empty, in wall-clock
+/// seconds. Never set when PM-US could not confirm it.
+static PMUS_SWEPT_CLEAN_AT: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+
+/// Record that the startup sweep proved the PM-US book empty at `at`. Read by
+/// `lot::recover` to release a rest whose place answer was lost.
+pub fn note_pmus_swept_clean(at: f64) {
+    let _ = PMUS_SWEPT_CLEAN_AT.set(at);
+}
+
 /// Publish the engine's view. Called from `Engine::maker_exit_tick` and nowhere
 /// else.
 ///
