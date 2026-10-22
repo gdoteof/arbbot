@@ -154,7 +154,7 @@ fn pmus_activity_key(v: &Value) -> Option<String> {
 /// Union of the archive and a fresh fetch, keyed; the fresh copy of a row wins
 /// (a balance change can go PENDING -> COMPLETED). Nothing in the archive is
 /// ever dropped. Sorted by key so the file is deterministic.
-fn merge(archive: Vec<Value>, fresh: Vec<Value>, key: fn(&Value) -> Option<String>) -> Result<Vec<Value>, String> {
+fn merge(archive: Vec<Value>, fresh: Vec<Value>, key: Key) -> Result<Vec<Value>, String> {
     let mut by: BTreeMap<String, Value> = BTreeMap::new();
     for v in archive.into_iter().chain(fresh) {
         let k = key(&v).ok_or_else(|| format!("row has no id: {}", v.to_string().chars().take(160).collect::<String>()))?;
@@ -183,9 +183,12 @@ fn write_atomic(path: &Path, v: &Value) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// The venue's own id for a row; see `merge`.
+type Key = fn(&Value) -> Option<String>;
+
 /// Everything one venue produced, written only once ALL of it was fetched.
 struct Fetched {
-    archives: Vec<(&'static str, Vec<Value>, fn(&Value) -> Option<String>)>,
+    archives: Vec<(&'static str, Vec<Value>, Key)>,
     snapshots: Vec<(&'static str, Value)>,
     consistent: bool,
 }
