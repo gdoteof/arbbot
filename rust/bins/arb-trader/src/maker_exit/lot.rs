@@ -472,8 +472,79 @@ pub(super) async fn place_group(
 /// a restart reloaded it, and every pass walked the whole order list again.
 const ABSENT_IS_PROOF_AFTER_S: f64 = 300.0;
 
-/// `Ok(false)`: the REST place was lost and Kalshi, long after its list could
-/// lag, has no order under our client id — it never landed. Never returned for
+/// Where `arb-venue-sync` archives each venue's account history.
+const VENUE_DIR: &str = "data/venue";
+
+/// Widens a lost PM-US rest's window on both sides, for skew between our clock
+/// and the venue's `createTime`. A wider window can only refuse more.
+const PMUS_WINDOW_SLACK_S: f64 = 60.0;
+
+/// Whether PM-US's own account history proves a lost rest filled nothing.
+///
+/// PM-US carries no client id, so a rest whose place answer was lost has no
+/// venue id to read. A startup sweep that proved the book empty after the place
+/// means it cannot still be resting. What is left is whether it filled before
+/// the sweep cancelled it, and every PM-US fill is a `trade` activity. So a
+/// history synced after the sweep with no trade on the market between the place
+/// and the sweep is the proof. Any trade in that window refuses, ours or a
+/// sibling's: telling them apart is the reconciliation the latch forces.
+fn pmus_history_shows_no_fill(
+    sync: &serde_json::Value,
+    activities: impl FnOnce() -> Result<serde_json::Value, String>,
+    market: &str,
+    placed: f64,
+    swept: f64,
+) -> Result<(), String> {
+    if placed >= swept {
+        return Err("it was placed after this process's startup sweep, so it may still be resting".into());
+    }
+    if sync["polymarket_us"]["ok"].as_bool() != Some(true) {
+        return Err("the last PM-US history sync did not succeed".into());
+    }
+    let (from, to) = (placed - PMUS_WINDOW_SLACK_S, swept + PMUS_WINDOW_SLACK_S);
+    // `at` is when the sync STARTED, so everything before it is in the archive.
+    let synced = sync["at"].as_f64().ok_or("sync.json has no `at`")?;
+    if synced < to {
+        return Err(format!("PM-US history was last synced {:.0}s before the window closes", to - synced));
+    }
+    let activities = activities()?;
+    let rows = activities.as_array().ok_or("the PM-US history is not a list")?;
+    for t in rows.iter().filter_map(|r| r.get("trade")) {
+        if t["marketSlug"].as_str() != Some(market) {
+            continue;
+        }
+        let at = t["createTime"]
+            .as_str()
+            .and_then(|s| s.get(..19))
+            .and_then(|s| crate::taketake::parse_iso8601_z(&format!("{s}Z")));
+        match at {
+            None => return Err(format!("a trade on {market} has an unreadable createTime")),
+            Some(at) if (from..=to).contains(&at) => {
+                return Err(format!("PM-US history shows a trade on {market} at {at:.0}, inside the window"))
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// [`pmus_history_shows_no_fill`] over the archive on disk. `sync.json` is read
+/// first: it is written after the history, so the history read second is at
+/// least as new as the sync that vouches for it. The history (14 MB in October
+/// 2026) is read only once the sync is new enough to vouch for the window.
+fn pmus_archive_shows_no_fill(market: &str, placed: f64, swept: f64) -> Result<(), String> {
+    let read = |name: &str| -> Result<serde_json::Value, String> {
+        let path = format!("{VENUE_DIR}/{name}");
+        let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))
+    };
+    let sync = read("sync.json")?;
+    pmus_history_shows_no_fill(&sync, || read("pmus_activities.json"), market, placed, swept)
+}
+
+/// `Ok(false)`: the REST place was lost and it provably neither rests nor
+/// filled. On Kalshi that is no order under our client id long after its list
+/// could lag. On PM-US it is [`pmus_history_shows_no_fill`]. Never returned for
 /// a hedge: a hedge's rest leg already filled, and releasing it could hedge twice.
 async fn recover(
     sink: &Sink,
@@ -493,7 +564,19 @@ async fn recover(
     if venue == Venue::PolymarketUs {
         // PM-US has no client id on the wire. Its existing recovery helper
         // matches market/quantity only, which can adopt a sibling lot's order.
-        return Err(format!("PM-US acknowledgement lost for {}; retaining reservation; venue order identity requires reconciliation", receipt.client));
+        let lost = format!("PM-US acknowledgement lost for {}; retaining reservation; venue order identity requires reconciliation", receipt.client);
+        if hedge {
+            return Err(lost);
+        }
+        let Some(&swept) = super::PMUS_SWEPT_CLEAN_AT.get() else {
+            return Err(format!("{lost} (no proven-clean PM-US startup sweep in this process)"));
+        };
+        let (market, placed) = (order.pm_market.clone(), receipt.book_ts);
+        return match tokio::task::spawn_blocking(move || pmus_archive_shows_no_fill(&market, placed, swept)).await {
+            Ok(Ok(())) => Ok(false),
+            Ok(Err(why)) => Err(format!("{lost} ({why})")),
+            Err(e) => Err(format!("{lost} (history check failed: {e})")),
+        };
     }
     let req = receipt.request(order, hedge);
     let s = sink.clone();
@@ -740,10 +823,11 @@ async fn advance(
     let (rest_sink, hedge_sink) = sinks(a.order.shape, k, p);
     if !recover(rest_sink, &mut a.rest, &a.order, false).await? {
         out.push(format!(
-            "[maker-exit] lot={}:{}: client {} never reached Kalshi (absent {:.0}s after the lost place); releasing the reservation",
+            "[maker-exit] lot={}:{}: client {} provably neither rests nor filled on {:?} ({:.0}s after the lost place); releasing the reservation",
             a.order.rel_id,
             a.order.closes_ts,
             a.rest.client,
+            a.order.shape.rest_venue(),
             wall_now() - a.rest.book_ts
         ));
         state.active = None;
@@ -1666,6 +1750,55 @@ mod tests {
         b.lot.as_mut().unwrap().unlatch();
     }
 
+    /// 2026-10-15T08:43:00Z, a startup sweep; the rest was placed an hour before.
+    const SWEPT: f64 = 1_792_053_780.0;
+    const PLACED: f64 = SWEPT - 3600.0;
+
+    fn synced(ok: bool, at: f64) -> serde_json::Value {
+        serde_json::json!({"at": at, "polymarket_us": {"ok": ok}})
+    }
+
+    fn trade(market: &str, at: &str) -> serde_json::Value {
+        serde_json::json!({"trade": {"marketSlug": market, "createTime": at}, "type": "ACTIVITY_TYPE_TRADE"})
+    }
+
+    fn check(sync: &serde_json::Value, rows: Vec<serde_json::Value>) -> Result<(), String> {
+        pmus_history_shows_no_fill(sync, || Ok(serde_json::Value::Array(rows)), "pm-a", PLACED, SWEPT)
+    }
+
+    #[test]
+    fn pmus_history_with_no_trade_on_the_market_in_the_window_proves_no_fill() {
+        let sync = synced(true, SWEPT + 3600.0);
+        let rows = vec![
+            trade("pm-b", "2026-10-15T08:00:00.123Z"),
+            trade("pm-a", "2026-10-15T07:30:00.000000001Z"),
+            trade("pm-a", "2026-10-15T08:45:00Z"),
+        ];
+        assert_eq!(check(&sync, rows), Ok(()));
+    }
+
+    #[test]
+    fn any_trade_on_the_market_in_the_window_refuses_whoever_it_was() {
+        let sync = synced(true, SWEPT + 3600.0);
+        for at in ["2026-10-15T07:42:00.5Z", "2026-10-15T08:00:00Z", "2026-10-15T08:43:30Z"] {
+            let err = check(&sync, vec![trade("pm-a", at)]).unwrap_err();
+            assert!(err.contains("inside the window"), "{at}: {err}");
+        }
+        let err = check(&sync, vec![trade("pm-a", "yesterday")]).unwrap_err();
+        assert!(err.contains("unreadable createTime"), "{err}");
+    }
+
+    #[test]
+    fn pmus_history_proves_nothing_until_a_good_sync_covers_the_window() {
+        let never = || -> Result<serde_json::Value, String> { panic!("read the history before the sync vouched for it") };
+        let late = pmus_history_shows_no_fill(&synced(true, SWEPT + 30.0), never, "pm-a", PLACED, SWEPT);
+        assert!(late.unwrap_err().contains("last synced"));
+        let failed = check(&synced(false, SWEPT + 3600.0), vec![]).unwrap_err();
+        assert!(failed.contains("did not succeed"), "{failed}");
+        let after = pmus_history_shows_no_fill(&synced(true, SWEPT + 3600.0), never, "pm-a", SWEPT + 1.0, SWEPT);
+        assert!(after.unwrap_err().contains("may still be resting"));
+    }
+
     #[tokio::test]
     async fn kalshi_absence_releases_a_503_place_only_after_the_list_could_lag() {
         let _g = crate::naked_act::TEST_SERIAL.lock().await;
@@ -1679,7 +1812,7 @@ mod tests {
         assert!(a.lot.as_ref().unwrap().latched);
         a.lot.as_mut().unwrap().active.as_mut().unwrap().rest.book_ts -= ABSENT_IS_PROOF_AFTER_S + 1.0;
         let out = f.manage(&mut a).await.join("\n");
-        assert!(out.contains("never reached Kalshi"), "{out}");
+        assert!(out.contains("provably neither rests nor filled on Kalshi"), "{out}");
         let lot = a.lot.as_ref().unwrap();
         assert!(!lot.busy() && !lot.latched);
         assert!(f.k.orders.lock().unwrap().is_empty());
