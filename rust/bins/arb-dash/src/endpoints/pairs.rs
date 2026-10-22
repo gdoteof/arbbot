@@ -1,7 +1,7 @@
 //! Registry inventory. Historical quote drill-downs were removed with the
 //! top-of-book rollup; this endpoint is intentionally registry-only.
 
-use arb_registry::{Allowlist, Registry};
+use arb_registry::Registry;
 
 use crate::Args;
 
@@ -10,7 +10,6 @@ pub fn list_json(a: &Args) -> String {
         Ok(r) => r,
         Err(e) => return format!("{{\"error\":\"{}\"}}", e.replace('"', "'")),
     };
-    let allow = Allowlist::load(&a.tradable);
     let rows: Vec<serde_json::Value> = reg
         .relationships
         .iter()
@@ -20,8 +19,7 @@ pub fn list_json(a: &Args) -> String {
                 "kind": r.kind,
                 "verdict": r.verdict,
                 "vetted_by": r.vetted_by,
-                "tradable": r.tradable(&allow),
-                "human_vetted": r.human_vetted(),
+                "tradable": r.tradable(),
                 "oracle_risk": r.oracle_risk,
                 "tranche": r.tranche,
                 "legs": r.legs.iter().map(|l| format!("{}:{}", l.venue, l.market_id))
@@ -29,11 +27,17 @@ pub fn list_json(a: &Args) -> String {
             })
         })
         .collect();
+    let tradable_by = |who: &str| {
+        reg.relationships
+            .iter()
+            .filter(|r| r.tradable() && r.vetted_by.as_deref() == Some(who))
+            .count()
+    };
     serde_json::json!({
         "count": rows.len(),
-        "tradable": reg.relationships.iter().filter(|r| r.tradable(&allow)).count(),
-        "human_vetted": reg.relationships.iter().filter(|r| r.human_vetted()).count(),
-        "allowlisted": allow.len(),
+        "tradable": reg.relationships.iter().filter(|r| r.tradable()).count(),
+        "tradable_human": tradable_by("human"),
+        "tradable_agent": tradable_by("agent"),
         "rows": rows,
     })
     .to_string()

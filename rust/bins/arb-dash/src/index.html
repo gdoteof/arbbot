@@ -527,14 +527,13 @@ function pairsPanel(d){
   const rows=shown.map(r=>`<tr data-k="${esc(r.id)}">
       <td><span class="rel">${esc(r.id)}</span></td>
       <td>${esc(r.verdict||'—')}</td>
-      <td>${esc(r.vetted_by||'—')}${r.tradable && !r.human_vetted ? ' <span class="dim">+allowlist</span>' : ''}</td>
+      <td>${esc(r.vetted_by||'—')}</td>
       <td class="num ${r.tradable?'ok':'dim'}">${r.tradable?'yes':'no'}</td>
       <td class="dim">${(r.legs||[]).length>2 ? (r.legs.length+' legs') : esc((r.legs||[]).map(l=>l.length>44?l.slice(0,44)+'…':l).join('  |  '))}</td>
     </tr>`).join('');
   const el = $(`<section class="wide">
     <h2>Tracked pairs &middot; ${d.count} registered &middot; ${d.tradable} tradable
-      <span class="dim">(${d.human_vetted} by human verdict, ${d.allowlisted}
-        id(s) in the allowlist — the two overlap)</span>
+      <span class="dim">(greenlit by verdict: ${d.tradable_human} human, ${d.tradable_agent} agent)</span>
       ${q?`&middot; <span class="ok">${shown.length} match "${esc(q)}"</span>`:''}</h2>
     <input id="pair-q" placeholder="filter by id, verdict, vetter or leg…"
       value="${esc(S.pairQuery)}" style="width:100%;max-width:420px;margin-bottom:10px;

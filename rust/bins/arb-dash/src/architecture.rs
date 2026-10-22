@@ -147,11 +147,11 @@ const NODES: &[Decl] = &[
     },
     // ---- decide -----------------------------------------------------------
     Decl {
-        id: "registry", label: "registry.yaml + tradable.yaml", sub: "the trading gate",
+        id: "registry", label: "registry.yaml", sub: "the trading gate",
         lane: 3, row: 0, kind: "artifact", unit: None,
         probe: Probe::File("config/registry.yaml"), max_age_s: None, expect: Expect::Live,
-        what: "The vetted pair set. A relationship trades only with vetted_by: human or an \
-               entry in tradable.yaml, and that stamp is never applied programmatically. \
+        what: "The vetted pair set. A relationship trades only with verdict: equivalent or \
+               equivalent-with-caveat; vetted_by (human | agent) records who greenlit it. \
                Gitignored: it is the trading pair set.",
     },
     Decl {

@@ -400,10 +400,14 @@ digest_stage() {
   #
   # 2>/dev/null keeps stderr out of the digest, but it also discards the reason a
   # run died — so `rc` below is the only thing that can tell us it did.
+  #
+  # registry-pin-v2.yaml is registry-pin.yaml with every `equivalent*` verdict
+  # that the old human-or-tradable.yaml gate refused rewritten to `unreviewed`
+  # (96 ids, verdict lines only), so the verdict-only gate admits the same 43
+  # relationships against the same baseline.
   line=$(cd "$PRIMARY" && timeout $T_DIGEST nice -n 19 "$ROOT/rust/target/release/arb-trader" \
       --bench-tape data/golden/bench-tape-2026-07-28.jsonl \
-      --registry   data/golden/registry-pin.yaml \
-      --tradable   data/golden/tradable-pin.yaml \
+      --registry   data/golden/registry-pin-v2.yaml \
       --kill-file  /nonexistent/KILL "$@" 2>/dev/null | tail -1)
   rc=$?
   # Before any comparison: a replay that did not RUN has no digest, and reporting

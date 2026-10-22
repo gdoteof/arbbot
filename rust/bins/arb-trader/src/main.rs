@@ -60,10 +60,6 @@ struct Args {
     /// Engine-sequenced write-ahead log path (see src/wal.rs).
     wal: Option<String>,
     registry: String,
-    /// Allowlist half of the tradable gate (config/tradable.yaml). A missing
-    /// file is an EMPTY allowlist — the gate then falls back to registry
-    /// human-vetting alone, which never widens it.
-    tradable: String,
     /// Recorder health feed. Critical-feed staleness pulls ALL quotes, because
     /// cross-venue prices are hedge-priced against the other venue's book, so
     /// one stale feed invalidates BOTH sides. Empty string disables the check.
@@ -252,7 +248,6 @@ fn default_args() -> Args {
         replay_wal: None,
         wal: None,
         registry: "config/registry.yaml".into(),
-        tradable: "config/tradable.yaml".into(),
         health: "data/health.jsonl".into(),
         enable_orders: false,
         confirm_live: false,
@@ -305,7 +300,6 @@ fn parse_args() -> Args {
             "--replay-wal" => a.replay_wal = it.next(),
             "--wal" => a.wal = it.next(),
             "--registry" => a.registry = it.next().expect("--registry value"),
-            "--tradable" => a.tradable = it.next().expect("--tradable value"),
             "--health" => a.health = it.next().expect("--health value"),
             "--enable-orders" => a.enable_orders = true,
             "--yes-trade-live" => a.confirm_live = true,
@@ -412,21 +406,13 @@ type MarketIndex = HashMap<(Venue, String), Vec<usize>>;
 /// Relationship id -> (oracle_risk, kind). See `rel_meta` below for why.
 type RelMeta = HashMap<String, (String, String)>;
 
-fn load_quoters(
-    registry: &str,
-    tradable: &str,
-    rel_prefixes: &[String],
-) -> (Vec<Quoter>, MarketIndex, RelMeta) {
+fn load_quoters(registry: &str, rel_prefixes: &[String]) -> (Vec<Quoter>, MarketIndex, RelMeta) {
     let reg = arb_registry::Registry::load(registry).expect("read registry");
-    // THE GATE (card c9ac7d1d, exec/main.py:131-146): this process QUOTES a
-    // relationship only if it is HUMAN-vetted in the registry or explicitly
-    // allowlisted in config/tradable.yaml. An agent verdict is not enough.
-    // A missing allowlist file is an empty allowlist, which is the
-    // conservative direction — it never widens the gate. A registry veto
-    // (`Relationship::veto`) beats both halves.
-    let allow = arb_registry::Allowlist::load(tradable);
+    // THE GATE: this process QUOTES a relationship only if its registry verdict
+    // is `equivalent` or `equivalent-with-caveat` (`Relationship::tradable`).
+    // Who wrote the verdict (`vetted_by: human | agent`) is a label, not part
+    // of the gate.
     let total = reg.relationships.len();
-    let mut n_gated = 0usize;
     let mut n_vetoed = 0usize;
 
     // Metadata for the risk view, keyed by id: oracle_risk scales the per-rel
@@ -434,14 +420,7 @@ fn load_quoters(
     // `Rel`. Built from the FULL registry, not the quoting subset — a basket we
     // no longer quote still consumes capital.
     let mut rel_meta: RelMeta = HashMap::new();
-    // Which ids would survive `config/tradable.yaml` being emptied — i.e. the
-    // ones deleting a line does NOT revoke. Collected here because the registry
-    // is consumed below and `Rel` does not carry the verdict.
-    let mut human_vetted: std::collections::BTreeSet<String> = Default::default();
     for r in &reg.relationships {
-        if r.human_vetted() {
-            human_vetted.insert(r.id.clone());
-        }
         rel_meta.insert(
             r.id.clone(),
             (
@@ -456,32 +435,16 @@ fn load_quoters(
         .into_iter()
         .filter(|r| r.legs.len() == 2)
         .filter(|r| {
-            // A veto is not just another blocked rel. If the id is ALSO
-            // allowlisted, this line is the only place the operator learns the
-            // revocation they wrote actually took effect — say it by name.
-            //
             // SCOPE, and it is the dangerous half: this gate binds THIS PROCESS
-            // and nothing else. No other component reads the registry verdict or
-            // the allowlist — `arbbot-hedge.timer` fires the naked-leg hedger
-            // every 5 minutes and places live Kalshi orders without consulting
-            // either. So a revocation stops the quoter and does NOT stop the
-            // account from trading the pair, and a line that reads as
-            // account-wide tells the operator the risk is gone when it is not.
-            if let Some(v) = r.veto() {
-                n_vetoed += 1;
-                if allow.contains(&r.id) {
-                    eprintln!(
-                        "[gate] VETO {}: registry verdict {v:?} overrides its entry in \
-                         {tradable} — this process will not quote it. That is the whole \
-                         effect: the naked-leg hedger does not read this gate and can \
-                         still place orders on the pair.",
-                        r.id
-                    );
-                }
-            }
-            let ok = r.tradable(&allow);
+            // and nothing else. No other component reads the registry verdict —
+            // `arbbot-hedge.timer` fires the naked-leg hedger every 5 minutes
+            // and places live Kalshi orders without consulting it. So a
+            // revocation stops the quoter and does NOT stop the account from
+            // trading the pair, and a line that reads as account-wide tells the
+            // operator the risk is gone when it is not.
+            let ok = r.tradable();
             if !ok {
-                n_gated += 1;
+                n_vetoed += 1;
             }
             ok
         })
@@ -508,34 +471,9 @@ fn load_quoters(
         .collect();
 
     eprintln!(
-        "[gate] {total} relationships -> {} quoting; {n_gated} not quoted ({n_vetoed} vetoed by \
-         registry verdict, rest not human-vetted and not in {tradable}, which lists {} ids). \
+        "[gate] {total} relationships -> {} quoting; {n_vetoed} not quoted by registry verdict. \
          Quoting is the only thing this gate decides; it is not an account-wide halt.",
         quoters.len(),
-        allow.len()
-    );
-
-    // The allowlist half of the gate is the half an operator revokes by DELETING
-    // a line, and a deletion is invisible from in here: this process holds no
-    // previous allowlist, so "removed" and "never listed" are the same state. It
-    // cannot report the removal. What it can report is the present set the
-    // removal is meant to shrink, which is what an operator checks a revoke
-    // against — and the absence of an id from this list is the confirmation the
-    // aggregate census above can only hint at with a changed number.
-    //
-    // One line, listing ids, and only these ids: bounded by `tradable.yaml`, a
-    // file a human writes, and emitted ONCE at startup. Naming the not-quoted
-    // set instead would be a line per relationship over most of the registry —
-    // volume that scales with the registry is how #41 got to 355k lines.
-    let allow_only: Vec<&str> = quoters
-        .iter()
-        .map(|q| q.rel.id.as_str())
-        .filter(|id| !human_vetted.contains(*id))
-        .collect();
-    eprintln!(
-        "[gate] quoting on {tradable} alone (deleting the line stops the quoter, and \
-         nothing else): {}",
-        if allow_only.is_empty() { "(none)".into() } else { allow_only.join(", ") }
     );
 
     let mut by_market: MarketIndex = HashMap::new();
@@ -2289,8 +2227,7 @@ async fn main() {
         8.0
     };
 
-    let (mut quoters, by_market, rel_meta) =
-        load_quoters(&args.registry, &args.tradable, &args.rel_prefixes);
+    let (mut quoters, by_market, rel_meta) = load_quoters(&args.registry, &args.rel_prefixes);
     // ONE read of the trade ledger, folded by BOTH seeds. Reading it twice
     // straddles `startup_sweep`'s venue round-trip, and a basket appended by
     // arbbot-hedge.timer inside that window reaches neither seed — see
@@ -2450,8 +2387,9 @@ mod gate_tests {
         d
     }
 
-    /// One entry per gate outcome: human-vetted, agent-vetted, rejected, and
-    /// an agent-vetted one that the allowlist rescues.
+    /// One entry per gate outcome: a greenlight from each kind of vetter, a
+    /// rejection from each, an agent verdict that was never a greenlight, and
+    /// a verdict nobody can classify.
     const REGISTRY: &str = r#"
 relationships:
   - id: human-ok
@@ -2461,97 +2399,60 @@ relationships:
     legs:
       - {venue: kalshi, market_id: K1}
       - {venue: polymarket_us, market_id: P1}
-  - id: agent-only
+  - id: agent-ok
     type: cross-venue-equivalent
-    verdict: equivalent
+    verdict: equivalent-with-caveat
     vetted_by: agent
     legs:
       - {venue: kalshi, market_id: K2}
       - {venue: polymarket_us, market_id: P2}
-  - id: rejected-one
+  - id: rejected-human
     type: cross-venue-equivalent
     verdict: rejected
     vetted_by: human
     legs:
       - {venue: kalshi, market_id: K3}
       - {venue: polymarket_us, market_id: P3}
-  - id: allowlisted
-    type: cross-venue-equivalent
-    verdict: equivalent
-    vetted_by: agent
-    legs:
-      - {venue: kalshi, market_id: K4}
-      - {venue: polymarket_us, market_id: P4}
-  - id: rejected-and-allowlisted
+  - id: rejected-agent
     type: cross-venue-equivalent
     verdict: rejected
     vetted_by: agent
     legs:
+      - {venue: kalshi, market_id: K4}
+      - {venue: polymarket_us, market_id: P4}
+  - id: unreviewed-agent
+    type: cross-venue-equivalent
+    verdict: unreviewed
+    vetted_by: agent
+    legs:
       - {venue: kalshi, market_id: K5}
       - {venue: polymarket_us, market_id: P5}
-  - id: unknown-verdict-and-allowlisted
+  - id: unknown-verdict
     type: cross-venue-equivalent
     verdict: not-equivalent
-    vetted_by: agent
+    vetted_by: human
     legs:
       - {venue: kalshi, market_id: K6}
       - {venue: polymarket_us, market_id: P6}
 "#;
 
-    fn ids(reg: &str, allow: &str, prefixes: &[String]) -> Vec<String> {
-        let (qs, _, _) = load_quoters(reg, allow, prefixes);
+    fn ids(reg: &str, prefixes: &[String]) -> Vec<String> {
+        let (qs, _, _) = load_quoters(reg, prefixes);
         qs.into_iter().map(|q| q.rel.id).collect()
     }
 
-    /// The gate (card c9ac7d1d): agent-vetted is NOT enough, and a `rejected`
-    /// verdict never quotes however it was vetted.
+    /// The gate is the verdict: an equivalent verdict quotes whoever vetted
+    /// it, and anything else — `rejected`, `unreviewed`, an unrecognised
+    /// spelling — never quotes however it was vetted.
     #[test]
-    fn only_human_vetted_or_allowlisted_relationships_quote() {
+    fn the_verdict_is_the_gate_whoever_vetted() {
         let d = scratch("basic");
         let reg = d.join("registry.yaml");
         std::fs::write(&reg, REGISTRY).unwrap();
-        let allow = d.join("tradable.yaml");
-        std::fs::write(&allow, "allow:\n  - allowlisted\n").unwrap();
 
-        let got = ids(reg.to_str().unwrap(), allow.to_str().unwrap(), &[]);
-        assert_eq!(got, vec!["human-ok".to_string(), "allowlisted".to_string()]);
-    }
-
-    /// Revoking a pair must actually revoke it. Editing the entry to
-    /// `verdict: rejected` — the registry's only revocation — used to leave an
-    /// ALLOWLISTED rel quoting, because the allowlist half of the gate never
-    /// looked at the verdict. An unrecognised verdict fails the same way.
-    #[test]
-    fn a_rejected_verdict_vetoes_an_allowlisted_relationship() {
-        let d = scratch("veto");
-        let reg = d.join("registry.yaml");
-        std::fs::write(&reg, REGISTRY).unwrap();
-        let allow = d.join("tradable.yaml");
-        std::fs::write(
-            &allow,
-            "allow:\n  - allowlisted\n  - rejected-and-allowlisted\n  \
-             - unknown-verdict-and-allowlisted\n",
-        )
-        .unwrap();
-
-        let got = ids(reg.to_str().unwrap(), allow.to_str().unwrap(), &[]);
-        assert_eq!(
-            got,
-            vec!["human-ok".to_string(), "allowlisted".to_string()],
-            "the allowlist must still grant, and must never override a verdict"
-        );
-    }
-
-    /// A MISSING allowlist is an empty one — the gate narrows, never widens.
-    /// This is the direction that matters: a typo'd path must not open the gate.
-    #[test]
-    fn a_missing_allowlist_file_narrows_the_gate() {
-        let d = scratch("noallow");
-        let reg = d.join("registry.yaml");
-        std::fs::write(&reg, REGISTRY).unwrap();
-
-        let got = ids(reg.to_str().unwrap(), "/nonexistent/tradable.yaml", &[]);
-        assert_eq!(got, vec!["human-ok".to_string()], "only registry vetting survives");
+        let got = ids(reg.to_str().unwrap(), &[]);
+        assert_eq!(got, vec!["human-ok".to_string(), "agent-ok".to_string()]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The gate composes with --relationship rather than replacing it: the
@@ -2561,34 +2462,32 @@ relationships:
         let d = scratch("prefix");
         let reg = d.join("registry.yaml");
         std::fs::write(&reg, REGISTRY).unwrap();
-        let allow = d.join("tradable.yaml");
-        std::fs::write(&allow, "allow: []\n").unwrap();
 
-        // asking for an agent-only rel by prefix still does NOT quote it
-        let got = ids(reg.to_str().unwrap(), allow.to_str().unwrap(), &["agent".to_string()]);
-        assert!(got.is_empty(), "prefix must not bypass the gate, got {got:?}");
+        // asking for vetoed rels by prefix still does NOT quote them
+        for p in ["unreviewed", "rejected", "unknown"] {
+            let got = ids(reg.to_str().unwrap(), &[p.to_string()]);
+            assert!(got.is_empty(), "prefix {p} must not bypass the gate, got {got:?}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// The venue-truth reconciliation reads the WHOLE registry, not the
     /// quoting subset. The two gates answer different questions:
     /// `load_quoters` asks what this engine may PLACE on, and a naked leg on a
-    /// pair that has since been revoked, de-allowlisted or only agent-vetted
-    /// is still a real position at a real venue. Narrowing this to the
-    /// tradable set would blind it to exactly the pairs most likely to have
-    /// been left behind.
+    /// pair that has since been revoked or demoted is still a real position
+    /// at a real venue. Narrowing this to the tradable set would blind it to
+    /// exactly the pairs most likely to have been left behind.
     #[test]
     fn the_reconciliation_covers_the_whole_registry_not_the_quotable_subset() {
         let d = scratch("recon-pairs");
         let reg = d.join("registry.yaml");
         std::fs::write(&reg, REGISTRY).unwrap();
-        let allow = d.join("tradable.yaml");
-        std::fs::write(&allow, "allow:\n  - allowlisted\n").unwrap();
 
-        let quotable = ids(reg.to_str().unwrap(), allow.to_str().unwrap(), &[]);
+        let quotable = ids(reg.to_str().unwrap(), &[]);
         let pairs = positions::pairs_from_registry(reg.to_str().unwrap());
         assert_eq!(pairs.len(), 6, "every relationship with both legs: {pairs:?}");
         assert!(pairs.len() > quotable.len(), "and strictly more than this run quotes");
-        for id in ["rejected-one", "agent-only", "rejected-and-allowlisted"] {
+        for id in ["rejected-human", "rejected-agent", "unreviewed-agent"] {
             assert!(
                 pairs.iter().any(|p| p.rel_id == id),
                 "{id} cannot be quoted, and can still be naked"
@@ -3201,7 +3100,6 @@ relationships:
         std::fs::write(&reg, REGISTRY).unwrap();
         let mut a = default_args();
         a.registry = reg.to_string_lossy().into_owned();
-        a.tradable = "/nonexistent/tradable.yaml".into(); // registry vetting alone
         a.apr_asof = Some(ASOF.into());
         a.min_apr = Some(0.0);
         a.toxgate = None;
@@ -3212,7 +3110,7 @@ relationships:
     /// `risk` is None, i.e. every assertion below rides on an EXPLICIT
     /// `--min-apr`; the floating default has its own test.
     fn decide(a: &Args, pm_bid: &str, now: f64) -> Vec<Intent> {
-        let (mut quoters, _, _) = load_quoters(&a.registry, &a.tradable, &[]);
+        let (mut quoters, _, _) = load_quoters(&a.registry, &[]);
         assert_eq!(quoters.len(), 1, "the fixture relationship must survive the gate");
         install_policy(a, &mut quoters, None);
 
@@ -3455,7 +3353,7 @@ relationships:
         let mut a = args(&d);
         a.min_apr = None; // float — but there is nothing to float on
 
-        let (mut quoters, _, _) = load_quoters(&a.registry, &a.tradable, &[]);
+        let (mut quoters, _, _) = load_quoters(&a.registry, &[]);
         let apr = install_policy(&a, &mut quoters, None).apr;
         assert!(apr.is_none(), "nothing to refresh without a risk view");
 
@@ -3475,7 +3373,7 @@ relationships:
 
         // ...and an explicit bar bites in bench exactly as it does live.
         a.min_apr = Some(APR_CEIL);
-        let (mut quoters, _, _) = load_quoters(&a.registry, &a.tradable, &[]);
+        let (mut quoters, _, _) = load_quoters(&a.registry, &[]);
         install_policy(&a, &mut quoters, None);
         assert!(place_on(&decide_now(&mut quoters), "P").is_none());
     }
@@ -3487,7 +3385,7 @@ relationships:
         let d = scratch("negative");
         let mut a = args(&d);
         a.min_apr = Some(-5.0);
-        let (mut quoters, _, _) = load_quoters(&a.registry, &a.tradable, &[]);
+        let (mut quoters, _, _) = load_quoters(&a.registry, &[]);
         let (bar, _, _) = apply_apr(&mut quoters, a.min_apr, a.apr_asof.as_deref(), None);
         assert_eq!(bar, -5.0, "the sentinel must not swallow a real value");
         // `set_apr` treats <= 0 as OFF, so the decision is the unhurdled one.

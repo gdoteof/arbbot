@@ -556,12 +556,11 @@ pub fn json(a: &Args) -> String {
     // failure mode this view exists to avoid: an untradable pair shows a fat
     // edge forever and no gate will ever explain it, because no gate ever ran.
     let reg = arb_registry::Registry::load(&a.registry).ok();
-    let allow = arb_registry::Allowlist::load(&a.tradable);
     let mut market_rel: HashMap<String, String> = HashMap::new();
     let mut tradable: HashMap<String, bool> = HashMap::new();
     if let Some(r) = &reg {
         for rel in &r.relationships {
-            tradable.insert(rel.id.clone(), rel.tradable(&allow));
+            tradable.insert(rel.id.clone(), rel.tradable());
             for leg in &rel.legs {
                 market_rel.insert(leg.market_id.clone(), rel.id.clone());
             }

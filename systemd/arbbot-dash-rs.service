@@ -39,8 +39,7 @@ ExecStart=%h/claude/arbbot/rust/target/release/arb-dash \
     --parquet-dir data/parquet \
     --kalshi-dir data/venue \
     --pmus-dir data/venue \
-    --registry config/registry.yaml \
-    --tradable config/tradable.yaml
+    --registry config/registry.yaml
 Restart=always
 RestartSec=5
 MemoryMax=2G

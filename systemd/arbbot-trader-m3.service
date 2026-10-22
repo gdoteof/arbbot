@@ -48,7 +48,6 @@ Environment=ARBBOT_CREDENTIALS_DIR=%h/.arbbot-credentials
 ExecStart=%h/claude/arbbot/rust/target/release/arb-trader \
     --socket data/arbbot.sock \
     --registry config/registry.yaml \
-    --tradable config/tradable.yaml \
     --health data/health.jsonl \
     --rel-prefix xvus-nobel-peace-26-elonmusk \
     --wal data/trader-rs/m3-wal.jsonl \

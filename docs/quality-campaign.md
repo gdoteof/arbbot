@@ -45,8 +45,7 @@ which would leave the trap open while looking like it had been closed.
 cargo build --release -p arb-trader --manifest-path rust/Cargo.toml
 ./rust/target/release/arb-trader \
     --bench-tape data/golden/bench-tape-2026-07-28.jsonl \
-    --registry   data/golden/registry-pin.yaml \
-    --tradable   data/golden/tradable-pin.yaml \
+    --registry   data/golden/registry-pin-v2.yaml \
     --kill-file  /nonexistent/KILL 2>/dev/null | tail -1
 ```
 
@@ -190,8 +189,7 @@ The exact command line behind the stage-6 row:
 cd /home/geoff/claude/arbbot
 rust/target/release/arb-trader \
     --bench-tape data/golden/bench-tape-2026-07-28.jsonl \
-    --registry   data/golden/registry-pin.yaml \
-    --tradable   data/golden/tradable-pin.yaml \
+    --registry   data/golden/registry-pin-v2.yaml \
     --kill-file  /nonexistent/KILL \
     --min-apr 12 --apr-asof 2026-07-28 2>/dev/null | tail -1
 ```
@@ -442,6 +440,12 @@ quiet mid-day.
 They are pinned rather than read from `config/` because the live registry gets
 edited — a digest compared against a moving registry proves nothing.
 
+Since the registry verdict became the whole gate (`tradable.yaml` retired,
+2026-10-22) the gate reads `registry-pin-v2.yaml`: `registry-pin.yaml` with the
+96 `equivalent*` verdicts the old human-or-allowlist gate refused rewritten to
+`unreviewed`, verdict lines only. It admits the same 43 relationships, which is
+why neither digest moved.
+
 None of it is committed (`data/` is gitignored: it is market tape). Rebuild:
 
 ```bash
@@ -450,8 +454,7 @@ for v in kalshi polymarket_us polymarket; do head -n 300000 data/raw/$v-$D.jsonl
   | awk '{ if (match($0, /"ts_local_ns":-?[0-9]+/)) k=substr($0, RSTART+15, RLENGTH-15); else k=0;
            print k "\t" $0 }' \
   | sort -k1,1n -k2 -S 2G | cut -f2- > data/golden/bench-tape-$D.jsonl
-cp config/registry.yaml data/golden/registry-pin.yaml
-cp config/tradable.yaml data/golden/tradable-pin.yaml
+cp config/registry.yaml data/golden/registry-pin-v2.yaml
 ```
 
 ## When a digest is ALLOWED to change
