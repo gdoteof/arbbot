@@ -24,8 +24,9 @@ reality, and earns live trading stage by stage.
 
 - **Registry** (`config/registry.yaml`): the relationship graph — cross-venue
   equivalents, exclusives (at-most-one), partitions (exactly-one), implications,
-  ladders, rollups. Agent-proposed entries are recordable/scannable but **never
-  tradable** until `vetted_by: human`.
+  ladders, rollups. An entry is **tradable only** with an `equivalent` /
+  `equivalent-with-caveat` verdict from a `human` or `agent` vetter; an agent
+  verdict that is not a greenlight is recorded as `unreviewed`.
 - **Scanner**: generic basket pricer — enumerate side assignments (canonical
   all-YES/all-NO beyond 10 legs), keep baskets with min feasible payoff >= 1,
   price against executable depth net of exact per-role fees, respect tick sizes

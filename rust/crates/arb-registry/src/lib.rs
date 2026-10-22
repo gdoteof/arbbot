@@ -60,15 +60,15 @@ impl Relationship {
         }
     }
 
-    /// THE gate: the verdict alone. `equivalent` / `equivalent-with-caveat`
-    /// is a greenlight whoever wrote it. `vetted_by` (`human` | `agent`)
-    /// records who did the reading and is deliberately not consulted — an
-    /// agent may greenlight a pair it is confident resolves identically on
-    /// both venues. The flip side: an agent verdict that is NOT meant as a
-    /// greenlight must be written as something else (`unreviewed`), never as
-    /// `equivalent`.
+    /// THE gate: an `equivalent` / `equivalent-with-caveat` verdict read by a
+    /// `human` or an `agent`, either of which may greenlight — an agent
+    /// greenlights a pair it is confident resolves identically on both
+    /// venues. Rule-generated rows (`vetted_by: mechanical`, the sports map)
+    /// and rows with no vetter never quote on their verdict alone. The flip
+    /// side: an agent verdict that is NOT meant as a greenlight must be
+    /// written as something else (`unreviewed`), never as `equivalent`.
     pub fn tradable(&self) -> bool {
-        self.veto().is_none()
+        self.veto().is_none() && matches!(self.vetted_by.as_deref(), Some("human" | "agent"))
     }
 }
 
@@ -141,6 +141,11 @@ relationships:
     vetted_by: human
   - id: no-verdict
     vetted_by: human
+  - id: mechanical-equivalent
+    verdict: equivalent
+    vetted_by: mechanical
+  - id: unvetted-equivalent
+    verdict: equivalent
 "#;
 
     #[test]
@@ -148,7 +153,7 @@ relationships:
         let p = std::env::temp_dir().join(format!("arb-reg-{}.yaml", std::process::id()));
         std::fs::write(&p, YAML).unwrap();
         let reg = Registry::load(p.to_str().unwrap()).expect("loads");
-        assert_eq!(reg.relationships.len(), 7);
+        assert_eq!(reg.relationships.len(), 9);
 
         let r = reg.get("xvus-time-poty-26-zohranmamdani").expect("found");
         assert_eq!(r.legs.len(), 2);
@@ -184,6 +189,24 @@ relationships:
         ] {
             let r = reg.get(id).unwrap();
             assert_eq!(r.veto(), Some(why), "{id}");
+            assert!(!r.tradable(), "{id} must not quote");
+        }
+        let _ = std::fs::remove_file(p);
+    }
+
+    /// A greenlight is a human's or an agent's reading. The sports map writes
+    /// `verdict: equivalent` with `vetted_by: mechanical` on every candidate,
+    /// and a row with no vetter has no reading behind it at all; neither
+    /// quotes, though neither is a revocation either.
+    #[test]
+    fn an_equivalent_verdict_needs_a_human_or_agent_vetter() {
+        let p = std::env::temp_dir().join(format!("arb-reg-vetter-{}.yaml", std::process::id()));
+        std::fs::write(&p, YAML).unwrap();
+        let reg = Registry::load(p.to_str().unwrap()).expect("loads");
+
+        for id in ["mechanical-equivalent", "unvetted-equivalent"] {
+            let r = reg.get(id).unwrap();
+            assert_eq!(r.veto(), None, "{id}: the verdict itself is fine");
             assert!(!r.tradable(), "{id} must not quote");
         }
         let _ = std::fs::remove_file(p);

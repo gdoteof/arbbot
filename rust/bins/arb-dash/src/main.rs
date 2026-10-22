@@ -141,6 +141,9 @@ fn main() {
             "--exec-config" => a.exec_config = v,
             "--topics-config" => a.topics_config = v,
             "--port" => a.port = v.parse().unwrap_or(4749),
+            // Retired with config/tradable.yaml (the registry verdict is the
+            // gate); ignored so a unit that still passes it does not exit 2.
+            "--tradable" => eprintln!("[args] --tradable is retired and ignored"),
             other => {
                 eprintln!("unknown arg: {other}");
                 exit(2);

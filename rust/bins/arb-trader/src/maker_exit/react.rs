@@ -346,10 +346,14 @@ mod tests {
         // Kalshi stops trading CPI at 08:25 ET and PM-US trades on past the
         // 08:30 print, so these two families must never be quoted into it.
         let entries = parse_rows(text, true).unwrap();
-        for family in ["cpi-26sep", "gdp-26q3"] {
+        for family in ["cpi-26sep", "gdp-26q3", "cpi-26oct", "nfp-26oct"] {
             assert!(entries.iter().any(|(f, _, _)| f == family), "{family} must black out entries");
             assert!(rows.iter().any(|(f, _, _)| f == family), "{family} must black out exits too");
         }
+        // 00:00 EST on each release day: US clocks leave DST on 2026-11-01.
+        let from = |family: &str| rows.iter().find(|(f, _, _)| f == family).unwrap().1;
+        assert_eq!(from("cpi-26oct"), 1_794_286_800.0, "2026-11-10T05:00:00Z");
+        assert_eq!(from("nfp-26oct"), 1_793_941_200.0, "2026-11-06T05:00:00Z");
     }
 
     /// `entries` is opt-in per row and changes nothing about exits: a row

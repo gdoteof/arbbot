@@ -267,7 +267,8 @@ const NODES: &[Decl] = &[
         lane: 5, row: 6, kind: "timer", unit: Some("arbbot-sports-map.timer"),
         probe: Probe::Timer, max_age_s: None, expect: Expect::Live,
         what: "Rematches the two venues' sports calendars into candidate pairs. Candidates \
-               only: nothing here reaches the engine without a human vetting stamp.",
+               only: its rows are vetted_by mechanical, and the engine quotes only rows a \
+               human or agent greenlit in config/registry.yaml.",
     },
     Decl {
         id: "equity", label: "equity history", sub: "arbbot-equity.timer · 15 min",

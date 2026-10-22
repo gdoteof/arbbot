@@ -379,6 +379,14 @@ fn parse_args() -> Args {
             "--maker-exit-take" => a.maker_exit_take = true,
             "--exit-blackouts" => a.exit_blackouts = it.next().unwrap_or_default(),
             "--maker-exit-shadow" => a.maker_exit_shadow = true,
+            // Retired with config/tradable.yaml: the registry verdict is the
+            // whole gate. Accepted and ignored so a unit or rollback drop-in
+            // that still passes it cannot strand the trader on exit 2, which
+            // the unit's RestartPreventExitStatus=2 never restarts.
+            "--tradable" => {
+                let _ = it.next();
+                eprintln!("[args] --tradable is retired and ignored: the registry verdict is the gate");
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(2);
@@ -435,13 +443,12 @@ fn load_quoters(registry: &str, rel_prefixes: &[String]) -> (Vec<Quoter>, Market
         .into_iter()
         .filter(|r| r.legs.len() == 2)
         .filter(|r| {
-            // SCOPE, and it is the dangerous half: this gate binds THIS PROCESS
-            // and nothing else. No other component reads the registry verdict —
-            // `arbbot-hedge.timer` fires the naked-leg hedger every 5 minutes
-            // and places live Kalshi orders without consulting it. So a
-            // revocation stops the quoter and does NOT stop the account from
-            // trading the pair, and a line that reads as account-wide tells the
-            // operator the risk is gone when it is not.
+            // SCOPE, and it is the dangerous half: this gate decides what THIS
+            // PROCESS quotes and nothing else. Maker-exit and the positions
+            // reconciliation work across the whole registry, so a revocation
+            // stops new entries and does NOT stop the engine exiting or hedging
+            // a position already held, and a line that reads as account-wide
+            // tells the operator the risk is gone when it is not.
             let ok = r.tradable();
             if !ok {
                 n_vetoed += 1;
@@ -471,7 +478,8 @@ fn load_quoters(registry: &str, rel_prefixes: &[String]) -> (Vec<Quoter>, Market
         .collect();
 
     eprintln!(
-        "[gate] {total} relationships -> {} quoting; {n_vetoed} not quoted by registry verdict. \
+        "[gate] {total} relationships -> {} quoting; {n_vetoed} not greenlit in the registry \
+         (verdict not equivalent, or not vetted by a human or agent). \
          Quoting is the only thing this gate decides; it is not an account-wide halt.",
         quoters.len(),
     );
@@ -2388,8 +2396,8 @@ mod gate_tests {
     }
 
     /// One entry per gate outcome: a greenlight from each kind of vetter, a
-    /// rejection from each, an agent verdict that was never a greenlight, and
-    /// a verdict nobody can classify.
+    /// rejection from each, an agent verdict that was never a greenlight, a
+    /// verdict nobody can classify, and a rule-generated equivalent.
     const REGISTRY: &str = r#"
 relationships:
   - id: human-ok
@@ -2434,6 +2442,13 @@ relationships:
     legs:
       - {venue: kalshi, market_id: K6}
       - {venue: polymarket_us, market_id: P6}
+  - id: mechanical-equivalent
+    type: cross-venue-equivalent
+    verdict: equivalent
+    vetted_by: mechanical
+    legs:
+      - {venue: kalshi, market_id: K7}
+      - {venue: polymarket_us, market_id: P7}
 "#;
 
     fn ids(reg: &str, prefixes: &[String]) -> Vec<String> {
@@ -2464,10 +2479,12 @@ relationships:
         std::fs::write(&reg, REGISTRY).unwrap();
 
         // asking for vetoed rels by prefix still does NOT quote them
-        for p in ["unreviewed", "rejected", "unknown"] {
+        for p in ["unreviewed", "rejected", "unknown", "mechanical"] {
             let got = ids(reg.to_str().unwrap(), &[p.to_string()]);
             assert!(got.is_empty(), "prefix {p} must not bypass the gate, got {got:?}");
         }
+        // and a prefix that does match a greenlit rel still quotes it
+        assert_eq!(ids(reg.to_str().unwrap(), &["agent".to_string()]), vec!["agent-ok".to_string()]);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -2485,7 +2502,7 @@ relationships:
 
         let quotable = ids(reg.to_str().unwrap(), &[]);
         let pairs = positions::pairs_from_registry(reg.to_str().unwrap());
-        assert_eq!(pairs.len(), 6, "every relationship with both legs: {pairs:?}");
+        assert_eq!(pairs.len(), 7, "every relationship with both legs: {pairs:?}");
         assert!(pairs.len() > quotable.len(), "and strictly more than this run quotes");
         for id in ["rejected-human", "rejected-agent", "unreviewed-agent"] {
             assert!(
