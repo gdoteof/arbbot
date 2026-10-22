@@ -1301,11 +1301,14 @@ async fn report_undischarged_hedges(
             );
         }
     }
-    let intents = std::fs::read_to_string(out).unwrap_or_default();
-    let found = orphan::undischarged(&intents, ledger.clone());
-    let ids = found.iter().map(|u| u.maker_order_id.clone()).collect();
-    let places = orphan::entry_places(&intents, &ids);
-    drop(intents);
+    let found = orphan::undischarged(&lines_matching(out, |l| l.contains("\"hedge_needed\"")), ledger.clone());
+    let ids: std::collections::BTreeSet<String> = found.iter().map(|u| u.maker_order_id.clone()).collect();
+    let needles: Vec<String> = ids.iter().map(|id| format!("\"order_id\":\"{id}\"")).collect();
+    let places = if ids.is_empty() {
+        std::collections::BTreeMap::new()
+    } else {
+        orphan::entry_places(&lines_matching(out, |l| needles.iter().any(|n| l.contains(n.as_str()))), &ids)
+    };
     let (adopted, refused) = if found.is_empty() {
         (Vec::new(), Vec::new())
     } else {
@@ -1335,6 +1338,76 @@ async fn report_undischarged_hedges(
         seed_exposure_from_census(rv, &found, &registry_class_of(&args.registry, rel_meta));
     }
     (left.iter().map(|u| u.missing() as u64).sum(), adopted)
+}
+
+/// The lines of `path` that `keep` accepts, newline-joined.
+///
+/// The `--out` stream is append-only across restarts, 1.35 GB by 2026-10-22,
+/// and the census needs a few hundred of its lines. Reading it whole held the
+/// file twice over against the unit's `MemoryMax`. A line that is not UTF-8 is
+/// skipped, as an unparseable one already is; a read error ends the scan with
+/// what was read so far.
+fn lines_matching(path: &str, keep: impl Fn(&str) -> bool) -> String {
+    use std::io::BufRead;
+    let mut out = String::new();
+    let Ok(f) = std::fs::File::open(path) else { return out };
+    let mut r = std::io::BufReader::new(f);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match r.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => return out,
+            Ok(_) => {}
+        }
+        if let Ok(l) = std::str::from_utf8(&buf) {
+            let l = l.trim_end_matches('\n');
+            if keep(l) {
+                out.push_str(l);
+                out.push('\n');
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod lines_matching_tests {
+    use super::*;
+
+    /// The census over the filtered lines is the census over the whole file:
+    /// `undischarged` reads only `hedge_needed` lines and `entry_places` only
+    /// lines naming one of its ids.
+    #[test]
+    fn the_filtered_census_matches_the_whole_file() {
+        let body = concat!(
+            r#"{"count":5,"order_id":"m1","place":"K","price":"0.4000","side":"bid","ts":1.0,"venue":"kalshi"}"#, "\n",
+            r#"{"skip":["topic budget"],"ts":1.5}"#, "\n",
+            r#"{"anchor_price":"0.6000","hedge_needed":"P","order_id":"m1","qty":5,"ts":2.0}"#, "\n",
+            r#"{"cancel":"K","order_id":"m1","price":"0.4000","side":"bid","ts":2.5,"venue":"kalshi"}"#, "\n",
+            r#"{"count":5,"order_id":"m11","place":"K","price":"0.4100","side":"bid","ts":3.0,"venue":"kalshi"}"#, "\n",
+            r#"{"anchor_price":"0.5000","hedge_needed":"K","order_id":"m2","qty":3,"ts":4.0}"#, "\n",
+            r#"{"count":3,"order_id":"m2","place":"P","price":"0.5500","side":"ask","ts":3.5,"venue":"polymarket_us"}"#,
+        );
+        let dir = std::env::temp_dir().join(format!("arb-lines-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("intents.jsonl");
+        let mut bytes = body.as_bytes().to_vec();
+        bytes.splice(0..0, b"\xff\xfe not utf-8\n".iter().copied());
+        std::fs::write(&path, &bytes).unwrap();
+        let path = path.to_str().unwrap();
+
+        let whole = orphan::undischarged(body, vec![]);
+        let filtered = orphan::undischarged(&lines_matching(path, |l| l.contains("\"hedge_needed\"")), vec![]);
+        assert_eq!(filtered, whole);
+        assert_eq!(whole.len(), 2);
+        let ids: std::collections::BTreeSet<String> = whole.iter().map(|u| u.maker_order_id.clone()).collect();
+        let needles: Vec<String> = ids.iter().map(|id| format!("\"order_id\":\"{id}\"")).collect();
+        let kept = lines_matching(path, |l| needles.iter().any(|n| l.contains(n.as_str())));
+        assert!(!kept.contains("m11"), "a longer id is not a match: {kept}");
+        assert_eq!(orphan::entry_places(&kept, &ids), orphan::entry_places(body, &ids));
+        assert_eq!(orphan::entry_places(body, &ids).len(), 2, "the last line has no newline");
+        assert_eq!(lines_matching("/nonexistent/intents.jsonl", |_| true), "");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// Hedge market -> (relationship id, class) over the FULL registry.
