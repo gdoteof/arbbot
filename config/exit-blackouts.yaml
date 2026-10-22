@@ -36,6 +36,13 @@
   from: 2026-10-03T04:00:00Z   # 2026-10-03 00:00 ET (final polls on the 3rd)
   why: Brazil presidential first round 2026-10-04, polls close 20:00Z
 
+# The runoff RESOLVES the market, so this row also stops entries. The row
+# above stays exits-only: the first round did not resolve anything.
+- family: brazil-pres-26
+  from: 2026-10-25T04:00:00Z   # 2026-10-25 00:00 ET
+  why: Brazil presidential runoff 2026-10-25, polls close 20:00Z
+  entries: true
+
 - family: nobel-peace-26
   from: 2026-10-08T04:00:00Z   # 2026-10-08 00:00 ET
   why: Nobel Peace Prize announcement 2026-10-09 09:00Z (Kalshi expected expiry)
