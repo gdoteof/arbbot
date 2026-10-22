@@ -1087,6 +1087,57 @@ fn build_risk_view(
     rv
 }
 
+/// The ledger's open baskets by direction, for the relationships the registry
+/// calls cross-venue equivalents: on any other kind the Kalshi leg's side does
+/// not say which way the basket points.
+fn directed_pairs(
+    recs: Vec<serde_json::Value>,
+    rel_meta: &HashMap<String, (String, String)>,
+) -> HashMap<String, (f64, f64)> {
+    use naked_act::Held;
+    ledger::open_by_kalshi_side(recs)
+        .into_iter()
+        .filter(|(r, _)| rel_meta.get(r).is_some_and(|(_, kind)| kind == RelType::CrossVenueEquivalent.as_str()))
+        .map(|(r, sides)| {
+            let (mut standard, mut inverse) = (0.0, 0.0);
+            for (side, qty) in sides {
+                if Held::LongYes.matches(&side) {
+                    standard += qty;
+                } else if Held::ShortYes.matches(&side) {
+                    inverse += qty;
+                }
+            }
+            (r, (standard, inverse))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod directed_tests {
+    use super::*;
+
+    #[test]
+    fn both_side_spellings_count_and_only_cross_venue_pairs_get_a_direction() {
+        let recs: Vec<serde_json::Value> = [
+            r#"{"status":"open","relationship_id":"xv","ts":1.0,"qty":10,"legs":[{"venue":"kalshi","side":"bid"}]}"#,
+            r#"{"status":"open","relationship_id":"xv","ts":2.0,"qty":4,"legs":[{"venue":"kalshi","side":"yes"}]}"#,
+            r#"{"status":"open","relationship_id":"xv","ts":3.0,"qty":6,"legs":[{"venue":"kalshi","side":"ask"}]}"#,
+            r#"{"status":"open","relationship_id":"xv","ts":4.0,"qty":1,"legs":[{"venue":"kalshi","side":"no"}]}"#,
+            r#"{"status":"open","relationship_id":"xv","ts":5.0,"qty":9,"legs":[{"venue":"kalshi","side":"mixed"}]}"#,
+            r#"{"status":"open","relationship_id":"implies","ts":1.0,"qty":3,"legs":[{"venue":"kalshi","side":"yes"}]}"#,
+        ]
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+        let meta = HashMap::from([
+            ("xv".to_string(), ("low".to_string(), "cross-venue-equivalent".to_string())),
+            ("implies".to_string(), ("low".to_string(), "implies".to_string())),
+        ]);
+        let got = directed_pairs(recs, &meta);
+        assert_eq!(got, HashMap::from([("xv".to_string(), (14.0, 7.0))]));
+    }
+}
+
 /// Seed exposure from the open baskets in the trade ledger (exec/main.py:264).
 /// Without this the caps reset on every restart and the engine believes the
 /// whole book is free.
@@ -1138,6 +1189,7 @@ fn seed_exposure_from_ledger(
             // closes are spent. Declaring them keeps `release_closed` from
             // subtracting the whole close history again on its first poll.
             rv.seed_released(&ledger::closed_lots(recs.clone()));
+            rv.set_directed(directed_pairs(recs.clone(), rel_meta));
         }
         Err(e) => {
             // Fail LOUD: an unreadable ledger means unknown exposure, and
@@ -1911,6 +1963,7 @@ fn spawn_exposure_release(
             // behaviour, for one cycle.
             match read {
                 Ok(recs) => {
+                    rv.set_directed(directed_pairs(recs.clone(), &meta));
                     let (lots, ct) = rv.release_closed(&ledger::closed_lots(recs), &meta);
                     if lots > 0 {
                         eprintln!(

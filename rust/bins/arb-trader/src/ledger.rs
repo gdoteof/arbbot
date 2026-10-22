@@ -70,9 +70,9 @@ pub(crate) fn apply_corrections(records: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-/// Open contracts per relationship, net of unwinds. Partial unwinds reduce the
-/// basket rather than dropping it; a fully unwound basket disappears.
-pub fn open_exposure(records: Vec<Value>) -> HashMap<String, f64> {
+/// Every open record with its contracts left after unwinds. Partial unwinds
+/// reduce the basket rather than dropping it; a fully unwound basket is skipped.
+fn each_open(records: Vec<Value>, mut each: impl FnMut(&str, f64, &Value)) {
     let records = apply_corrections(records);
 
     let mut unwound: HashMap<Key, f64> = HashMap::new();
@@ -84,7 +84,6 @@ pub fn open_exposure(records: Vec<Value>) -> HashMap<String, f64> {
         }
     }
 
-    let mut out: HashMap<String, f64> = HashMap::new();
     for r in &records {
         if status_of(r) != "open" {
             continue;
@@ -96,9 +95,32 @@ pub fn open_exposure(records: Vec<Value>) -> HashMap<String, f64> {
             .unwrap_or(0.0);
         let remaining = if closed <= 0.0 { qty } else { qty - closed };
         if remaining > 0.0 {
-            *out.entry(rel.to_string()).or_default() += remaining;
+            each(rel, remaining, r);
         }
     }
+}
+
+/// Open contracts per relationship, net of unwinds.
+pub fn open_exposure(records: Vec<Value>) -> HashMap<String, f64> {
+    let mut out: HashMap<String, f64> = HashMap::new();
+    each_open(records, |rel, remaining, _| *out.entry(rel.to_string()).or_default() += remaining);
+    out
+}
+
+/// Open contracts per relationship by the `side` its Kalshi leg records, as
+/// written: two writers spell it two ways (`naked_act::Held::matches`). `""`
+/// when the lot has no Kalshi leg or the leg names no side.
+pub fn open_by_kalshi_side(records: Vec<Value>) -> HashMap<String, HashMap<String, f64>> {
+    let mut out: HashMap<String, HashMap<String, f64>> = HashMap::new();
+    each_open(records, |rel, remaining, r| {
+        let side = r
+            .get("legs")
+            .and_then(Value::as_array)
+            .and_then(|legs| legs.iter().find(|l| l.get("venue").and_then(Value::as_str) == Some("kalshi")))
+            .and_then(|l| l.get("side").and_then(Value::as_str))
+            .unwrap_or("");
+        *out.entry(rel.to_string()).or_default().entry(side.to_string()).or_default() += remaining;
+    });
     out
 }
 
@@ -458,6 +480,22 @@ mod tests {
 
     fn v(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn open_baskets_are_keyed_by_the_kalshi_legs_side_as_written() {
+        let recs = vec![
+            v(r#"{"status":"open","relationship_id":"r1","ts":1.0,"qty":10,"legs":[{"venue":"kalshi","side":"bid"},{"venue":"polymarket_us","side":"ask"}]}"#),
+            v(r#"{"status":"open","relationship_id":"r1","ts":2.0,"qty":4,"legs":[{"venue":"polymarket_us","side":"no"},{"venue":"kalshi","side":"yes"}]}"#),
+            v(r#"{"status":"open","relationship_id":"r1","ts":3.0,"qty":6,"legs":[{"venue":"kalshi","side":"ask"}]}"#),
+            v(r#"{"status":"unwound","relationship_id":"r1","closes_ts":3.0,"qty":2}"#),
+            v(r#"{"status":"open","relationship_id":"r2","ts":1.0,"qty":7}"#),
+        ];
+        let got = open_by_kalshi_side(recs);
+        let r1: HashMap<String, f64> =
+            HashMap::from([("bid".into(), 10.0), ("yes".into(), 4.0), ("ask".into(), 4.0)]);
+        assert_eq!(got["r1"], r1);
+        assert_eq!(got["r2"], HashMap::from([(String::new(), 7.0)]), "no Kalshi leg");
     }
 
     #[test]
