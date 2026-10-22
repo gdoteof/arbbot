@@ -30,12 +30,13 @@ pub const EQUITY_OPENING: &str = "equity:opening_balance";
 
 pub const PNL_REALIZED: &str = "pnl:realized";
 
-/// PM-US realized P&L that cannot be itemized. PM-US exposes no fill or
-/// settlement history (`pmus-no-history-endpoints`), so P&L on a FULLY closed
-/// position is unrecoverable — the position simply vanishes from
-/// `/v1/portfolio/positions`. This account holds that residual so it is never
-/// mistaken for verified, trade-level P&L. It should stop growing once we
-/// record our own fills forward from cutover.
+/// PM-US realized P&L that is not itemized. The importer reads only current
+/// positions, so P&L on a FULLY closed position is invisible to it — the
+/// position simply vanishes from `/v1/portfolio/positions`. The trades and
+/// resolutions that would itemize it are in `/v1/portfolio/activities`
+/// (`pmus-activities-endpoint`), which nothing imports. This account holds
+/// that residual so it is never mistaken for verified, trade-level P&L. It
+/// should stop growing once we record our own fills forward from cutover.
 pub const PNL_PMUS_UNITEMIZED: &str = "pnl:realized:pmus_unitemized";
 
 /// Split by venue AND role: the whole maker-vs-taker question turns on this,

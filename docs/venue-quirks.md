@@ -132,7 +132,7 @@ double-entry books. Together they make the Kalshi account reconcile to
 - **Venue:** kalshi
 - **What the API does:** `GET /portfolio/deposits` and `/portfolio/withdrawals` exist and return funding history (`amount_cents`, `status`, `type`, `created_ts`). `/portfolio/transfers` and `/portfolio/transactions` are 404.
 - **Failure it prevents:** without these the cash accounts have no legitimate source and the books open with an unexplained plug.
-- **Port requirement:** Seed `equity:capital` from these endpoints rather than asking a human. Contrast `pmus-no-history-endpoints`, where you must.
+- **Port requirement:** Seed `equity:capital` from these endpoints rather than asking a human. PM-US carries the same under `/v1/portfolio/activities` (`pmus-activities-endpoint`).
 
 ## Kalshi — market data (WS/REST)
 
@@ -311,11 +311,14 @@ double-entry books. Together they make the Kalshi account reconcile to
 
 ## Polymarket US (QCX) — accounting / cash
 
-### `pmus-no-history-endpoints`
+### `pmus-activities-endpoint`
 - **Venue:** polymarket_us
-- **What the API does:** PM-US exposes **only** `/v1/account/balances` and `/v1/portfolio/positions`. There is no fill history, no settlement history, and no deposit/transfer history. Probed and 404 on 2026-07-27: `/v1/portfolio/fills`, `/v1/portfolio/trades`, `/v1/portfolio/settlements`, `/v1/account/transfers`, `/v1/account/transactions`, `/v1/account/activity`, `/v1/account/deposits`, `/v1/portfolio/activity`.
-- **Failure it prevents:** assuming a Kalshi-style rebuild is possible on PM-US. It is not — the account cannot be reconstructed from the venue.
-- **Port requirement:** PM-US books open from a human-supplied funding total plus a reconciling entry against `currentBalance`, and record fills going forward from our own observation. Only Kalshi gets penny-exact provenance. Re-probe periodically in case PM-US ships history endpoints.
+- **What the API does:** `GET /v1/portfolio/activities` (signed like every private PM-US read; cursor-paged by `cursor` = the previous `nextCursor` until `eof: true`; `types` repeated once per value; `sortOrder` `SORT_ORDER_DESCENDING` by default) returns the account's whole history, back to its first trade. Each row has a `type` and one payload: `ACTIVITY_TYPE_TRADE` → `trade` (`id`, `marketSlug`, `state`, `price`, `qtyDecimal`, `isAggressor`, `costBasis`, `realizedPnl`); `ACTIVITY_TYPE_POSITION_RESOLUTION` → `positionResolution`; every balance change → `accountBalanceChange` (`transactionId`, `status`, `amount.value`, `createTime`). Balance-change types: `ACCOUNT_DEPOSIT`, `ACCOUNT_ADVANCED_DEPOSIT`, `ACCOUNT_WITHDRAWAL`, `TRANSFER`, `REFERRAL_BONUS`, `TAKER_FEE_REBATE`, `LIQUIDITY_PROGRAM`, all prefixed `ACTIVITY_TYPE_`. Verified 2026-10-22.
+- **Liquidity-program payouts arrive as `ACTIVITY_TYPE_TRANSFER`** (`transferReason: TRANSFER_REASON_UNSPECIFIED`), not as `ACTIVITY_TYPE_LIQUIDITY_PROGRAM`, which comes back empty. They sum, to the cent, to the `status: PAID` rows of `GET /v1/incentives/earnings` (`programType: liquidityProgram`). A promotional deposit bonus arrives as `ACTIVITY_TYPE_REFERRAL_BONUS` with `transferReason: TRANSFER_REASON_DEPOSIT_BONUS`. Only the deposit and withdrawal types are external capital; the other balance changes are income.
+- **The 2026-07-27 probe missed it.** `/v1/portfolio/fills`, `/v1/portfolio/trades`, `/v1/portfolio/settlements`, `/v1/account/transfers`, `/v1/account/transactions`, `/v1/account/activity`, `/v1/account/deposits` and `/v1/portfolio/activity` (singular) all 404, which was recorded here as "PM-US has no history". The endpoint is plural.
+- **Failure it prevents:** opening PM-US books from a human-typed funding total plus an unexplained plug when the venue itemizes both; booking reward transfers as contributed capital.
+- **Current handling:** nothing reads it. `config/funding.yaml` and `arb-books --pmus-deposits` carry the PM-US funding total by hand, and `pnl:realized:pmus_unitemized` holds closed-position P&L the importer never sees.
+- **Port requirement:** Seed PM-US funding from the deposit and withdrawal rows, as Kalshi's is from `/portfolio/deposits`, and itemize closed-position P&L from the TRADE and POSITION_RESOLUTION rows.
 
 ### `pmus-margin-is-one-dollar-per-short`
 - **Venue:** polymarket_us

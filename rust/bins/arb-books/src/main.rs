@@ -111,7 +111,7 @@ fn main() {
 
     if !pmus_dir.is_empty() {
         if pmus_deposits.is_empty() {
-            eprintln!("--pmus-deposits is required with --pmus-dir (PM-US has no deposits endpoint)");
+            eprintln!("--pmus-deposits is required with --pmus-dir (arb-books does not read PM-US deposit history)");
             exit(2);
         }
         let balances: Balances = read_one(&format!("{pmus_dir}/pmus_balances.json"));
