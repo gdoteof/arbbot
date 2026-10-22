@@ -30,6 +30,11 @@ pub const EQUITY_OPENING: &str = "equity:opening_balance";
 
 pub const PNL_REALIZED: &str = "pnl:realized";
 
+/// Cash PM-US paid us that is neither a trade nor contributed capital:
+/// liquidity-program payouts, deposit bonuses, fee rebates, goodwill credits.
+/// See `funding`.
+pub const INCOME_CREDITS_PMUS: &str = "income:venue_credits:pmus";
+
 /// PM-US realized P&L that is not itemized. The importer reads only current
 /// positions, so P&L on a FULLY closed position is invisible to it — the
 /// position simply vanishes from `/v1/portfolio/positions`. The trades and

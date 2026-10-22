@@ -76,26 +76,9 @@ impl KalshiImport {
     /// the position at that instant.
     pub fn apply(mut self, cx: &mut Cx, j: &mut Journal) -> Result<(), LedgerError> {
         for d in &self.deposits {
-            if d.status != "applied" {
-                continue;
+            if let Some(e) = crate::funding::kalshi_deposit(cx, d) {
+                j.post(cx, e)?;
             }
-            let cents = cx.from_i64(d.amount_cents);
-            let hundred = cx.parse_exact("100");
-            let amt = cx.div(cents, hundred);
-            let credit = neg(cx, amt);
-            j.post(
-                cx,
-                Entry {
-                    id: format!("kalshi:deposit:{}", d.id),
-                    ts: d.created_ts,
-                    source: Source::VenueDeposit,
-                    memo: format!("kalshi deposit {}", d.id),
-                    postings: vec![
-                        Posting::new(accounts::CASH_KALSHI, amt),
-                        Posting::new(accounts::EQUITY_CAPITAL, credit),
-                    ],
-                },
-            )?;
         }
 
         self.fills.sort_by_key(|f| f.ts);

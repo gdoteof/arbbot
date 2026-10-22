@@ -128,6 +128,13 @@ double-entry books. Together they make the Kalshi account reconcile to
 - **Failure it prevents:** paying out gross rather than net overstates settlement cash.
 - **Port requirement:** Credit `revenue/100`; derive realized P&L against the per-side cost fields.
 
+### `kalshi-history-cutoff`
+- **Venue:** kalshi
+- **What the API does:** `GET /historical/cutoff` returns per-kind cutoffs (`trades_created_ts`, `market_settled_ts`, `orders_updated_ts`, `market_positions_last_updated_ts`). Fills older than the fill cutoff leave `/portfolio/fills` for `GET /historical/fills` (same row shape, same cursor paging). Settlements have NO historical endpoint (`/historical/settlements` and `/historical/portfolio/settlements` are 404), and on 2026-10-22 `/portfolio/settlements` returned nothing settled before 2026-10-02 although the account had settlements from 2026-07-23. Closed-market positions move to `GET /historical/positions`.
+- **Failure it prevents:** rebuilding Kalshi from the live endpoints alone silently loses every fill before the cutoff and every settlement that has aged out, and the books stop reconciling with no error.
+- **Current handling:** `arb-venue-sync` reads both fill endpoints and merges everything into an archive in `data/venue/` that never drops a row, keyed by `fill_id` and by ticker plus `settled_time`. The settlements from 2026-07-23 to 2026-07-25 survive only in the archive, seeded from a hand fetch on 2026-07-27, with a copy in `data/venue/seed-20260727/`.
+- **Port requirement:** Treat `data/venue/kalshi_settlements.json` as the system of record, not a cache. Never rebuild it from the API.
+
 ### `kalshi-deposits-endpoint-exists`
 - **Venue:** kalshi
 - **What the API does:** `GET /portfolio/deposits` and `/portfolio/withdrawals` exist and return funding history (`amount_cents`, `status`, `type`, `created_ts`). `/portfolio/transfers` and `/portfolio/transactions` are 404.
@@ -317,7 +324,7 @@ double-entry books. Together they make the Kalshi account reconcile to
 - **Liquidity-program payouts arrive as `ACTIVITY_TYPE_TRANSFER`** (`transferReason: TRANSFER_REASON_UNSPECIFIED`), not as `ACTIVITY_TYPE_LIQUIDITY_PROGRAM`, which comes back empty. They sum, to the cent, to the `status: PAID` rows of `GET /v1/incentives/earnings` (`programType: liquidityProgram`). A promotional deposit bonus arrives as `ACTIVITY_TYPE_REFERRAL_BONUS` with `transferReason: TRANSFER_REASON_DEPOSIT_BONUS`. Only the deposit and withdrawal types are external capital; the other balance changes are income.
 - **The 2026-07-27 probe missed it.** `/v1/portfolio/fills`, `/v1/portfolio/trades`, `/v1/portfolio/settlements`, `/v1/account/transfers`, `/v1/account/transactions`, `/v1/account/activity`, `/v1/account/deposits` and `/v1/portfolio/activity` (singular) all 404, which was recorded here as "PM-US has no history". The endpoint is plural.
 - **Failure it prevents:** opening PM-US books from a human-typed funding total plus an unexplained plug when the venue itemizes both; booking reward transfers as contributed capital.
-- **Current handling:** nothing reads it. `config/funding.yaml` and `arb-books --pmus-deposits` carry the PM-US funding total by hand, and `pnl:realized:pmus_unitemized` holds closed-position P&L the importer never sees.
+- **Current handling:** `arb-venue-sync` archives every row to `data/venue/pmus_activities.json` (newest first, stopping at the first fully archived page; `limit` above 100 silently falls back to ~20 rows a page, and a 56-page crawl at ~4 requests/s drew a Cloudflare 429, error code 1015). `arb_ledger::funding` books the balance-change rows, and the Capital page and daily equity read them. The trade and resolution rows are not booked yet: `arb-books --pmus-deposits` still opens PM-US from a typed total, and `pnl:realized:pmus_unitemized` holds the closed-position P&L that importer never sees.
 - **Port requirement:** Seed PM-US funding from the deposit and withdrawal rows, as Kalshi's is from `/portfolio/deposits`, and itemize closed-position P&L from the TRADE and POSITION_RESOLUTION rows.
 
 ### `pmus-margin-is-one-dollar-per-short`

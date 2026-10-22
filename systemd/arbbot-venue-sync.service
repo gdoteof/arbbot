@@ -1,0 +1,8 @@
+[Unit]
+Description=arbbot venue history sync (both venues' deposits, fills, settlements, activity -> data/venue)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/claude/arbbot
+Nice=10
+ExecStart=%h/claude/arbbot/rust/target/release/arb-venue-sync --out data/venue

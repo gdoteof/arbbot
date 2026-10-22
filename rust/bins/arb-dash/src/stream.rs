@@ -33,7 +33,7 @@ fn stat_all(paths: &[String]) -> u64 {
 /// what makes a push cheaper than a poll: an idle board redraws nothing.
 fn state_json(a: &Args) -> String {
     let day = integrity::build(&a.data_dir).today;
-    let books = stat_all(&[format!("{}/exec/capital.json", a.data_dir),"config/funding.yaml".into()])
+    let books = stat_all(&[format!("{}/exec/capital.json", a.data_dir), format!("{}/sync.json", a.kalshi_dir)])
         ^ (arb_core::clock::now_secs()/5); // Refresh ages and outage status even when snapshots stop.
     let recording = stat_all(
         &VENUES.iter().map(|v| format!("{}/raw/{v}-{day}.jsonl", a.data_dir)).collect::<Vec<_>>(),
