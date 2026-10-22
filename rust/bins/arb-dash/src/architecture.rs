@@ -374,8 +374,27 @@ fn tags_of(cmd: &str) -> Vec<String> {
 /// `/proc/<pid>`'s mtime is the process start time, which is why no timestamp
 /// has to be parsed out of `systemctl`. Where a unit has several processes
 /// (an `ExecStart=/bin/sh -c …` grows a child), the OLDEST is the main one.
+/// `/proc/<pid>/stat` field 22, `starttime`: clock ticks after boot. The
+/// command name (field 2) is parenthesised and may itself contain spaces and
+/// `)`, so fields are counted from the LAST `)`.
+fn start_ticks(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Boot time, epoch seconds: the `btime` line of `/proc/stat`.
+fn boot_time() -> Option<u64> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    stat.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
+}
+
+/// `/proc` reports times in USER_HZ, which the kernel fixes at 100 for its
+/// userspace ABI regardless of the internal tick rate.
+const USER_HZ: u64 = 100;
+
 pub fn procs_by_unit() -> BTreeMap<String, Proc> {
     let now = now_secs();
+    let btime = boot_time();
     let mut out: BTreeMap<String, Proc> = BTreeMap::new();
     let Ok(rd) = std::fs::read_dir("/proc") else { return out };
     for entry in rd.flatten() {
@@ -386,11 +405,16 @@ pub fn procs_by_unit() -> BTreeMap<String, Proc> {
         if !unit.starts_with("arbbot-") {
             continue;
         }
-        let started = std::fs::metadata(format!("/proc/{pid}"))
+        // NOT the mtime of /proc/<pid>: that dates the kernel's directory
+        // entry, which is made on first access and remade after eviction. On
+        // 2026-10-22 it put an engine up 7d 3h at 1d 21h, which let a config
+        // edited in between read as already loaded.
+        let started = std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
+            .as_deref()
+            .and_then(start_ticks)
+            .zip(btime)
+            .map(|(ticks, boot)| boot + ticks / USER_HZ)
             .unwrap_or(now);
         let cmd = std::fs::read_to_string(format!("/proc/{pid}/cmdline"))
             .unwrap_or_default()
@@ -663,6 +687,14 @@ pub fn json() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn start_ticks_counts_fields_from_the_last_paren() {
+        let stat = "3370874 (arb (trader) x) S 1 3370874 3370874 0 -1 4194560 1 2 3 4 5 6 7 8 20 0 9 0 \
+                    23860362 100 200";
+        assert_eq!(super::start_ticks(stat), Some(23860362));
+        assert_eq!(super::start_ticks("garbage"), None);
+    }
+
     use super::*;
 
     /// The topology is the one hand-written thing here, so the one thing that
