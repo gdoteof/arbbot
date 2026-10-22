@@ -74,3 +74,15 @@
   from: 2026-10-29T04:00:00Z   # 2026-10-29 00:00 ET
   why: BEA Q3 GDP advance estimate, 2026-10-29 or -30 08:30 ET
   entries: true
+
+# Same shape as cpi-26sep: Kalshi closes at 08:25 (core) / 08:29 ET on release
+# day and PM-US trades on past the print. US clocks are on EST from 11-01.
+- family: cpi-26oct
+  from: 2026-11-10T05:00:00Z   # 2026-11-10 00:00 ET
+  why: BLS October CPI release 2026-11-10 08:30 ET
+  entries: true
+
+- family: nfp-26oct
+  from: 2026-11-06T05:00:00Z   # 2026-11-06 00:00 ET
+  why: BLS October Employment Situation release 2026-11-06 08:30 ET
+  entries: true

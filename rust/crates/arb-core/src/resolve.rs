@@ -109,6 +109,13 @@ const RULES: &[(&str, &str, bool)] = &[
     // settlement-report bounds, as with FOMC.
     ("xvus-cpi-26sep", "2026-10-16", true),
     ("xvus-gdp-26q3", "2026-11-01", true),
+    // Added 2026-10-22 (Claude, agent greenlight under the verdict-only
+    // gate). The October rollover of the CPI MoM and core MoM ladders (BLS
+    // release 2026-11-10 08:30 ET; Kalshi has not listed October YoY) and the
+    // October payrolls print (BLS Employment Situation 2026-11-06 08:30 ET).
+    // Dated two days past each release like the September CPI rows.
+    ("xvus-cpi-26oct", "2026-11-12", true),
+    ("xvus-nfp-26oct", "2026-11-08", true),
 ];
 
 /// `-> (YYYY-MM-DD, estimated)`. `None` when the family is unknown, which
@@ -273,6 +280,9 @@ mod tests {
         assert_eq!(resolve_date("xvus-cpi-26sep-coremom-gt0p3"), Some(("2026-10-16", true)));
         assert_eq!(resolve_date("xvus-cpi-26sep-mom-gtn0p2"), Some(("2026-10-16", true)));
         assert_eq!(resolve_date("xvus-gdp-26q3-gt1p5"), Some(("2026-11-01", true)));
+        assert_eq!(resolve_date("xvus-cpi-26oct-mom-gtn0p1"), Some(("2026-11-12", true)));
+        assert_eq!(resolve_date("xvus-cpi-26oct-coremom-gt0p3"), Some(("2026-11-12", true)));
+        assert_eq!(resolve_date("xvus-nfp-26oct-gt100k"), Some(("2026-11-08", true)));
         assert_eq!(resolve_date("xvus-btc150k-ladder-07-31-2026"), None);
     }
 
