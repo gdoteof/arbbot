@@ -32,9 +32,6 @@
   from: 2026-10-01T04:00:00Z   # 2026-10-01 00:00 ET
   why: Tesla Q3 deliveries report, expected 2026-10-02 ~09:00 ET
 
-- family: brazil-pres-26
-  from: 2026-10-03T04:00:00Z   # 2026-10-03 00:00 ET (final polls on the 3rd)
-  why: Brazil presidential first round 2026-10-04, polls close 20:00Z
 
 # The runoff RESOLVES the market, so this row also stops entries. The row
 # above stays exits-only: the first round did not resolve anything.
