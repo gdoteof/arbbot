@@ -1,5 +1,5 @@
 # Trading capital comes from authenticated venue snapshots, refreshed automatically.
-# Original deposits live in config/funding.yaml and are reporting-only.
+# Deposits come from each venue's own history (data/venue, arb-venue-sync) and are reporting-only.
 capital_source: venue
 # Legacy concentration setting. Production class/global ceilings currently share
 # the explicit 85% deployment policy shown on the Capital page; neither uses deposits.

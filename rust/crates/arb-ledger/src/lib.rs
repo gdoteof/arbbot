@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use arb_core::scan::{Cx, D};
 
 pub mod accounts;
+pub mod funding;
 pub mod kalshi;
 pub mod pmus;
 pub mod report;

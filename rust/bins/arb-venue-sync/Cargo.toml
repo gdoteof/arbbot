@@ -1,0 +1,11 @@
+[package]
+name = "arb-venue-sync"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[dependencies]
+arb-venue = { path = "../../crates/arb-venue" }
+serde_json = { workspace = true }

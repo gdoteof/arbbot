@@ -203,6 +203,7 @@ fn build(
     let mut positions = 0.;
     let mut equity = 0.;
     let mut deposits = 0.;
+    let mut credits = 0.;
     let mut funding_known = true;
     for (venue, a) in accounts {
         let fields = [
@@ -223,6 +224,7 @@ fn build(
             Some(n) => deposits += n,
             None => funding_known = false,
         }
+        credits += funding.as_ref().and_then(|f| number(&f["credits_usd"][venue])).unwrap_or(0.);
     }
     let k = &snapshot["accounts"]["kalshi"];
     let holdings = k["holdings"].as_array();
@@ -245,11 +247,51 @@ fn build(
     snapshot["producer_alive"] = json!(alive);
     snapshot["funding"] = funding.unwrap_or(Value::Null);
     snapshot["totals"] = json!({"available_cash_usd":cash,"reserved_cash_usd":reserved,"positions_value_usd":positions,
-        "equity_usd":equity,"deposits_usd":funding_known.then_some(deposits),
+        "equity_usd":equity,"deposits_usd":funding_known.then_some(deposits),"credits_usd":funding_known.then_some(credits),
         "profit_usd":funding_known.then_some(equity-deposits),"return_pct":(funding_known && deposits>0.).then_some((equity/deposits-1.)*100.)});
     snapshot["position_comparison"] = position_pairs(&snapshot, registry, entry_basis, now, fresh);
     snapshot
 }
+/// Every funding flow in the venue-history archive `arb-venue-sync` keeps in
+/// `data/venue/`, booked through `arb_ledger::funding` exactly as the books
+/// book it. Any missing file or refused row is an error, never a smaller total.
+pub(crate) fn funding_flows(a: &Args) -> Result<Vec<arb_ledger::funding::Flow>, String> {
+    fn read<T: serde::de::DeserializeOwned>(path: &str) -> Result<T, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))
+    }
+    let deposits: Vec<arb_ledger::kalshi::Deposit> = read(&format!("{}/kalshi_deposits.json", a.kalshi_dir))?;
+    let withdrawals: Vec<arb_ledger::kalshi::Deposit> = read(&format!("{}/kalshi_withdrawals.json", a.kalshi_dir))?;
+    let activities: Vec<Value> = read(&format!("{}/pmus_activities.json", a.pmus_dir))?;
+    let mut cx = arb_core::scan::Cx::default();
+    let mut entries = arb_ledger::funding::kalshi(&mut cx, &deposits, &withdrawals)?;
+    entries.extend(arb_ledger::funding::pmus(&mut cx, &activities)?);
+    Ok(arb_ledger::funding::flows(&mut cx, &entries))
+}
+
+/// Capital in and venue credits per venue, as `build` reads them, or an
+/// `error` object that leaves every funding-derived figure unknown.
+fn funding_value(a: &Args) -> Value {
+    let flows = match funding_flows(a) {
+        Ok(f) => f,
+        Err(e) => return json!({"error": e}),
+    };
+    let mut cx = arb_core::scan::Cx::default();
+    let totals = arb_ledger::funding::totals(&mut cx, &flows);
+    let mut v = json!({"source": "venue history (arb-venue-sync)", "credits_usd": {}});
+    for venue in ["kalshi", "polymarket_us"] {
+        let (capital, credit) = totals.get(venue).map_or(("0".into(), "0".into()), |(c, k)| (c.to_string(), k.to_string()));
+        v[venue] = json!(capital);
+        v["credits_usd"][venue] = json!(credit);
+    }
+    let sync = format!("{}/sync.json", a.kalshi_dir);
+    v["synced_at"] = std::fs::read_to_string(&sync)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .map_or(Value::Null, |s| s["at"].clone());
+    v
+}
+
 pub fn json(a: &Args) -> String {
     let path = format!("{}/exec/capital.json", a.data_dir);
     let snapshot: Value = match std::fs::read_to_string(&path)
@@ -262,9 +304,7 @@ pub fn json(a: &Args) -> String {
                 .to_string()
         }
     };
-    let funding = std::fs::read_to_string("config/funding.yaml")
-        .ok()
-        .and_then(|s| serde_yaml::from_str::<Value>(&s).ok());
+    let funding = Some(funding_value(a));
     let alive = snapshot["pid"].as_u64().is_some_and(|pid| {
         std::fs::read(format!("/proc/{pid}/cmdline"))
             .ok()
@@ -326,6 +366,19 @@ mod tests {
         );
         assert_eq!(a["totals"]["equity_usd"], b["totals"]["equity_usd"]);
         assert_eq!(a["totals"]["profit_usd"], 5.);
+        assert_eq!(a["totals"]["credits_usd"], 0.);
+        let c = build(
+            snapshot(),
+            Some(json!({"kalshi":"100","polymarket_us":"0","credits_usd":{"polymarket_us":"3"}})),
+            None,
+            &EntryBasis::new(),
+            110,
+            true,
+        );
+        assert_eq!(c["totals"]["profit_usd"], 5., "a credit is profit, not capital");
+        assert_eq!(c["totals"]["credits_usd"], 3.);
+        let unknown = build(snapshot(), Some(json!({"error":"x"})), None, &EntryBasis::new(), 110, true);
+        assert_eq!(unknown["totals"]["profit_usd"], Value::Null);
         assert_eq!(a["fresh"], true);
     }
     #[test]
