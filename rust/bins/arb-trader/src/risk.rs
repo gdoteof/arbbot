@@ -26,7 +26,7 @@
 use arb_core::model::{BookSide, Venue};
 use arb_core::quoter::{RiskGate, RiskVerdict};
 use arb_core::risk::{check_order, ConfigIn, ExposureIn, Input, RelIn, TopicIn};
-use arb_core::scan::Rel;
+use arb_core::scan::{Rel, RelType};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -68,6 +68,11 @@ const OVERFLOW_FRAC: &str = "0.10";
 /// candidate in one event shares that settlement. So this bounds the tail, not
 /// the expected loss.
 ///
+/// A divergence has two branches, and a standard basket and an inverse one on
+/// the same pair lose in opposite ones, so each relationship is charged its
+/// worse branch ([`Tail::worst`]), not the sum of both. Summed across the
+/// event's relationships, as if every one diverged against us at once.
+///
 /// Applied in [`RiskView::check`] and not in `arb_core::risk::check_order`,
 /// whose decisions are pinned against the Python fixtures.
 const PER_EVENT_LOSS: f64 = 0.15;
@@ -88,10 +93,77 @@ struct Exposure {
     by_topic: HashMap<String, f64>,
 }
 
+/// Which way a basket on a two-venue equivalent pair points. Standard is long
+/// Kalshi YES + short the other venue's YES; inverse is the reverse.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Direction {
+    Standard,
+    Inverse,
+}
+
+/// The basket a fill of this order opens: buying Kalshi YES, or selling the
+/// other venue's YES, opens a standard one. None for any other relationship
+/// shape and for a check that names no side; the event cap counts those in
+/// both branches.
+fn direction_of(rel: &Rel, venue: Venue, side: Option<BookSide>) -> Option<Direction> {
+    let kalshi_legs = rel.legs.iter().filter(|l| l.venue == Venue::Kalshi).count();
+    if rel.rtype != RelType::CrossVenueEquivalent || rel.legs.len() != 2 || kalshi_legs != 1 {
+        return None;
+    }
+    Some(match (venue == Venue::Kalshi, side?) {
+        (true, BookSide::Bid) | (false, BookSide::Ask) => Direction::Standard,
+        (true, BookSide::Ask) | (false, BookSide::Bid) => Direction::Inverse,
+    })
+}
+
+/// One relationship's exposure as the per-event cap sees it, in contracts.
+#[derive(Default, Clone, Copy, Debug)]
+struct Tail {
+    /// Filled baskets the ledger says are standard / inverse.
+    standard: f64,
+    inverse: f64,
+    /// What loses in BOTH branches: filled contracts the ledger has not given
+    /// a direction, and resting quotes of no known direction.
+    either: f64,
+    /// Resting quotes that would open a standard / inverse basket. Each counts
+    /// only in the branch it loses in, and never offsets: it may not fill.
+    resting_standard: f64,
+    resting_inverse: f64,
+}
+
+impl Tail {
+    /// What a standard-losing / inverse-losing divergence costs.
+    fn branches(&self) -> (f64, f64) {
+        (
+            self.either + self.standard + self.resting_standard - self.inverse,
+            self.either + self.inverse + self.resting_inverse - self.standard,
+        )
+    }
+
+    /// The worse branch. Never negative: the two sum to the resting quotes
+    /// plus twice `either`.
+    fn worst(&self) -> f64 {
+        let (s, i) = self.branches();
+        s.max(i)
+    }
+
+    fn rest(&mut self, dir: Option<Direction>, qty: f64) {
+        match dir {
+            Some(Direction::Standard) => self.resting_standard += qty,
+            Some(Direction::Inverse) => self.resting_inverse += qty,
+            None => self.either += qty,
+        }
+    }
+}
+
 /// The (relationship, market, side) one resting quote sits on. There is at most
 /// one of ours per slot — that is what `Quoter::resting` is keyed by — so a
 /// reprice REPLACES its own reservation rather than stacking a second one.
 type Slot = (String, String, BookSide);
+
+/// What a slot holds against the caps: its class, its contracts, and the
+/// basket a fill of it opens.
+type Reservation = (&'static str, f64, Option<Direction>);
 
 /// How old a balance figure may be and still authorise spending, whatever its
 /// provenance. Three poll cycles (`main::BALANCE_POLL` is 60s).
@@ -284,7 +356,13 @@ pub struct RiskView {
     /// Armed take-take IOCs use separate `ioc/<order-id>` slots. Fills consume
     /// them and terminal venue reads release the unfilled remainder. Unknown
     /// execution outcomes keep their reservation; dry-run checks reserve nothing.
-    reserved: Mutex<HashMap<Slot, (&'static str, f64)>>,
+    reserved: Mutex<HashMap<Slot, Reservation>>,
+    /// Open baskets by direction, `(standard, inverse)`, from the ledger
+    /// (`ledger::open_by_direction`), refreshed with each ledger read. What
+    /// `exposure` holds beyond it — a fill the ledger has not booked yet, an
+    /// undischarged hedge — has no direction, and the event cap counts it in
+    /// both branches.
+    directed: Mutex<HashMap<String, (f64, f64)>>,
     /// Counts, for the stats line. Rejections are not errors — a gate that
     /// never fires is a gate nobody can see working.
     pub checked: Mutex<(u64, u64)>, // (allowed, rejected)
@@ -581,6 +659,7 @@ impl RiskView {
             exposure: Mutex::new(Exposure::default()),
             released: Mutex::new(HashSet::new()),
             reserved: Mutex::new(HashMap::new()),
+            directed: Mutex::new(HashMap::new()),
             checked: Mutex::new((0, 0)),
             naked_worst: Mutex::new(None),
         }
@@ -872,7 +951,7 @@ impl RiskView {
     pub fn consume(&self, rel_id: &str, market_id: &str, side: BookSide, qty: f64) {
         let mut r = self.reserved.lock().expect("reserved");
         let key = (rel_id.to_string(), market_id.to_string(), side);
-        if let Some((_, left)) = r.get_mut(&key) {
+        if let Some((_, left, _)) = r.get_mut(&key) {
             *left -= qty;
             if *left <= 0.0 {
                 r.remove(&key);
@@ -888,7 +967,13 @@ impl RiskView {
     /// and `risk_reserved` that only ever rises is a reservation leak — the one
     /// failure of this mechanism that is worse than the bug it fixes.
     pub fn reserved_ct(&self) -> f64 {
-        self.reserved.lock().expect("reserved").values().map(|(_, q)| q).sum()
+        self.reserved.lock().expect("reserved").values().map(|(_, q, _)| q).sum()
+    }
+
+    /// Install the ledger's open baskets by direction for the per-event cap,
+    /// replacing the previous reading. See the `directed` field.
+    pub fn set_directed(&self, by_rel: HashMap<String, (f64, f64)>) {
+        *self.directed.lock().expect("directed") = by_rel;
     }
 
     /// Open contracts on one relationship. The take-take concentration cap is
@@ -1223,6 +1308,24 @@ impl RiskGate for RiskView {
         // every time a quote rests — `utilization` excludes them for the same
         // reason. Taken before the fold below, which mutates `by_rel`.
         let book: f64 = by_rel.values().sum();
+        // The event's relationships, filled half first: `by_rel` holds only
+        // fills until the reservation fold below. A ledger reading that claims
+        // more than is open is ignored for that relationship, which counts it
+        // in both branches as before.
+        let event = event_of(&rel.id);
+        let mut tails: HashMap<String, Tail> = HashMap::new();
+        {
+            let directed = self.directed.lock().expect("directed");
+            for (r, &filled) in by_rel.iter().filter(|(r, _)| event_of(r) == event) {
+                let t = tails.entry(r.clone()).or_default();
+                match directed.get(r) {
+                    Some(&(s, i)) if s + i <= filled + 1e-9 => {
+                        (t.standard, t.inverse, t.either) = (s, i, filled - s - i);
+                    }
+                    _ => t.either = filled,
+                }
+            }
+        }
         // Capital already committed by quotes that are RESTING. Without this
         // the gate is a pure read and every resting quote in the process spends
         // the same headroom — see the module header.
@@ -1234,9 +1337,12 @@ impl RiskGate for RiskView {
         let mine = rests_on.map(|(m, s)| (rel.id.clone(), m.to_string(), s));
         {
             let r = self.reserved.lock().expect("reserved");
-            for (slot, (class, qty)) in r.iter() {
+            for (slot, (class, qty, dir)) in r.iter() {
                 if Some(slot) == mine.as_ref() {
                     continue;
+                }
+                if event_of(&slot.0) == event {
+                    tails.entry(slot.0.clone()).or_default().rest(*dir, *qty);
                 }
                 *by_rel.entry(slot.0.clone()).or_default() += qty;
                 *by_class.entry((*class).to_string()).or_default() += qty;
@@ -1281,13 +1387,24 @@ impl RiskGate for RiskView {
         // topic budget reads, so a resting quote on one candidate spends the
         // whole event's room the way it spends the topic's.
         let nav = inp.config.bankroll.parse::<f64>().unwrap_or(0.0);
-        let event = event_of(&rel.id);
-        let event_open: f64 =
-            by_rel.iter().filter(|(r, _)| event_of(r) == event).map(|(_, q)| q).sum();
+        let dir = direction_of(rel, venue, rests_on.map(|(_, s)| s));
+        let tail_before: f64 = tails.values().map(Tail::worst).sum();
+        let this = tails.get(&rel.id).copied().unwrap_or_default();
+        let others = tail_before - this.worst();
+        let mut grown = this;
+        grown.rest(dir, notional as f64);
+        let tail_after = others + grown.worst();
         let event_cap = nav * PER_EVENT_LOSS;
-        if event_open + notional as f64 > event_cap {
+        // Over the cap is refused only when it GROWS the tail: a quote on the
+        // branch that is not the worst one costs the event nothing.
+        if tail_after > event_cap + 1e-9 && tail_after > tail_before + 1e-9 {
+            let nets = if (tail_after - tail_before - notional as f64).abs() > 1e-9 {
+                format!(" nets to {tail_after:.2}")
+            } else {
+                String::new()
+            };
             d.reasons.push(format!(
-                "per-event loss cap [{event}]: {event_open:.2}+{notional} > {event_cap:.2}"
+                "per-event loss cap [{event}]: {tail_before:.2}+{notional}{nets} > {event_cap:.2}"
             ));
         }
         if let Some(worst) = *self.naked_worst.lock().expect("naked_worst") {
@@ -1309,7 +1426,7 @@ impl RiskGate for RiskView {
                 self.reserved
                     .lock()
                     .expect("reserved")
-                    .insert(slot, (rel.rtype.as_str(), notional as f64));
+                    .insert(slot, (rel.rtype.as_str(), notional as f64, dir));
             }
         }
         let mut c = self.checked.lock().expect("checked");
@@ -1325,7 +1442,17 @@ impl RiskGate for RiskView {
         // The event's room as well, whichever is tighter, so a clip the event
         // cap refuses is re-priced at what the event will still take, exactly
         // like one the topic budget refuses.
-        let event_room = (event_cap - event_open).floor().max(0.0) as i64;
+        //
+        // The room is what this order's branch can grow before the event's
+        // tail passes the cap, or passes where it already stands if that is
+        // higher.
+        let (s, i) = this.branches();
+        let grows = match dir {
+            Some(Direction::Standard) => s,
+            Some(Direction::Inverse) => i,
+            None => s.max(i),
+        };
+        let event_room = (event_cap.max(tail_before) - others - grows).floor().max(0.0) as i64;
         let topic_headroom = Some(
             d.topic_headroom
                 .as_deref()
@@ -2686,6 +2813,97 @@ mod tests {
         );
         v.release(a, "K", BookSide::Bid);
         assert!(v.check(&rel(b), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
+    }
+
+    /// A STANDARD AND AN INVERSE BASKET LOSE IN OPPOSITE BRANCHES, so a quote
+    /// that would open the side the event is short of costs its tail nothing.
+    /// $147 cap; 140 standard contracts held across two candidates.
+    #[test]
+    fn a_quote_on_the_branch_that_is_not_the_worst_costs_the_event_nothing() {
+        let (a, b) = ("xvus-time-poty-26-zohranmamdani", "xvus-time-poty-26-ai");
+        let v = view_topics_low("/nonexistent/topics.yaml", &[a, b]);
+        v.record_open(a, "cross-venue-equivalent", 100.0);
+        v.record_open(b, "cross-venue-equivalent", 40.0);
+        v.set_directed(HashMap::from([(a.to_string(), (100.0, 0.0)), (b.to_string(), (40.0, 0.0))]));
+
+        // Buying Kalshi YES or selling PM-US YES opens another standard basket.
+        for (venue, market, side) in [(Venue::Kalshi, "K", BookSide::Bid), (Venue::PolymarketUs, "P", BookSide::Ask)] {
+            let d = v.check(&rel(a), venue, 25, Some((market, side)));
+            assert!(
+                d.reasons.iter().any(|r| r == "per-event loss cap [xvus-time-poty-26]: 140.00+25 > 147.00"),
+                "{venue:?} {side:?}: {:?}",
+                d.reasons
+            );
+            assert_eq!(d.topic_headroom, Some(7));
+        }
+        // The reverse opens an inverse one, which only ever offsets.
+        for (venue, market, side) in [(Venue::Kalshi, "K", BookSide::Ask), (Venue::PolymarketUs, "P", BookSide::Bid)] {
+            let d = v.check(&rel(a), venue, 25, Some((market, side)));
+            assert!(d.allowed, "{venue:?} {side:?}: {:?}", d.reasons);
+            v.release(a, market, side);
+        }
+    }
+
+    /// TWO-SIDED QUOTING RESERVES ITS WORSE SIDE, NOT BOTH: a bid and an ask on
+    /// one pair can each fill, but every fill of the ask shrinks the branch the
+    /// bid grows.
+    #[test]
+    fn a_two_sided_quote_spends_the_events_room_once() {
+        let (a, b) = ("xvus-time-poty-26-zohranmamdani", "xvus-time-poty-26-ai");
+        let v = view_topics_low("/nonexistent/topics.yaml", &[a, b]);
+        v.record_open(a, "cross-venue-equivalent", 100.0);
+        v.set_directed(HashMap::from([(a.to_string(), (100.0, 0.0))]));
+        assert!(v.check(&rel(a), Venue::Kalshi, 25, Some(("K", BookSide::Bid))).allowed);
+        assert!(v.check(&rel(a), Venue::Kalshi, 25, Some(("K", BookSide::Ask))).allowed);
+        // 100 + 25 on the standard branch; the ask's 25 sits on the other one.
+        let d = v.check(&rel(b), Venue::Kalshi, 25, Some(("K", BookSide::Bid)));
+        assert!(
+            d.reasons.iter().any(|r| r == "per-event loss cap [xvus-time-poty-26]: 125.00+25 > 147.00"),
+            "{:?}",
+            d.reasons
+        );
+        assert_eq!(d.topic_headroom, Some(22));
+    }
+
+    /// Over the cap, an order that does not grow the tail still opens: it is
+    /// sized to what it can add before its own branch becomes the worst.
+    #[test]
+    fn an_event_over_its_cap_still_takes_the_side_that_does_not_grow_it() {
+        let a = "xvus-time-poty-26-zohranmamdani";
+        let v = view_topics_low("/nonexistent/topics.yaml", &[a]);
+        v.record_open(a, "cross-venue-equivalent", 149.0);
+        v.set_directed(HashMap::from([(a.to_string(), (149.0, 0.0))]));
+        assert!(!v.check(&rel(a), Venue::Kalshi, 1, Some(("K", BookSide::Bid))).allowed);
+        let d = v.check(&rel(a), Venue::Kalshi, 1, Some(("K", BookSide::Ask)));
+        assert!(d.allowed, "{:?}", d.reasons);
+    }
+
+    /// WHAT THE LEDGER HAS NOT DIRECTED LOSES BOTH WAYS. A fill the ledger has
+    /// not booked, an undischarged hedge's seed, a reading that claims more
+    /// than is open, and any relationship that is not a Kalshi-to-PM pair are
+    /// all charged in full, as the gross cap charged everything.
+    #[test]
+    fn exposure_of_unknown_direction_is_charged_in_both_branches() {
+        let a = "xvus-time-poty-26-zohranmamdani";
+        let v = view_topics_low("/nonexistent/topics.yaml", &[a]);
+        v.record_open(a, "cross-venue-equivalent", 140.0);
+        let refused = |v: &RiskView, r: &Rel| {
+            let d = v.check(r, Venue::Kalshi, 25, Some(("K", BookSide::Ask)));
+            d.reasons.iter().any(|r| r.starts_with("per-event loss cap [xvus-time-poty-26]: 140.00+25"))
+        };
+        assert!(refused(&v, &rel(a)), "no ledger reading");
+        v.set_directed(HashMap::from([(a.to_string(), (200.0, 0.0))]));
+        assert!(refused(&v, &rel(a)), "a reading above what is open");
+        v.set_directed(HashMap::from([(a.to_string(), (140.0, 0.0))]));
+        assert!(!refused(&v, &rel(a)), "the same reading, consistent");
+        let mut implies = rel(a);
+        implies.rtype = RelType::Implies;
+        implies.legs[1].venue = Venue::Kalshi;
+        assert!(refused(&v, &implies), "not a two-venue pair");
+        assert!(
+            v.check(&rel(a), Venue::Kalshi, 25, None).reasons.iter().any(|r| r.starts_with("per-event loss cap")),
+            "a check that names no side"
+        );
     }
 
     /// THE NAKED LIMIT: past 15% of NAV in worst-case naked loss, nothing new
