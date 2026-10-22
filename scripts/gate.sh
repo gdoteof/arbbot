@@ -66,7 +66,17 @@ ROOT="$(git rev-parse --show-toplevel)"
 # re-entry, and two French BRET quotes that no longer clear are withheld. Net:
 # 31703/187/136 -> 31705/185/134. The APR stage is byte-identical because its
 # hurdle had already excluded those unsafe quotes.
-BASELINE_SHA=434305e4e4f5c0bbc91b4a731337f0e552d6692e240d4fc4c65606adc6130989
+#
+# Re-pinned 2026-10-22 for MAX_CLIP 25 -> 50. Clip sizes on the tape's places,
+# `--out` on both binaries:
+#
+#   25  {3:2, 5:1, 8:1, 10:2, 12:4, 16:3, 19:1, 20:3, 21:1, 22:1, 23:1, 25:165}
+#   50  {...same below 25..., 30:2, 31:1, 33:1, 39:1, 43:1, 50:163}
+#
+# Every place that rested the 25 ceiling now rests up to its hedge touch, and
+# four more places and cancels follow from those larger clips being resized
+# when the touch shrinks under them. 31705/185/134 -> 31714/189/138.
+BASELINE_SHA=eed3f124bbcecc5c5d06787919fb6de3083cd4c088bfd3d7cc8096f4a371368e
 # Re-pinned 2026-08-23 by the same #82 bisect as the baseline above: this stage
 # moved with it, 38978b34/31485/15/6 -> 02c9a582/31487/16/7. One extra place and
 # one extra cancel, from the same adaptive clip — the hurdle refuses all but a
@@ -75,7 +85,10 @@ BASELINE_SHA=434305e4e4f5c0bbc91b4a731337f0e552d6692e240d4fc4c65606adc6130989
 #
 # (Previously re-pinned 2026-08-14, authorized by Geoff, for #65's dating of the
 # DECEMBER btc150k rung, which that PR also did not re-pin.)
-APR_SHA=02c9a5829910430e77678d73517cc0a5f6e79567a2ac03a84364a1091faa8bea
+#
+# Re-pinned 2026-10-22 with the baseline above, for MAX_CLIP 50:
+# 31487/16/7 -> 31489/17/8, one more place and cancel from a resized clip.
+APR_SHA=2ae6a85e6eb94739b4be183d33dd6865ac2e5362f298a898d1bb504e5a550d7d
 fail=0
 skip_digest=0
 allow_change=0
@@ -466,7 +479,7 @@ elif [ "$skip_digest" = 1 ]; then
   suffix=" (DIGESTS SKIPPED)"
 else
 echo "--- 5/6 real-tape digest ---"
-  digest_stage DIGEST "$BASELINE_SHA" "31705 / 185 / 134"
+  digest_stage DIGEST "$BASELINE_SHA" "31714 / 189 / 138"
 
 # --- 6/6 The SAME tape with the maker APR hurdle turned on.
 #
@@ -487,7 +500,7 @@ echo "--- 5/6 real-tape digest ---"
 # 167 of 182 until the queue-aware `touch_excl_self` fix held one of stage 5's
 # places instead of repricing it; the 15 that clear the bar are unaffected.)
 echo "--- 6/6 real-tape digest, APR hurdle on ---"
-  digest_stage "APR-DIGEST" "$APR_SHA" "31487 / 16 / 7" --min-apr 12 --apr-asof 2026-07-28
+  digest_stage "APR-DIGEST" "$APR_SHA" "31489 / 17 / 8" --min-apr 12 --apr-asof 2026-07-28
 fi
 
 # A hatched run says HATCHED, not PASS, and exits 3. Both halves matter, and the

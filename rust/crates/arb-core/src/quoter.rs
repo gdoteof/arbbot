@@ -255,10 +255,17 @@ struct RestingQuote {
 ///
 /// `MAX_CLIP` is a LEGGING bound, not a capital one. Between a maker fill and
 /// the hedge IOC landing (~40-70ms observed) we are one-legged for the whole
-/// clip, so this caps that exposure at 5x the old one. Raising it wants
+/// clip, so this caps that exposure at 10x the old one. Raising it wants
 /// `hedges_naked` watched, not just headroom.
+///
+/// 50, not 25, from the ledger: 14 of the 118 maker-hedge fills between
+/// 2026-09-24 and 10-08 filled the whole 25-lot clip, and in 12 of them the
+/// tape shows 50 or more contracts traded at or through our price within
+/// the 30s before the fill and the 2s after. A 50 clip would have filled up to
+/// 293 more contracts on 1,030. The clip is still the hedge touch's size
+/// whenever that is smaller, so this changes only books with a deep hedge.
 pub const MIN_CLIP: i64 = 3;
-pub const MAX_CLIP: i64 = 25;
+pub const MAX_CLIP: i64 = 50;
 
 pub struct Quoter {
     price_grids: HashMap<String, Option<PriceGrid>>,
