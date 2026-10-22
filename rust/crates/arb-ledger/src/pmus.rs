@@ -1,9 +1,9 @@
 //! Polymarket US importer: opening balances from venue truth + one named plug.
 //!
-//! PM-US is the opposite of Kalshi. It exposes ONLY current balances and
-//! current positions — no fills, no settlements, no deposits
-//! (`pmus-no-history-endpoints` in docs/venue-quirks.md). So the account cannot
-//! be rebuilt; it can only be OPENED at a point in time:
+//! This importer reads ONLY current balances and current positions. PM-US's
+//! history (`/v1/portfolio/activities`, `pmus-activities-endpoint` in
+//! docs/venue-quirks.md) is not read, so the account is not rebuilt; it is
+//! OPENED at a point in time:
 //!
 //!   1. the funding total, which a human supplies (Geoff: $525 = a $500
 //!      deposit plus a $25 outage-goodwill credit),
@@ -88,7 +88,8 @@ impl Position {
 }
 
 pub struct PmusImport {
-    /// Human-supplied funding total. PM-US has no deposits endpoint.
+    /// Human-supplied funding total. `/v1/portfolio/activities` carries the
+    /// same deposits, but this importer does not read it.
     pub deposits_usd: String,
     pub balances: Balances,
     pub positions: Vec<Position>,
@@ -105,7 +106,7 @@ impl PmusImport {
                 ts: 0,
                 source: Source::Manual,
                 memo: format!(
-                    "pmus funding {} (operator-supplied; venue exposes no deposits endpoint)",
+                    "pmus funding {} (operator-supplied)",
                     self.deposits_usd
                 ),
                 postings: vec![
@@ -163,7 +164,7 @@ impl PmusImport {
                     ts: 0,
                     source: Source::Reconciliation,
                     memo: "residual to venue buyingPower: realized P&L on closed \
-                           PM-US positions, unrecoverable (no history endpoints)"
+                           PM-US positions, not itemized (venue history not imported)"
                         .into(),
                     postings,
                 },

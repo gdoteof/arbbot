@@ -198,11 +198,11 @@ pub trait VenueGateway {
     /// first — venue truth for a private fill feed, carrying the venue's own
     /// per-fill id so a caller can MERGE rather than overwrite.
     ///
-    /// The default is NO history, and for PM-US that is not a stub but the
-    /// fact: quirk `pmus-no-history-endpoints` records `/v1/portfolio/fills`,
-    /// `/v1/portfolio/trades` and six more probed and 404 on 2026-07-27. Its
-    /// feed does not need one anyway — it reports the venue's own cumulative
-    /// `cumQuantity`, so the next frame on an order restates the total.
+    /// The default is NO history. PM-US keeps it: its trades are in
+    /// `/v1/portfolio/activities` (quirk `pmus-activities-endpoint`), which
+    /// this gateway does not read, and its feed does not need one — it
+    /// reports the venue's own cumulative `cumQuantity`, so the next frame on
+    /// an order restates the total.
     fn fills_since(&self, _min_ts: i64) -> Result<Vec<resp::KalshiFillRow>, VenueError> {
         Ok(Vec::new())
     }
