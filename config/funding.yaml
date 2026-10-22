@@ -1,5 +1,7 @@
 # Original external cash only, confirmed by Geoff 2026-09-18.
 # Reporting baseline; never read by the trader's risk gate.
 # Goodwill credits are included in profit, not contributed capital.
-kalshi: '439.78'
+# Kalshi: venue-truth from GET /portfolio/deposits (no withdrawals):
+#   2026-07-20  $39.98 + $399.80   2026-10-22  $99.95 + $899.55
+kalshi: '1439.28'
 polymarket_us: '500.00'
