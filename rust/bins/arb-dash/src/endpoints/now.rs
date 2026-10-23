@@ -29,9 +29,10 @@
 //!     `println!`ed rather than written to a file, so this is where it lives;
 //!     reading it costs one bounded `journalctl` and needs no change to — and
 //!     no restart of — the armed engine.
-//!   * the tail of the scanner's live opportunity stream, for what is
-//!     crossing RIGHT NOW. Only the tail: that file is ~780 MB by evening and
-//!     the question is about the last few seconds.
+//!   * the tail of the engine's opportunity stream (`--opportunities-out`),
+//!     for what has crossed inside the window. The engine restates a crossing
+//!     it still sees every 30s, so a row's age says whether it is
+//!     crossing now.
 //!
 //! What this view CANNOT do, stated plainly because the gap is the interesting
 //! part: a skip line is `{"skip":[reason], "ts":…}` and carries no
@@ -537,6 +538,12 @@ pub fn json(a: &Args) -> String {
     for o in &opp_lines {
         let Some(rel) = o.get("relationship_id").and_then(Value::as_str) else { continue };
         let ts = f(o.get("ts_local_ns")).map(|n| n / 1e9).unwrap_or(now);
+        // The same claim bound as the intents: the engine writes a held
+        // crossing every 30s, so 4 MB of tail is hours of history, and an
+        // edge from the morning is not what is crossing now.
+        if ts < now - WINDOW_S {
+            continue;
+        }
         opp_first = opp_first.min(ts);
         let edge = f(o.get("net_edge_per_contract")).unwrap_or(0.0);
         let total = f(o.get("net_edge_total")).unwrap_or(0.0);

@@ -133,6 +133,10 @@ pub struct RunCfg {
     /// into `pending_hedges` before the first event (`adopt_obligations`).
     /// Empty in bench/replay and unarmed.
     pub adopt: Vec<crate::orphan::Adopted>,
+    /// `--opportunities-out`: what the opportunity stream prices and where it
+    /// writes. None = off. It reads the feed lines the engine has finished
+    /// with and nothing else, so it is allowed in bench/replay.
+    pub opportunities: Option<crate::opportunities::Spec>,
 }
 
 /// Immediately-executable crossings, tested on the book event that creates
@@ -270,7 +274,7 @@ fn bar_in_force(bar: &crate::taketake::Bar, apr: Option<&AprCfg>) -> Option<f64>
     bar.tradable().map(|b| floor.map_or(b, |f| b.max(f)))
 }
 
-fn levels_of(v: Option<&serde_json::Value>) -> Option<Vec<Level>> {
+pub(crate) fn levels_of(v: Option<&serde_json::Value>) -> Option<Vec<Level>> {
     let mut out = Vec::new();
     for l in v?.as_array()? {
         let price = l.get("price")?.as_str()?.to_owned();
@@ -430,6 +434,8 @@ struct Engine {
     intents: Vec<Intent>,
     out: Option<std::io::BufWriter<std::fs::File>>,
     wal: Option<Wal>,
+    /// The opportunity stream (`crate::opportunities`); None = off.
+    opps: Option<crate::opportunities::Emitter>,
     t_start: std::time::Instant,
     /// The health-file keys we require evidence for — the venues we quote.
     required: Vec<String>,
@@ -756,7 +762,7 @@ fn sweep_backoff(attempts: u32) -> u32 {
 
 impl Engine {
     fn new(
-        cfg: RunCfg,
+        mut cfg: RunCfg,
         exec_txs: HashMap<Venue, mpsc::Sender<ExecCmd>>,
         exec_stats: Arc<ExecStats>,
         by_market: &ByMarket,
@@ -856,6 +862,7 @@ impl Engine {
         let required = required_feeds(by_market);
         let t_start = std::time::Instant::now();
         let wal = cfg.wal_path.as_deref().map(Wal::spawn);
+        let opps = cfg.opportunities.take().map(|s| crate::opportunities::Emitter::spawn(s, cfg.bench));
         let out = cfg.out_path.as_ref().map(|p| {
             if let Some(dir) = std::path::Path::new(p).parent() {
                 std::fs::create_dir_all(dir).expect("out dir");
@@ -879,6 +886,7 @@ impl Engine {
             intents: Vec::new(),
             out,
             wal,
+            opps,
             t_start,
             required,
             n_ev: 0,
@@ -1706,6 +1714,9 @@ impl Engine {
             // line nobody greps.
             "marks_unpriced_rows": self.marks_unpriced_rows,
             "marks_no_book": self.marks_no_book.len(),
+            // Lines written to, and feed lines dropped before reaching, the
+            // opportunity stream. Null while `--opportunities-out` is off.
+            "opportunities": self.opps.as_ref().map(|o| o.gauges()),
             "risk_allowed": self.cfg.risk.as_ref().map(|r| r.stats().0).unwrap_or(0),
             "risk_rejected": self.cfg.risk.as_ref().map(|r| r.stats().1).unwrap_or(0),
             // Contracts held against the caps by quotes that are RESTING and
@@ -2009,6 +2020,11 @@ impl Engine {
         self.decision.record(t_deq.elapsed().as_nanos() as u64);
         if self.exit_dirty_at.is_some_and(|t| queued == 0 || t.elapsed() >= EXIT_FLUSH_MAX_DELAY) {
             self.flush_exit_books();
+        }
+        // Last: the line moves to the opportunity stream's own thread once the
+        // engine is done with it. A queue push, never a wait.
+        if let Some(o) = self.opps.as_ref() {
+            o.offer(m.line);
         }
     }
 
@@ -2871,6 +2887,10 @@ impl Engine {
                 u.market_id
             );
         }
+        // Before the summary, so its counts are final and the file is complete.
+        if let Some(o) = self.opps.as_mut() {
+            o.close();
+        }
         let mut s = self.summary();
         if self.cfg.bench {
             let digest = std::mem::take(&mut self.digest);
@@ -3084,6 +3104,7 @@ fn test_cfg() -> RunCfg {
         armed: false,
         hedges_undischarged: 0,
         adopt: Vec::new(),
+        opportunities: None,
     }
 }
 
@@ -3282,6 +3303,7 @@ mod feed_wiring_tests {
             armed: false,
             hedges_undischarged: 0,
             adopt: Vec::new(),
+            opportunities: None,
         }
     }
 

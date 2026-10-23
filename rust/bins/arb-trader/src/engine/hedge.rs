@@ -1368,6 +1368,7 @@ mod hedge_deadline_tests {
             armed: false,
             hedges_undischarged: 0,
             adopt: Vec::new(),
+            opportunities: None,
         };
         // No executors: nothing can reach a venue from this test by construction.
         let handle = tokio::spawn(run(
@@ -1487,6 +1488,7 @@ mod hedge_deadline_tests {
             armed: false,
             hedges_undischarged: 0,
             adopt: Vec::new(),
+            opportunities: None,
         };
         let handle = tokio::spawn(run(
             vec![q],

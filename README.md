@@ -99,11 +99,11 @@ that day, transparently to callers (`src/arbbot/record/archive.py`).
 
 ## Dashboard
 
-Instrument panel at **http://127.0.0.1:4748** (`arbbot-dash.service`) — live view
-of accumulating data: feed health (calibration plate), crossings observed, per-
-relationship crossings/edge/lifetimes, and the full relationship ledger.
-Ranges: Today / 7d / All. Auto-refreshes every 10s; `?theme=light|dark` forces
-a theme. Read-only; binds 127.0.0.1 only.
+Instrument panel at **http://127.0.0.1:4749** (`arb-dash`, `arbbot-dash-rs.service`)
+— capital, what the engine is doing now, opportunities, pairs, trades, the live
+tape and recording health. Read-only; binds 127.0.0.1 only. The opportunity
+views read `data/scan/opportunities-<utc_day>.jsonl`, which the armed engine
+writes under `--opportunities-out`.
 
 ## Documentation
 
