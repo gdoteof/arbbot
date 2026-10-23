@@ -163,13 +163,6 @@ const NODES: &[Decl] = &[
                in per-venue executors so a slow venue can never stall the reader.",
     },
     Decl {
-        id: "scanner", label: "scan.daemon (Python)", sub: "arbbot-scanner.service",
-        lane: 3, row: 3, kind: "process", unit: Some("arbbot-scanner.service"),
-        probe: Probe::Unit, max_age_s: None, expect: Expect::Live,
-        what: "The last Python daemon on the live path. It subscribes to the same socket and \
-               writes the research tape the opportunity views read; it places nothing.",
-    },
-    Decl {
         id: "marks", label: "data/exec/marks.json", sub: "position marks",
         lane: 3, row: 5, kind: "artifact", unit: None,
         probe: Probe::File("data/exec/marks.json"), max_age_s: Some(900), expect: Expect::Live,
@@ -211,12 +204,15 @@ const NODES: &[Decl] = &[
                caps reset to an empty book on every restart. Quiet for days is normal.",
     },
     Decl {
-        id: "scan", label: "data/scan/*.jsonl", sub: "research tape",
+        id: "scan", label: "data/scan/opportunities-*.jsonl", sub: "arb-trader --opportunities-out",
         lane: 4, row: 5, kind: "artifact", unit: None,
-        probe: Probe::Newest("data/scan", "lifetimes-"), max_age_s: Some(3600),
+        // Written only while something crosses, so a quiet day is not a fault.
+        probe: Probe::Newest("data/scan", "opportunities-"), max_age_s: None,
         expect: Expect::Live,
-        what: "Quote lifetimes, maker fills and the sports equivalence map — the inputs to \
-               every backtest, and to the opportunity views on this dashboard.",
+        what: "What crosses, per pair and side, priced by the engine's own fees and depth: a \
+               line when a crossing appears, at most one a second while it moves, one a \
+               minute while it holds. The opportunity views read it; the nightly archive \
+               keeps it.",
     },
     // ---- observe ----------------------------------------------------------
     Decl {
@@ -233,13 +229,6 @@ const NODES: &[Decl] = &[
         probe: Probe::Unit, max_age_s: None, expect: Expect::Live,
         what: "Binds 127.0.0.1 only, holds no credentials, cannot place or cancel an \
                order, and is entirely read-only.",
-    },
-    Decl {
-        id: "dash_py", label: "Python dash", sub: "arbbot-dash.service · :4748",
-        lane: 5, row: 2, kind: "process", unit: Some("arbbot-dash.service"),
-        probe: Probe::Unit, max_age_s: None, expect: Expect::Live,
-        what: "The older instrument panel, still up on its own port so numbers can be \
-               compared side by side.",
     },
     Decl {
         id: "report", label: "nightly ETL + report", sub: "arbbot-report.timer · 07:30",
@@ -261,14 +250,6 @@ const NODES: &[Decl] = &[
         lane: 5, row: 5, kind: "timer", unit: Some("arbbot-settle.timer"),
         probe: Probe::Timer, max_age_s: None, expect: Expect::Live,
         what: "Turns settled baskets into realized P&L by appending to the ledger.",
-    },
-    Decl {
-        id: "sportsmap", label: "sports equivalence map", sub: "arbbot-sports-map.timer · 6h",
-        lane: 5, row: 6, kind: "timer", unit: Some("arbbot-sports-map.timer"),
-        probe: Probe::Timer, max_age_s: None, expect: Expect::Live,
-        what: "Rematches the two venues' sports calendars into candidate pairs. Candidates \
-               only: its rows are vetted_by mechanical, and the engine quotes only rows a \
-               human or agent greenlit in config/registry.yaml.",
     },
     Decl {
         id: "equity", label: "equity history", sub: "arbbot-equity.timer · 15 min",
@@ -296,7 +277,6 @@ const EDGES: &[Edge] = &[
     Edge { from: "recorder", to: "tape", label: "append", kind: "write" },
     Edge { from: "recorder", to: "health", label: "liveness", kind: "write" },
     Edge { from: "sock", to: "trader_m3", label: "frames", kind: "feed" },
-    Edge { from: "sock", to: "scanner", label: "frames", kind: "feed" },
     Edge { from: "registry", to: "trader_m3", label: "vetted pairs", kind: "read" },
     Edge { from: "health", to: "trader_m3", label: "quote gate", kind: "read" },
     Edge { from: "trader_m3", to: "marks", label: "writes", kind: "write" },
@@ -308,7 +288,7 @@ const EDGES: &[Edge] = &[
     Edge { from: "trader_m3", to: "m3_intents", label: "decisions", kind: "write" },
     Edge { from: "trader_m3", to: "ledger", label: "booked baskets", kind: "write" },
     Edge { from: "ledger", to: "trader_m3", label: "open book at start", kind: "read" },
-    Edge { from: "scanner", to: "scan", label: "lifetimes / maker", kind: "write" },
+    Edge { from: "trader_m3", to: "scan", label: "opportunities", kind: "write" },
     Edge { from: "m3_intents", to: "dash_rs", label: "live tape", kind: "read" },
     Edge { from: "ledger", to: "dash_rs", label: "trades view", kind: "read" },
     Edge { from: "scan", to: "dash_rs", label: "opportunities", kind: "read" },
@@ -317,7 +297,6 @@ const EDGES: &[Edge] = &[
     Edge { from: "report", to: "parquet", label: "archive", kind: "write" },
     Edge { from: "health", to: "watchdog", label: "→ ntfy", kind: "read" },
     Edge { from: "settle", to: "ledger", label: "realized P&L", kind: "write" },
-    Edge { from: "sportsmap", to: "scan", label: "candidate pairs", kind: "write" },
     Edge { from: "trader_m3", to: "equity", label: "capital.json", kind: "read" },
     Edge { from: "equity", to: "dash_rs", label: "daily equity", kind: "read" },
 ];

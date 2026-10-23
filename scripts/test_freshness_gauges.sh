@@ -9,7 +9,7 @@
 # The fake is the ENVIRONMENT, never the code under test:
 #   * a temp root whose scripts/ and config/ are SYMLINKS to this repo, so $0 is
 #     the real script and `cd $(dirname $0)/..` lands in the temp root
-#   * fresh data/ fixtures, so the recorder/scanner staleness checks are quiet
+#   * fresh data/ fixtures, so the recorder staleness checks are quiet
 #     and every POST in a scenario is attributable to the gauge block
 #   * stub systemctl / journalctl / curl on PATH
 #   * ARBBOT_WATCHDOG_STATE_DIR pointed at the temp root — the live cooldown

@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# Alert (ntfy, 30-min self-cooldown) when scan output goes stale while the
-# recorder is alive — catches a dead, hung, or crash-looping scanner.
-# Adversarial review P1 fix (2026-07-20): before this, nothing watched the scanner.
-# 2026-07-29: extended past the Python stack to cover the armed Rust engine and
-# its live feed. The retired shadow recorder/trader are intentionally omitted.
+# Alert (ntfy, 30-min self-cooldown) when the recorder, its feeds or the armed
+# Rust engine go stale, die or crash-loop. The retired shadow recorder/trader
+# are intentionally omitted.
 set -u
 cd "$(dirname "$0")/.."
 TOPIC=$(python3 -c "import yaml;print(yaml.safe_load(open('config/recorder.yaml')).get('ntfy_topic',''))" 2>/dev/null)
@@ -72,7 +70,7 @@ note() { routine+=("$1"); }
 armed_page() { armed+=("$1"); }   # own stamp; see STAMP_ARMED above
 age() { echo $(( now - $(stat -c %Y "$1" 2>/dev/null || echo 0) )); }
 
-# --- Python stack ---
+# --- Recorder ---
 # arbbot-recorder is load-bearing — the armed engine reads its socket — so a
 # stopped one pages even though stopping it is deliberate.
 if systemctl --user is-active --quiet arbbot-recorder; then
@@ -83,8 +81,7 @@ if systemctl --user is-active --quiet arbbot-recorder; then
   # <two weeks>s" on every poll while the recorder wrote ~800 MB/day two entries
   # down the same directory — burning the shared cooldown stamp the whole time.
   # "Writing NOTHING" means no feed at all, which is what the newest file
-  # measures, and it survives the next feed-config change too (the scanner
-  # check below has always used this idiom).
+  # measures, and it survives the next feed-config change too.
   newest_raw=$(ls -t data/raw/*-"$DAY".jsonl 2>/dev/null | head -1)
   raw_age=$(age "$newest_raw")
   [ "$raw_age" -gt 900 ] && page "recorder writing NOTHING for ${raw_age}s"
@@ -101,15 +98,9 @@ if systemctl --user is-active --quiet arbbot-recorder; then
 else
   page "recorder service DOWN"
 fi
-if systemctl --user is-active --quiet arbbot-scanner; then
-  newest_scan=$(ls -t data/scan/opportunities-$DAY.jsonl data/scan/probe-$DAY.json 2>/dev/null | head -1)
-  scan_age=$(age "$newest_scan")
-  # a scanner that is UP and producing nothing is the defect this script was
-  # written for, and no operator asked for it — that still pages.
-  [ "$scan_age" -gt 900 ] && page "scanner writing NOTHING for ${scan_age}s (service alive = hung or starved)"
-else
-  note "scanner service DOWN"
-fi
+# The opportunity stream is written by the armed engine, which is watched
+# below; it is quiet whenever nothing crosses, so its age is not a liveness
+# signal and is deliberately not checked.
 
 # --- Armed Rust trader ---
 # The armed trader retries failures indefinitely with 30s -> 5min backoff.
