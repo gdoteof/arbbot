@@ -357,6 +357,9 @@ synthetic() {
   put '{"elapsed_s": 300.0, "_invocation": false}'; ok 360.0
   put '{"elapsed_s": 300.0, "_invocation": [""]}'; ok 360.0
   put '{"elapsed_s": 300.0, "_invocation": "a1"}'; ok 360.0
+  put '{"elapsed_s": 9007199254740993, "_invocation": "a1"}'; ok 9007199254740992.0
+  put '{"elapsed_s": 9007199254740992.0, "_invocation": "a1"}'; ok 9007199254740993
+  put '{"elapsed_s": 9007199254740996.0, "_invocation": "a1"}'; ok 9007199254740995
   put '{"elapsed_s": "abc", "_invocation": "a1"}'; ok 360.0
   put '{"elapsed_s": "abc", "_invocation": "zz"}'; ok 360.0
   put '{"elapsed_s": [1, 2], "_invocation": "a1"}'
