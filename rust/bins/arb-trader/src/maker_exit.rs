@@ -315,7 +315,7 @@ static UNRESOLVED: AtomicU64 = AtomicU64::new(0);
 /// NOT because decrementing would break the page. An earlier draft of this
 /// comment claimed a heal-then-relapse would return the gauge to a value it had
 /// already reported and so fail to read as a rise; that is FALSE, and driving
-/// `scripts/gauge_deltas.py` through 0 -> 1 -> 0 -> 1 shows it paging both
+/// `arb-gauges` through 0 -> 1 -> 0 -> 1 shows it paging both
 /// times. Its RISE rule re-clamps with `base = min(base, cur)` for exactly this
 /// case — "a level that fell needs its baseline to fall with it".
 ///
@@ -325,7 +325,7 @@ static UNRESOLVED: AtomicU64 = AtomicU64::new(0);
 ///     now", which [`outstanding`] already answers, and destroys "how many times
 ///     has this happened" — the number that says whether the close path is
 ///     unreliable rather than unlucky.
-///   * `gauge_deltas.py` picked RISE *because* this gauge is a ratchet, and says
+///   * `arb-gauges` picked RISE *because* this gauge is a ratchet, and says
 ///     so. Making it fall would leave that rule reading something it was not
 ///     chosen for.
 ///   * `maker_exit_healed` is worth reading on its own: it is how an operator
@@ -7087,7 +7087,7 @@ mod tests {
     /// whether the close path is unreliable rather than unlucky.
     ///
     /// (It would NOT break the page. That claim was in an earlier draft and is
-    /// false: `gauge_deltas.py`'s RISE rule re-clamps its baseline with
+    /// false: `arb-gauges`' RISE rule re-clamps its baseline with
     /// `base = min(base, cur)`, and driven through 0 -> 1 -> 0 -> 1 it pages
     /// both times. The reason here is legibility, not alerting.)
     #[tokio::test]

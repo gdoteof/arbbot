@@ -1676,7 +1676,7 @@ impl Engine {
             // `maker_exit_unresolved` counts a Kalshi exit that FILLED and whose
             // PM-US leg did not close — a naked short the ledger still records
             // as a hedged basket. It is a RATCHET and is READ ON A RISE (see
-            // `scripts/gauge_deltas.py`), so it is an INCIDENT COUNT, not a
+            // `rust/bins/arb-gauges`), so it is an INCIDENT COUNT, not a
             // level: `maker_exit_healed` says how many of those incidents
             // `maker_exit::heal` closed by itself, and the difference between
             // the two is what is naked RIGHT NOW. Alarm on the rise of the
