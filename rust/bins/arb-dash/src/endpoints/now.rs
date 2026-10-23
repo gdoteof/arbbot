@@ -31,7 +31,7 @@
 //!     no restart of — the armed engine.
 //!   * the tail of the engine's opportunity stream (`--opportunities-out`),
 //!     for what has crossed inside the window. The engine restates a crossing
-//!     it still sees once a minute, so a row's age says whether it is
+//!     it still sees every 30s, so a row's age says whether it is
 //!     crossing now.
 //!
 //! What this view CANNOT do, stated plainly because the gap is the interesting
@@ -539,7 +539,7 @@ pub fn json(a: &Args) -> String {
         let Some(rel) = o.get("relationship_id").and_then(Value::as_str) else { continue };
         let ts = f(o.get("ts_local_ns")).map(|n| n / 1e9).unwrap_or(now);
         // The same claim bound as the intents: the engine writes a held
-        // crossing once a minute, so 4 MB of tail is hours of history, and an
+        // crossing every 30s, so 4 MB of tail is hours of history, and an
         // edge from the morning is not what is crossing now.
         if ts < now - WINDOW_S {
             continue;

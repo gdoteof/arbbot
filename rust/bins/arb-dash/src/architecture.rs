@@ -210,9 +210,9 @@ const NODES: &[Decl] = &[
         probe: Probe::Newest("data/scan", "opportunities-"), max_age_s: None,
         expect: Expect::Live,
         what: "What crosses, per pair and side, priced by the engine's own fees and depth: a \
-               line when a crossing appears, at most one a second while it moves, one a \
-               minute while it holds. The opportunity views read it; the nightly archive \
-               keeps it.",
+               line when a crossing appears, at most one a second while it moves, one \
+               every 30s while it holds, and none once a leg's book has gone unheard for \
+               90s. The opportunity views read it; the nightly archive keeps it.",
     },
     // ---- observe ----------------------------------------------------------
     Decl {
