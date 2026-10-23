@@ -37,8 +37,14 @@ struct Run {
 /// Run the shell over `source` (`--bench-tape` or `--replay-wal`), returning
 /// its digest, stats summary and the intent file it wrote.
 fn run(src_flag: &str, src: &Path, out: &Path, wal: Option<&Path>) -> Run {
+    run_with(src_flag, src, out, wal, &[])
+}
+
+/// `run`, with further arguments appended to the command line.
+fn run_with(src_flag: &str, src: &Path, out: &Path, wal: Option<&Path>, extra: &[&std::ffi::OsStr]) -> Run {
     let _ = std::fs::remove_file(out);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_arb-trader"));
+    cmd.args(extra);
     cmd.arg(src_flag)
         .arg(src)
         .arg("--registry")
@@ -137,6 +143,44 @@ fn logging_a_wal_does_not_change_decisions() {
     let with = run("--bench-tape", &tape, &tmp("yeswal.jsonl"), Some(&tmp("neutral.wal")));
     assert_eq!(without.digest, with.digest, "--wal is decision-neutral");
     assert_eq!(without.intents, with.intents);
+}
+
+/// `--opportunities-out` is decision-neutral: over a tape whose books cross,
+/// so the stream really prices and writes, the intent stream is byte-identical
+/// with and without it. A bench run's stream is itself deterministic.
+#[test]
+fn the_opportunity_stream_does_not_change_decisions() {
+    let tape = data("synth-crossing-tape.jsonl");
+    let with_opps = |name: &str| {
+        let dir = tmp(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        let r = run_with(
+            "--bench-tape",
+            &tape,
+            &tmp(&format!("{name}.jsonl")),
+            None,
+            &["--opportunities-out".as_ref(), dir.as_os_str()],
+        );
+        // 1700000000 is 2023-11-14 UTC
+        let text = std::fs::read_to_string(dir.join("opportunities-2023-11-14.jsonl")).expect("stream file");
+        (r, text)
+    };
+    let without = run("--bench-tape", &tape, &tmp("noopps.jsonl"), None);
+    let (with, text) = with_opps("opps-a");
+    let (_, again) = with_opps("opps-b");
+    assert!(!without.intents.is_empty(), "the tape must make the engine decide something");
+    assert_eq!(without.digest, with.digest, "--opportunities-out is decision-neutral");
+    assert_eq!(without.intents, with.intents);
+    assert!(without.summary["opportunities"].is_null(), "off by default");
+    assert_eq!(text, again, "a bench run's stream is a function of the tape");
+    let recs: Vec<serde_json::Value> =
+        text.lines().map(|l| serde_json::from_str(l).expect("record json")).collect();
+    assert!(!recs.is_empty(), "the crossing was written");
+    assert!(recs.iter().all(|r| r["relationship_id"] == "synth-fill-rel"
+        && r["signature"] == "synth-fill-rel:YN"
+        && r["engine_scope"] == "quoted"));
+    assert_eq!(with.summary["opportunities"]["written"], recs.len() as u64);
+    assert_eq!(with.summary["opportunities"]["dropped"], 0);
 }
 
 // ------------------------------------------------------------ hedge placing ---

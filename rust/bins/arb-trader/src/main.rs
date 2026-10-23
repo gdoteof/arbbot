@@ -27,7 +27,7 @@
 // `toxgate_stale` and `maker_apr_bar`. Each fit alone; together they did not,
 // so both branches gated green and the merge would not have built — the same
 // shape as #33, caught here only because the gate now refuses a stale base.
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 mod capital;
 mod engine;
@@ -39,6 +39,7 @@ mod ledger;
 mod maker_exit;
 mod marks;
 mod naked_act;
+mod opportunities;
 mod orphan;
 mod positions;
 mod risk;
@@ -203,6 +204,9 @@ struct Args {
     /// `--maker-exit` when both are given — same rule, same reason, same
     /// function as `--positions-recon-act-shadow`.
     maker_exit_shadow: bool,
+    /// Write the opportunity stream (`crate::opportunities`) into this
+    /// directory as `opportunities-<UTC day>.jsonl`. `None` = off, the default.
+    opportunities_out: Option<String>,
 }
 
 /// The floating maker APR bar (Geoff 2026-07-22, card 80ff7987), port of
@@ -287,6 +291,7 @@ fn default_args() -> Args {
         maker_exit_take: false,
         exit_blackouts: "config/exit-blackouts.yaml".into(),
         maker_exit_shadow: false,
+        opportunities_out: None,
     }
 }
 
@@ -379,6 +384,9 @@ fn parse_args() -> Args {
             "--maker-exit-take" => a.maker_exit_take = true,
             "--exit-blackouts" => a.exit_blackouts = it.next().unwrap_or_default(),
             "--maker-exit-shadow" => a.maker_exit_shadow = true,
+            "--opportunities-out" => {
+                a.opportunities_out = Some(it.next().expect("--opportunities-out value"))
+            }
             // Retired with config/tradable.yaml: the registry verdict is the
             // whole gate. Accepted and ignored so a unit or rollback drop-in
             // that still passes it cannot strand the trader on exit 2, which
@@ -2120,6 +2128,8 @@ fn run_cfg(
     engine::RunCfg {
         hedges_undischarged: undischarged,
         adopt: Vec::new(),
+        // Read from the registry by `main` before anything is armed.
+        opportunities: None,
         out_path: args.out,
         kill_file: args.kill_file,
         stats_every_s: args.stats_every_s,
@@ -2236,6 +2246,10 @@ async fn main() {
     };
 
     let (mut quoters, by_market, rel_meta) = load_quoters(&args.registry, &args.rel_prefixes);
+    let opportunities = args
+        .opportunities_out
+        .as_deref()
+        .map(|dir| opportunities::Spec::load(dir, &args.registry, &args.rel_prefixes));
     // ONE read of the trade ledger, folded by BOTH seeds. Reading it twice
     // straddles `startup_sweep`'s venue round-trip, and a basket appended by
     // arbbot-hedge.timer inside that window reaches neither seed — see
@@ -2377,6 +2391,7 @@ async fn main() {
     let mut cfg =
         run_cfg(args, bench, armed, !exec_txs.is_empty(), risk, undischarged, policy);
     cfg.adopt = adopt;
+    cfg.opportunities = opportunities;
     let summary = engine::run(quoters, by_market, rx, exec_txs, exec_stats, cfg).await;
     println!("{summary}");
     if armed {
