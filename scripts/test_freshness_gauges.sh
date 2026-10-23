@@ -7,8 +7,9 @@
 # timer runs, not a copy or a reimplementation — against captured stats lines.
 #
 # The fake is the ENVIRONMENT, never the code under test:
-#   * a temp root whose scripts/ and config/ are SYMLINKS to this repo, so $0 is
-#     the real script and `cd $(dirname $0)/..` lands in the temp root
+#   * a temp root whose scripts/ and rust/ are SYMLINKS to this repo, so $0 is
+#     the real script, `cd $(dirname $0)/..` lands in the temp root, and the
+#     gauge evaluator it runs is this repo's rust/target/release/arb-gauges
 #   * fresh data/ fixtures, so the recorder staleness checks are quiet
 #     and every POST in a scenario is attributable to the gauge block
 #   * stub systemctl / journalctl / curl on PATH
@@ -27,12 +28,19 @@ REPO=$PWD
 PROOF=0
 [ "${1:-}" = --with-exit-code-proof ] && PROOF=1
 
-TMP=$(mktemp -d /tmp/arbbot-gaugetest.XXXXXX)
+# Without the binary every gauge scenario below would fail on "gauge check
+# FAILED to run (arb-gauges exited 127)", which reads like a dozen defects.
+[ -x "$REPO/rust/target/release/arb-gauges" ] || {
+  echo "no rust/target/release/arb-gauges — build it: (cd rust && cargo build --release -p arb-gauges)" >&2
+  exit 2
+}
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/arbbot-gaugetest.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 ROOT=$TMP/root
 mkdir -p "$ROOT/data/raw" "$ROOT/data/raw-rs" "$ROOT/data/scan" "$TMP/bin" "$TMP/creds"
 ln -s "$REPO/scripts" "$ROOT/scripts"
-ln -s "$REPO/config" "$ROOT/config"
+ln -s "$REPO/rust" "$ROOT/rust"
 DAY=$(date -u +%F)
 touch "$ROOT/data/raw/polymarket-$DAY.jsonl" "$ROOT/data/health.jsonl" \
       "$ROOT/data/scan/opportunities-$DAY.jsonl" \
