@@ -1,4 +1,4 @@
-//! Opportunity coverage per pair, straight off the scanner's tape.
+//! Opportunity coverage per pair, straight off the opportunity stream.
 
 use arb_query::{opps, sources_for_range};
 

@@ -775,7 +775,7 @@ function nowOpportunities(d){
   const order = ['acted','refused','no refusal seen','out of engine scope','not tradable'];
   const total = Object.values(by).reduce((a,b) => a+b.usd, 0) || 1;
   return $(`<section class="wide">
-    <h2>On the table right now &middot; ${dur(o.window_s)} of the scanner's stream</h2>
+    <h2>On the table right now &middot; ${dur(o.window_s)} of the engine's opportunity stream</h2>
     <div class="split">${order.filter(k=>by[k]).map(k =>
       `<i class="v-${VERDICT[k].cls}" style="width:${(by[k].usd/total*100).toFixed(1)}%"
          title="${esc(k)}: ${esc(VERDICT[k].what)}"></i>`).join('')}</div>
@@ -788,7 +788,7 @@ function nowOpportunities(d){
         <th>topic</th><th>why not</th></tr></thead>
       <tbody>${rows.map(r => `<tr data-k="o-${esc(r.relationship_id)}">
         <td><span class="rel">${esc(r.relationship_id)}</span>
-          <div class="sub">${esc(r.tranche)} &middot; seen ${r.observations}&times; &middot;
+          <div class="sub">${esc(r.tranche)} &middot; ${r.observations} lines &middot;
             last ${dur(r.last_age_s)} ago</div></td>
         <td class="num">${(r.best_edge*100).toFixed(2)}&cent;</td>
         <td class="num"><b>${usd0(r.edge_usd)}</b></td>
@@ -801,7 +801,8 @@ function nowOpportunities(d){
       </tr>`).join('')}</tbody>
     </table></div>
     <div class="sub" style="margin-top:8px">
-      Crossings the SCANNER found, over every registry pair; the verdict is what
+      Crossings the opportunity stream found, over every two-leg Kalshi / PM-US
+      registry pair that is not rejected; the verdict is what
       the ENGINE could do about each. <b>not tradable</b> and <b>out of engine
       scope</b> were never evaluated by a gate, so no amount of freed capital
       reaches them — they need a vetting decision${o.scope?' or a wider <code>--rel-prefix</code> than <code>'+esc(o.scope)+'</code>':''}.
