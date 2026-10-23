@@ -35,12 +35,16 @@
 //!     `not_tradable` (the registry verdict does not greenlight it) or
 //!     `out_of_scope` (greenlit, but outside `--rel-prefix`).
 //!   * A line is written when a crossing appears or changes, at most once a
-//!     second, and once a minute while it holds unchanged — not on every book
-//!     event. See [`SigState`].
+//!     second, and every 30s of tape time while it holds unchanged — not on
+//!     every book event. See [`SigState`].
 //!
-//! Like the Python scanner it reads no market status and no feed health: a
-//! frozen book on a closed market can show as a crossing until a snapshot
-//! replaces it, and a FEED_DOWN line clears every book.
+//! There is no market catalog here, so no market status. The Python scanner
+//! skipped a pair while its catalog showed a leg neither active nor unknown;
+//! this treats a pair as not crossing once any leg's book has gone unheard for
+//! [`SILENT_AFTER_NS`] of tape time. The recorder re-sends every book it holds
+//! every 30s and evicts closed and resolved markets without a tombstone, so
+//! silence is how an eviction looks from here. It reads no feed health; a
+//! FEED_DOWN line clears every book.
 
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
@@ -58,7 +62,19 @@ use arb_core::scan::{scan_relationship, Cx, MarketMeta, Opportunity, Rel, RelLeg
 const QUEUE: usize = 65536;
 /// The least time between two lines for one signature while it is changing.
 const MIN_GAP_NS: i64 = 1_000_000_000;
-const NS_PER_MIN: i64 = 60_000_000_000;
+/// How often an unchanged crossing is written again. Under 60s, so a reader
+/// that ends a spell at a 60s gap (the Python scanner's lifetimes) never sees
+/// one inside a crossing that holds, and every minute still has a line.
+const HOLD_RESTATE_NS: i64 = 30_000_000_000;
+/// How often arb-recorder re-sends a snapshot of every book it holds
+/// (`health::health_task`, started with 30.0 in its `main`).
+const RECORDER_RESTATE_NS: i64 = 30_000_000_000;
+/// A book unheard for this long has been evicted by the recorder, which sends
+/// no tombstone: three missed restatements.
+const SILENT_AFTER_NS: i64 = 3 * RECORDER_RESTATE_NS;
+/// The day file's write buffer. A record (about 600 bytes) shorter than this
+/// reaches the file in one write; see `DayFiles::write`.
+const WRITE_BUF: usize = 8 * 1024;
 const NS_PER_DAY: i64 = 86_400_000_000_000;
 
 /// Whether this process quotes a relationship, and if not, why not — the two
@@ -141,7 +157,8 @@ struct Gauges {
 
 /// The engine's handle on the stream.
 pub struct Emitter {
-    tx: Option<SyncSender<String>>,
+    /// Each line travels with the drop count at the moment it was queued.
+    tx: Option<SyncSender<(u64, String)>>,
     /// Wait for room rather than drop: bench and WAL replay, where nothing is
     /// live to stall and the stream should not depend on thread scheduling.
     lossless: bool,
@@ -162,7 +179,7 @@ impl Emitter {
             count(EngineScope::OutOfScope),
             spec.dir
         );
-        let (tx, rx) = sync_channel::<String>(QUEUE);
+        let (tx, rx) = sync_channel::<(u64, String)>(QUEUE);
         let g = gauges.clone();
         match std::thread::Builder::new().name("opportunities".into()).spawn(move || drain(spec, rx, &g)) {
             Ok(h) => Emitter { tx: Some(tx), lossless, thread: Some(h), gauges },
@@ -174,10 +191,12 @@ impl Emitter {
     }
 
     /// Queue one feed line the engine has finished with. Never blocks unless
-    /// `lossless`.
+    /// `lossless`. Called from the engine's one thread, which is also the only
+    /// writer of `dropped`.
     pub fn offer(&self, line: String) {
         if let Some(tx) = &self.tx {
-            let sent = if self.lossless { tx.send(line).is_ok() } else { tx.try_send(line).is_ok() };
+            let msg = (self.gauges.dropped.load(AtomicOrdering::Relaxed), line);
+            let sent = if self.lossless { tx.send(msg).is_ok() } else { tx.try_send(msg).is_ok() };
             if !sent {
                 self.gauges.dropped.fetch_add(1, AtomicOrdering::Relaxed);
             }
@@ -206,17 +225,16 @@ impl Emitter {
 /// The thread body: apply each line, price what it moved, write what is due,
 /// and flush whenever the queue is empty — so a tail is at most one line
 /// behind, and a burst is written in large pieces.
-fn drain(spec: Spec, rx: Receiver<String>, g: &Gauges) {
+fn drain(spec: Spec, rx: Receiver<(u64, String)>, g: &Gauges) {
     let mut scan = Scanner::new(spec.rels);
     let mut files = DayFiles::new(&spec.dir);
     let mut out = Vec::new();
     let mut drops_seen = 0u64;
     let mut next = rx.recv().ok();
-    while let Some(line) = next {
-        // A line queued after a drop is received after the drop was counted,
-        // so checking here means no line is ever applied to a book that
-        // missed one.
-        let drops = g.dropped.load(AtomicOrdering::Relaxed);
+    while let Some((drops, line)) = next {
+        // The first line queued after a drop is the first to carry the new
+        // count, so the books are discarded exactly where the gap is and no
+        // line is applied to a book that missed one.
         if drops != drops_seen {
             if drops_seen == 0 {
                 eprintln!(
@@ -257,15 +275,16 @@ struct Obs {
 /// been written about it.
 ///
 /// A line is written when the crossing appears; when its priced content (size,
-/// prices, fees, edge) changes, at most once per [`MIN_GAP_NS`]; once per UTC
-/// minute while it holds unchanged; and, if a change is still unwritten, when
-/// it vanishes. Within a throttled interval the highest-edge state is the one
-/// written, and the latest state follows it once the gap allows. That keeps
-/// what the dashboard reads off the tail — each pair's best edge over the
-/// window, how long ago it was last seen, the minutes it was seen in — while a
-/// crossing that sits for an hour costs sixty lines rather than one per book
-/// event. On the Python scanner's 2026-10-22 file (291,601 lines) the same
-/// signatures changed state 8,551 times across 17,265 signature-minutes.
+/// prices, fees, edge) changes, at most once per [`MIN_GAP_NS`]; every
+/// [`HOLD_RESTATE_NS`] while it holds unchanged; and, if a change is still
+/// unwritten, when it vanishes or a leg falls silent. Within a throttled
+/// interval the highest-edge state is the one written, and the latest state
+/// follows it once the gap allows. That keeps what the dashboard reads off the
+/// tail — each pair's best edge over the window, how long ago it was last
+/// seen, the minutes it was seen in — while a crossing that sits for an hour
+/// costs 120 lines rather than one per book event. On the Python scanner's
+/// 2026-10-22 file (291,601 lines) the same signatures changed state 8,551
+/// times across 17,265 signature-minutes.
 struct SigState {
     sig: String,
     last: Obs,
@@ -307,9 +326,8 @@ impl SigState {
                 return Some((b.ts, b.prefix));
             }
         }
-        let new_minute =
-            self.written_at.is_some_and(|t| t.div_euclid(NS_PER_MIN) != now.div_euclid(NS_PER_MIN));
-        if self.best.is_none() && new_minute {
+        let held = self.written_at.is_some_and(|t| now.saturating_sub(t) >= HOLD_RESTATE_NS);
+        if self.best.is_none() && held {
             self.written_at = Some(now);
             return Some((now, self.last.prefix.clone()));
         }
@@ -330,6 +348,16 @@ fn prefix_of(cx: &mut Cx, o: &Opportunity) -> Option<String> {
     Some(line)
 }
 
+/// A market some pair prices.
+struct Watched {
+    /// Indexes into `Scanner::rels` of the pairs with a leg on it.
+    rels: Vec<usize>,
+    /// `clock_ns` when a snapshot or delta was last applied to its book. The
+    /// clock, not the line's own timestamp: a restated snapshot carries the
+    /// time its book last changed, however recently it was sent.
+    heard: Option<i64>,
+}
+
 /// Books, the pricing universe and the open crossings. Pure: lines in,
 /// `(ts, record)` pairs out, so every rule above is testable without a thread
 /// or a file.
@@ -338,7 +366,7 @@ struct Scanner {
     fees: FeeSchedule,
     books: BookBuilder,
     rels: Vec<(Rel, EngineScope)>,
-    by_market: HashMap<Venue, HashMap<String, Vec<usize>>>,
+    markets: HashMap<Venue, HashMap<String, Watched>>,
     dirty: BTreeSet<usize>,
     open: Vec<Vec<SigState>>,
     clock_ns: i64,
@@ -348,14 +376,20 @@ impl Scanner {
     fn new(rels: Vec<(Rel, EngineScope)>) -> Scanner {
         let mut cx = Cx::default();
         let fees = FeeSchedule::new(&mut cx);
-        let mut by_market: HashMap<Venue, HashMap<String, Vec<usize>>> = HashMap::new();
+        let mut markets: HashMap<Venue, HashMap<String, Watched>> = HashMap::new();
         for (ri, (rel, _)) in rels.iter().enumerate() {
             for leg in &rel.legs {
-                by_market.entry(leg.venue).or_default().entry(leg.market_id.clone()).or_default().push(ri);
+                markets
+                    .entry(leg.venue)
+                    .or_default()
+                    .entry(leg.market_id.clone())
+                    .or_insert_with(|| Watched { rels: Vec::new(), heard: None })
+                    .rels
+                    .push(ri);
             }
         }
         let open = rels.iter().map(|_| Vec::new()).collect();
-        Scanner { cx, fees, books: BookBuilder::new(), rels, by_market, dirty: BTreeSet::new(), open, clock_ns: 0 }
+        Scanner { cx, fees, books: BookBuilder::new(), rels, markets, dirty: BTreeSet::new(), open, clock_ns: 0 }
     }
 
     /// Apply one feed line. Snapshots and deltas are read exactly as
@@ -376,7 +410,7 @@ impl Scanner {
         let ts_local_ns = v.get("ts_local_ns").and_then(|x| x.as_i64()).unwrap_or(0);
         let ts_venue = v.get("ts_venue").and_then(|x| x.as_str()).map(str::to_owned);
         self.clock_ns = self.clock_ns.max(ts_local_ns);
-        let Some(idxs) = self.by_market.get(&venue).and_then(|m| m.get(market_id)) else { return };
+        let Some(w) = self.markets.get_mut(&venue).and_then(|m| m.get_mut(market_id)) else { return };
         let moved = if kind == "snapshot" {
             let (Some(bids), Some(asks)) =
                 (crate::engine::levels_of(v.get("bids")), crate::engine::levels_of(v.get("asks")))
@@ -384,6 +418,7 @@ impl Scanner {
                 return;
             };
             self.books.apply_snapshot(venue, market_id, bids, asks, seq, ts_local_ns, ts_venue);
+            w.heard = Some(self.clock_ns);
             true
         } else {
             let Some(side) = v.get("side").and_then(|x| x.as_str()).and_then(BookSide::parse) else {
@@ -395,26 +430,50 @@ impl Scanner {
                 return;
             };
             match self.books.apply_delta(venue, market_id, side, price, size, seq, ts_local_ns, ts_venue) {
-                Ok(applied) => applied,
+                Ok(applied) => {
+                    w.heard = Some(self.clock_ns);
+                    applied
+                }
                 // The builder removed the book: whatever crossed on it is gone.
                 Err(ApplyError::GapDetected { .. }) => true,
                 Err(ApplyError::NotSynced) => false,
             }
         };
         if moved {
-            self.dirty.extend(idxs.iter().copied());
+            self.dirty.extend(w.rels.iter().copied());
         }
     }
 
-    /// Price every relationship whose books moved since the last call, then
-    /// emit whatever is due.
+    /// Every leg of pair `ri` has been heard within [`SILENT_AFTER_NS`].
+    fn live(&self, ri: usize, now: i64) -> bool {
+        self.rels.get(ri).is_some_and(|(rel, _)| {
+            rel.legs.iter().all(|l| {
+                self.markets
+                    .get(&l.venue)
+                    .and_then(|m| m.get(&l.market_id))
+                    .and_then(|w| w.heard)
+                    .is_some_and(|t| now.saturating_sub(t) <= SILENT_AFTER_NS)
+            })
+        })
+    }
+
+    /// Price every relationship whose books moved since the last call, close
+    /// every crossing with a silent leg, then emit whatever is due.
     fn price(&mut self, out: &mut Vec<(i64, String)>) {
         let now = self.clock_ns;
         for ri in std::mem::take(&mut self.dirty) {
             self.rescan(ri, now, out);
         }
-        for (ri, states) in self.open.iter_mut().enumerate() {
-            let Some((_, scope)) = self.rels.get(ri) else { continue };
+        for ri in 0..self.open.len() {
+            if self.open[ri].is_empty() {
+                continue;
+            }
+            let live = self.live(ri, now);
+            let (Some((_, scope)), Some(states)) = (self.rels.get(ri), self.open.get_mut(ri)) else { continue };
+            if !live {
+                close(states, *scope, out);
+                continue;
+            }
             for st in states.iter_mut() {
                 if let Some((ts, prefix)) = st.due(now) {
                     out.push((ts, record(&prefix, ts, *scope)));
@@ -424,6 +483,7 @@ impl Scanner {
     }
 
     fn rescan(&mut self, ri: usize, now: i64, out: &mut Vec<(i64, String)>) {
+        let live = self.live(ri, now);
         let Scanner { cx, fees, books, rels, open, .. } = self;
         let (Some((rel, scope)), Some(states)) = (rels.get(ri), open.get_mut(ri)) else { return };
         let one = cx.one;
@@ -433,7 +493,8 @@ impl Scanner {
             close_time: None,
             taker_coef_override: None,
         };
-        let seen: Vec<(String, Obs)> = scan_relationship(cx, fees, rel, books, &metas, 0)
+        let found = if live { scan_relationship(cx, fees, rel, books, &metas, 0) } else { Vec::new() };
+        let seen: Vec<(String, Obs)> = found
             .iter()
             .filter_map(|o| {
                 let prefix = prefix_of(cx, o)?;
@@ -462,14 +523,22 @@ impl Scanner {
     fn reset(&mut self, out: &mut Vec<(i64, String)>) {
         for (ri, states) in self.open.iter_mut().enumerate() {
             let Some((_, scope)) = self.rels.get(ri) else { continue };
-            for st in states.drain(..) {
-                if let Some(b) = st.best {
-                    out.push((b.ts, record(&b.prefix, b.ts, *scope)));
-                }
-            }
+            close(states, *scope, out);
+        }
+        for w in self.markets.values_mut().flat_map(|m| m.values_mut()) {
+            w.heard = None;
         }
         self.books = BookBuilder::new();
         self.dirty.clear();
+    }
+}
+
+/// End every crossing in `states`, writing any change not yet written.
+fn close(states: &mut Vec<SigState>, scope: EngineScope, out: &mut Vec<(i64, String)>) {
+    for st in states.drain(..) {
+        if let Some(b) = st.best {
+            out.push((b.ts, record(&b.prefix, b.ts, scope)));
+        }
     }
 }
 
@@ -499,12 +568,17 @@ impl DayFiles {
         if self.w.is_none() {
             self.day = None;
         }
-        for (ts, line) in out.drain(..) {
+        for (ts, mut line) in out.drain(..) {
             let day = ts.div_euclid(NS_PER_DAY);
             if self.day != Some(day) {
                 self.open(day, g);
             }
-            let ok = self.w.as_mut().is_some_and(|w| writeln!(w, "{line}").is_ok());
+            // One `write_all` per record, newline included. `BufWriter`
+            // flushes before buffering a write that does not fit, so a record
+            // shorter than its buffer never straddles two syscalls, and a kill
+            // cannot leave half a record joined to the next.
+            line.push('\n');
+            let ok = self.w.as_mut().is_some_and(|w| w.write_all(line.as_bytes()).is_ok());
             if ok {
                 g.written.fetch_add(1, AtomicOrdering::Relaxed);
             } else {
@@ -528,7 +602,7 @@ impl DayFiles {
         let f = std::fs::create_dir_all(&self.dir)
             .and_then(|_| std::fs::OpenOptions::new().create(true).append(true).open(&path));
         match f {
-            Ok(f) => self.w = Some(std::io::BufWriter::new(f)),
+            Ok(f) => self.w = Some(std::io::BufWriter::with_capacity(WRITE_BUF, f)),
             Err(e) => {
                 if !self.warned {
                     eprintln!("[opportunities] cannot open {}: {e}", path.display());
@@ -551,6 +625,8 @@ impl DayFiles {
 mod tests {
     use super::*;
 
+    const S: i64 = 1_000_000_000;
+    const NS_PER_MIN: i64 = 60 * S;
     const K: &str = "KXHEISMAN-27-MTONE";
     const P: &str = "tec-cfb-heisman-2026-12-13-w-malton";
     /// 2026-10-22T00:00:00Z
@@ -600,6 +676,13 @@ mod tests {
             snap("kalshi", K, 1, ts, &[("0.06", "19")], &[("0.07", "500")]),
             snap("polymarket_us", P, 1, ts, &[("0.02", "500")], &[("0.05", "300")]),
         ]
+    }
+
+    /// Every book the scanner holds, restated the way arb-recorder's 30s
+    /// rebroadcast restates it: the same levels and seq, stamped with the
+    /// time the book last changed.
+    fn rebroadcast(scan: &Scanner) -> Vec<String> {
+        scan.books.snapshot_events().iter().map(|e| e.to_json_line()).collect()
     }
 
     /// Feed lines exactly as `drain` does, returning what would be written.
@@ -690,7 +773,7 @@ relationships:
 
     /// A book that ticks a thousand times inside one second yields one line for
     /// the change, carrying the best edge seen; a crossing that then sits
-    /// unchanged costs one line a minute; and the latest state is not lost.
+    /// unchanged costs one line every 30s; and the latest state is not lost.
     #[test]
     fn volume_is_bounded_per_signature_and_the_best_edge_survives() {
         let mut scan = Scanner::new(vec![rel(EngineScope::Quoted)]);
@@ -729,17 +812,24 @@ relationships:
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].1["basket"][1]["vwap"], "0.050000");
 
-        // Five quiet minutes of unrelated feed: one heartbeat per minute.
-        let mut beats = 0;
-        for s in 0..300i64 {
-            let ts = t0 + 3 * MIN_GAP_NS + s * 1_000_000_000;
-            beats += run(&mut scan, &[snap("kalshi", "UNRELATED", 3 + s as u64, ts, &[], &[])]).len();
+        // Five quiet minutes of unrelated feed, with both books restated every
+        // 30s as the recorder restates them — old timestamps and all, which
+        // must still count as hearing them.
+        let mut beats = Vec::new();
+        for i in 0..300i64 {
+            let ts = t0 + 3 * MIN_GAP_NS + i * S;
+            let mut lines = vec![snap("kalshi", "UNRELATED", 3 + i as u64, ts, &[], &[])];
+            if i % 30 == 15 {
+                lines.extend(rebroadcast(&scan));
+            }
+            beats.extend(run(&mut scan, &lines).into_iter().map(|(ts, _)| ts));
         }
-        assert_eq!(beats, 5, "one line per UTC minute while unchanged");
+        assert_eq!(beats.len(), 9, "{beats:?}");
+        assert!(beats.windows(2).all(|w| w[1] - w[0] == HOLD_RESTATE_NS), "{beats:?}");
 
         // A change that is still throttled when the crossing vanishes is
         // written as it goes, so a short spike is never lost.
-        let t1 = t0 + 10 * NS_PER_MIN;
+        let t1 = t0 + 303 * S;
         assert_eq!(run(&mut scan, &[delta("polymarket_us", P, 1004, t1, "ask", "0.045", "19")]).len(), 1);
         let spike = run(&mut scan, &[delta("polymarket_us", P, 1005, t1 + 10, "ask", "0.03", "19")]);
         assert!(spike.is_empty(), "throttled");
@@ -766,14 +856,54 @@ relationships:
         assert_eq!(run(&mut scan, &crossing(DAY0 + 4 * NS_PER_MIN)).len(), 1);
     }
 
-    /// Wait for the writer thread to have written `n` lines, so a test can
-    /// act between two lines the way the engine would.
-    fn wait_written(g: &Gauges, n: u64) {
-        let t = std::time::Instant::now();
-        while g.written.load(AtomicOrdering::Relaxed) < n {
-            assert!(t.elapsed() < std::time::Duration::from_secs(10), "writer thread stalled");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+    /// The recorder evicts a closed market's book and sends no tombstone. A
+    /// pair with a leg unheard past `SILENT_AFTER_NS` stops being written, its
+    /// unwritten change going out as it closes; it comes back only once every
+    /// leg has been heard again.
+    #[test]
+    fn a_crossing_whose_legs_fall_silent_stops_until_they_are_heard() {
+        let mut scan = Scanner::new(vec![rel(EngineScope::Quoted)]);
+        let t0 = DAY0;
+        assert_eq!(run(&mut scan, &crossing(t0)).len(), 1);
+        let better = delta("polymarket_us", P, 2, t0 + S / 2, "ask", "0.04", "19");
+        assert!(run(&mut scan, &[better]).is_empty(), "throttled");
+
+        let quiet = |scan: &mut Scanner, from: i64, to: i64| -> usize {
+            (from..=to)
+                .step_by(10)
+                .map(|i| run(scan, &[snap("kalshi", "UNRELATED", i as u64, t0 + i * S, &[], &[])]).len())
+                .sum()
+        };
+        // The throttled change goes out at 30s and heartbeats follow at 60s
+        // and 90s; by 91s the Kalshi leg has been silent past the bound.
+        assert_eq!(quiet(&mut scan, 30, 90), 3);
+        let closed = run(&mut scan, &[snap("kalshi", "UNRELATED", 91, t0 + 91 * S, &[], &[])]);
+        assert!(closed.is_empty(), "nothing was left unwritten: {closed:?}");
+        assert!(scan.open[0].is_empty(), "closed once a leg is silent");
+        assert_eq!(quiet(&mut scan, 100, 300), 0, "no heartbeat for a silent pair");
+
+        // One leg heard again is not enough; both are.
+        let k = snap("kalshi", K, 2, t0 + 301 * S, &[("0.06", "19")], &[("0.07", "500")]);
+        assert!(run(&mut scan, &[k]).is_empty());
+        let p = snap("polymarket_us", P, 3, t0 + 302 * S, &[("0.02", "500")], &[("0.05", "300")]);
+        let back = run(&mut scan, &[p]);
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert_eq!(back[0].0, t0 + 302 * S);
+    }
+
+    /// A change still unwritten when the legs fall silent is written as the
+    /// crossing closes, stamped when it was seen.
+    #[test]
+    fn falling_silent_writes_the_unwritten_change() {
+        let mut scan = Scanner::new(vec![rel(EngineScope::Quoted)]);
+        assert_eq!(run(&mut scan, &crossing(DAY0)).len(), 1);
+        let better = delta("polymarket_us", P, 2, DAY0 + S / 2, "ask", "0.04", "19");
+        assert!(run(&mut scan, &[better]).is_empty(), "throttled");
+        let late = run(&mut scan, &[snap("kalshi", "UNRELATED", 1, DAY0 + 100 * S, &[], &[])]);
+        assert_eq!(late.len(), 1, "{late:?}");
+        assert_eq!(late[0].0, DAY0 + S / 2);
+        assert_eq!(late[0].1["basket"][1]["vwap"], "0.040000");
+        assert!(scan.open[0].is_empty());
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -790,7 +920,7 @@ relationships:
     fn files_roll_at_utc_midnight() {
         let dir = scratch("roll");
         let mut e = Emitter::spawn(Spec { dir: dir.to_string_lossy().into_owned(), rels: vec![rel(EngineScope::Quoted)] }, false);
-        let before = DAY0 - 2 * NS_PER_MIN;
+        let before = DAY0 - 40 * S;
         for l in crossing(before) {
             e.offer(l);
         }
@@ -810,30 +940,47 @@ relationships:
         assert_eq!(e.gauges(), serde_json::json!({"written": 2, "dropped": 0, "write_errors": 0}));
     }
 
-    /// A line the engine could not queue empties the books before the next
-    /// line is applied: the open crossing is forgotten rather than restated
-    /// off a book that may have missed a delta.
+    /// The books are discarded exactly where a line went missing. Lines queued
+    /// before the drop are applied even though the drop is already counted
+    /// when they are read; the first line queued after it finds empty books,
+    /// so the open crossing is forgotten rather than restated off a book that
+    /// may have missed a delta.
     #[test]
     fn a_dropped_line_discards_the_books() {
         for dropped in [false, true] {
-            let g = Arc::new(Gauges::default());
-            let (tx, rx) = sync_channel::<String>(8);
-            let dir = scratch(if dropped { "drop-yes" } else { "drop-no" });
-            let spec = Spec { dir: dir.to_string_lossy().into_owned(), rels: vec![rel(EngineScope::Quoted)] };
-            let g2 = g.clone();
-            let h = std::thread::spawn(move || drain(spec, rx, &g2));
-            for l in crossing(DAY0) {
-                tx.send(l).unwrap();
-            }
-            wait_written(&g, 1);
+            let g = Gauges::default();
             if dropped {
                 g.dropped.fetch_add(1, AtomicOrdering::Relaxed);
             }
-            tx.send(snap("kalshi", "UNRELATED", 1, DAY0 + 2 * NS_PER_MIN, &[], &[])).unwrap();
+            let (tx, rx) = sync_channel::<(u64, String)>(8);
+            for l in crossing(DAY0) {
+                tx.send((0, l)).unwrap();
+            }
+            let after = u64::from(dropped);
+            tx.send((after, snap("kalshi", "UNRELATED", 1, DAY0 + 40 * S, &[], &[]))).unwrap();
             drop(tx);
-            h.join().unwrap();
+            let dir = scratch(if dropped { "drop-yes" } else { "drop-no" });
+            drain(Spec { dir: dir.to_string_lossy().into_owned(), rels: vec![rel(EngineScope::Quoted)] }, rx, &g);
             let want = if dropped { 1 } else { 2 };
             assert_eq!(g.written.load(AtomicOrdering::Relaxed), want, "dropped={dropped}");
         }
+    }
+
+    /// A record and its newline reach the file in one write. The second record
+    /// here exactly fills the buffer behind the first, so its newline is the
+    /// byte that does not fit: written apart, the record would go to the file
+    /// without it, and a kill then would join it to whatever is appended next.
+    #[test]
+    fn a_record_is_one_write() {
+        let dir = scratch("one-write");
+        let path = dir.join("opportunities-2026-10-22.jsonl");
+        let mut files = DayFiles::new(&dir.to_string_lossy());
+        let g = Gauges::default();
+        let a = "a".repeat(4000);
+        let b = "b".repeat(WRITE_BUF - a.len() - 1);
+        files.write(&mut vec![(DAY0, a.clone()), (DAY0, b.clone())], &g);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{a}\n"), "only whole records");
+        files.flush(&g);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{a}\n{b}\n"));
     }
 }
