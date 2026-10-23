@@ -4,19 +4,19 @@
 # are intentionally omitted.
 set -u
 cd "$(dirname "$0")/.."
-TOPIC=$(python3 -c "import yaml;print(yaml.safe_load(open('config/recorder.yaml')).get('ntfy_topic',''))" 2>/dev/null)
-# The topic is a capability secret and was moved out of the (public) config into
-# the credentials dir on 2026-07-22. ops/config.py falls back to that dir; this
-# script did not, so for the next 7 days every alert it raised was computed and
-# then dropped on the floor. Resolve in ops/config.py's ORDER, not just its last
-# step: a unit that grows a systemd LoadCredential= or an ARBBOT_CREDENTIALS_DIR
-# pointing elsewhere is exactly how that divergence comes back.
-if [ -z "$TOPIC" ]; then
-  for d in "${CREDENTIALS_DIRECTORY:-}" "${ARBBOT_CREDENTIALS_DIR:-}" "${HOME:-}/.arbbot-credentials"; do
-    [ -n "$d" ] && [ -r "$d/ntfy_topic" ] &&
-      { TOPIC=$(tr -d '[:space:]' < "$d/ntfy_topic"); break; }
-  done
-fi
+# The ntfy topic is a capability secret, so it lives in the credentials dir and
+# never in the (public) config — config/recorder.yaml's `ntfy_topic` is empty
+# by design. Until 2026-07-22 the topic was in that file, and for 7 days after
+# it moved this script read only the file: every alert it raised was computed
+# and then dropped on the floor. Resolve in ops/config.py's credential ORDER,
+# not just its last step: a unit that grows a systemd LoadCredential= or an
+# ARBBOT_CREDENTIALS_DIR pointing elsewhere is exactly how that divergence
+# comes back.
+TOPIC=""
+for d in "${CREDENTIALS_DIRECTORY:-}" "${ARBBOT_CREDENTIALS_DIR:-}" "${HOME:-}/.arbbot-credentials"; do
+  [ -n "$d" ] && [ -r "$d/ntfy_topic" ] &&
+    { TOPIC=$(tr -d '[:space:]' < "$d/ntfy_topic"); break; }
+done
 DAY=$(date -u +%F)
 # All state lives in /tmp, as it always has. The override exists ONLY so
 # scripts/test_freshness_gauges.sh can exercise this file for real: a test that
@@ -136,7 +136,7 @@ fi
 # watched what the armed one was SAYING. `engine/mod.rs::summary` prints a JSON
 # line of safety counters to stdout every 60s and, measured 2026-07-29, had zero
 # consumers outside rust/ — including the ones whose own doc comments call them
-# THE alarm for a specific money condition. See scripts/gauge_deltas.py for the
+# THE alarm for a specific money condition. See rust/bins/arb-gauges for the
 # per-gauge page/note decision and the reasoning behind each threshold.
 #
 # Gated on is-active for the same reason the block above uses is-failed: this
@@ -145,7 +145,7 @@ fi
 # that would page about a process that no longer exists — and about counters
 # frozen at whatever they were when a human disarmed. Stopped means skip, and
 # skipping also leaves the baseline untouched, which is what makes the restart
-# rule in gauge_deltas.py work.
+# rule in arb-gauges work.
 GAUGE_STATE=$STATE_DIR/arbbot-gauge-last
 GAUGE_WINDOW=600   # 10x the unit's --stats-every 60
 rm -f "$GAUGE_STATE.ok" "$GAUGE_STATE.held"   # never adopt a previous run's leftovers
@@ -163,24 +163,25 @@ if systemctl --user is-active --quiet arbbot-trader-m3; then
       page "ARMED trader-m3 has printed NO stats line in ${GAUGE_WINDOW}s while ACTIVE — every safety gauge is unread, and that tick shares the engine's select loop with the kill switch and the hedge deadline"
   else
     # systemd's InvocationID: a fresh UUID for every start of the unit, and the
-    # only EXACT process identity available here. gauge_deltas.py used to detect
-    # a restart from elapsed_s going backwards alone, which misses the case
-    # where the replacement process is already older than the dead one was when
-    # last sampled — and in that case a brand-new process inherited the old
-    # one's sustain streak and paged on its first observation. Empty is a valid
+    # only EXACT process identity available here. A restart detected from
+    # elapsed_s going backwards alone misses the case where the replacement
+    # process is already older than the dead one was when last sampled — and
+    # in that case a brand-new process inherits the old one's sustain streak
+    # and pages on its first observation. Empty is a valid
     # answer (the evaluator falls back to elapsed_s); it is passed positionally
     # so a caller that forgets it fails loudly.
     inv=$(systemctl --user show arbbot-trader-m3 -p InvocationID --value 2>/dev/null)
-    gout=$(printf '%s\n' "$stats" | python3 scripts/gauge_deltas.py \
+    gout=$(printf '%s\n' "$stats" | rust/target/release/arb-gauges \
              "$GAUGE_STATE" "$GAUGE_STATE.ok" "$GAUGE_STATE.held" "$inv")
     grc=$?
     if [ $grc -ne 0 ]; then
       # Neither candidate state is trustworthy if the writer died, and adopting
       # a half-written one is how a single crash turns into an alarm that pages
-      # for ever and reads nothing. gauge_deltas.py falls back to a cold start
-      # on an unreadable state file precisely so this branch stays rare.
+      # for ever and reads nothing. arb-gauges falls back to a cold start on an
+      # unreadable state file precisely so this branch stays rare. A binary
+      # that is missing (exit 127) or not executable (126) lands here too.
       rm -f "$GAUGE_STATE.ok" "$GAUGE_STATE.held"
-      page "ARMED trader-m3 gauge check FAILED to run (gauge_deltas.py exited $grc) — the safety counters were NOT read this cycle; see the watchdog journal"
+      page "ARMED trader-m3 gauge check FAILED to run (arb-gauges exited $grc) — the safety counters were NOT read this cycle; see the watchdog journal"
     elif [ -n "$gout" ]; then
       while IFS='|' read -r sev msg; do
         case "$sev" in PAGE) page "$msg" ;; NOTE) note "$msg" ;; esac
