@@ -206,6 +206,21 @@ pub fn topic_of(rel_id: &str, topics: &[TopicIn]) -> String {
     }
 }
 
+/// The event a relationship belongs to: its id without the last `-` segment,
+/// which the registry uses for the outcome. `xvus-time-poty-26-zohranmamdani`
+/// is event `xvus-time-poty-26`, and `xvus-tsla-q3-deliv-q3-above-440k` is
+/// `xvus-tsla-q3-deliv-q3-above`.
+///
+/// Taken from the relationship id and NOT from the Kalshi ticker, because the
+/// ticker prefix is not an event key: `KXNOBELPEACE-27-MKUL` sits in the 2026
+/// prize's event `KXNOBELPEACE-26`.
+///
+/// `pub` for the reason [`topic_of`] is: the dashboard attributes a per-event
+/// loss cap refusal to the pairs of the event the trader's gate charged.
+pub fn event_of(rel_id: &str) -> &str {
+    rel_id.rsplit_once('-').map_or(rel_id, |(event, _)| event)
+}
+
 fn topic_budget(config: &ConfigIn, topic: &str) -> (Option<String>, Option<String>) {
     for t in &config.topics {
         if t.family == topic {

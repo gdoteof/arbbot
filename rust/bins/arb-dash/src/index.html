@@ -616,7 +616,7 @@ function oppsPanel(o){
 const VERDICT = {
   'acted':             {cls:'ok',   what:'the engine acted on this in the window'},
   'refused':           {cls:'warn', what:'a gate refused it — the gate is named'},
-  'no refusal seen':   {cls:'dim',  what:'tradable, in scope, and no gate fired in the window: it either did not clear its APR bar or nothing asked'},
+  'no refusal seen':   {cls:'dim',  what:'tradable, in scope, and no gate that names it fired in the window: it either did not clear its APR bar or nothing asked'},
   'not tradable':      {cls:'bad',  what:'never considered — the registry verdict is not an equivalent greenlit by a human or agent'},
   'out of engine scope':{cls:'bad', what:'never considered — outside this engine’s --rel-prefix'},
 };
@@ -703,7 +703,8 @@ function nowConstraints(d){
       <tbody>${d.constraints.map(c => `<tr data-k="c-${esc(c.gate+(c.scope||''))}">
         <td><b>${esc(c.gate)}</b></td>
         <td>${c.scoped ? esc(c.scope)
-          : '<span class="dim" title="This gate names no scope: it refuses every pair it covers, so no row on it is about one pair.">everything</span>'}</td>
+          : c.everything ? '<span class="dim" title="This gate refuses every pair alike, so no row on it is about one pair.">everything</span>'
+          : '<span class="warn" title="This gate refuses one pair at a time, but the engine’s reason does not say which, so this view cannot either. It is NOT a gate on every pair, and no pair below is marked as refused by it. The numbers are that pair’s.">one pair, unnamed</span>'}</td>
         <td class="num">${c.hits.toLocaleString()}</td>
         <td class="num">${c.deployed==null?'<span class="dim">—</span>':usd0(c.deployed)}</td>
         <td class="num">${c.limit==null?'<span class="dim">—</span>'
@@ -807,7 +808,10 @@ function nowOpportunities(d){
       scope</b> were never evaluated by a gate, so no amount of freed capital
       reaches them — they need a vetting decision${o.scope?' or a wider <code>--rel-prefix</code> than <code>'+esc(o.scope)+'</code>':''}.
       <b>no refusal seen</b> means the engine considered it and no gate fired:
-      the block, if any, is the APR bar rather than capital.
+      the block, if any, is the APR bar rather than capital.${
+      d.constraints.some(c => !c.scoped && !c.everything) ? ` Except: ${
+        d.constraints.filter(c => !c.scoped && !c.everything).map(c => '<b>'+esc(c.gate)+'</b>').join(', ')}
+      refused a pair the engine did not name, and it may be one of these.` : ''}
     </div>
   </section>`);
 }
