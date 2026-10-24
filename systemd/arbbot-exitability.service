@@ -1,5 +1,5 @@
 [Unit]
-Description=arbbot exitability fit (per-pair odds of a par exit, for the dashboard)
+Description=arbbot exitability fit (per-pair odds the engine sells a lot back, for the dashboard)
 
 [Service]
 Type=oneshot
