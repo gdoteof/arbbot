@@ -48,6 +48,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use arb_core::clock::now_secs;
+use arb_core::resolve::{today_iso, years_to};
 use arb_core::risk::{event_of, topic_of, TopicIn};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -240,6 +241,15 @@ fn covering_refusal<'a>(constraints: &'a [Gate], topic: &str, event: &str) -> Op
         .or_else(|| constraints.iter().find(|g| applies_to_everything(&g.gate)))
 }
 
+/// A crossing's APR, by take-take's own formula: net edge over the cost of one
+/// contract, annualised to the pair's resolve date (`arb_core::resolve`, the
+/// table take-take reads). `None` for a pair with no resolve date, or a basket
+/// with no cost to divide by.
+fn crossing_apr(rel_id: &str, edge: f64, cost: f64, today: &str) -> Option<f64> {
+    let yrs = years_to(rel_id, today)?;
+    (cost > 0.0).then(|| edge / cost / yrs * 100.0)
+}
+
 /// What has to come free before the refused order would fit.
 ///
 /// This is the only number on the panel the engine did not produce, and it is
@@ -270,6 +280,8 @@ fn break_point(g: &Gate, class_cap: Option<f64>) -> (Option<f64>, Option<f64>) {
 #[derive(Default)]
 struct Opp {
     edge: f64,
+    /// What one contract of the basket costs before fees: `gross_cost / size`.
+    cost: f64,
     total: f64,
     size: String,
     tranche: String,
@@ -608,6 +620,10 @@ pub fn json(a: &Args) -> String {
         let e = opps.entry(rel.to_string()).or_default();
         if edge > e.edge {
             e.edge = edge;
+            e.cost = match (f(o.get("gross_cost")), f(o.get("size"))) {
+                (Some(g), Some(n)) if n > 0.0 => g / n,
+                _ => 0.0,
+            };
             e.total = total;
             e.size = o.get("size").and_then(Value::as_str).unwrap_or("").to_string();
             e.tranche = o.get("tranche").and_then(Value::as_str).unwrap_or("").to_string();
@@ -641,6 +657,10 @@ pub fn json(a: &Args) -> String {
         .iter()
         .filter_map(|(m, ts)| market_rel.get(m).map(|r| (r.clone(), *ts)))
         .collect();
+    // The bar a crossing must beat, as the engine last reported it. Read, not
+    // derived: it is a blend over the book that moves with every fill.
+    let bar_apr = summary.as_ref().and_then(|s| f(s.get("take_take_bar_apr")));
+    let today = today_iso(now);
     let mut opp_rows: Vec<Value> = opps
         .iter()
         .map(|(rel, o)| {
@@ -654,6 +674,10 @@ pub fn json(a: &Args) -> String {
             } else {
                 covering_refusal(&constraints, &topic, event_of(rel))
             };
+            let apr = crossing_apr(rel, o.edge, o.cost, &today);
+            // Below the bar comes before any gate: freeing capital does not
+            // make a crossing the engine would not take at any capital.
+            let below_bar = matches!((apr, bar_apr), (Some(a), Some(b)) if a < b);
             // Exactly one of these, and in this order — the first that applies
             // is the whole reason.
             let verdict = if !is_tradable {
@@ -662,12 +686,15 @@ pub fn json(a: &Args) -> String {
                 "out of engine scope"
             } else if acted_rels.contains_key(rel) {
                 "acted"
+            } else if below_bar {
+                "below bar"
             } else if why.is_some() {
                 "refused"
             } else {
                 "no refusal seen"
             };
             json!({ "relationship_id": rel, "best_edge": o.edge, "edge_usd": o.total,
+                    "apr": apr,
                     "size": o.size, "tranche": o.tranche, "observations": o.n,
                     "last_age_s": (now - o.last).max(0.0), "topic": topic,
                     "acted": acted_rels.contains_key(rel),
@@ -759,7 +786,7 @@ pub fn json(a: &Args) -> String {
     out.insert(
         "opportunities".into(),
         json!({ "window_s": if opp_first < f64::MAX { now - opp_first } else { 0.0 },
-                "scope": scope, "rows": opp_rows }),
+                "scope": scope, "bar_apr": bar_apr, "rows": opp_rows }),
     );
     out.insert("stale_config".into(), Value::Array(stale_config));
     out.insert("recent".into(), Value::Array(recent));
@@ -972,6 +999,17 @@ mod tests {
         assert!(stale(60, 3600), "edited a minute ago, engine up an hour");
         assert!(!stale(7200, 3600), "edited before the engine started: it read this");
         assert!(!stale(3600, 3600), "same instant is not evidence of a later edit");
+    }
+
+    /// A thin edge on a long-dated pair is not a missed trade. 1.65c on a
+    /// 98.35c basket held 69 days is ~9%/yr — under any bar the engine runs.
+    #[test]
+    fn a_crossing_is_annualised_the_way_take_take_annualises_it() {
+        let apr = crossing_apr("xvus-aliens-26-12-31-2026", 0.0165, 0.9835, "2026-10-24").unwrap();
+        assert!((apr - 0.0165 / 0.9835 / (69.0 / 365.25) * 100.0).abs() < 1e-9, "{apr}");
+        assert!((apr - 8.88).abs() < 0.01, "{apr}");
+        assert_eq!(crossing_apr("xvus-unknown-family-99", 0.05, 0.9, "2026-10-24"), None, "undated");
+        assert_eq!(crossing_apr("xvus-aliens-26-12-31-2026", 0.05, 0.0, "2026-10-24"), None, "no cost");
     }
 
     /// `topic_of` is arb-core's, so a position is bucketed exactly the way the
