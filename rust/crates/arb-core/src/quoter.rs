@@ -688,7 +688,11 @@ impl Quoter {
             // not evidence that the resting price is wrong.)
             let crossed = self.crossed_reason(books, i);
             if let Some(reason) = &crossed {
-                intents.push(Intent::Skip(intent::Skip { skip: vec![reason.clone()], ts: now }));
+                intents.push(Intent::Skip(intent::Skip {
+                    relationship_id: Some(self.rel.id.clone()),
+                    skip: vec![reason.clone()],
+                    ts: now,
+                }));
             }
             for side in [BookSide::Bid, BookSide::Ask] {
                 let key = (i, side);
@@ -766,7 +770,11 @@ impl Quoter {
                         },
                     };
                     if let Some(why) = why {
-                        intents.push(Intent::Skip(intent::Skip { skip: vec![why], ts: now }));
+                        intents.push(Intent::Skip(intent::Skip {
+                            relationship_id: Some(self.rel.id.clone()),
+                            skip: vec![why],
+                            ts: now,
+                        }));
                         target = None;
                     }
                 }
@@ -936,7 +944,11 @@ impl Quoter {
                         }
                     }
                     if !v.allowed {
-                        intents.push(Intent::Skip(intent::Skip { skip: v.reasons, ts: now }));
+                        intents.push(Intent::Skip(intent::Skip {
+                            relationship_id: Some(self.rel.id.clone()),
+                            skip: v.reasons,
+                            ts: now,
+                        }));
                         let since = *self.refused_since.entry(key).or_insert(now);
                         // At most ONE cancel per resting quote, and it is
                         // `resting.remove` that bounds it, not the delay above:

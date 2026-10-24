@@ -56,7 +56,7 @@ The `sha256` field of that summary line MUST equal the baseline:
 
 | field | baseline | where it came from |
 |---|---|---|
-| `sha256` | `eed3f124bbcecc5c5d06787919fb6de3083cd4c088bfd3d7cc8096f4a371368e` | re-pinned 2026-10-22 for `MAX_CLIP` 25 -> 50 (was `434305e4…` from the 2026-09-18 unsafe-quote cancellation, before that `214d4e94…` from #82's adaptive clip) |
+| `sha256` | `c8d49e68b7ea0854a6c6c015ff8debd24485462df388693cf0ee93497a2bc1ac` | re-pinned 2026-10-24 for the pair on every skip line, no decision moved (was `eed3f124…` from `MAX_CLIP` 25 -> 50, `434305e4…` from the 2026-09-18 unsafe-quote cancellation, before that `214d4e94…` from #82's adaptive clip) |
 | `intents` | 31714 | same |
 | `would_place` | 189 | same |
 | `would_cancel` | 138 | same |
@@ -148,7 +148,7 @@ when a refactor changes what the engine decides rather than whether it crashes.
 
 | field | baseline | where it came from |
 |---|---|---|
-| `sha256` | `2ae6a85e6eb94739b4be183d33dd6865ac2e5362f298a898d1bb504e5a550d7d` | re-pinned 2026-10-22 for `MAX_CLIP` 25 -> 50 (was `02c9a582…` from #82's adaptive clip, `38978b34…` from #65, before that `2d330021…` from #22) |
+| `sha256` | `9378efd67c81d38c9e3958be8a93a71c62475845be6715b20dffd797cce476f3` | re-pinned 2026-10-24 for the pair on every skip line, no decision moved (was `2ae6a85e…` from `MAX_CLIP` 25 -> 50, `02c9a582…` from #82's adaptive clip, `38978b34…` from #65, before that `2d330021…` from #22) |
 | `intents` | 31489 | same |
 | `would_place` | 17 | same |
 | `would_cancel` | 8 | same |

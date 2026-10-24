@@ -76,7 +76,13 @@ ROOT="$(git rev-parse --show-toplevel)"
 # Every place that rested the 25 ceiling now rests up to its hedge touch, and
 # four more places and cancels follow from those larger clips being resized
 # when the touch shrinks under them. 31705/185/134 -> 31714/189/138.
-BASELINE_SHA=eed3f124bbcecc5c5d06787919fb6de3083cd4c088bfd3d7cc8096f4a371368e
+#
+# Re-pinned 2026-10-24 because every skip line now names its pair
+# (`"relationship_id":…` ahead of `"skip"`). No decision moved: `--out` on both
+# binaries gives the same 31714 lines, all 31464 skip lines carry the key, and
+# deleting it restores each one byte for byte; no place, cancel or hedge line
+# differs. Counts unchanged at 31714/189/138.
+BASELINE_SHA=c8d49e68b7ea0854a6c6c015ff8debd24485462df388693cf0ee93497a2bc1ac
 # Re-pinned 2026-08-23 by the same #82 bisect as the baseline above: this stage
 # moved with it, 38978b34/31485/15/6 -> 02c9a582/31487/16/7. One extra place and
 # one extra cancel, from the same adaptive clip — the hurdle refuses all but a
@@ -88,7 +94,10 @@ BASELINE_SHA=eed3f124bbcecc5c5d06787919fb6de3083cd4c088bfd3d7cc8096f4a371368e
 #
 # Re-pinned 2026-10-22 with the baseline above, for MAX_CLIP 50:
 # 31487/16/7 -> 31489/17/8, one more place and cancel from a resized clip.
-APR_SHA=2ae6a85e6eb94739b4be183d33dd6865ac2e5362f298a898d1bb504e5a550d7d
+#
+# Re-pinned 2026-10-24 with the baseline above, for the pair on every skip
+# line: the same proof over 31489 lines (31464 skips), counts unchanged.
+APR_SHA=9378efd67c81d38c9e3958be8a93a71c62475845be6715b20dffd797cce476f3
 fail=0
 skip_digest=0
 allow_change=0

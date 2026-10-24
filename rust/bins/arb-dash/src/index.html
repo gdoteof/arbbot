@@ -705,7 +705,7 @@ function nowConstraints(d){
         <td><b>${esc(c.gate)}</b></td>
         <td>${c.scoped ? esc(c.scope)
           : c.everything ? '<span class="dim" title="This gate refuses every pair alike, so no row on it is about one pair.">everything</span>'
-          : '<span class="warn" title="This gate refuses one pair at a time, but the engine’s reason does not say which, so this view cannot either. It is NOT a gate on every pair, and no pair below is marked as refused by it. The numbers are that pair’s.">one pair, unnamed</span>'}</td>
+          : '<span class="warn" title="This gate refuses one pair at a time, and these refusals come from skip lines written before the engine named the pair on each, so this view cannot say which. It is NOT a gate on every pair, and no pair below is marked as refused by it. The numbers are that pair’s.">one pair, unnamed</span>'}</td>
         <td class="num">${c.hits.toLocaleString()}</td>
         <td class="num">${c.deployed==null?'<span class="dim">—</span>':usd0(c.deployed)}</td>
         <td class="num">${c.limit==null?'<span class="dim">—</span>'
@@ -803,7 +803,7 @@ function nowOpportunities(d){
               title="${esc(VERDICT[r.verdict]?VERDICT[r.verdict].what:'')}">${esc(r.verdict)}</span>
           ${r.verdict==='below bar'?`<div class="sub">${pct(r.apr)} &lt; ${pct(o.bar_apr)}</div>`
           : r.blocked_by?`<div class="sub">${esc(r.blocked_by.gate)}${
-            r.blocked_by.scoped?' ['+esc(r.blocked_by.scope)+']':''}</div>`:''}</td>
+            r.blocked_by.scoped && r.blocked_by.scope!==r.relationship_id?' ['+esc(r.blocked_by.scope)+']':''}</div>`:''}</td>
       </tr>`).join('')}</tbody>
     </table></div>
     <div class="sub" style="margin-top:8px">
