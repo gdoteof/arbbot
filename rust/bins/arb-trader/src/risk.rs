@@ -25,7 +25,7 @@
 
 use arb_core::model::{BookSide, Venue};
 use arb_core::quoter::{RiskGate, RiskVerdict};
-use arb_core::risk::{check_order, ConfigIn, ExposureIn, Input, RelIn, TopicIn};
+use arb_core::risk::{check_order, event_of, ConfigIn, ExposureIn, Input, RelIn, TopicIn};
 use arb_core::scan::{Rel, RelType};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -1231,18 +1231,6 @@ fn topic_of(rel_id: &str, topics: &[(String, String, Option<String>)]) -> String
         }
     }
     if best.is_empty() { "other".to_string() } else { best.to_string() }
-}
-
-/// The event a relationship belongs to: its id without the last `-` segment,
-/// which the registry uses for the outcome. `xvus-time-poty-26-zohranmamdani`
-/// is event `xvus-time-poty-26`, and `xvus-tsla-q3-deliv-q3-above-440k` is
-/// `xvus-tsla-q3-deliv-q3-above`.
-///
-/// Taken from the relationship id and NOT from the Kalshi ticker, because the
-/// ticker prefix is not an event key: `KXNOBELPEACE-27-MKUL` sits in the 2026
-/// prize's event `KXNOBELPEACE-26`.
-fn event_of(rel_id: &str) -> &str {
-    rel_id.rsplit_once('-').map_or(rel_id, |(event, _)| event)
 }
 
 /// Every venue whose cash a basket on `rel` would spend, charged the full

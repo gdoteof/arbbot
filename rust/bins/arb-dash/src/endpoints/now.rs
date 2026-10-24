@@ -37,15 +37,18 @@
 //! What this view CANNOT do, stated plainly because the gap is the interesting
 //! part: a skip line is `{"skip":[reason], "ts":…}` and carries no
 //! relationship id, so no refusal can be attributed to the pair that provoked
-//! it. Topic-scoped gates are attributable — the topic is in the string, and
-//! `arb_core::risk::topic_of` buckets a pair the same way the gate did — but
-//! `class cap` and `global cap` name no scope and apply to everything. Rows
-//! say which of the two they are getting.
+//! it. Topic- and event-scoped gates are attributable — the topic or event is
+//! in the string, and `arb_core::risk::{topic_of, event_of}` bucket a pair the
+//! same way the gate did. `class cap` and `global cap` name no scope and apply
+//! to everything. `per-relationship tail cap` names no scope either, but it
+//! refuses ONE pair, and the string does not say which — so it is attributed
+//! to no pair rather than to all of them. Rows say which of the three they
+//! are getting.
 
 use std::collections::{BTreeMap, HashMap};
 
 use arb_core::clock::now_secs;
-use arb_core::risk::{topic_of, TopicIn};
+use arb_core::risk::{event_of, topic_of, TopicIn};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
@@ -164,8 +167,35 @@ fn classify(reason: &str) -> Gate {
                 g.deployed = Some(0.0);
             }
         }
-    } else if reason.starts_with("per-relationship tail cap") {
+    } else if let Some(rest) = reason.strip_prefix("per-event loss cap [") {
+        g.gate = "per-event loss cap".into();
+        if let Some((event, nums)) = rest.split_once("]: ") {
+            g.scope = Some(event.to_string());
+            (g.deployed, g.need, g.limit) = triple(nums);
+            // `145.00+25 nets to 160.00 > 147.00`: a quote that nets against
+            // another branch grows the event's tail by less than its size, and
+            // the growth is what has to fit.
+            if let Some((_, after)) = nums.split_once(" nets to ") {
+                let after = after.split('>').next().and_then(|a| a.trim().parse::<f64>().ok());
+                g.need = match (after, g.deployed) {
+                    (Some(a), Some(d)) => Some(a - d),
+                    _ => None,
+                };
+            }
+        }
+    } else if let Some(rest) = reason.strip_prefix("per-relationship tail cap: notional ") {
         g.gate = "per-relationship tail cap".into();
+        // `25 > headroom 20.0 (cap 150.0, oracle_risk=low)` states the
+        // headroom, not what the pair holds: held is cap - headroom.
+        let num = |s: Option<&str>| s.and_then(|s| s.trim().parse::<f64>().ok());
+        let (need, rest) = rest.split_once(" > headroom ").unzip();
+        let (headroom, cap) = rest.and_then(|r| r.split_once(" (cap ")).unzip();
+        g.need = num(need);
+        g.limit = num(cap.and_then(|c| c.split(',').next()));
+        g.deployed = match (g.limit, num(headroom)) {
+            (Some(c), Some(h)) => Some(c - h),
+            _ => None,
+        };
     } else {
         // A gate this parser does not know must still GROUP, or one row per
         // price turns a single repeating condition into a wall of rows. The
@@ -181,6 +211,33 @@ fn classify(reason: &str) -> Gate {
             .join(" ");
     }
     g
+}
+
+/// Does this gate refuse every pair alike?
+///
+/// NOT the same question as "does its reason name a scope". The class and
+/// global caps name none because they have none; the per-relationship tail cap
+/// names none because the engine's string omits the pair, and it refuses only
+/// that pair. Reading every scope-less gate as covering everything put one
+/// pair's tail cap down as the blocker on every pair on the page.
+fn applies_to_everything(gate: &str) -> bool {
+    matches!(gate, "class cap" | "global cap") || gate.starts_with("kill switch")
+}
+
+/// The refusal that COVERS a pair, from the engine's own stream: a gate on the
+/// pair's topic if there is one, else a per-event cap on its event, else a gate
+/// that applies to everything. A tail cap is never the answer: it refused one
+/// pair and does not say which.
+fn covering_refusal<'a>(constraints: &'a [Gate], topic: &str, event: &str) -> Option<&'a Gate> {
+    constraints
+        .iter()
+        .find(|g| g.scope.as_deref() == Some(topic))
+        .or_else(|| {
+            constraints
+                .iter()
+                .find(|g| g.gate == "per-event loss cap" && g.scope.as_deref() == Some(event))
+        })
+        .or_else(|| constraints.iter().find(|g| applies_to_everything(&g.gate)))
 }
 
 /// What has to come free before the refused order would fit.
@@ -477,9 +534,10 @@ pub fn json(a: &Args) -> String {
                 "at": g.at, "headroom": headroom, "free_needed": free,
                 "last_age_s": (now - g.last_ts).max(0.0),
                 "text": g.text,
-                // A gate that names no scope refuses every pair it applies to,
-                // so a row must never be read as being about one of them.
+                // Scoped, everything, or neither: a scope-less gate that is
+                // not one of the global caps is about one pair it does not name.
                 "scoped": g.scope.is_some(),
+                "everything": applies_to_everything(&g.gate),
             })
         })
         .collect();
@@ -589,17 +647,12 @@ pub fn json(a: &Args) -> String {
             let topic = topic_of(rel, &topics.topics);
             let is_tradable = tradable.get(rel).copied().unwrap_or(false);
             let in_scope = scope.as_ref().map(|p| rel.starts_with(p)).unwrap_or(true);
-            // The refusal that COVERS this pair, from the engine's own stream:
-            // a topic-scoped gate on this pair's topic if there is one, else
-            // the unscoped gates, which apply to everything. Only asked once
-            // the pair is one the engine could have acted on at all.
+            // Only asked once the pair is one the engine could have acted on
+            // at all.
             let why = if !is_tradable || !in_scope {
                 None
             } else {
-                constraints
-                    .iter()
-                    .find(|g| g.scope.as_deref() == Some(topic.as_str()))
-                    .or_else(|| constraints.iter().find(|g| g.scope.is_none()))
+                covering_refusal(&constraints, &topic, event_of(rel))
             };
             // Exactly one of these, and in this order — the first that applies
             // is the whole reason.
@@ -777,6 +830,68 @@ mod tests {
         assert_eq!(g.gate, "venue cash");
         assert_eq!(g.scope.as_deref(), Some("kalshi"));
         assert_eq!((g.need, g.limit), (Some(12.5), Some(4.0)));
+    }
+
+    /// The two per-pair caps, in the exact strings `arb_core::risk::check_order`
+    /// and the trader's `RiskView::check` build. The tail cap states headroom,
+    /// not holdings, so what the pair holds is the cap minus it.
+    #[test]
+    fn the_per_pair_caps_are_read_back_out_of_their_refusals() {
+        let g = classify("per-relationship tail cap: notional 25 > headroom 20.0 (cap 150.0, oracle_risk=low)");
+        assert_eq!(g.gate, "per-relationship tail cap");
+        assert_eq!(g.scope, None, "the string does not name the pair");
+        assert_eq!((g.deployed, g.need, g.limit), (Some(130.0), Some(25.0), Some(150.0)));
+        let (headroom, free) = break_point(&g, None);
+        assert!((headroom.unwrap() - 20.0).abs() < 1e-9);
+        assert!((free.unwrap() - 5.0).abs() < 1e-9, "5 must come off before a clip of 25 fits");
+
+        let g = classify("per-event loss cap [xvus-time-poty-26]: 145.00+5 > 147.00");
+        assert_eq!(g.gate, "per-event loss cap");
+        assert_eq!(g.scope.as_deref(), Some("xvus-time-poty-26"));
+        assert_eq!((g.deployed, g.need, g.limit), (Some(145.0), Some(5.0), Some(147.0)));
+
+        let g = classify("per-event loss cap [xvus-brazil-pres-26]: 145.00+25 nets to 160.00 > 147.00");
+        assert_eq!(g.scope.as_deref(), Some("xvus-brazil-pres-26"));
+        assert_eq!((g.deployed, g.limit), (Some(145.0), Some(147.0)));
+        assert!((g.need.unwrap() - 15.0).abs() < 1e-9, "the tail grows by 15, not the 25 quoted");
+    }
+
+    /// ONE PAIR'S TAIL CAP IS NOT EVERY PAIR'S BLOCKER. A scope-less gate was
+    /// read as covering everything, so a single pair at its tail cap was
+    /// shown as the refusal on every pair on the page. Each pair now gets
+    /// its topic's gate, else its event's, else a cap that truly covers all —
+    /// and the tail cap, which names no pair, covers none.
+    #[test]
+    fn a_tail_cap_is_attributed_to_no_pair_rather_than_to_all_of_them() {
+        let tail = classify("per-relationship tail cap: notional 25 > headroom 20.0 (cap 150.0, oracle_risk=low)");
+        let event = classify("per-event loss cap [xvus-brazil-pres-26]: 145.00+5 > 147.00");
+        let topic = classify("topic budget [time-poty-26]: 154+5 > 150");
+        let gates = vec![tail.clone(), event.clone(), topic.clone()];
+
+        let lula = "xvus-brazil-pres-26-luizinacioluladasilva";
+        let pick = |gates: &[Gate], rel: &str, t: &str| {
+            covering_refusal(gates, t, event_of(rel)).map(|g| g.gate.clone())
+        };
+        assert_eq!(pick(&gates, lula, "other").as_deref(), Some("per-event loss cap"));
+        assert_eq!(
+            pick(&gates, "xvus-time-poty-26-zohranmamdani", "time-poty-26").as_deref(),
+            Some("topic budget")
+        );
+        assert_eq!(pick(&gates, "xvus-gdp-26q3-gt2p0", "gdp-26q3"), None, "not the tail cap");
+
+        let class = classify("class cap: 341+5 > 343.00");
+        let gates = vec![tail, class];
+        assert_eq!(
+            pick(&gates, "xvus-gdp-26q3-gt2p0", "gdp-26q3").as_deref(),
+            Some("class cap"),
+            "a cap with no scope because it has none still covers everything"
+        );
+        for g in ["class cap", "global cap", "kill switch active", "kill switch"] {
+            assert!(applies_to_everything(g), "{g}");
+        }
+        for g in ["per-relationship tail cap", "per-event loss cap", "topic budget", "venue cash"] {
+            assert!(!applies_to_everything(g), "{g}");
+        }
     }
 
     /// The gate appends `(overflow needs apr>=N)` to the same reason. The
