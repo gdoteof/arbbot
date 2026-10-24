@@ -1,15 +1,16 @@
-//! arb-exitability — how likely each pair is to give a lot back at par, and how
-//! soon. The nightly refit behind the dashboard's Exitability view.
+//! arb-exitability — how likely each pair is to let the engine sell a lot back
+//! before resolution, how soon, and for how much. The nightly refit behind the
+//! dashboard's Exitability view.
 //!
 //! The entry bar prices every lot as held to resolution. A pair whose basis
-//! keeps round-tripping is worth far more than that, because the lot comes back
-//! at par in days and the capital goes round again. This measures it per pair:
+//! keeps round-tripping is worth far more than that, because the lot is sold
+//! back in days and the capital goes round again. This measures it per pair:
 //!
 //!   1. replay the archived books of the last `--days` days into minute grids;
-//!   2. simulate every maker entry the tape would have filled, and the first
-//!      minute each could have exited at par (`sim`);
-//!   3. replay our own lots the same way and measure how much later than the
-//!      tape's first chance we actually got out (`fit::calibrate`);
+//!   2. simulate every maker entry the tape would have filled, and each hour
+//!      after it in which the engine's exit rule could have sold it (`sim`);
+//!   3. replay our own lots the same way and measure what share of those
+//!      chances the engine actually took (`fit::calibrate`);
 //!   4. turn the entries into a calibrated, shrunk p per pair (`fit`).
 //!
 //! Reads only: the archive, the registry and the ledger. Writes
@@ -144,23 +145,48 @@ fn pairs(registry: &str) -> Result<Vec<Pair>, String> {
         .collect())
 }
 
-fn obs(entries: &[Entry], cross: bool) -> Vec<Obs> {
-    entries
-        .iter()
-        .map(|e| {
-            let tau = if cross { e.tau_cross } else { e.tau_best };
-            Obs { minutes: tau.unwrap_or(e.watched) as f64, exited: tau.is_some() }
-        })
-        .collect()
+/// Which exit an observation counts.
+#[derive(Clone, Copy)]
+enum Model {
+    /// The engine's rule, maker or cross.
+    Engine,
+    /// The engine's rule, crossing both legs only.
+    Cross,
+    /// $1.00 or better: the bar a par exit would set.
+    Par,
 }
 
-fn entry_days(entries: &[Entry]) -> f64 {
-    entries.iter().map(|e| e.t / DAY_MINUTES).collect::<BTreeSet<_>>().len() as f64
+fn ob(e: &Entry, model: Model) -> Obs<'_> {
+    Obs {
+        chances: match model {
+            Model::Engine => &e.chances,
+            Model::Cross => &e.chances_cross,
+            Model::Par => &e.chances_par,
+        },
+        cost: e.cost,
+        watched: e.watched as f64,
+    }
+}
+
+fn obs(entries: &[Entry], model: Model) -> Vec<Obs<'_>> {
+    entries.iter().map(|e| ob(e, model)).collect()
+}
+
+fn entry_days<'a>(entries: impl IntoIterator<Item = &'a Entry>) -> f64 {
+    entries.into_iter().map(|e| e.t / DAY_MINUTES).collect::<BTreeSet<_>>().len() as f64
+}
+
+/// One pair's fit under one reading of its entries.
+struct Shrunk {
+    own: fit::Survival,
+    p: f64,
+    p_lcb: f64,
 }
 
 fn round(x: f64, places: i32) -> f64 {
     let m = 10f64.powi(places);
-    (x * m).round() / m
+    // `+ 0.0` turns a negative zero (an empty float sum) into a plain one.
+    (x * m).round() / m + 0.0
 }
 
 fn opt(x: Option<f64>, places: i32) -> Value {
@@ -205,9 +231,14 @@ fn run(a: &Args) -> Result<String, String> {
     let (pmus, p_missing) = pmus.map_err(|_| "polymarket_us reader panicked")??;
 
     let hurdle = a.hurdle_pct / 100.0;
-    // Minutes from the window's start to a pair's guarded resolve, and the
-    // hold value at minute t (`maker_exit::reservation_floor`).
+    // Minutes from the window's start to a pair's resolve, and what holding to
+    // it is worth at minute t (`maker_exit::reservation_floor`). A pair with no
+    // resolve rule has no hold value, so only the profit floors bind.
     let resolve_min = |p: &Pair| p.resolves.and_then(parse_iso).map(|d| (d - first_day) * DAY_MINUTES as i64);
+    let hold_for = |p: &Pair| {
+        let res = resolve_min(p);
+        move |t: usize| res.map_or(0.0, |r| 1.0 / (1.0 + hurdle * ((r - t as i64).max(0) as f64 / 1440.0) / 365.25))
+    };
     let sims: Vec<(&Pair, PairSim)> = pairs
         .iter()
         .filter_map(|p| {
@@ -215,19 +246,21 @@ fn run(a: &Args) -> Result<String, String> {
             let end = resolve_min(p)
                 .map_or(n as i64, |r| r - RESOLVE_GUARD_DAYS * DAY_MINUTES as i64)
                 .clamp(0, n as i64) as usize;
-            Some((p, sim::simulate(k, m, end)))
+            Some((p, sim::simulate(k, m, end, fit::HORIZON_MIN as usize, hold_for(p))))
         })
         .filter(|(_, s)| s.valid_minutes > 0)
         .collect();
 
     // Calibration: our own lots entered inside the window, against the tape.
-    // A lot out by a maker exit before the window closed gives its real time;
-    // one still held (or closed some other way) gives the time it HAS been
-    // held, a lower bound. Leaving the slow ones out would measure only the
-    // lots that were quick, so they count, at no less than they are known to be.
+    // Each counts the exit chances the tape offered it: up to and including
+    // the one it took, for a lot out by a maker exit before the window
+    // closed; and up to now, or to when it closed, for one not out that way,
+    // whether still held, settled or closed by some other path. Leaving those
+    // out would measure only the lots that were quick.
     let records = ledger::apply_corrections(ledger::read(&a.ledger)?);
     let window_end_s = (t0_ns as f64 + n as f64 * MINUTE_NS as f64) / 1e9;
-    let (mut calib, mut censored): (Vec<(f64, f64)>, usize) = (Vec::new(), 0);
+    let mut calib: Vec<(usize, bool)> = Vec::new();
+    let (mut held, mut closed) = (0, 0);
     let by_rel: HashMap<&str, &(&Pair, PairSim)> = sims.iter().map(|x| (x.0.rel.as_str(), x)).collect();
     for lot in lots::lots(&records) {
         let Some((pair, s)) = by_rel.get(lot.rel.as_str()) else { continue };
@@ -239,47 +272,75 @@ fn run(a: &Args) -> Result<String, String> {
             Some(x) if x <= window_end_s => (x, true),
             _ => (lot.closed_ts.unwrap_or(f64::INFINITY).min(window_end_s), false),
         };
-        let res = resolve_min(pair);
-        let floor = |t: usize| {
-            res.map_or(0.0, |r| 1.0 / (1.0 + hurdle * ((r - t as i64).max(0) as f64 / 1440.0) / 365.25))
-        };
-        let Some(sim_min) = s.engine_exit(lot.dir, t0 as usize, lot.cost, floor) else { continue };
-        let real_min = (out_at - lot.ts) / 60.0;
-        // A held lot whose tape exit is still ahead of it says nothing yet.
-        if exact || real_min > sim_min as f64 {
-            calib.push((real_min, sim_min as f64));
-            censored += usize::from(!exact);
+        let limit = ((out_at - lot.ts) / 60.0).max(0.0) as usize;
+        let offered = s.engine_chances(lot.dir, t0 as usize, lot.cost, limit, hold_for(pair)).len();
+        // A lot out before the tape's first chance took one the tape did not see.
+        let offered = if exact { offered.max(1) } else { offered };
+        if offered == 0 {
+            continue;
+        }
+        calib.push((offered, exact));
+        if !exact {
+            if lot.closed_ts.is_some_and(|c| c <= window_end_s) { closed += 1 } else { held += 1 }
         }
     }
     let cal = fit::calibrate(&calib);
-    let k = cal.k;
+    let c = cal.take;
 
-    // Pool, then shrink pair -> family -> everything.
-    let all: Vec<Entry> = sims.iter().flat_map(|(_, s)| s.entries.iter().cloned()).collect();
-    let global = fit::survival(&obs(&all, false), k);
-    let mut fam_entries: BTreeMap<&str, Vec<Entry>> = BTreeMap::new();
-    for (p, s) in &sims {
-        fam_entries.entry(p.family.as_str()).or_default().extend(s.entries.iter().cloned());
+    // Each pair's p over the entries `keep` admits, shrunk toward its family
+    // WITHOUT it (shrinking toward a family that contains it counts its own
+    // evidence twice, entirely so in a family of one), and that toward
+    // everything.
+    let shrunk = |keep: fn(&Entry) -> bool| -> Vec<Shrunk> {
+        let kept: Vec<Vec<&Entry>> = sims.iter().map(|(_, s)| s.entries.iter().filter(|e| keep(e)).collect()).collect();
+        let view: Vec<Vec<Obs>> = kept.iter().map(|es| es.iter().map(|e| ob(e, Model::Engine)).collect()).collect();
+        let everything = fit::survival(&view.iter().flatten().copied().collect::<Vec<_>>(), c).p;
+        (0..sims.len())
+            .map(|i| {
+                let others: Vec<usize> =
+                    (0..sims.len()).filter(|&j| j != i && sims[j].0.family == sims[i].0.family).collect();
+                let o: Vec<Obs> = others.iter().flat_map(|&j| view[j].iter().copied()).collect();
+                let fam = fit::shrink(fit::survival(&o, c).p, entry_days(others.iter().flat_map(|&j| kept[j].iter().copied())), everything);
+                let own = fit::survival(&view[i], c);
+                let days = entry_days(kept[i].iter().copied());
+                let p = if view[i].is_empty() { fam } else { fit::shrink(own.p, days, fam) };
+                Shrunk { p, p_lcb: fit::lower_bound(p, days), own }
+            })
+            .collect()
+    };
+    let fits = shrunk(|_| true);
+    // The lens prices lots the hold rule refuses, and those exit on their own
+    // cost: `cost + EXIT_FLOOR` is their floor, not the hold value. A fatter
+    // lock waits for the hold value, further above what it cost, and gains
+    // more when it gets it, so the lens reads its p, exit time and gain off
+    // the entries whose floor was their cost.
+    let lens = shrunk(|e| e.cost_bound);
+    let engine: Vec<Vec<Obs>> = sims.iter().map(|(_, s)| obs(&s.entries, Model::Engine)).collect();
+    let global = fit::survival(&engine.iter().flatten().copied().collect::<Vec<_>>(), c);
+    let days_of: Vec<f64> = sims.iter().map(|(_, s)| entry_days(&s.entries)).collect();
+
+    let mut families: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, (p, _)) in sims.iter().enumerate() {
+        families.entry(p.family.as_str()).or_default().push(i);
     }
-    let fam_p: BTreeMap<&str, (f64, f64, usize)> = fam_entries
+    let families: Vec<Value> = families
         .iter()
-        .map(|(f, es)| {
-            let d = entry_days(es);
-            (*f, (fit::shrink(fit::survival(&obs(es, false), k).p, d, global.p), d, es.len()))
+        .map(|(f, idx)| {
+            let o: Vec<Obs> = idx.iter().flat_map(|&i| engine[i].iter().copied()).collect();
+            let d = entry_days(idx.iter().flat_map(|&i| &sims[i].1.entries));
+            json!({"family": f, "p": round(fit::shrink(fit::survival(&o, c).p, d, global.p), 4),
+                   "entry_days": d, "entries": o.len()})
         })
         .collect();
 
     let day_s = |t: usize| (t0_ns as f64 / 1e9) + (t * 60) as f64;
     let mut out_pairs = Vec::new();
     let mut history = serde_json::Map::new();
-    for (p, s) in &sims {
+    for (i, (p, s)) in sims.iter().enumerate() {
         let e = &s.entries;
-        let best = fit::survival(&obs(e, false), k);
-        let cross = fit::survival(&obs(e, true), k);
-        let days_seen = entry_days(e);
-        let fam = fam_p.get(p.family.as_str()).map_or(global.p, |f| f.0);
-        let p_shrunk = if e.is_empty() { fam } else { fit::shrink(best.p, days_seen, fam) };
-        let p_lcb = fit::lower_bound(p_shrunk, days_seen);
+        let Shrunk { own: best, p: p_shrunk, p_lcb } = &fits[i];
+        let cross = fit::survival(&obs(e, Model::Cross), c);
+        let par = fit::survival(&obs(e, Model::Par), c);
         let recent: Vec<Value> = e
             .iter()
             .rev()
@@ -287,38 +348,48 @@ fn run(a: &Args) -> Result<String, String> {
             .map(|x| {
                 json!({"ts": round(day_s(x.t), 0), "dir": x.dir.as_str(), "shape": x.shape.as_str(),
                        "lock": round(1.0 - x.cost, 4),
-                       "exit_h": x.tau_best.map(|m| round(m as f64 / 60.0, 2)),
-                       "cross_exit_h": x.tau_cross.map(|m| round(m as f64 / 60.0, 2)),
+                       "chances": x.chances.len(),
+                       "exit_h": x.chances.first().map(|z| round(z.minutes as f64 / 60.0, 2)),
+                       "exit_gain": x.chances.first().map(|z| round(z.proceeds - x.cost, 4)),
+                       "exit_proceeds": x.chances.first().map(|z| round(z.proceeds, 4)),
+                       "cross_exit_h": x.chances_cross.first().map(|z| round(z.minutes as f64 / 60.0, 2)),
+                       "par_h": x.chances_par.first().map(|z| round(z.minutes as f64 / 60.0, 2)),
                        "watched_h": round(x.watched as f64 / 60.0, 1)})
             })
             .collect();
-        // Every entry's lock, ascending: the dashboard counts how many clear
-        // a margin at whatever bar is in force when it is read.
-        let mut locks: Vec<f64> = e.iter().map(|x| round(1.0 - x.cost, 4)).collect();
-        locks.sort_by(f64::total_cmp);
+        let l = &lens[i];
         history.insert(
             p.rel.clone(),
-            json!({"p": round(p_shrunk, 4), "p_lcb": round(p_lcb, 4), "entries": e.len()}),
+            json!({"p": round(*p_shrunk, 4), "p_lcb": round(*p_lcb, 4), "entries": e.len()}),
         );
         out_pairs.push(json!({
             "rel": p.rel, "family": p.family, "kalshi": p.kalshi, "pmus": p.pmus,
             "vetted_by": p.vetted_by, "verdict": p.verdict, "resolves": p.resolves,
             "valid_minutes": s.valid_minutes,
-            "entries": e.len(), "entry_days": days_seen,
+            "entries": e.len(), "entry_days": days_of[i],
             "entries_kalshi_yes": e.iter().filter(|x| x.dir == Dir::KYes).count(),
-            "exits_tape": e.iter().filter(|x| x.tau_best.is_some()).count(),
+            "exits_tape": e.iter().filter(|x| !x.chances.is_empty()).count(),
             "median_lock": opt(median(e.iter().map(|x| 1.0 - x.cost).collect()), 4),
-            "locks": locks,
+            // Entries clearing each lock on the `clear_step` grid: the dashboard
+            // reads it at whatever margin is in force when it is viewed.
+            "clearing": s.clearing,
             "p_tape": round(best.p_tape, 4),
             "p_unshrunk": round(best.p, 4),
-            "p": round(p_shrunk, 4),
-            "p_lcb": round(p_lcb, 4),
+            "p": round(*p_shrunk, 4),
+            "p_lcb": round(*p_lcb, 4),
             "p_cross": round(cross.p, 4),
+            "p_par": round(par.p, 4),
+            "mean_gain": opt(best.mean_gain, 4),
+            "mean_gain_par": opt(par.mean_gain, 4),
             "mean_exit_days": opt(best.mean_exit_min.map(|m| m / 1440.0), 3),
             "median_exit_days": opt(best.median_exit_min.map(|m| m / 1440.0), 3),
             "curve": best.curve.iter().map(|v| round(*v, 4)).collect::<Vec<_>>(),
             "curve_tape": best.curve_tape.iter().map(|v| round(*v, 4)).collect::<Vec<_>>(),
-            "curve_cross": cross.curve.iter().map(|v| round(*v, 4)).collect::<Vec<_>>(),
+            // What the lens reads: the entries whose exit floor was their cost.
+            "lens_entries": e.iter().filter(|x| x.cost_bound).count(),
+            "lens_p_lcb": round(l.p_lcb, 4),
+            "lens_exit_days": opt(l.own.mean_exit_min.map(|m| m / 1440.0), 3),
+            "lens_gain": opt(l.own.mean_gain, 4),
             "kalshi_vol_1h": opt(s.kalshi_vol_1h, 5),
             "basis_sd": opt(s.basis_sd, 5),
             "recent": recent,
@@ -331,15 +402,16 @@ fn run(a: &Args) -> Result<String, String> {
         "generated_at": generated_at,
         "horizon_days": fit::HORIZON_MIN / 1440.0, "curve_days": fit::CURVE_DAYS,
         "prior_days": fit::PRIOR_DAYS, "calibration_hurdle_pct": a.hurdle_pct,
+        "exit_floor": sim::EXIT_FLOOR, "clear_step": sim::CLEAR_STEP,
         "fees": {"kalshi_taker": sim::KALSHI_TAKER, "kalshi_maker": sim::KALSHI_MAKER,
                  "pmus_taker": sim::PMUS_TAKER, "pmus_maker": 0.0},
         "missing_days": {"kalshi": k_missing, "polymarket_us": p_missing},
-        "calibration": {"k": round(cal.k, 3), "lots": cal.lots, "held": censored, "estimated": cal.estimated,
-                        "median_ratio": opt(cal.median_ratio, 3)},
-        "global": {"entries": all.len(), "p_tape": round(global.p_tape, 4), "p": round(global.p, 4),
-                   "curve": global.curve.iter().map(|v| round(*v, 4)).collect::<Vec<_>>()},
-        "families": fam_p.iter().map(|(f, (p, d, n))| json!({"family": f, "p": round(*p, 4),
-                     "entry_days": d, "entries": n})).collect::<Vec<_>>(),
+        "calibration": {"share": round(c.share, 3), "rate": round(c.rate, 3), "lots": cal.lots,
+                        "offered": cal.offered, "taken": cal.taken,
+                        "held": held, "closed": closed, "estimated": cal.estimated},
+        "global": {"entries": engine.iter().map(Vec::len).sum::<usize>(), "p_tape": round(global.p_tape, 4),
+                   "p": round(global.p, 4), "curve": global.curve.iter().map(|v| round(*v, 4)).collect::<Vec<_>>()},
+        "families": families,
         "pairs": out_pairs,
     });
 
@@ -353,7 +425,7 @@ fn run(a: &Args) -> Result<String, String> {
     if !newer_exists {
         write_atomic(&latest, &doc.to_string())?;
     }
-    let line = json!({"as_of": as_of, "generated_at": generated_at, "k": round(cal.k, 3),
+    let line = json!({"as_of": as_of, "generated_at": generated_at, "share": round(c.share, 3), "rate": round(c.rate, 3),
                       "calibration_lots": cal.lots, "p_global": round(global.p, 4), "pairs": history});
     let hist = format!("{}/history.jsonl", a.out_dir);
     std::fs::OpenOptions::new()
@@ -363,12 +435,17 @@ fn run(a: &Args) -> Result<String, String> {
         .and_then(|mut f| f.write_all(format!("{line}\n").as_bytes()))
         .map_err(|e| format!("append {hist}: {e}"))?;
     Ok(format!(
-        "as_of {as_of}: {} pairs, {} entries, k {:.2} over {} lots ({} still held){}, p(global) {:.2}{}",
+        "as_of {as_of}: {} pairs, {} entries, take {:.2} of lots at {:.2} a chance over {} lots ({} of {} chances \
+         taken; {} held, {} closed without a maker exit){}, p(global) {:.2}{}",
         sims.len(),
-        all.len(),
-        cal.k,
+        engine.iter().map(Vec::len).sum::<usize>(),
+        c.share,
+        c.rate,
         cal.lots,
-        censored,
+        cal.taken,
+        cal.offered,
+        held,
+        closed,
         if cal.estimated { "" } else { " (UNCALIBRATED)" },
         global.p,
         if newer_exists { "; latest.json is newer, left alone" } else { "" },
