@@ -1617,8 +1617,16 @@ impl Engine {
                 _ => {}
             }
         }
+        // The scarcer venue's free cash: an exit frees cash on both, and the
+        // gate refuses on whichever is short. Either venue unread = unknown.
+        let free_cash = self.cfg.risk.as_ref().and_then(|r| {
+            let k = r.balance_of("kalshi")?.parse::<f64>().ok()?;
+            let p = r.balance_of("polymarket_us")?.parse::<f64>().ok()?;
+            Some(k.min(p))
+        });
         crate::maker_exit::publish_view(crate::maker_exit::EngineView {
             apr_bar: self.apr_bar,
+            exit_apr: crate::maker_exit::exit_discount_apr(self.apr_bar, free_cash),
             global_cap_usd: self.cfg.risk.as_ref().map_or(0.0, |r| r.global_cap_usd()),
             pm_ask,
             pm_ask_depth,
@@ -4548,7 +4556,7 @@ mod apr_refresh_tests {
     /// book by design, and the bar comes out at the ceiling instead of the
     /// floor. That composition is correct and is pinned below; what it is not
     /// is an idle book, which is what this fixture is for.
-    fn idle_risk() -> Arc<crate::risk::RiskView> {
+    pub(super) fn idle_risk() -> Arc<crate::risk::RiskView> {
         let d = std::env::temp_dir().join(format!("arb-trader-apr-{}-{}",
             std::process::id(), std::thread::current().name().unwrap_or("test")));
         std::fs::create_dir_all(&d).unwrap();
@@ -4820,6 +4828,41 @@ mod maker_exit_seam_tests {
         on.maker_exit_tick(&mut quoters);
         let v = crate::maker_exit::engine_view().expect("published");
         assert_eq!(v.apr_bar, 14.5, "the hurdle in force, not a second derivation of it");
+        crate::maker_exit::reset_view();
+    }
+
+    /// The exit discount on the view is derived from the SMALLER of the two
+    /// venues' live balances: Kalshi flush and PM-US short is scarce, and so
+    /// is the reverse; only both ample reaches the floor. No risk view = scarce.
+    #[test]
+    fn the_exit_discount_on_the_view_follows_the_scarcer_venue() {
+        let _g = crate::maker_exit::test_serial();
+        crate::maker_exit::reset_view();
+        let (mut quoters, _) = quoter_and_books();
+        let floor = crate::APR_FLOOR;
+
+        let mut unrisked = test_engine(armed_cfg());
+        unrisked.apr_bar = 60.0;
+        unrisked.maker_exit_tick(&mut quoters);
+        assert_eq!(crate::maker_exit::engine_view().unwrap().exit_apr, 60.0, "no balances = scarce");
+
+        let risk = super::apr_refresh_tests::idle_risk();
+        let mut cfg = armed_cfg();
+        cfg.risk = Some(risk.clone());
+        let mut eng = test_engine(cfg);
+        eng.apr_bar = 60.0;
+        for (k, p, want, why) in [
+            ("1000", "50", 60.0, "PM-US short"),
+            ("50", "1000", 60.0, "Kalshi short"),
+            ("1000", "1000", floor, "both ample"),
+        ] {
+            risk.set_live_balances(vec![("kalshi".into(), k.into()), ("polymarket_us".into(), p.into())])
+                .unwrap();
+            eng.maker_exit_tick(&mut quoters);
+            let v = crate::maker_exit::engine_view().unwrap();
+            assert_eq!(v.apr_bar, 60.0);
+            assert_eq!(v.exit_apr, want, "{why}");
+        }
         crate::maker_exit::reset_view();
     }
 

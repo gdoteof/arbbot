@@ -831,13 +831,21 @@ impl RiskView {
 
     /// What the gate is spending against, per venue, whatever the provenance.
     ///
-    /// TEST-ONLY, and it exists because its absence hid a live defect: with no
-    /// way to read the pairs back, a mutation handing the SAME sink in for both
-    /// venues — publishing Kalshi's cash under `polymarket_us`, which is the key
-    /// the per-venue cash check is keyed on — survived the entire suite. The
-    /// cycle-level labelling was pinned; the call site that fills the two slots
-    /// was not. Nothing in production needs this, so it does not exist there.
-    #[cfg(test)]
+    /// It was test-only until 2026-10-24, and it exists because its absence hid
+    /// a live defect: with no way to read the pairs back, a mutation handing
+    /// the SAME sink in for both venues — publishing Kalshi's cash under
+    /// `polymarket_us`, which is the key the per-venue cash check is keyed on
+    /// — survived the entire suite. The cycle-level labelling was pinned; the
+    /// call site that fills the two slots was not.
+    ///
+    /// Its one production reader is `Engine::maker_exit_tick`, which feeds the
+    /// smaller of the two venues' figures to `maker_exit::exit_discount_apr`
+    /// so passive exits price off the cash the gate would spend. It does not
+    /// apply the staleness haircut `spendable` does. Maker exits never consult
+    /// the gate, so during a balance outage they price off the last reading;
+    /// the only cash that moves while entries are refused is what those exits
+    /// free, so the stale figure can only understate it, which errs toward
+    /// the hurdle.
     pub fn balance_of(&self, venue: &str) -> Option<String> {
         let g = self.balances.lock().expect("balances");
         let pairs = match &*g {
