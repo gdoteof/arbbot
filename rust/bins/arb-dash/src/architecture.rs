@@ -255,9 +255,10 @@ const NODES: &[Decl] = &[
         id: "exitability", label: "exitability fit", sub: "arbbot-exitability.timer · 08:15",
         lane: 5, row: 6, kind: "timer", unit: Some("arbbot-exitability.timer"),
         probe: Probe::Timer, max_age_s: None, expect: Expect::Live,
-        what: "Replays four weeks of archived books to estimate, per pair, how likely a lot \
-               is to come back at par inside two weeks, calibrated against our own exits. \
-               Read by the Exitability view only; the entry bar does not use it.",
+        what: "Replays four weeks of archived books to estimate, per pair, how likely the \
+               engine is to sell a lot back inside two weeks under its own exit rule, \
+               calibrated against our own exits. Read by the Exitability view only; the \
+               entry bar does not use it.",
     },
     Decl {
         id: "equity", label: "equity history", sub: "arbbot-equity.timer · 15 min",

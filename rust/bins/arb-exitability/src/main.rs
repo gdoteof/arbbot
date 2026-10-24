@@ -9,8 +9,9 @@
 //!   1. replay the archived books of the last `--days` days into minute grids;
 //!   2. simulate every maker entry the tape would have filled, and each hour
 //!      after it in which the engine's exit rule could have sold it (`sim`);
-//!   3. replay our own lots the same way and measure what share of those
-//!      chances the engine actually took (`fit::calibrate`);
+//!   3. replay our own lots the same way and measure what share of them get
+//!      out at all, and how often one of those takes a chance it is offered
+//!      (`fit::calibrate`);
 //!   4. turn the entries into a calibrated, shrunk p per pair (`fit`).
 //!
 //! Reads only: the archive, the registry and the ledger. Writes
