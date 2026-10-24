@@ -223,6 +223,26 @@
     .arch .flow,.arch .pulse{animation:none}
     .arch .flow{stroke-dasharray:none}
   }
+  /* --- exitability ----------------------------------------------------- */
+  .xchart{width:100%;height:auto;display:block;overflow:visible}
+  .xchart text{font:10px ui-monospace,SFMono-Regular,Menlo,monospace;fill:var(--dim)}
+  .xchart .grid{stroke:var(--line);stroke-width:1}
+  .xchart .axis{stroke:var(--line-strong);stroke-width:1}
+  .xchart .hold,.xchart .lens{fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+  .xchart .hold{stroke:var(--muted)} .xchart .lens{stroke:var(--accent)}
+  .xchart .band{fill:var(--accent);opacity:.1}
+  .xchart .stem{stroke:var(--accent);stroke-width:1;opacity:.4}
+  .xchart .dot{fill:var(--accent);stroke:var(--panel);stroke-width:2}
+  .xchart .dot.tape{fill:var(--muted)} .xchart .dot.on{stroke:var(--ink)}
+  .xchart .hit{fill:transparent;cursor:pointer}
+  .xchart .rule-hold{stroke:var(--muted);stroke-width:2} .xchart .rule-lens{stroke:var(--accent);stroke-width:2}
+  .xlegend{display:flex;gap:16px;flex-wrap:wrap;font-size:11px;color:var(--dim);margin-top:8px}
+  .xlegend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+  .xrow{cursor:pointer} .xrow.on td{background:color-mix(in srgb,var(--accent) 10%,transparent)}
+  .xgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}
+  .xgrid > div{min-width:0}
+  .xtable{max-height:520px;overflow-y:auto}
+  .xtable th{position:sticky;top:0;background:var(--panel);z-index:1}
   .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;font-size:11px;color:var(--dim)}
   .legend i{display:inline-block;width:18px;height:0;border-top-width:2px;
     border-top-style:solid;vertical-align:middle;margin-right:5px}
@@ -1148,6 +1168,7 @@ const VIEWS = [
   {path:'/opportunities', label:'Opportunities'},
   {path:'/pairs',         label:'Pairs'},
   {path:'/trades',        label:'Trades'},
+  {path:'/exitability',   label:'Exitability'},
   {path:'/live',          label:'Live'},
   {path:'/architecture',  label:'Architecture'},
 ];
@@ -1178,6 +1199,7 @@ const S = {
   stream:    {},                 // last SSE frame
   pairQuery: '',
   trades:    {query:'', status:'all', strategy:'all', sort:'time:desc', page:1, pageSize:25},
+  exit:      {sel:null, query:'', sort:'relief:desc'},
   link:      {cls:'dim', text:'● connecting…', title:''},
   alerts:    null,               // /api/alerts, polled on every view
 };
@@ -1205,6 +1227,7 @@ const NEEDS = {
   '/pairs':         () => ({pairs:    '/api/pairs'}),
   '/now':           () => ({now:      '/api/now'}),
   '/trades':        () => ({trades:   '/api/trades'}),
+  '/exitability':   () => ({exit:     '/api/exitability'}),
   '/live':          () => ({}),
   '/architecture':  () => ({arch:     '/api/architecture'}),
 };
@@ -1214,6 +1237,8 @@ const NEEDS = {
 const TOPIC = {
   '/':'books', '/recording':'recording', '/opportunities':'opportunities',
   '/pairs':'pairs', '/trades':'now', '/live':'now',
+  // Rewritten once a night; the bar it is priced at is re-read on each fetch.
+  '/exitability':'exitability',
   // The tape moving is the cheapest proof the ingest half is alive, so it is
   // also the right thing to re-measure the whole picture on.
   '/architecture':'recording',
@@ -1442,6 +1467,7 @@ const DRAW = {
     f.append(pairsPanel(d));
     return `${d.count||0} pairs registered &middot; ${d.tradable||0} tradable`;
   },
+  '/exitability': (f) => drawExitability(f),
   '/opportunities': (f) => {
     const o = S.data.opps;
     if(!o) return loading(f, 'opportunity coverage');
@@ -1888,6 +1914,315 @@ function tradeWire(){
 }
 
 /* --------------------------------------------------------------------------
+   EXITABILITY — how likely the engine is to sell each pair's lots back before
+   resolution, under its own exit rule, and what that would do to the lock a
+   pair has to clear.
+
+   The fit is nightly (arb-exitability); the margins are priced server-side at
+   the bar in force on every request (endpoints/exitability.rs). Nothing on
+   this page feeds the engine.
+   -------------------------------------------------------------------------- */
+const pctp = (v) => (v===null||v===undefined||!isFinite(v)) ? '—' : Math.round(Number(v)*100)+'%';
+const daysf = (v) => (v===null||v===undefined||!isFinite(v)) ? '—'
+  : Number(v) < 1/24 ? Math.round(Number(v)*1440)+'m'
+  : Number(v) < 1 ? (Number(v)*24).toFixed(1)+'h' : Number(v).toFixed(1)+'d';
+const relShort = (r) => String(r).replace(/^xvus-/, '');
+const niceStep = (span, steps) => steps.find(s => span/s <= 8) || steps[steps.length-1];
+const resolvesIn = (p) => p.days_to_resolve==null ? '—' : p.days_to_resolve < 0 ? 'resolved' : p.days_to_resolve+'d';
+
+function exitRows(d){
+  const q = S.exit.query.trim().toLowerCase();
+  const [key, dir] = S.exit.sort.split(':');
+  const val = {
+    relief: p => p.margin_hold!=null ? p.margin_hold - p.margin_lens : -1,
+    hold:   p => p.margin_hold ?? -1,
+    days:   p => p.days_to_resolve ?? 1e9,
+    p:      p => p.lens_p_lcb,
+    par:    p => p.p_par,
+    exit:   p => p.lens_exit_days ?? 1e9,
+    take:   p => p.lens_gain ?? -1,
+    entries:p => p.entries,
+    gain:   p => (p.clear_lens_per_day ?? 0) - (p.clear_hold_per_day ?? 0),
+    rel:    p => p.rel,
+  }[key] || (p => 0);
+  const rows = (d.pairs||[]).filter(p => !q || p.rel.toLowerCase().includes(q));
+  rows.sort((a,b) => { const x=val(a), y=val(b); return (x<y?-1:x>y?1:0) * (dir==='asc'?1:-1); });
+  return rows;
+}
+
+function exitHero(d){
+  const ps = d.pairs||[], c = d.calibration||{};
+  const sum = (k) => ps.reduce((s,p) => s + (p[k]||0), 0);
+  const hold = sum('clear_hold_per_day'), lens = sum('clear_lens_per_day');
+  const relieved = ps.filter(p => p.margin_hold!=null && p.margin_hold - p.margin_lens >= 0.01).length;
+  const stale = d.age_s!=null && d.age_s > 36*3600;
+  const miss = Object.entries(d.missing_days||{}).filter(([,v]) => v.length);
+  return $(`<section class="wide capital-hero">
+    ${c.estimated===false?`<div class="banner">Uncalibrated: only ${c.lots} of our lots fall inside the window, fewer than the fit needs, so every p below assumes the engine takes every exit chance the tape offers. Read them as upper bounds.</div>`:''}
+    ${stale?`<div class="banner">This fit is ${dur(d.age_s)} old. arbbot-exitability.timer refits it each morning; check <code>systemctl --user status arbbot-exitability.service</code>.</div>`:''}
+    ${miss.length?`<div class="banner">No archive for ${miss.map(([v,ds])=>`${esc(v)} on ${ds.map(esc).join(', ')}`).join('; ')}: those days count as watched without an exit, which reads exitability low.</div>`:''}
+    <div class="hero-line"><div>
+      <div class="eyebrow">Tape fills a day that clear the bar</div>
+      <div class="hero-value">${hold.toFixed(1)} <span class="dim">→</span> ${lens.toFixed(1)}</div>
+      <div class="sub">holding to resolution → pricing in the engine's exit, at the ${d.bar_pct.toFixed(1)}% ${d.bar_source==='engine'?'bar the running engine reports':'floor (no engine reported a bar in the last 15 minutes)'}.
+        Simulated maker fills over the last ${d.window_days} days, at most one per direction and shape per hour among those that clear each margin, per day each pair was on the tape, priced at today's bar and today's days to resolution.</div>
+    </div>
+    <div class="metric-grid">
+      <div class="metric-card"><span>Lots the engine gets out</span><b>${pctp(c.share)}</b><div class="sub">taking ${pctp(c.rate)} of the exit chances each is offered · ${c.lots} of our lots, ${c.held??0} held and ${c.closed??0} closed without a maker exit</div></div>
+      <div class="metric-card"><span>Sold back within ${d.horizon_days} days</span><b>${pctp(d.global?.p)}</b><div class="sub">all pairs pooled · ${(d.global?.entries||0).toLocaleString()} entries · ${pctp(d.global?.p_tape)} if every chance were taken</div></div>
+      <div class="metric-card"><span>Pairs ≥1¢ cheaper to enter</span><b>${relieved}</b><div class="sub">of ${ps.length} · fit as of ${esc(d.as_of)}</div></div>
+    </div></div>
+  </section>`);
+}
+
+/* Days to resolution against the lock each rule asks for. The hold rule is
+   one curve (the bar is global); each pair drops from it to its lens margin. */
+function exitScatter(d, sel){
+  const ps = (d.pairs||[]).filter(p => p.margin_hold!=null);
+  if(!ps.length) return $(`<section class="wide"><h2>Lock needed, by days to resolution</h2><div class="dim">No pair resolves today or later.</div></section>`);
+  const W=900, H=300, L=46, R=18, T=14, B=34;
+  const xStep = niceStep(Math.max(...ps.map(p=>p.days_to_resolve)), [7,14,30,60,90,180,365]);
+  const xMax = Math.max(xStep, Math.ceil(Math.max(...ps.map(p=>p.days_to_resolve)) / xStep) * xStep);
+  const yRaw = Math.max(...ps.map(p=>p.margin_hold)) * 100;
+  const yStep = niceStep(yRaw, [1,2,5,10,20,25,50]);
+  const yMax = Math.max(yStep, Math.ceil(yRaw / yStep) * yStep);
+  const x = v => L + (W-L-R) * v / xMax, y = c => T + (H-T-B) * (1 - c / yMax);
+  const r = d.bar_pct / 100;
+  const curve = Array.from({length: 61}, (_,i) => {
+    const dd = Math.max(1, xMax*i/60);
+    return `${i?'L':'M'}${x(xMax*i/60).toFixed(1)},${y(100*(1-1/(1+r*dd/365.25))).toFixed(1)}`;
+  }).join('');
+  let grid='';
+  for(let c=0; c<=yMax+1e-9; c+=yStep) grid += `<line class="grid" x1="${L}" x2="${W-R}" y1="${y(c)}" y2="${y(c)}"/><text x="${L-8}" y="${y(c)+3}" text-anchor="end">${c}¢</text>`;
+  for(let v=0; v<=xMax; v+=xStep) grid += `<text x="${x(v)}" y="${H-B+16}" text-anchor="middle">${v}d</text>`;
+  const marks = ps.map(p => {
+    const on = sel && p.rel===sel.rel, cx = x(p.days_to_resolve).toFixed(1);
+    const yh = y(p.margin_hold*100).toFixed(1), yl = y(p.margin_lens*100).toFixed(1);
+    const tip = `${p.rel}\n${p.days_to_resolve} days to resolution · sold back in ${d.horizon_days}d: ${pctp(p.lens_p_lcb)} (80% bound) · ~${daysf(p.lens_exit_days)} · ${cents(p.lens_gain)} over cost\nhold ${cents(p.margin_hold)} → lens ${cents(p.margin_lens)}`;
+    return `<g data-exit-rel="${esc(p.rel)}"><title>${esc(tip)}</title>
+      <line class="stem" x1="${cx}" x2="${cx}" y1="${yh}" y2="${yl}"/>
+      <circle class="dot${on?' on':''}" cx="${cx}" cy="${yl}" r="${on?6:4}"/>
+      <circle class="hit" cx="${cx}" cy="${yl}" r="12"/></g>`;
+  }).join('');
+  return $(`<section class="wide"><h2>Lock needed, by days to resolution</h2>
+    <div class="scroll"><svg class="xchart" style="min-width:640px" viewBox="0 0 ${W} ${H}" role="img" aria-label="Lock needed per pair under the hold rule and the lens">
+      ${grid}<line class="axis" x1="${L}" x2="${W-R}" y1="${y(0)}" y2="${y(0)}"/>
+      <path class="hold" d="${curve}"/>${marks}
+    </svg></div>
+    <div class="xlegend"><span><i style="background:var(--muted)"></i>holding to resolution (the bar today)</span>
+      <span><i style="background:var(--accent)"></i>pricing in the pair's odds of the engine selling the lot back (the lens)</span>
+      <span class="sub">each dot drops from the curve by what its exit odds are worth · click one to inspect it</span></div>
+  </section>`);
+}
+
+function exitTable(d, rows, sel){
+  const [key, dir] = S.exit.sort.split(':');
+  const th = (k, label, num=true) => `<th class="sortable${num?' num':''}" data-exit-sort="${k}">${label}${k===key?(dir==='asc'?' ↑':' ↓'):''}</th>`;
+  const body = rows.map(p => {
+    const relief = p.margin_hold!=null ? p.margin_hold - p.margin_lens : null;
+    return `<tr class="xrow${sel&&p.rel===sel.rel?' on':''}" data-k="${esc(p.rel)}" data-exit-rel="${esc(p.rel)}">
+      <td><div class="trade-primary" title="${esc(p.rel)}">${esc(relShort(p.rel))}</div>
+        <div class="sub">${esc(p.vetted_by||'unreviewed')}${p.verdict?' · '+esc(p.verdict):''}</div></td>
+      <td class="num">${resolvesIn(p)}</td>
+      <td class="num">${p.entries} <span class="sub">/ ${p.entry_days}d</span></td>
+      <td class="num">${pctp(p.lens_p_lcb)} <span class="sub">${pctp(p.p)}</span></td>
+      <td class="num">${pctp(p.p_par)}</td>
+      <td class="num">${daysf(p.lens_exit_days)}</td>
+      <td class="num">${cents(p.lens_gain)}</td>
+      <td class="num">${cents(p.margin_hold)}</td>
+      <td class="num">${cents(p.margin_lens)}</td>
+      <td class="num">${relief!=null?cents(relief):'—'}</td>
+      <td class="num">${p.clear_hold_per_day!=null?`${p.clear_hold_per_day.toFixed(1)} → ${p.clear_lens_per_day.toFixed(1)}`:'—'}</td></tr>`;
+  }).join('');
+  return $(`<section class="wide trade-explorer">
+    <div class="trade-explorer-head"><div><h2>Pairs</h2><div class="sub">p is the chance the engine sells a lot back within ${d.horizon_days} days under its own exit rule, read off the entries the hold rule refuses; the first figure is its 80% lower bound, which the lens uses, and the second is p over every entry. "At par" is the same chance were the exit to wait for $1.00 net. Exit and gain: mean days to the exit, and proceeds over cost.</div></div>
+      <div class="trade-count">${rows.length} / ${(d.pairs||[]).length}</div></div>
+    <div class="trade-toolbar" style="grid-template-columns:minmax(220px,1fr)"><input id="exit-search" class="trade-control trade-search" placeholder="filter pairs…" value="${esc(S.exit.query)}"></div>
+    <div class="scroll xtable"><table class="trade-table" style="min-width:1120px"><thead><tr>
+      ${th('rel','pair',false)}${th('days','resolves in')}${th('entries','tape entries')}${th('p','p 14d · bound / all')}${th('par','at par')}${th('exit','exit')}${th('take','gain')}
+      ${th('hold','hold lock')}<th class="num">lens lock</th>${th('relief','relief')}${th('gain','fills/day hold → lens')}
+    </tr></thead><tbody>${body||'<tr><td colspan="11" class="dim">No pair matches.</td></tr>'}</tbody></table></div>
+  </section>`);
+}
+
+/* P(sold back by h) for one pair: were every chance the tape offered taken,
+   and at the take measured on our own lots. x is square-root scaled so an
+   hour and two weeks both get room. */
+function survivalChart(d, p){
+  const W=440, H=230, L=40, R=16, T=12, B=30, days=d.curve_days||[], c=d.calibration||{};
+  const xMax = Math.max(...days), x = v => L + (W-L-R) * Math.sqrt(v / xMax), y = v => T + (H-T-B) * (1 - v);
+  const line = (vals) => [[0,0], ...days.map((dd,i)=>[dd, vals[i]])].map(([a,b],i)=>`${i?'L':'M'}${x(a).toFixed(1)},${y(b).toFixed(1)}`).join('');
+  const dots = (vals, cls, what) => days.map((dd,i)=>`<g><title>${esc(`${what} · ${daysf(dd)}: ${pctp(vals[i])}`)}</title>
+    <circle class="dot ${cls}" cx="${x(dd).toFixed(1)}" cy="${y(vals[i]).toFixed(1)}" r="4"/><circle class="hit" cx="${x(dd).toFixed(1)}" cy="${y(vals[i]).toFixed(1)}" r="11"/></g>`).join('');
+  let grid='';
+  for(const v of [0,.25,.5,.75,1]) grid += `<line class="grid" x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}"/><text x="${L-6}" y="${y(v)+3}" text-anchor="end">${v*100}%</text>`;
+  for(const dd of days.filter(v => [1/24, 1, 3, 7, 14].some(t => Math.abs(t-v) < 1e-6))) grid += `<text x="${x(dd)}" y="${H-B+16}" text-anchor="middle">${daysf(dd)}</text>`;
+  const yb = y(p.p_lcb).toFixed(1), xe = x(xMax);
+  return `<div><h2>Chance the engine sells a lot back by…</h2>
+    <svg class="xchart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Exit probability by horizon">${grid}
+      <line class="axis" x1="${L}" x2="${W-R}" y1="${y(0)}" y2="${y(0)}"/>
+      <path class="hold" d="${line(p.curve_tape)}"/><path class="lens" d="${line(p.curve)}"/>
+      ${dots(p.curve_tape,'tape','every chance taken')}${dots(p.curve,'','expected')}
+      <line class="rule-lens" x1="${xe-14}" x2="${xe}" y1="${yb}" y2="${yb}"/>
+      <text x="${xe-18}" y="${Number(yb)+3}" text-anchor="end">80% bound ${pctp(p.p_lcb)}</text>
+    </svg>
+    <div class="xlegend"><span><i style="background:var(--muted)"></i>were every chance the tape offered taken</span>
+      <span><i style="background:var(--accent)"></i>expected: ${pctp(c.share)} of lots, ${pctp(c.rate)} of chances</span></div></div>`;
+}
+
+/* How many of the window's tape entries clear each lock, against the two
+   margins: the gap between the counts at the two rules is what the lens adds.
+   Read straight off the nightly's grid, which thins at every lock separately,
+   so the counts at the rules are exact. */
+function lockChart(d, p){
+  const c = p.clearing||[], step = (d.clear_step||0.001)*100;
+  if(!c.length) return `<div><h2>Tape entries clearing each lock</h2><div class="dim">The tape filled no entry on this pair in the window.</div></div>`;
+  const at = (v) => { const j = Math.max(0, Math.ceil(v/step - 1e-9)); return j < c.length ? c[j] : 0; };
+  const hold = p.margin_hold!=null ? p.margin_hold*100 : null, lens = p.margin_lens!=null ? p.margin_lens*100 : null;
+  const top = Math.min(30, Math.max(c.length*step, hold??0, lens??0) + 1);
+  const W=440, H=230, L=40, R=16, T=26, B=30, peak = Math.max(1, c[0]);
+  const x = v => L + (W-L-R) * Math.min(v, top) / top, y = n => T + (H-T-B) * (1 - n/peak);
+  const jmax = Math.min(c.length, Math.ceil(top/step));
+  let path = `M${x(0).toFixed(1)},${y(c[0]).toFixed(1)}`;
+  for(let j=1; j<jmax; j++) path += `H${x(j*step).toFixed(1)}V${y(c[j]).toFixed(1)}`;
+  path += jmax===c.length ? `H${x(jmax*step).toFixed(1)}V${y(0).toFixed(1)}H${x(top).toFixed(1)}` : `H${x(top).toFixed(1)}`;
+  const area = `${path}V${y(0).toFixed(1)}H${x(0).toFixed(1)}Z`;
+  let hits='';
+  for(let v=0; v<top; v+=1) hits += `<rect class="hit" x="${x(v).toFixed(1)}" y="${T}" width="${(x(v+1)-x(v)).toFixed(1)}" height="${H-T-B}"><title>${esc(`a lock of ${v}¢ or more: ${at(v)} entr${at(v)===1?'y':'ies'}`)}</title></rect>`;
+  // Each label on its own row; one past the middle hangs to the left of its
+  // rule so it cannot run off the chart.
+  const rule = (v, cls, label, row) => {
+    if(v==null || v > top) return '';
+    const right = x(v) > L + (W-L-R)/2;
+    return `<line class="${cls}" x1="${x(v)}" x2="${x(v)}" y1="${T-4}" y2="${y(0)}"/>
+      <text x="${right ? x(v)-4 : x(v)+4}" y="${T-14+row*11}" text-anchor="${right?'end':'start'}">${label} ${v.toFixed(1)}¢ · ${at(v)}</text>`;
+  };
+  let ticks='';
+  const tstep = niceStep(top, [1,2,5,10]);
+  for(let v=0; v<=top; v+=tstep) ticks += `<text x="${x(v)}" y="${H-B+16}" text-anchor="middle">${v}¢</text>`;
+  ticks += `<text x="${L-6}" y="${y(peak)+3}" text-anchor="end">${peak}</text><text x="${L-6}" y="${y(0)+3}" text-anchor="end">0</text>`;
+  const both = hold!=null ? at(hold) : null, lensOnly = hold!=null && lens!=null ? at(lens) - at(hold) : null;
+  return `<div><h2>Tape entries clearing each lock</h2>
+    <svg class="xchart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Simulated entries clearing each lock">${ticks}
+      <line class="axis" x1="${L}" x2="${W-R}" y1="${y(0)}" y2="${y(0)}"/>
+      <path class="band" d="${area}"/><path class="lens" d="${path}"/>
+      ${rule(lens,'rule-lens','lens',0)}${rule(hold,'rule-hold','hold',1)}${hits}
+    </svg>
+    <div class="xlegend">${both!=null?`<span>${both} clear the hold margin</span>`:''}${lensOnly!=null?`<span>${lensOnly} more clear only the lens</span>`:''}
+      <span class="sub">of ${c[0]} in the window${hold!=null&&hold>top?` · hold margin ${hold.toFixed(1)}¢ is off the right edge`:''}</span></div></div>`;
+}
+
+/* The fit's own record: one point per nightly run. */
+function historyChart(p){
+  const h = (p.history||[]).filter(r => r[1]!=null);
+  if(h.length < 2) return `<div><h2>p, night by night</h2><div class="dim">${h.length?'One fit so far':'No history yet'}; a line appears from the second night.</div></div>`;
+  const W=440, H=230, L=40, R=16, T=12, B=30;
+  const x = i => L + (W-L-R) * i / (h.length-1), y = v => T + (H-T-B) * (1 - v);
+  const pts = h.map((r,i) => [x(i), y(r[1]), y(r[2]??r[1])]);
+  const band = `M${pts.map(q=>`${q[0].toFixed(1)},${q[1].toFixed(1)}`).join('L')}L${pts.slice().reverse().map(q=>`${q[0].toFixed(1)},${q[2].toFixed(1)}`).join('L')}Z`;
+  let grid='';
+  for(const v of [0,.5,1]) grid += `<line class="grid" x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}"/><text x="${L-6}" y="${y(v)+3}" text-anchor="end">${v*100}%</text>`;
+  for(const i of [0, h.length-1]) grid += `<text x="${x(i)}" y="${H-B+16}" text-anchor="${i?'end':'start'}">${esc(String(h[i][0]).slice(5))}</text>`;
+  const dots = h.map((r,i)=>`<g><title>${esc(`${r[0]}: p ${pctp(r[1])}, 80% bound ${pctp(r[2])}`)}</title><circle class="hit" cx="${x(i)}" cy="${y(r[1])}" r="10"/></g>`).join('');
+  const last = pts[pts.length-1];
+  return `<div><h2>p, night by night</h2>
+    <svg class="xchart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Exit probability by fit date">${grid}
+      <line class="axis" x1="${L}" x2="${W-R}" y1="${y(0)}" y2="${y(0)}"/>
+      <path class="band" d="${band}"/><path class="lens" d="M${pts.map(q=>`${q[0].toFixed(1)},${q[1].toFixed(1)}`).join('L')}"/>
+      <circle class="dot" cx="${last[0]}" cy="${last[1]}" r="4"/>${dots}
+    </svg><div class="xlegend"><span class="sub">line: p · shaded down to its 80% bound</span></div></div>`;
+}
+
+function exitDrill(d, p){
+  if(!p) return $(`<section class="wide"><div class="dim">Pick a pair to inspect it.</div></section>`);
+  const fam = (d.families||[]).find(f => f.family===p.family);
+  const kv = (k, v, t='') => `<div class="kv"${t?` title="${esc(t)}"`:''}><span>${k}</span><b>${v}</b></div>`;
+  const recent = (p.recent||[]).map(e => `<tr><td class="sub">${new Date(e.ts*1000).toISOString().slice(5,16).replace('T',' ')}</td>
+    <td>${esc(e.dir)}</td><td class="sub">${esc(e.shape)}</td><td class="num">${cents(e.lock)}</td>
+    <td class="num">${e.exit_h!=null?`${daysf(e.exit_h/24)} <span class="sub">${cents(e.exit_gain)} over cost</span>`:'<span class="dim">none</span>'}</td>
+    <td class="num">${e.chances}</td>
+    <td class="num">${e.par_h!=null?daysf(e.par_h/24):'<span class="dim">none</span>'}</td>
+    <td class="num">${e.cross_exit_h!=null?daysf(e.cross_exit_h/24):'<span class="dim">none</span>'}</td>
+    <td class="num sub">${daysf(e.watched_h/24)}</td></tr>`).join('');
+  return $(`<section class="wide"><h2>${esc(p.rel)}</h2>
+    <div class="xgrid">
+      <div>
+        ${kv('Kalshi', `<code style="overflow-wrap:anywhere">${esc(p.kalshi)}</code>`)}
+        ${kv('PM-US', `<code style="overflow-wrap:anywhere">${esc(p.pmus)}</code>`)}
+        ${kv('Resolves', p.resolves?`${esc(p.resolves)} · ${resolvesIn(p)}`:'<span class="warn">no resolve rule</span>')}
+        ${kv('Tape entries', `${p.entries} on ${p.entry_days} days · ${p.exits_tape} offered an exit`, 'Simulated maker fills, at most one per direction and shape per hour')}
+        ${kv('p, every chance taken', pctp(p.p_tape), 'Kaplan-Meier on the first exit chance, censored at the end of the window')}
+        ${kv('p at the take', pctp(p.p_unshrunk), 'The share of lots the engine gets out, each chance taken at the rate measured on our own lots')}
+        ${kv('p shrunk to its family', `${pctp(p.p)} <span class="sub">family ${fam?pctp(fam.p):'—'}</span>`)}
+        ${kv('80% lower bound', pctp(p.p_lcb))}
+        ${kv('Out for, on average', `${cents(p.mean_gain)} over cost · ${daysf(p.mean_exit_days)} / ${daysf(p.median_exit_days)}`, 'Mean proceeds over cost of the exit taken; mean and median days to it')}
+        ${kv('At par instead', `${pctp(p.p_par)} · ${cents(p.mean_gain_par)} over cost`, 'The same chance were the exit to wait for $1.00 net of fees')}
+        ${kv('Crossing both legs only', pctp(p.p_cross), 'The same rule taken as two taker legs: always fillable, never optimistic')}
+        ${kv('What the lens reads', `${p.lens_entries} entries · ${pctp(p.lens_p_lcb)} · ${daysf(p.lens_exit_days)} · ${cents(p.lens_gain)}`, 'The entries whose exit floor was their own cost, the lots the hold rule refuses: 80% bound on p, mean days to the exit, mean proceeds over cost')}
+        ${kv('Kalshi 1h move · basis sd', `${cents(p.kalshi_vol_1h)} · ${cents(p.basis_sd)}`)}
+        ${kv('Lock at the bar: hold → lens', p.margin_hold!=null?`${cents(p.margin_hold)} → ${cents(p.margin_lens)}`:'—')}
+      </div>
+      ${survivalChart(d, p)}
+    </div>
+    <div class="xgrid" style="margin-top:18px">${lockChart(d, p)}${historyChart(p)}</div>
+    <h2 style="margin-top:18px">Newest simulated entries</h2>
+    <div class="scroll"><table style="min-width:860px"><thead><tr><th>entered (UTC)</th><th>basket</th><th>rested on</th><th class="num">lock</th>
+      <th class="num">first exit chance</th><th class="num">chances</th><th class="num">at par</th><th class="num">crossing only</th><th class="num">watched</th></tr></thead>
+      <tbody>${recent||'<tr><td colspan="9" class="dim">None.</td></tr>'}</tbody></table></div>
+  </section>`);
+}
+
+function exitMethod(d){
+  const runs = (d.runs||[]).slice(-10).reverse().map(r => `<tr><td>${esc(r.as_of)}</td>
+    <td class="num">${r.share!=null?`${pctp(r.share)} · ${pctp(r.rate)}`:'—'}</td>
+    <td class="num">${r.calibration_lots}</td><td class="num">${pctp(r.p_global)}</td></tr>`).join('');
+  const f = d.fees||{};
+  return $(`<section class="wide"><h2>How this is measured</h2>
+    <details class="audit-note"><summary>The model, and what it leaves out</summary><div class="sub">
+      <p><b>Entries.</b> ${d.window_days} days of archived books (${esc(d.first_day)} to ${esc(d.as_of)}) are replayed onto a one-minute grid. A maker quote rests one tick inside the touch, or joins a one-tick touch, and counts as filled when a trade prints at its price (a full tick through it when it joined, since it is then behind the queue). The other leg is taken. At most one entry per direction and shape per hour, so one long dislocation is not counted as sixty trades.</p>
+      <p><b>Exits.</b> The engine's own rule, not par. Proceeds net of exit fees must clear the lot's cost by half a cent and beat holding to resolution at a ${d.calibration_hurdle_pct}% hurdle, which is <code>maker_exit</code>'s reservation floor. A maker exit rests one tick inside on either venue (same fill test) with the other leg taken; a cross is admitted on prices one tick worse than the touch on each leg, as the engine scores one, and paid at the touch. Each hour after an entry in which the rule could be met is one exit chance. Fees: Kalshi ${f.kalshi_taker} taker / ${f.kalshi_maker} maker, PM-US ${f.pmus_taker} taker / ${f.pmus_maker} maker, as p(1−p) per contract. Each pair is cut two days before its resolve date, so a book frozen after the event does not read as an exit.</p>
+      <p><b>Why not par.</b> With weeks to resolution the hold value is well under $1, so the engine sells below par, and most of our real exits come in below it. Waiting for $1.00 net leaves most pairs with no exit at all in the window: compare "at par" with p in the table.</p>
+      <p><b>The take.</b> The tape says when an exit was available, not whether the engine took it. Our own lots entered in the window are replayed under the same rule, each counting the chances it was offered up to the one it took, or up to now (or its close) if it was never sold back. They split: most that get out take one of their first few chances, and some are offered dozens and take none. So the fit has two parts, by maximum likelihood: the share of lots the engine can get out at all, and the rate it takes each chance one of those is offered. One rate alone would be set by the lots that never get out.</p>
+      <p><b>Pooling.</b> Kaplan-Meier over expected counts, so an entry near the end of the window counts for the time it was watched rather than as a failure. Each pair is shrunk toward its family without it, and the family toward all pairs, with ${d.prior_days} days of prior weight. Evidence is counted in entry days, because hourly entries within one dislocation share one outcome. The 80% bound uses the same day count.</p>
+      <p><b>The margin.</b> Holding admits a basket costing C when C ≤ V = 1/(1+rT). The lens admits it when p·(C+g)/(1+rτ) + (1−p)·V ≥ C, with p the 80% bound, τ the mean days to the exit and g the mean proceeds over cost. All three are read off the entries whose exit floor was their own cost: those are the lots the hold rule refuses, and they need only a half-cent move over what they paid. A fatter lock waits for the hold value and gains more when it gets it. The lens never asks more than holding, and never less than the half-cent floor. A lot not sold back within ${d.horizon_days} days is assumed held to resolution; when resolution comes first, p keeps only the exits before it.</p>
+      <p><b>Counts.</b> Fills clearing a margin are thinned at that margin, one per direction and shape per hour among the fills that clear it, so a thin fill early in an hour does not hide a fat one later. Rates are per day the pair was on the tape, at least one.</p>
+      <p><b>Not modelled.</b> Queue position beyond the one-tick rule. Depth: a fill is one contract, so a whole lot is assumed to go at once; the share of lots never taken absorbs some of that. Also our own quotes in the tape, one exit at a time, a PM-US book that went silent (its last quote is carried forward), regime change after the window, and the PM-US taker fee before 10-19, when it was 0.06.</p>
+    </div></details>
+    <h2 style="margin-top:16px">Nightly runs</h2>
+    <table style="max-width:560px"><thead><tr><th>as of</th><th class="num">lots out · rate a chance</th><th class="num">our lots</th><th class="num">p, all pairs</th></tr></thead>
+      <tbody>${runs||'<tr><td colspan="4" class="dim">No runs recorded.</td></tr>'}</tbody></table>
+  </section>`);
+}
+
+function drawExitability(f){
+  const d = S.data.exit;
+  if(!d) return loading(f, 'exitability fit');
+  if(d.error) return fail(f, d.error);
+  const rows = exitRows(d);
+  const sel = (d.pairs||[]).find(p => p.rel===S.exit.sel) || rows[0];
+  f.append(exitHero(d));
+  f.append(exitScatter(d, sel));
+  f.append(exitTable(d, rows, sel));
+  f.append(exitDrill(d, sel));
+  f.append(exitMethod(d));
+  return `fit as of ${esc(d.as_of)} &middot; ${(d.pairs||[]).length} pairs &middot; bar ${d.bar_pct.toFixed(1)}%`;
+}
+
+function exitWire(){
+  document.querySelectorAll('[data-exit-rel]').forEach(el => {
+    el.onclick = () => set(st => { st.exit.sel = el.dataset.exitRel; });
+  });
+  document.querySelectorAll('[data-exit-sort]').forEach(el => {
+    el.onclick = () => set(st => {
+      const [k, dir] = st.exit.sort.split(':'), key = el.dataset.exitSort;
+      st.exit.sort = `${key}:${k===key && dir==='desc' ? 'asc' : 'desc'}`;
+    });
+  });
+  const search = document.getElementById('exit-search');
+  if(search) search.oninput = () => set(st => { st.exit.query = search.value; });
+}
+
+/* --------------------------------------------------------------------------
    RENDER — the only function permitted to touch the document
    -------------------------------------------------------------------------- */
 function renderNav(active){
@@ -1942,6 +2277,7 @@ function render(){
   apply(document.getElementById('root'), frag);
 
   if(p === '/trades') tradeWire();
+  if(p === '/exitability') exitWire();
 
   // The live tape owns a dedicated connection, so it has to be opened and
   // closed as the view comes and goes — leaving it open would keep an SSE

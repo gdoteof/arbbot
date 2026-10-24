@@ -4,6 +4,7 @@ pub mod alerts;
 pub mod books;
 pub mod capital;
 pub mod equity;
+pub mod exitability;
 pub mod now;
 pub mod opportunities;
 pub mod pairs;

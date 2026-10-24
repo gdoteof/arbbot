@@ -252,6 +252,14 @@ const NODES: &[Decl] = &[
         what: "Turns settled baskets into realized P&L by appending to the ledger.",
     },
     Decl {
+        id: "exitability", label: "exitability fit", sub: "arbbot-exitability.timer · 08:15",
+        lane: 5, row: 6, kind: "timer", unit: Some("arbbot-exitability.timer"),
+        probe: Probe::Timer, max_age_s: None, expect: Expect::Live,
+        what: "Replays four weeks of archived books to estimate, per pair, how likely a lot \
+               is to come back at par inside two weeks, calibrated against our own exits. \
+               Read by the Exitability view only; the entry bar does not use it.",
+    },
+    Decl {
         id: "equity", label: "equity history", sub: "arbbot-equity.timer · 15 min",
         lane: 5, row: 7, kind: "timer", unit: Some("arbbot-equity.timer"),
         probe: Probe::Timer, max_age_s: None, expect: Expect::Live,
@@ -299,6 +307,9 @@ const EDGES: &[Edge] = &[
     Edge { from: "settle", to: "ledger", label: "realized P&L", kind: "write" },
     Edge { from: "trader_m3", to: "equity", label: "capital.json", kind: "read" },
     Edge { from: "equity", to: "dash_rs", label: "daily equity", kind: "read" },
+    Edge { from: "parquet", to: "exitability", label: "28 days of books", kind: "read" },
+    Edge { from: "ledger", to: "exitability", label: "our exits", kind: "read" },
+    Edge { from: "exitability", to: "dash_rs", label: "exit odds", kind: "read" },
 ];
 
 // ---------------------------------------------------------------------------

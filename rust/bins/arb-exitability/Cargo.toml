@@ -1,0 +1,16 @@
+[package]
+name = "arb-exitability"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Row reads only, the same arrow-free build arb-query uses.
+parquet = { version = "56", default-features = false, features = ["zstd"] }
+arb-core = { path = "../../crates/arb-core" }
+arb-query = { path = "../../crates/arb-query" }
+arb-registry = { path = "../../crates/arb-registry" }
