@@ -15,7 +15,7 @@ pub type D = dec::Decimal<12>; // 36-digit capacity, ops rounded to prec 28
 
 /// Shared contexts: HALF_EVEN for general math (Python's default), plus the
 /// two explicit-rounding quantize modes the scanner uses (ROUND_DOWN sizing,
-/// ROUND_CEILING fee cents).
+/// ROUND_CEILING Kalshi fees).
 pub struct Cx {
     even: Context<D>,
     down: Context<D>,
@@ -109,12 +109,19 @@ impl Cx {
         !v.is_zero() && !v.is_negative()
     }
 
-    /// x.quantize(Decimal("0.01"), ROUND_CEILING) — ceil_cents. The precision is
-    /// fixed at 2: this carried a `dp` argument its one caller passed `2` to and
-    /// the body never read.
-    pub fn quantize_ceil(&mut self, mut x: D) -> D {
-        let q = self.q_cent;
+    /// x.quantize(Decimal("0.0001"), ROUND_CEILING) — how Kalshi rounds an
+    /// order's fee (`fees.rs`).
+    pub fn quantize_ceil_4dp(&mut self, mut x: D) -> D {
+        let q = self.q_4dp;
         self.ceil.quantize(&mut x, &q);
+        x
+    }
+
+    /// x.quantize(Decimal("0.01")), HALF_EVEN — how PM-US rounds an order's
+    /// commission (`fees.rs`).
+    pub fn quantize_cent_even(&mut self, mut x: D) -> D {
+        let q = self.q_cent;
+        self.even.quantize(&mut x, &q);
         x
     }
 
@@ -702,7 +709,7 @@ pub fn maker_quote_limit(
     if !cx.is_pos(rough) {
         return None;
     }
-    let maker_fee = fees.fee(
+    let maker_fee = fees.for_market(maker_leg.venue, &maker_leg.market_id).fee(
         cx, maker_leg.venue, crate::fees::Role::Maker, rough, hedge_size,
         &maker_meta.category,
     );
@@ -773,7 +780,7 @@ pub fn maker_ask_quote_limit(
     let rough = cx.add(hedge_vwap, per);
     let one = cx.one;
     let capped = cx.min(rough, one);
-    let maker_fee = fees.fee(
+    let maker_fee = fees.for_market(maker_leg.venue, &maker_leg.market_id).fee(
         cx, maker_leg.venue, crate::fees::Role::Maker, capped, hedge_size,
         &maker_meta.category,
     );

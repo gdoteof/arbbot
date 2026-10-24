@@ -544,7 +544,7 @@ pub(super) fn first_attempt_acceptable(
 /// ask bought back off the ask makes `m - t`.
 ///
 /// Fees are charged on `qty` for both legs even though the entry may have
-/// filled as a larger order. Kalshi rounds each order UP to the cent, so the
+/// filled as a larger order. Kalshi rounds each order UP to $0.0001, so the
 /// fee on the smaller size is never less per contract than the share the
 /// entry actually paid — the conservative reading.
 ///
@@ -568,6 +568,7 @@ pub(super) fn sell_back_acceptable(
         BookSide::Ask => cx.sub(m, t),
     };
     let gross = cx.mul(per_ct, q);
+    let fees = &fees.for_market(entry.venue, &entry.market_id);
     let fee_in = fees.fee(cx, entry.venue, entry.role, m, q, "");
     let fee_out = fees.fee(cx, entry.venue, Role::Taker, t, q, "");
     let net = cx.sub(gross, fee_in);
@@ -2842,6 +2843,12 @@ mod sell_back_tests {
         EntryLeg { venue, market_id: "K".into(), side, price: price.into(), role }
     }
 
+    /// The same leg on a Kalshi series that charges makers
+    /// (`fees::KALSHI_MAKER_FEE_SERIES`), as jersmi's KXHEISMAN does.
+    fn heisman(side: BookSide, price: &str) -> EntryLeg {
+        EntryLeg { market_id: "KXHEISMAN-27-JSMIT".into(), ..entry(Venue::Kalshi, side, price, Role::Maker) }
+    }
+
     fn ok(e: &EntryLeg, touch: &str, qty: i64) -> bool {
         let mut cx = Cx::default();
         let fees = FeeSchedule::new(&mut cx);
@@ -2850,21 +2857,26 @@ mod sell_back_tests {
 
     /// The jersmi lots, priced by hand. A short entry (a maker ASK filled) is
     /// bought back off the ask, and clears only once the spread pays BOTH
-    /// Kalshi fees — each rounded up to the cent — plus `MIN_LOCK` a contract.
+    /// Kalshi fees — each ceiled to $0.0001 per order — plus `MIN_LOCK` a contract.
     #[test]
     fn a_short_entry_buys_back_below_its_price_after_both_fees() {
-        let lot8 = entry(Venue::Kalshi, BookSide::Ask, "0.25", Role::Maker);
-        // 8 x 0.03 = 0.24 gross, fees 0.03 + 0.10, net 0.11 >= 8 x 0.005
+        let lot8 = heisman(BookSide::Ask, "0.25");
+        // 8 x 0.03 = 0.24 gross, fees 0.0263 + 0.0961, net 0.1176 >= 8 x 0.005
         assert!(ok(&lot8, "0.22", 8));
 
-        let lot25 = entry(Venue::Kalshi, BookSide::Ask, "0.21", Role::Maker);
-        // 25 x 0.02 = 0.50 gross, fees 0.08 + 0.27, net 0.15 >= 0.125
+        let lot25 = heisman(BookSide::Ask, "0.21");
+        // 25 x 0.02 = 0.50 gross, fees 0.0726 + 0.2694, net 0.158 >= 0.125
         assert!(ok(&lot25, "0.19", 25));
-        // 25 x 0.01 = 0.25 gross, fees 0.08 + 0.28: a LOSS once fees are paid
+        // 25 x 0.01 = 0.25 gross, fees 0.0726 + 0.28: a LOSS once fees are paid
         assert!(!ok(&lot25, "0.20", 25), "a one-tick spread does not pay two fees");
         assert!(!ok(&lot25, "0.21", 25), "flat is a loss after fees");
-        // 5 x 0.02 = 0.10 gross, fees 0.02 + 0.06: +0.02, under 5 x 0.005
-        assert!(!ok(&lot25, "0.19", 5), "a profit under MIN_LOCK is not worth the trade");
+        // Dearer contracts pay more fee on the same 2c spread: 5 x 0.02 = 0.10
+        // gross, fees 0.0184 + 0.0706: +0.011, under 5 x 0.005
+        let lot30 = heisman(BookSide::Ask, "0.30");
+        assert!(!ok(&lot30, "0.28", 5), "a profit under MIN_LOCK is not worth the trade");
+        // On a series that does not charge makers the same lot keeps the 0.0184.
+        let free = entry(Venue::Kalshi, BookSide::Ask, "0.30", Role::Maker);
+        assert!(ok(&free, "0.28", 5), "0.10 gross less 0.0706 taker clears 0.025");
     }
 
     /// A long entry (a maker BID filled) is sold into the bid, so the same

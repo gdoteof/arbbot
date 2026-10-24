@@ -11,7 +11,7 @@
 //!   that backwards puts the reconciliation $156.67 out.
 //!
 //! Fees come from the fill's `fee_cost` (what the venue actually charged,
-//! ceil-to-cent per order), never from the modelled curve. Settlement
+//! ceiled to $0.0001 per order), never from the modelled curve. Settlement
 //! `fee_cost` is IGNORED: it restates the market's fill fees and booking it
 //! would double-count.
 

@@ -1052,6 +1052,7 @@ fn hedge_limit(
         let limit = hedge_limit(cx, fees, &normalized, qty, &view)?;
         return complement(cx, &limit).ok_or("invalid normalized hedge limit".into());
     }
+    let fees = &fees.for_market(arb_core::model::Venue::Kalshi, &o.market);
     if o.cross.is_none() {
         return price_close(cx, fees, o, qty, v);
     }

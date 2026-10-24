@@ -47,10 +47,10 @@
 //!     strictly increasing, so pricing off the ask understates the cost of every
 //!     fill above it. [`buy_limit`] solves the fixed point instead.
 //!   * **The fee is the schedule's, not the Python's approximation.** Kalshi
-//!     rounds a taker fee UP to the cent over the whole clip
+//!     rounds a taker fee UP to $0.0001 over the whole clip
 //!     (`FeeSchedule::fee`); `kalshi_taker_fee` in the script quantizes
-//!     `0.07·p·(1-p)` to 4dp per contract and so under-states it — 1.12c where
-//!     the venue charges 2c on a single contract at $0.19.
+//!     `0.07·p·(1-p)` to 4dp per contract and so under-states it on any clip
+//!     above one contract.
 //!   * **An empty side is not a price of zero.** Kalshi spells "no ask" as
 //!     `"0.0000"` (1,742 of the 35,640 market rows captured in
 //!     `data/catalogs/`), and `Decimal("0.0000") <= limit` is TRUE for every
@@ -762,8 +762,8 @@ pub fn kalshi_step(cx: &mut Cx, ladder: Option<&[(String, String, String)]>, x: 
 ///
 /// Per contract because that is the unit the basket arithmetic is in, but
 /// derived from the whole clip because that is how the venue charges: the
-/// schedule ceils to the cent ONCE over `qty·p·(1-p)`, so a 5-lot pays less per
-/// contract than a 1-lot does. Sizing before pricing is therefore not an
+/// schedule ceils to $0.0001 ONCE over `qty·p·(1-p)`, so the per-contract fee
+/// moves with the clip. Sizing before pricing is therefore not an
 /// optimisation, it is a precondition.
 fn fee_per_ct(cx: &mut Cx, fees: &FeeSchedule, price: D, qty: i64) -> D {
     let size = cx.from_i64(qty);

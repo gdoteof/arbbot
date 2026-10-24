@@ -927,8 +927,9 @@ fn a_naked_sell_back_prices_as_the_spread_less_both_fees() {
     let out = build(rec, "default", 1785250000.0);
     let r = &out["rows"][0];
     assert_eq!(r["hedged"], true, "{r}");
-    // 5 x (0.45 - 0.38) = 0.35, less Kalshi maker 0.03 and taker 0.09
-    assert!((r["net_usd"].as_f64().unwrap() - 0.23).abs() < 1e-9, "{}", r["net_usd"]);
+    // 5 x (0.45 - 0.38) = 0.35, less the Kalshi taker fee ceil(0.07*5*0.45*0.55)
+    // = 0.0867; "K" is not a maker-fee series, so the resting entry paid nothing.
+    assert!((r["net_usd"].as_f64().unwrap() - 0.2633).abs() < 1e-9, "{}", r["net_usd"]);
     assert_eq!(out["totals"]["realized_trades"], 1);
     assert_eq!(out["totals"]["open_trades"], 0, "a close is not a working position");
 }

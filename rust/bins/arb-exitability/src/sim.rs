@@ -34,9 +34,9 @@ use crate::tape::Series;
 
 pub const KALSHI_TAKER: f64 = 0.07;
 pub const KALSHI_MAKER: f64 = 0.0175;
-/// PM-US's exchange-wide taker coefficient since 2026-10-19. Applied to the
-/// whole window; before that date it was 0.06, so earlier exits read slightly
-/// harder than they were.
+/// PM-US's exchange-wide taker coefficient since 2026-09-19 (`fees.rs`).
+/// Applied to the whole window; before that date it was 0.06, so earlier exits
+/// read slightly harder than they were.
 pub const PMUS_TAKER: f64 = 0.0695;
 pub const TICK: f64 = 0.01;
 /// Below this lock an entry is not worth simulating: the engine's own floor.

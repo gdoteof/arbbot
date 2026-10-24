@@ -44,9 +44,9 @@ use arb_core::scan::{feasible_min_payoff, Cx, Rel, Side, D};
 /// mandate; loosening what fires at the tails is not, and `max(real, floor)`
 /// is the only shape that can never charge less than reality. It also stands
 /// in for two costs `detect` genuinely cannot see: PM-US's per-market
-/// `feeCoefficient` (the schedule's 0.06 is documented as the observed
-/// FALLBACK, and `taker_coef_override` is never populated in this workspace),
-/// and a clip that walks past the touch it was sized against.
+/// `feeCoefficient` (the schedule's 0.0695 is the coefficient every market has
+/// reported since 2026-09-19, and `taker_coef_override` is never populated in
+/// this workspace), and a clip that walks past the touch it was sized against.
 const FEE_CT: &str = "0.02";
 
 /// The fee curves, built once. A `FeeSchedule` is a constant coefficient
@@ -62,11 +62,11 @@ fn schedule() -> &'static FeeSchedule {
 /// Both-leg taker fee per contract for a K->PM crossing of `size` contracts:
 /// buy Kalshi YES at `k_ask`, sell PM-US YES at `p_bid`. Floored at `FEE_CT`.
 ///
-/// SIZE IS AN INPUT, not a scale factor. Kalshi ceils its fee to the cent per
-/// ORDER (`fees.rs`, `quantize_ceil`), so at 0.47 a 5-lot pays 0.0180/ct of
-/// Kalshi fee and a 50-lot pays 0.0176 — and it is not even monotone, because
-/// what matters is where the ceiling lands. There is no per-contract figure to
-/// multiply, which is why this is computed after the clip is known.
+/// SIZE IS AN INPUT, not a scale factor. Kalshi ceils its fee to $0.0001 per
+/// ORDER and PM-US rounds its commission to the cent per order (`fees.rs`), so
+/// the per-contract fee depends on where each rounding lands and is not even
+/// monotone in the clip. There is no per-contract figure to multiply, which is
+/// why this is computed after the clip is known.
 fn both_leg_taker_fee(cx: &mut Cx, k_ask: D, p_bid: D, size: i64) -> D {
     let sched = schedule();
     let n = cx.from_i64(size);
@@ -477,7 +477,7 @@ pub fn detect(
         return Err(Skip::NoResolveDate);
     };
 
-    // SIZE BEFORE FEE. Kalshi ceils its fee to the cent per ORDER, so the
+    // SIZE BEFORE FEE. Both venues round the fee per ORDER (`fees.rs`), so the
     // per-contract cost is a function of the clip and simply does not exist
     // until the clip does. Sizing is bounded by remaining per-rel headroom,
     // the depth on the two levels we would actually cross, and the clip.
@@ -740,10 +740,10 @@ mod tests {
     ///   edge=+7c net=+5c apr=7%
     /// — and what it is really worth. Python's flat 2c fee was under half the
     /// truth: at Kalshi ask 0.43 the taker fee is
-    /// `ceil_cents(0.07 * 20 * 0.43 * 0.57) = 0.35` (0.0175/ct) and at PM-US
-    /// bid 0.50 it is `0.06 * 0.50 * 0.50 * 20 = 0.30` (0.015/ct), so
-    /// **0.0325/ct**, not 0.02. Net is 3.75c not 5c, and the APR 5.43%/yr not
-    /// 7% — 38% lower, exactly as the audit computed.
+    /// `ceil4(0.07 * 20 * 0.43 * 0.57) = 0.3432` (0.01716/ct) and at PM-US
+    /// bid 0.50 it is `round(0.0695 * 0.50 * 0.50 * 20) = 0.35` (0.0175/ct), so
+    /// **0.03466/ct**, not 0.02. Net is 3.53c not 5c, and the APR 5.12%/yr not
+    /// 7%.
     /// france-pres-27 resolves 2027-04-25, so ~0.742yr from 2026-07-28.
     #[test]
     fn melenchon_pays_the_real_both_leg_fee_not_the_flat_two_cents() {
@@ -754,9 +754,9 @@ mod tests {
         let got =
             detect(&mut cx, &r, &b, "2026-07-28", 0.0, 50, 0, 20, "0.01").expect("clears a zero bar");
         assert_eq!(got.edge, "0.070000");
-        assert_eq!(got.fee, "0.032500", "0.0175 kalshi + 0.015 pmus, per contract");
-        assert_eq!(got.net, "0.037500");
-        assert!((got.apr - 5.4346).abs() < 0.01, "expected ~5.43%/yr, got {}", got.apr);
+        assert_eq!(got.fee, "0.034660", "0.01716 kalshi + 0.0175 pmus, per contract");
+        assert_eq!(got.net, "0.035340");
+        assert!((got.apr - 5.1215).abs() < 0.01, "expected ~5.12%/yr, got {}", got.apr);
     }
 
     #[test]
@@ -845,51 +845,51 @@ mod tests {
 
     /// A crossing whose ENTIRE net edge fits inside the hedge's slip budget.
     ///
-    /// 10 days out from 2026-12-31, Kalshi ask 0.49 / PM-US bid 0.526, clip 20:
-    ///   edge 0.036
-    ///   fee  ceil_cents(0.07*20*0.49*0.51) = 0.35    -> 0.017500/ct
-    ///        + 0.06*0.526*0.474                      -> 0.014959/ct
-    ///                                                 = 0.032459/ct
-    ///   net  0.003541 -> 0.003541/0.964/(10/365.25) = 13.42%/yr
+    /// 10 days out from 2026-12-31, Kalshi ask 0.49 / PM-US bid 0.53, clip 20:
+    ///   edge 0.040
+    ///   fee  ceil4(0.07*20*0.49*0.51) = 0.3499       -> 0.017495/ct
+    ///        + round(0.0695*20*0.53*0.47) = 0.35      -> 0.017500/ct
+    ///                                                 = 0.034995/ct
+    ///   net  0.005005 -> 0.005005/0.96/(10/365.25) = 19.04%/yr
     /// which clears the ~10%/yr blended bar and fires. Leg 1 takes PM-US; our
     /// own take clears the 0.49 ask, it reprints at 0.50 — exactly the 1c
     /// budget, which `hedge_price_acceptable` ACCEPTS — and the basket realises
-    /// 0.026 - 0.032459 = -0.006459/ct. A +$0.07 basket logged as riskless
-    /// settles as a -$0.13 loss, on a leg-2 move the engine itself licensed.
+    /// 0.030 - 0.034995 = -0.004995/ct. A +$0.10 basket logged as riskless
+    /// settles as a -$0.10 loss, on a leg-2 move the engine itself licensed.
     ///
     /// At this horizon the bar only demands net >= ~0.0027, so the whole band
-    /// 0.0027..0.01 was fireable and negative-EV: the allowance could be 2.8x
+    /// 0.0027..0.01 was fireable and negative-EV: the allowance could be 2x
     /// the edge. This is the band the gate closes.
     #[test]
     fn refuses_a_crossing_the_hedge_is_licensed_to_erase() {
         let mut cx = Cx::default();
         let r = rel("xvus-fedcut-26-usfed-2026-cut");
-        let b = books("0.48", "0.49", "20", "0.526", "20", "0.53");
+        let b = books("0.48", "0.49", "20", "0.53", "20", "0.54");
 
         // what it is worth on screen — and that it does clear the bar, so the
         // refusal below is the slip gate and nothing else
         let priced = detect(&mut cx, &r, &b, "2026-12-21", 10.0, 50, 0, 20, "0")
-            .expect("with no budget to lose, this is a 13.4%/yr crossing");
-        assert_eq!(priced.edge, "0.036000");
-        assert_eq!(priced.fee, "0.032459", "0.0175 kalshi + 0.014959 pmus");
-        assert_eq!(priced.net, "0.003541");
-        assert!((priced.apr - 13.4165).abs() < 0.01, "got {}", priced.apr);
+            .expect("with no budget to lose, this is a 19%/yr crossing");
+        assert_eq!(priced.edge, "0.040000");
+        assert_eq!(priced.fee, "0.034995", "0.017495 kalshi + 0.0175 pmus");
+        assert_eq!(priced.net, "0.005005");
+        assert!((priced.apr - 19.0424).abs() < 0.01, "got {}", priced.apr);
 
-        // at the live budget the hedge may give away 0.01 of a 0.003541 edge
+        // at the live budget the hedge may give away 0.01 of a 0.005005 edge
         assert_eq!(
             detect(&mut cx, &r, &b, "2026-12-21", 10.0, 50, 0, 20, "0.01"),
-            Err(Skip::NetUnderSlip { net: "0.003541".into(), slip: "0.01".into() })
+            Err(Skip::NetUnderSlip { net: "0.005005".into(), slip: "0.01".into() })
         );
 
         // The boundary is refused too, because `hedge_price_acceptable` accepts
         // ITS boundary: at net == slip exactly, the worst in-policy fill nets
-        // zero. Net here is 0.036 - 0.03245944 exactly, so this is the real
-        // knife edge and not a rounded one.
+        // zero. Both fees land on a rounding boundary, so net is 0.040 -
+        // 0.034995 exactly and this is the real knife edge.
         assert!(matches!(
-            detect(&mut cx, &r, &b, "2026-12-21", 10.0, 50, 0, 20, "0.00354056"),
+            detect(&mut cx, &r, &b, "2026-12-21", 10.0, 50, 0, 20, "0.005005"),
             Err(Skip::NetUnderSlip { .. })
         ));
-        assert!(detect(&mut cx, &r, &b, "2026-12-21", 10.0, 50, 0, 20, "0.00354055").is_ok());
+        assert!(detect(&mut cx, &r, &b, "2026-12-21", 10.0, 50, 0, 20, "0.005004").is_ok());
 
         // ...and this is not a switch that turns take-take off. The crossings
         // the engine actually traded clear the budget several times over: the
@@ -950,18 +950,19 @@ mod tests {
         }
     }
 
-    /// Kalshi ceils its fee to the cent PER ORDER, so the per-contract fee is
-    /// not linear in the clip and is not even monotone in it — what matters is
-    /// where the ceiling lands. At Kalshi ask 0.47:
-    ///   clip  5: ceil(0.07*5*0.47*0.53)  = 0.09 -> 0.0180/ct
-    ///   clip 20: ceil(0.07*20*0.47*0.53) = 0.35 -> 0.0175/ct
-    ///   clip 50: ceil(0.07*50*0.47*0.53) = 0.88 -> 0.0176/ct  <- worse than 20
-    /// PM-US does not ceil, so its 0.014946/ct is the same at every clip.
+    /// Both venues round the fee PER ORDER — Kalshi ceils to $0.0001, PM-US
+    /// rounds to the cent — so the per-contract fee is not linear in the clip
+    /// and is not even monotone in it; what matters is where each rounding
+    /// lands. At Kalshi ask 0.47 / PM-US bid 0.53:
+    ///   clip  5: ceil4(0.07*5*0.47*0.53)  = 0.0872 -> 0.017440/ct
+    ///            round(0.0695*5*0.53*0.47) = 0.09   -> 0.018000/ct
+    ///   clip 20: 0.3488 -> 0.017440/ct;  0.35 -> 0.017500/ct
+    ///   clip 50: 0.8719 -> 0.017438/ct;  0.87 -> 0.017400/ct
     ///
     /// A per-contract figure assumed linear would have charged all three the
     /// same, which is why the fee is computed after the clip is known.
     #[test]
-    fn the_kalshi_ceiling_prices_each_clip_separately() {
+    fn the_per_order_rounding_prices_each_clip_separately() {
         let mut cx = Cx::default();
         let r = rel("xvus-fedcut-26-usfed-2026-cut");
         // 6c edge so every clip clears and a Candidate exists to inspect
@@ -972,9 +973,9 @@ mod tests {
             assert_eq!(got.size, clip);
             got.fee
         };
-        assert_eq!(f(&mut cx, 5), "0.032946", "0.0180 + 0.014946");
-        assert_eq!(f(&mut cx, 20), "0.032446", "0.0175 + 0.014946");
-        assert_eq!(f(&mut cx, 50), "0.032546", "0.0176 + 0.014946 — dearer than clip 20");
+        assert_eq!(f(&mut cx, 5), "0.035440", "0.017440 + 0.018000");
+        assert_eq!(f(&mut cx, 20), "0.034940", "0.017440 + 0.017500");
+        assert_eq!(f(&mut cx, 50), "0.034838", "0.017438 + 0.017400");
     }
 
     #[test]

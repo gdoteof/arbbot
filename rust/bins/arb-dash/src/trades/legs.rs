@@ -103,14 +103,16 @@ impl Modeller {
     /// Only an explicit `maker` gets the maker coefficient. An unrecorded role
     /// prices as a TAKER: overstating our own costs is the safe direction for
     /// an accounting view, and defaulting the other way would quietly flatter
-    /// it.
-    fn model(&mut self, venue: &str, role: &str, px: Option<f64>, qty: f64, cat: &str) -> f64 {
+    /// it. A Kalshi maker leg is priced for its market: the venue charges
+    /// makers on some series and not others (`fees::kalshi_charges_makers`).
+    fn model(&mut self, venue: &str, market_id: &str, role: &str, px: Option<f64>, qty: f64,
+             cat: &str) -> f64 {
         let role = if role == "maker" { Role::Maker } else { Role::Taker };
         match (Venue::parse(venue), px) {
             (Some(v), Some(px)) => {
                 let p = self.cx.parse_exact(&format!("{px}"));
                 let sz = self.cx.parse_exact(&format!("{qty}"));
-                let f = self.sched.fee(&mut self.cx, v, role, p, sz, cat);
+                let f = self.sched.for_market(v, market_id).fee(&mut self.cx, v, role, p, sz, cat);
                 self.cx.emit_6dp(f).parse::<f64>().unwrap_or(0.0)
             }
             _ => 0.0,
@@ -223,7 +225,8 @@ impl Legs {
                 Some(f) => f,
                 None => {
                     out.settled = false;
-                    m.model(&venue_s, &role_s, px, lqty, fee_category)
+                    let market_id = l.get("market_id").and_then(|v| v.as_str()).unwrap_or("");
+                    m.model(&venue_s, market_id, &role_s, px, lqty, fee_category)
                 }
             };
             out.fees += leg_fee;

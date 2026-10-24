@@ -45,8 +45,9 @@ pub const INCOME_CREDITS_PMUS: &str = "income:venue_credits:pmus";
 pub const PNL_PMUS_UNITEMIZED: &str = "pnl:realized:pmus_unitemized";
 
 /// Split by venue AND role: the whole maker-vs-taker question turns on this,
-/// and Kalshi's maker fee is 0.0175*P*(1-P), NOT zero (curves.py:69) — 23
-/// maker legs went unbooked in the old ledger on the assumption it was.
+/// and Kalshi's maker fee is 0.0175*P*(1-P) on its maker-fee series
+/// (`arb_core::fees::KALSHI_MAKER_FEE_SERIES`), NOT zero — 23 maker legs went
+/// unbooked in the old ledger on the assumption it was.
 pub const FEES_KALSHI_TAKER: &str = "expense:fees:kalshi:taker";
 pub const FEES_KALSHI_MAKER: &str = "expense:fees:kalshi:maker";
 pub const FEES_PMUS_TAKER: &str = "expense:fees:pmus:taker";
