@@ -1,0 +1,9 @@
+[Unit]
+Description=arbbot exitability fit daily at 08:15 local, after the 07:30 archive
+
+[Timer]
+OnCalendar=*-*-* 08:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

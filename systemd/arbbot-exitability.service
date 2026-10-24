@@ -1,0 +1,10 @@
+[Unit]
+Description=arbbot exitability fit (per-pair odds of a par exit, for the dashboard)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/claude/arbbot
+# Reads four weeks of archive; idle priority keeps it off the recorder's disk.
+Nice=19
+IOSchedulingClass=idle
+ExecStart=%h/claude/arbbot/rust/target/release/arb-exitability

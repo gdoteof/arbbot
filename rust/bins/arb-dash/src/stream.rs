@@ -47,9 +47,11 @@ fn state_json(a: &Args) -> String {
         ^ stat_sig(&format!("{}/exec/marks.json", a.data_dir)).rotate_left(23);
     let opps = stat_sig(&format!("{}/opportunities-{day}.jsonl", a.scan_dir));
     let registry = stat_all(std::slice::from_ref(&a.registry));
+    let exitability = stat_sig(&format!("{}/exitability/latest.json", a.data_dir));
     format!(
         "{{\"today\":\"{day}\",\"books\":{books},\"recording\":{recording},\
-         \"opportunities\":{opps},\"pairs\":{registry},\"now\":{now_sig}}}"
+         \"opportunities\":{opps},\"pairs\":{registry},\"now\":{now_sig},\
+         \"exitability\":{exitability}}}"
     )
 }
 

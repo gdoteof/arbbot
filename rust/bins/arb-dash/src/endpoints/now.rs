@@ -389,6 +389,12 @@ fn engine_summary(unit: &str, up_s: u64) -> (Option<Value>, Option<u64>, Option<
     }
 }
 
+/// The maker APR bar (percent) the armed engine last reported, if it has.
+pub(crate) fn maker_apr_bar() -> Option<f64> {
+    let (unit, p) = armed_engine()?;
+    engine_summary(&unit, p.up_s).0?.get("maker_apr_bar")?.as_f64()
+}
+
 /// The gauges worth a headline, in the order an operator reads them. Anything
 /// not named here is still returned under `all`, because a 75-gauge summary is
 /// exactly the thing you want in full when something is wrong.

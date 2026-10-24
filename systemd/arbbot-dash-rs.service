@@ -5,7 +5,7 @@
 # READ-ONLY: it serves views over the tape, scan output, and books. It holds no
 # credentials and has no order code path.
 #
-# Views: / (Capital) /now /opportunities /pairs /trades /live /recording
+# Views: / (Capital) /now /opportunities /pairs /trades /exitability /live /recording
 #        plus SSE at /api/stream.
 #
 # PATHS — everything below must be durable. This unit exists because the dash
