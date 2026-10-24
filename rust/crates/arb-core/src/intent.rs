@@ -138,6 +138,12 @@ pub struct HedgeNeeded {
 /// record: an engine that is skipping is an engine that is running.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Skip {
+    /// The pair the decision was about. Every site that skips knows it, so a
+    /// refusal can be put down to the pair it refused rather than guessed from
+    /// whatever scope its reason happens to name. Optional on the wire only so
+    /// lines written before it existed still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship_id: Option<String>,
     pub skip: Vec<String>,
     pub ts: f64,
 }
@@ -226,6 +232,19 @@ mod wire_format_tests {
         assert_eq!(it.to_line(), line);
     }
 
+    /// A skip names its pair ahead of `skip` (`relationship_id` < `skip`), and
+    /// a line written before it did still parses, to `None`. Composed: no
+    /// engine had written one when this was added.
+    #[test]
+    fn a_skip_names_its_pair_first_and_an_old_skip_still_parses() {
+        let line = r#"{"relationship_id":"xvus-time-poty-26-x","skip":["per-relationship tail cap: notional 25 > headroom 20.0 (cap 150.0, oracle_risk=low)"],"ts":1.0}"#;
+        let it = Intent::from_line(line).expect("parse");
+        assert!(matches!(&it, Intent::Skip(s) if s.relationship_id.as_deref() == Some("xvus-time-poty-26-x")));
+        assert_eq!(it.to_line(), line);
+        let old = Intent::from_line(REAL_LINES[0]).expect("parse");
+        assert!(matches!(old, Intent::Skip(Skip { relationship_id: None, .. })));
+    }
+
     /// The key SET is the discriminator, so an absent field must not become
     /// `null`: `arb_query::intents::fold` treats any present `cancel` as a
     /// cancel, and would read a place carrying `"cancel":null` as one.
@@ -290,7 +309,11 @@ mod wire_format_tests {
                 qty: 5,
                 ts: 1.0,
             }),
-            Intent::Skip(Skip { skip: vec!["why".into()], ts: 1.0 }),
+            Intent::Skip(Skip {
+                relationship_id: Some("xvus-r".into()),
+                skip: vec!["why".into()],
+                ts: 1.0,
+            }),
         ];
         for it in &all {
             let line = it.to_line();
@@ -307,7 +330,7 @@ mod wire_format_tests {
     /// `json!` macro did, and a line that lost it would differ by a byte.
     #[test]
     fn an_integral_timestamp_keeps_its_trailing_zero() {
-        let it = Intent::Skip(Skip { skip: vec!["x".into()], ts: 1785257814.0 });
+        let it = Intent::Skip(Skip { relationship_id: None, skip: vec!["x".into()], ts: 1785257814.0 });
         assert_eq!(it.to_line(), r#"{"skip":["x"],"ts":1785257814.0}"#);
     }
 

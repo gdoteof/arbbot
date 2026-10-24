@@ -34,16 +34,17 @@
 //!     it still sees every 30s, so a row's age says whether it is
 //!     crossing now.
 //!
-//! What this view CANNOT do, stated plainly because the gap is the interesting
-//! part: a skip line is `{"skip":[reason], "ts":…}` and carries no
-//! relationship id, so no refusal can be attributed to the pair that provoked
-//! it. Topic- and event-scoped gates are attributable — the topic or event is
-//! in the string, and `arb_core::risk::{topic_of, event_of}` bucket a pair the
-//! same way the gate did. `class cap` and `global cap` name no scope and apply
-//! to everything. `per-relationship tail cap` names no scope either, but it
-//! refuses ONE pair, and the string does not say which — so it is attributed
-//! to no pair rather than to all of them. Rows say which of the three they
-//! are getting.
+//! A skip line names the pair it refused (`{"relationship_id":…,"skip":[…]}`),
+//! so a refusal is put down to that pair and to no other. A gate whose reason
+//! names no scope and that is not a global cap — the per-relationship tail
+//! cap, a crossed book — is scoped to the pair its line names. `class cap` and
+//! `global cap` name no scope because they have none, and apply to everything.
+//!
+//! Lines written before skips named their pair carry no relationship id. For a
+//! window holding only those, attribution falls back to scope: topic- and
+//! event-scoped gates by `arb_core::risk::{topic_of, event_of}`, the global
+//! caps to everything, and a scope-less per-pair gate to no pair rather than
+//! to all of them.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -225,11 +226,40 @@ fn applies_to_everything(gate: &str) -> bool {
     matches!(gate, "class cap" | "global cap") || gate.starts_with("kill switch")
 }
 
-/// The refusal that COVERS a pair, from the engine's own stream: a gate on the
-/// pair's topic if there is one, else a per-event cap on its event, else a gate
-/// that applies to everything. A tail cap is never the answer: it refused one
-/// pair and does not say which.
-fn covering_refusal<'a>(constraints: &'a [Gate], topic: &str, event: &str) -> Option<&'a Gate> {
+/// Gate rows, keyed `(gate, scope)`, that a skip line naming each pair hit,
+/// with how often.
+type Named = HashMap<String, BTreeMap<(String, Option<String>), u64>>;
+
+/// One reason off a skip line that names `rel`. A gate with no scope of its own
+/// that is not a global cap refused that pair and only that pair, so the pair
+/// becomes its scope: one row per pair, rather than every pair's tail cap
+/// folded into a row whose numbers belong to whichever refused last.
+fn classify_for(reason: &str, rel: Option<&str>) -> Gate {
+    let mut g = classify(reason);
+    if g.scope.is_none() && !applies_to_everything(&g.gate) {
+        g.scope = rel.map(str::to_string);
+    }
+    g
+}
+
+/// The refusal that COVERS a pair, from the engine's own stream.
+///
+/// When skip lines name their pair, it is the gate that refused THIS pair most
+/// often in the window, and a pair no line names was not refused. A window of
+/// older lines falls back to scope: a gate on the pair's topic, else a per-event
+/// cap on its event, else a gate that applies to everything — never a
+/// scope-less per-pair gate, which refused one pair without saying which.
+fn covering_refusal<'a>(
+    constraints: &'a [Gate],
+    named: &Named,
+    rel: &str,
+    topic: &str,
+    event: &str,
+) -> Option<&'a Gate> {
+    if !named.is_empty() {
+        let (key, _) = named.get(rel)?.iter().max_by_key(|(_, n)| **n)?;
+        return constraints.iter().find(|g| g.gate == key.0 && g.scope == key.1);
+    }
     constraints
         .iter()
         .find(|g| g.scope.as_deref() == Some(topic))
@@ -471,15 +501,20 @@ pub fn json(a: &Args) -> String {
     let (mut places, mut cancels) = (0u64, 0u64);
     let mut resting: BTreeMap<String, Value> = BTreeMap::new();
     let mut gates: BTreeMap<(String, Option<String>), Gate> = BTreeMap::new();
+    let mut named = Named::new();
     let mut acted_markets: HashMap<String, f64> = HashMap::new();
     let mut recent: Vec<Value> = Vec::new();
 
     for l in &lines {
         let ts = f(l.get("ts")).unwrap_or(0.0);
         if let Some(reasons) = l.get("skip").and_then(Value::as_array) {
+            let rel = l.get("relationship_id").and_then(Value::as_str);
             for r in reasons.iter().filter_map(Value::as_str) {
-                let g = classify(r);
+                let g = classify_for(r, rel);
                 let key = (g.gate.clone(), g.scope.clone());
+                if let Some(rel) = rel {
+                    *named.entry(rel.to_string()).or_default().entry(key.clone()).or_default() += 1;
+                }
                 match gates.get_mut(&key) {
                     // Keep the NEWEST numbers, not the first: the deployed
                     // figure moves as the book does, and a stale one would
@@ -672,7 +707,7 @@ pub fn json(a: &Args) -> String {
             let why = if !is_tradable || !in_scope {
                 None
             } else {
-                covering_refusal(&constraints, &topic, event_of(rel))
+                covering_refusal(&constraints, &named, rel, &topic, event_of(rel))
             };
             let apr = crossing_apr(rel, o.edge, o.cost, &today);
             // Below the bar comes before any gate: freeing capital does not
@@ -885,9 +920,9 @@ mod tests {
 
     /// ONE PAIR'S TAIL CAP IS NOT EVERY PAIR'S BLOCKER. A scope-less gate was
     /// read as covering everything, so a single pair at its tail cap was
-    /// shown as the refusal on every pair on the page. Each pair now gets
-    /// its topic's gate, else its event's, else a cap that truly covers all —
-    /// and the tail cap, which names no pair, covers none.
+    /// shown as the refusal on every pair on the page. On lines that do not
+    /// name their pair, each pair gets its topic's gate, else its event's, else
+    /// a cap that truly covers all — and the tail cap covers none.
     #[test]
     fn a_tail_cap_is_attributed_to_no_pair_rather_than_to_all_of_them() {
         let tail = classify("per-relationship tail cap: notional 25 > headroom 20.0 (cap 150.0, oracle_risk=low)");
@@ -897,7 +932,7 @@ mod tests {
 
         let lula = "xvus-brazil-pres-26-luizinacioluladasilva";
         let pick = |gates: &[Gate], rel: &str, t: &str| {
-            covering_refusal(gates, t, event_of(rel)).map(|g| g.gate.clone())
+            covering_refusal(gates, &Named::new(), rel, t, event_of(rel)).map(|g| g.gate.clone())
         };
         assert_eq!(pick(&gates, lula, "other").as_deref(), Some("per-event loss cap"));
         assert_eq!(
@@ -919,6 +954,48 @@ mod tests {
         for g in ["per-relationship tail cap", "per-event loss cap", "topic budget", "venue cash"] {
             assert!(!applies_to_everything(g), "{g}");
         }
+    }
+
+    /// A skip line that names its pair puts the refusal on that pair alone. The
+    /// tail cap becomes a row OF the pair; a pair in the same topic that no line
+    /// named was not refused, however hard its topic budget is binding on a
+    /// neighbour; and a class cap, which has no scope, stays "everything".
+    #[test]
+    fn a_named_skip_is_attributed_to_its_pair_and_no_other() {
+        let zohran = "xvus-time-poty-26-zohranmamdani";
+        let ai = "xvus-time-poty-26-artificialintelligence";
+        let pope = "xvus-time-poty-26-popeleoxiv";
+        let lines = [
+            (zohran, "per-relationship tail cap: notional 25 > headroom 20.0 (cap 150.0, oracle_risk=low)"),
+            (zohran, "per-relationship tail cap: notional 25 > headroom 20.0 (cap 150.0, oracle_risk=low)"),
+            (ai, "topic budget [time-poty-26]: 154+5 > 150"),
+            (ai, "class cap: 341+5 > 343.00"),
+            (ai, "topic budget [time-poty-26]: 154+5 > 150"),
+        ];
+        let mut named = Named::new();
+        let mut gates: Vec<Gate> = Vec::new();
+        for (rel, reason) in lines {
+            let g = classify_for(reason, Some(rel));
+            *named.entry(rel.into()).or_default().entry((g.gate.clone(), g.scope.clone())).or_default() += 1;
+            if !gates.iter().any(|x| x.gate == g.gate && x.scope == g.scope) {
+                gates.push(g);
+            }
+        }
+        let tail = gates.iter().find(|g| g.gate == "per-relationship tail cap").unwrap();
+        assert_eq!(tail.scope.as_deref(), Some(zohran), "the row is the pair's");
+        let class = gates.iter().find(|g| g.gate == "class cap").unwrap();
+        assert_eq!(class.scope, None, "a global cap is not scoped to whoever it refused");
+
+        let pick = |rel: &str| {
+            covering_refusal(&gates, &named, rel, "time-poty-26", event_of(rel))
+                .map(|g| (g.gate.clone(), g.scope.clone()))
+        };
+        assert_eq!(pick(zohran), Some(("per-relationship tail cap".into(), Some(zohran.into()))));
+        assert_eq!(pick(ai), Some(("topic budget".into(), Some("time-poty-26".into()))), "its commonest");
+        assert_eq!(pick(pope), None, "no line named it, so nothing refused it");
+
+        let old = classify_for("per-relationship tail cap: notional 25 > headroom 20.0 (cap 150.0, oracle_risk=low)", None);
+        assert_eq!(old.scope, None, "an old line still reads as one pair, unnamed");
     }
 
     /// The gate appends `(overflow needs apr>=N)` to the same reason. The

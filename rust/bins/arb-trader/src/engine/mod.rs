@@ -2368,6 +2368,7 @@ impl Engine {
                 // nothing at all.
                 Err(crate::taketake::Skip::CrossedBook { venue }) => {
                     self.intents.push(Intent::Skip(intent::Skip {
+                        relationship_id: Some(quoters[qi].rel.id.clone()),
                         skip: vec![format!(
                             "crossed book {venue} take-take {}",
                             quoters[qi].rel.id
