@@ -87,15 +87,18 @@ fn basket(rec: &Value) -> Option<(Dir, f64)> {
     }
 }
 
+/// The earliest close time per basket, keyed as the ledger keys baskets:
+/// `(relationship_id, entry ts bits)`.
+type FirstClose = HashMap<(String, u64), f64>;
+
 /// Every basket entry, with the times of its first maker exit and its first
 /// close of any kind. `records` must already have had corrections folded in.
 pub fn lots(records: &[Value]) -> Vec<Lot> {
-    let (mut exits, mut closes): (HashMap<(String, u64), f64>, HashMap<(String, u64), f64>) =
-        (HashMap::new(), HashMap::new());
+    let (mut exits, mut closes) = (FirstClose::new(), FirstClose::new());
     for r in records.iter().filter(|r| text(r, "status") == "unwound") {
         if let (Some(of), Some(ts)) = (num(r.get("closes_ts")), num(r.get("ts"))) {
             let key = (text(r, "relationship_id").to_string(), of.to_bits());
-            let first = |m: &mut HashMap<(String, u64), f64>| {
+            let first = |m: &mut FirstClose| {
                 let e = m.entry(key.clone()).or_insert(ts);
                 *e = e.min(ts);
             };
