@@ -65,8 +65,9 @@ const RULES: &[(&str, &str, bool)] = &[
     // the whole `[other]` topic — 77 human-vetted pairs quoting with NO maker
     // hurdle, held back only by the $30 default topic budget, which cannot be
     // raised safely while nothing prices their hold. Each date is read off
-    // the pair's own legs, set a day or two after the event so it errs toward
-    // understating APR:
+    // the pair's own legs. Heisman and Oscars sit a day or two after the
+    // ceremony (unmeasured settlement, months out, so the pad costs nothing);
+    // TSLA is on the report day, see its own note:
     //
     // * Heisman: PM-US slug `tec-cfb-heisman-2026-12-13`, the ceremony; Kalshi
     //   (`KXHEISMAN-27`, "the 2026-2027 season") closes at year end.
@@ -86,10 +87,11 @@ const RULES: &[(&str, &str, bool)] = &[
     // the venues' own payouts (85 settled baskets): Kalshi and PM-US both
     // paid within 0.5–6.4 hours of the TSLA report, the September CPI print
     // and the Nobel announcement, and the cash was spendable in the same
-    // 15-minute equity sample. Two phantom days on a 1–14 day horizon
-    // understated APR by 12–63%, so the 50% floor was really demanding
-    // 57–134% on exactly the families that clear it. `years_to` still floors
-    // the horizon at one day, which covers the release morning itself.
+    // 15-minute equity sample. Two phantom days on a d-day horizon scale APR
+    // by d/(d+2): a third at one day out, seven eighths at fourteen, so the
+    // 50% floor was really demanding 57–150% on exactly the families that
+    // clear it. `years_to` still floors the horizon at one day, which covers
+    // the release morning itself.
     ("xvus-tsla-q3-deliv", "2026-10-02", true),
     ("xvus-aliens-26-12-31", "2027-01-01", false),
     // Added 2026-09-23 with the bestai pairs' allowlisting (Geoff delegated the

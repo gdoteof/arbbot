@@ -1404,6 +1404,14 @@ pub struct Order {
     /// The runner-up shape's lock, when it had one. `None` = the other shape
     /// could not be priced at all, and the log line says why instead.
     pub runner_up_ct: Option<String>,
+    /// The reservation floor this exit was planned against, per contract: the
+    /// output of `reservation_floor` at decision time. `still_pays` compares
+    /// the CURRENT floor to it, and a fall of a tick or more (cash tightened,
+    /// or the hurdle rose) pulls the rest so it is re-planned lower. `None` on
+    /// checkpoints written before 2026-10-24, which are then only ever pulled
+    /// for a rising floor, as before.
+    #[serde(default)]
+    pub floor_ct: Option<String>,
 }
 
 impl Order {
@@ -1599,24 +1607,20 @@ fn executable_depth(cx: &mut Cx, levels: &[Level], mut accepts: impl FnMut(&mut 
     cx.quantize_int_down(total).to_standard_notation_string().parse::<i64>().unwrap_or(0)
 }
 
-/// Minimum realized profit for a passive reservation price. A standard paired
-/// basket pays $1 at resolution. Releasing V now is at least as valuable as
-/// holding when V * (1 + hurdle * years) >= 1. Also retain the basis/fee buffer.
-/// This uses the attainable hurdle as an opportunity-cost model, not a promise
-/// that future redeployment will earn that rate.
-/// Kalshi free cash at or below which the exit discount is the full entry
-/// hurdle: one maximum take-take clip, the amount the risk gate needs free on
-/// EACH venue before it lets any entry through (`risk::venue_costs` charges the
-/// whole notional to both venues).
+/// Free cash on the scarcer venue at or below which the exit discount is the
+/// full entry hurdle: one maximum take-take clip, the most a single entry can
+/// ask the risk gate for on a venue (`risk::venue_costs` charges each entry's
+/// whole notional to BOTH venues, so the gate binds on the smaller balance).
 pub const EXIT_CASH_SCARCE_USD: f64 = 100.0;
 
-/// Kalshi free cash at or above which the exit discount is the idle-capital
-/// floor. Thirty days of Kalshi-leg deployment at October's pace ($13/day);
-/// a lot sold back today frees cash that nothing will need for a month.
+/// Free cash on the scarcer venue at or above which the exit discount is the
+/// idle-capital floor. Thirty days of Kalshi-leg deployment at October's pace
+/// ($13/day); a lot sold back today frees cash that nothing will need for a
+/// month.
 pub const EXIT_CASH_AMPLE_USD: f64 = 400.0;
 
 /// The rate at which a passive exit discounts the hold value of the lot it is
-/// selling: the SHADOW PRICE OF KALSHI CASH, not the entry hurdle.
+/// selling: the SHADOW PRICE OF CASH ON THE SCARCER VENUE, not the entry hurdle.
 ///
 /// Until 2026-10-24 `reservation_floor` discounted at the hurdle itself, which
 /// assumes every dollar freed is redeployed at that rate. It was not. Of 311
@@ -1628,19 +1632,28 @@ pub const EXIT_CASH_AMPLE_USD: f64 = 400.0;
 /// risk gate was refusing entries for want of it. PM-US cash never bound.
 /// Before and after that stretch the marginal reinvestment rate was zero.
 ///
-/// So the discount follows the scarce resource. With Kalshi cash at or under
+/// So the discount follows the scarce resource. `free_cash_usd` is the SMALLER
+/// of the two venues' free cash, because an exit sells both legs and so frees
+/// cash on both, and the gate refuses on whichever is short. At or under
 /// [`EXIT_CASH_SCARCE_USD`] the exit prices at the hurdle, as before; at or
 /// over [`EXIT_CASH_AMPLE_USD`] it prices at `APR_FLOOR`, the rate the maker
-/// hurdle itself charges idle capital (`apr_bar(0.0)`), and between the two it
-/// moves linearly so a basket's rests re-price by a tick at a time as cash
-/// tightens rather than all at once. Unknown cash (no risk view, no balance
-/// yet) is treated as scarce: the old behaviour, and the safe one.
+/// hurdle itself charges idle capital (`apr_bar(0.0)`); between the two it is
+/// linear, so the floor moves a little per dollar rather than flipping.
+/// Unknown cash (no risk view, no balance yet, either venue unread) is treated
+/// as scarce: the old behaviour, and the safe one.
+///
+/// A rest priced under one rate is re-checked under the current one by
+/// `still_pays`: a RISE in the floor pulls it because its lock no longer
+/// clears, and a FALL of a tick or more pulls it because the floor it was
+/// planned against ([`Order::floor_ct`]) is now stale-high. Without the second
+/// check a rest parked near par while cash was ample would sit there through
+/// the squeeze it is supposed to relieve.
 ///
 /// Measured over the same 311 exits, a floor of par − 1c (what `APR_FLOOR`
 /// gives at the median 81 days to resolution) would have netted +$12 after
 /// charging the squeeze its lost entries at 13.2c/Kalshi-dollar.
-pub fn exit_discount_apr(hurdle: f64, kalshi_free_cash_usd: Option<f64>) -> f64 {
-    let Some(cash) = kalshi_free_cash_usd.filter(|c| c.is_finite()) else { return hurdle };
+pub fn exit_discount_apr(hurdle: f64, free_cash_usd: Option<f64>) -> f64 {
+    let Some(cash) = free_cash_usd.filter(|c| c.is_finite()) else { return hurdle };
     if !hurdle.is_finite() || hurdle <= crate::APR_FLOOR {
         return hurdle;
     }
@@ -1649,6 +1662,12 @@ pub fn exit_discount_apr(hurdle: f64, kalshi_free_cash_usd: Option<f64>) -> f64 
     hurdle + (crate::APR_FLOOR - hurdle) * ample
 }
 
+/// Minimum realized profit for a passive reservation price. A standard paired
+/// basket pays $1 at resolution. Releasing V now is at least as valuable as
+/// holding when V * (1 + rate * years) >= 1. Also retain the basis/fee buffer.
+/// `hurdle` is the discount rate in force — [`exit_discount_apr`] of the
+/// entry hurdle and the scarcer venue's free cash — used as an
+/// opportunity-cost model, not a promise that future redeployment will earn it.
 fn reservation_floor(cx: &mut Cx, k_basis: D, pm_basis: D, resolves: Option<&str>,
     hurdle: f64, now: f64) -> Result<D, String> {
     let minimum = cx.parse_exact(EXIT_FLOOR);
@@ -1904,6 +1923,7 @@ pub fn decide(
         limit: String::new(), closes_ts: 0.0, k_basis: String::new(), pm_basis: String::new(),
         pm_ask_at_decision: String::new(), lock_ct: String::new(), cross: None,
         runner_up_ct: None,
+        floor_ct: None,
     });
     match view.suppressed_at.get(&rest_key) {
         None => {
@@ -2055,6 +2075,7 @@ pub fn decide(
         lock_ct: cx.emit_6dp(lock),
         cross,
         runner_up_ct: runner_up.map(|r| cx.emit_6dp(r)),
+        floor_ct: Some(min_lock),
     })
 }
 
@@ -3774,8 +3795,21 @@ fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> 
             Shape::RestKalshi => "PM-US ask moved above the profit floor",
             Shape::RestPmUs => "Kalshi bid moved below the profit ceiling",
         };
-        return Err(format!("{moved}: {} would no longer lock {}/ct (now {})",
-            o.limit, cx.emit_6dp(floor), cx.emit_6dp(lock)));
+        return Err(format!("{moved}: {} would no longer lock {}/ct at {:.1}%/yr (now {})",
+            o.limit, cx.emit_6dp(floor), view.exit_apr, cx.emit_6dp(lock)));
+    }
+    // The floor can also FALL from the one this rest was planned against — the
+    // exit discount rose because cash tightened or the hurdle moved — and a
+    // rest parked near par is then too dear to free the cash it should. A
+    // full tick of slack is the threshold, so a sub-cent drift re-plans nothing.
+    if let Some(planned) = o.floor_ct.as_deref().and_then(|s| cx.parse(s)) {
+        let fell = cx.sub(planned, floor);
+        if cx.cmp(fell, tick) != Ordering::Less {
+            return Err(format!(
+                "the exit discount rose to {:.1}%/yr: the floor fell from {}/ct to {}/ct, so the \
+                 rest at {} is priced for cash the engine no longer has",
+                view.exit_apr, cx.emit_6dp(planned), cx.emit_6dp(floor), o.limit));
+        }
     }
     // Price alone is not a hedge. Keep a passive first leg only while the
     // current close ladder contains enough whole contracts that still clear
@@ -5389,6 +5423,7 @@ mod tests {
                 lock_ct: "0.0100".into(),
                 cross: None,
         runner_up_ct: None,
+        floor_ct: None,
             },
             venue_order_id: "v1".into(),
             client_order_id: "x1".into(),
@@ -5423,6 +5458,7 @@ mod tests {
                 lock_ct: "0.0100".into(),
                 cross: None,
         runner_up_ct: None,
+        floor_ct: None,
             },
             venue_order_id: "v1".into(),
             client_order_id: "x1".into(),
@@ -6215,6 +6251,7 @@ mod tests {
             lock_ct: "0.0100".into(),
             cross: None,
         runner_up_ct: None,
+        floor_ct: None,
         };
         let rec = close_record(&o, "0.2100", "0.2000", 3, 99.0);
         assert_eq!(rec["status"], "unwound");
@@ -6258,6 +6295,7 @@ mod tests {
             lock_ct: "0.0100".into(),
             cross: None,
         runner_up_ct: None,
+        floor_ct: None,
         };
         let before = unresolved();
         let refused_before = refused();
@@ -6406,6 +6444,7 @@ mod tests {
                 lock_ct: "0.0100".into(),
                 cross: None,
         runner_up_ct: None,
+        floor_ct: None,
             },
             venue_order_id: "v1".into(),
             client_order_id: "x1".into(),
@@ -7676,6 +7715,51 @@ mod tests {
         assert!((at_floor - 0.9912).abs() < 5e-4, "{at_floor}");
         let at_bar = reservation_floor(&mut cx, kb, pb, Some("2027-01-13"), 60.0, now).unwrap();
         assert_eq!(cx.emit_6dp(at_bar), "0.005000");
+    }
+
+    /// `decide` and `still_pays` read `exit_apr`, not `apr_bar`: with the bar
+    /// held at 60% in both views, ample cash (4%) rests higher than scarce cash
+    /// (60%) and records the higher floor; and a rest planned under ample cash
+    /// is pulled for re-planning once the view says cash is scarce.
+    #[tokio::test]
+    async fn exits_price_off_the_exit_discount_and_re_plan_when_it_rises() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1., 34, "0.22", "0.19")];
+        let mut c = cand(34, 1.);
+        c.fwd_apr = 100.;
+        let today = (wall_now() / 86400.).floor() as i64;
+        c.resolves_by = Some(arb_core::resolve::iso_from_day(today + 81));
+        let q = quote(Some("0.10"), Some("0.20"));
+        let ample = EngineView { apr_bar: 60.0, exit_apr: crate::APR_FLOOR, ..view("0.20") };
+        let scarce = EngineView { apr_bar: 60.0, exit_apr: 60.0, ..view("0.20") };
+        let rich = decide(&mut cx, &fees, &recs, &c, "p-a", &q, &ample, Instant::now(), false,
+            DepthClaims::default()).unwrap();
+        let poor = decide(&mut cx, &fees, &recs, &c, "p-a", &q, &scarce, Instant::now(), false,
+            DepthClaims::default()).unwrap();
+        assert_eq!(rich.shape, poor.shape, "{rich:?} vs {poor:?}");
+        let (rl, pl) = (rich.limit.parse::<f64>().unwrap(), poor.limit.parse::<f64>().unwrap());
+        match rich.shape {
+            Shape::RestKalshi => assert!(rl > pl, "ample cash must ask MORE: {rl} vs {pl}"),
+            Shape::RestPmUs => assert!(rl < pl, "ample cash must bid LESS: {rl} vs {pl}"),
+        }
+        let rf = rich.floor_ct.as_deref().unwrap().parse::<f64>().unwrap();
+        let pf = poor.floor_ct.as_deref().unwrap().parse::<f64>().unwrap();
+        // At 60% the 81-day hold value sits under this basket's basis, so the
+        // scarce floor is the half-cent minimum; ample cash asks 1.3c more.
+        assert!(rf >= pf + 0.01, "the recorded floor follows the discount: {rf} vs {pf}");
+
+        // Same book, the discount rises: the rest is pulled to be re-planned.
+        assert!(still_pays(&mut cx, &fees, &rich, &ample).is_ok());
+        let why = still_pays(&mut cx, &fees, &rich, &scarce).unwrap_err();
+        assert!(why.contains("the floor fell from"), "{why}");
+        // A checkpoint from before the field existed is judged on its lock alone.
+        let legacy = Order { floor_ct: None, ..rich.clone() };
+        assert!(still_pays(&mut cx, &fees, &legacy, &scarce).is_ok());
+        // And the planned-poor rest is not pulled when cash turns ample: its
+        // lock is simply below the new floor, which the first check reports.
+        let why = still_pays(&mut cx, &fees, &poor, &ample).unwrap_err();
+        assert!(why.contains("would no longer lock"), "{why}");
     }
 
     #[test]
