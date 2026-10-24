@@ -1617,8 +1617,15 @@ impl Engine {
                 _ => {}
             }
         }
+        let kalshi_cash = self
+            .cfg
+            .risk
+            .as_ref()
+            .and_then(|r| r.balance_of("kalshi"))
+            .and_then(|s| s.parse::<f64>().ok());
         crate::maker_exit::publish_view(crate::maker_exit::EngineView {
             apr_bar: self.apr_bar,
+            exit_apr: crate::maker_exit::exit_discount_apr(self.apr_bar, kalshi_cash),
             global_cap_usd: self.cfg.risk.as_ref().map_or(0.0, |r| r.global_cap_usd()),
             pm_ask,
             pm_ask_depth,

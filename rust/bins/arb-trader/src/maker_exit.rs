@@ -435,6 +435,11 @@ pub struct EngineView {
     /// `Engine::apr_bar` — the number actually installed on the quoters, not a
     /// second derivation of it (`unwind` §4).
     pub apr_bar: f64,
+    /// The rate a PASSIVE exit discounts the hold value at: [`exit_discount_apr`]
+    /// of `apr_bar` and the Kalshi cash the engine last read. Carried on the
+    /// view so `decide` and `still_pays` price the same number the engine
+    /// derived, for the same reason `apr_bar` is.
+    pub exit_apr: f64,
     /// `RiskView::global_cap_usd`. `unwind::select` refuses a degenerate one.
     pub global_cap_usd: f64,
     /// PM-US market -> best YES ASK, the price a close would BUY through.
@@ -1599,6 +1604,51 @@ fn executable_depth(cx: &mut Cx, levels: &[Level], mut accepts: impl FnMut(&mut 
 /// holding when V * (1 + hurdle * years) >= 1. Also retain the basis/fee buffer.
 /// This uses the attainable hurdle as an opportunity-cost model, not a promise
 /// that future redeployment will earn that rate.
+/// Kalshi free cash at or below which the exit discount is the full entry
+/// hurdle: one maximum take-take clip, the amount the risk gate needs free on
+/// EACH venue before it lets any entry through (`risk::venue_costs` charges the
+/// whole notional to both venues).
+pub const EXIT_CASH_SCARCE_USD: f64 = 100.0;
+
+/// Kalshi free cash at or above which the exit discount is the idle-capital
+/// floor. Thirty days of Kalshi-leg deployment at October's pace ($13/day);
+/// a lot sold back today frees cash that nothing will need for a month.
+pub const EXIT_CASH_AMPLE_USD: f64 = 400.0;
+
+/// The rate at which a passive exit discounts the hold value of the lot it is
+/// selling: the SHADOW PRICE OF KALSHI CASH, not the entry hurdle.
+///
+/// Until 2026-10-24 `reservation_floor` discounted at the hurdle itself, which
+/// assumes every dollar freed is redeployed at that rate. It was not. Of 311
+/// maker-exits, 190 sold below par net of fees and gave back $33.78 of locks
+/// that every settled basket since has paid in full; the 180 that were not
+/// pick-offs sold their remaining lock at a capital-weighted 11.3%/yr implied
+/// while the hurdle read 50%+. The freed cash was redeployed in exactly one
+/// stretch, 09-27 to 10-22, when KALSHI cash sat between $3 and $92 and the
+/// risk gate was refusing entries for want of it. PM-US cash never bound.
+/// Before and after that stretch the marginal reinvestment rate was zero.
+///
+/// So the discount follows the scarce resource. With Kalshi cash at or under
+/// [`EXIT_CASH_SCARCE_USD`] the exit prices at the hurdle, as before; at or
+/// over [`EXIT_CASH_AMPLE_USD`] it prices at `APR_FLOOR`, the rate the maker
+/// hurdle itself charges idle capital (`apr_bar(0.0)`), and between the two it
+/// moves linearly so a basket's rests re-price by a tick at a time as cash
+/// tightens rather than all at once. Unknown cash (no risk view, no balance
+/// yet) is treated as scarce: the old behaviour, and the safe one.
+///
+/// Measured over the same 311 exits, a floor of par − 1c (what `APR_FLOOR`
+/// gives at the median 81 days to resolution) would have netted +$12 after
+/// charging the squeeze its lost entries at 13.2c/Kalshi-dollar.
+pub fn exit_discount_apr(hurdle: f64, kalshi_free_cash_usd: Option<f64>) -> f64 {
+    let Some(cash) = kalshi_free_cash_usd.filter(|c| c.is_finite()) else { return hurdle };
+    if !hurdle.is_finite() || hurdle <= crate::APR_FLOOR {
+        return hurdle;
+    }
+    let ample = ((cash - EXIT_CASH_SCARCE_USD) / (EXIT_CASH_AMPLE_USD - EXIT_CASH_SCARCE_USD))
+        .clamp(0.0, 1.0);
+    hurdle + (crate::APR_FLOOR - hurdle) * ample
+}
+
 fn reservation_floor(cx: &mut Cx, k_basis: D, pm_basis: D, resolves: Option<&str>,
     hurdle: f64, now: f64) -> Result<D, String> {
     let minimum = cx.parse_exact(EXIT_FLOOR);
@@ -1724,7 +1774,7 @@ pub fn decide(
         .parse(&pm_lot.cost_per_ct)
         .ok_or_else(|| refuse(format!("unparseable PM-US basis {}", pm_lot.cost_per_ct)))?;
     let min_lock = reservation_floor(cx, k_basis, pm_basis, cand.resolves_by.as_deref(),
-        view.apr_bar, wall_now())?.to_standard_notation_string();
+        view.exit_apr, wall_now())?.to_standard_notation_string();
     let tick = cx.parse_exact(TICK);
 
     // ------------------------------------------------------ the shape contest ---
@@ -3718,7 +3768,7 @@ fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> 
     // Evaluate the actual resting price. Rounding a derived bound to a penny
     // incorrectly pulls valid sub-cent Kalshi exits on an unchanged book.
     let lock = lock_per_ct(cx, fees, o.shape.roles(), k_sell, pm_buy, k_basis, pm_basis, o.qty);
-    let floor = reservation_floor(cx, k_basis, pm_basis, o.resolves_by.as_deref(), view.apr_bar, wall_now())?;
+    let floor = reservation_floor(cx, k_basis, pm_basis, o.resolves_by.as_deref(), view.exit_apr, wall_now())?;
     if cx.cmp(lock, floor) == Ordering::Less {
         let moved = match o.shape {
             Shape::RestKalshi => "PM-US ask moved above the profit floor",
@@ -4494,6 +4544,7 @@ mod tests {
         let then = Instant::now() - Duration::from_secs_f64(SUPPRESS_SETTLE_S + 1.0);
         EngineView {
             apr_bar: 16.0,
+            exit_apr: 16.0,
             global_cap_usd: 500.0,
             pm_ask: [("p-a".to_string(), pm_ask.to_string())].into_iter().collect(),
             pm_ask_depth: [("p-a".to_string(), vec![Level {
@@ -7588,9 +7639,43 @@ mod tests {
         }
         assert!(o.cross.is_none(), "the current touch is not an acceptable immediate exit");
         let kb = cx.parse(&o.k_basis).unwrap(); let pb = cx.parse(&o.pm_basis).unwrap();
-        let floor = reservation_floor(&mut cx, kb, pb, o.resolves_by.as_deref(), v.apr_bar, wall_now()).unwrap();
+        let floor = reservation_floor(&mut cx, kb, pb, o.resolves_by.as_deref(), v.exit_apr, wall_now()).unwrap();
         let lock = cx.parse(&o.lock_ct).unwrap();
         assert!(cx.cmp(lock, floor) != Ordering::Less);
+    }
+
+    #[test]
+    fn the_exit_discount_follows_kalshi_cash_not_the_hurdle() {
+        let floor = crate::APR_FLOOR;
+        // Unknown cash is scarce cash: the pre-2026-10-24 behaviour.
+        assert_eq!(exit_discount_apr(60.0, None), 60.0);
+        assert_eq!(exit_discount_apr(60.0, Some(f64::NAN)), 60.0);
+        // At or under one clip the hurdle governs, however far under.
+        assert_eq!(exit_discount_apr(60.0, Some(EXIT_CASH_SCARCE_USD)), 60.0);
+        assert_eq!(exit_discount_apr(60.0, Some(2.82)), 60.0);
+        // Ample cash prices the exit at the idle-capital floor, however far over.
+        assert_eq!(exit_discount_apr(60.0, Some(EXIT_CASH_AMPLE_USD)), floor);
+        assert_eq!(exit_discount_apr(60.0, Some(1092.41)), floor);
+        // Linear in between, so rests move a tick at a time as cash tightens.
+        let mid = exit_discount_apr(60.0, Some((EXIT_CASH_SCARCE_USD + EXIT_CASH_AMPLE_USD) / 2.0));
+        assert!((mid - (60.0 + floor) / 2.0).abs() < 1e-9, "{mid}");
+        // A hurdle already at the floor, or untrusted, passes through unchanged
+        // so `reservation_floor` keeps refusing it.
+        assert_eq!(exit_discount_apr(floor, Some(1000.0)), floor);
+        assert!(exit_discount_apr(f64::NAN, Some(1000.0)).is_nan());
+
+        // And the floor it produces on a 0.90 basket at the median 81 days is
+        // par less a cent, where the hurdle's hold value (0.8826) sits under
+        // cost and so sold the whole 10c lock for the half-cent minimum.
+        let (mut cx, _) = ready();
+        let kb = cx.parse_exact("0.20");
+        let pb = cx.parse_exact("0.70");
+        let now = arb_core::resolve::parse_iso("2026-10-24").unwrap() as f64 * 86400.0;
+        let at_floor = reservation_floor(&mut cx, kb, pb, Some("2027-01-13"), floor, now).unwrap();
+        let at_floor = cx.emit_6dp(at_floor).parse::<f64>().unwrap() + 0.90;
+        assert!((at_floor - 0.9912).abs() < 5e-4, "{at_floor}");
+        let at_bar = reservation_floor(&mut cx, kb, pb, Some("2027-01-13"), 60.0, now).unwrap();
+        assert_eq!(cx.emit_6dp(at_bar), "0.005000");
     }
 
     #[test]
