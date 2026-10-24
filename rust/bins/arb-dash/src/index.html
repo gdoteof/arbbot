@@ -616,7 +616,8 @@ function oppsPanel(o){
 const VERDICT = {
   'acted':             {cls:'ok',   what:'the engine acted on this in the window'},
   'refused':           {cls:'warn', what:'a gate refused it — the gate is named'},
-  'no refusal seen':   {cls:'dim',  what:'tradable, in scope, and no gate that names it fired in the window: it either did not clear its APR bar or nothing asked'},
+  'below bar':         {cls:'dim',  what:'tradable and in scope, but the crossing annualises under the engine’s APR bar: not a trade it wants at any capital'},
+  'no refusal seen':   {cls:'dim',  what:'tradable, in scope, not under the APR bar (or undated), and no gate that names it fired in the window'},
   'not tradable':      {cls:'bad',  what:'never considered — the registry verdict is not an equivalent greenlit by a human or agent'},
   'out of engine scope':{cls:'bad', what:'never considered — outside this engine’s --rel-prefix'},
 };
@@ -773,7 +774,8 @@ function nowOpportunities(d){
     const b = by[r.verdict] || (by[r.verdict] = {usd:0, n:0});
     b.usd += r.edge_usd || 0; b.n++;
   });
-  const order = ['acted','refused','no refusal seen','out of engine scope','not tradable'];
+  const order = ['acted','refused','no refusal seen','below bar','out of engine scope','not tradable'];
+  const pct = (v) => v==null ? '<span class="dim">—</span>' : v.toFixed(1)+'%';
   const total = Object.values(by).reduce((a,b) => a+b.usd, 0) || 1;
   return $(`<section class="wide">
     <h2>On the table right now &middot; ${dur(o.window_s)} of the engine's opportunity stream</h2>
@@ -785,6 +787,7 @@ function nowOpportunities(d){
         ${usd0(by[k].usd)} across ${by[k].n}</span>`).join('')}</div>
     <div class="scroll" style="margin-top:12px"><table>
       <thead><tr><th>relationship</th><th class="num">edge / contract</th>
+        <th class="num">APR${o.bar_apr==null?'':` <span class="dim">(bar ${o.bar_apr.toFixed(0)}%)</span>`}</th>
         <th class="num">edge available</th><th class="num">size</th>
         <th>topic</th><th>why not</th></tr></thead>
       <tbody>${rows.map(r => `<tr data-k="o-${esc(r.relationship_id)}">
@@ -792,12 +795,14 @@ function nowOpportunities(d){
           <div class="sub">${esc(r.tranche)} &middot; ${r.observations} lines &middot;
             last ${dur(r.last_age_s)} ago</div></td>
         <td class="num">${(r.best_edge*100).toFixed(2)}&cent;</td>
+        <td class="num">${pct(r.apr)}</td>
         <td class="num"><b>${usd0(r.edge_usd)}</b></td>
         <td class="num dim">${esc(r.size)}</td>
         <td class="sub">${esc(r.topic)}</td>
         <td><span class="badge ${VERDICT[r.verdict]?VERDICT[r.verdict].cls:'dim'}"
               title="${esc(VERDICT[r.verdict]?VERDICT[r.verdict].what:'')}">${esc(r.verdict)}</span>
-          ${r.blocked_by?`<div class="sub">${esc(r.blocked_by.gate)}${
+          ${r.verdict==='below bar'?`<div class="sub">${pct(r.apr)} &lt; ${pct(o.bar_apr)}</div>`
+          : r.blocked_by?`<div class="sub">${esc(r.blocked_by.gate)}${
             r.blocked_by.scoped?' ['+esc(r.blocked_by.scope)+']':''}</div>`:''}</td>
       </tr>`).join('')}</tbody>
     </table></div>
@@ -807,8 +812,12 @@ function nowOpportunities(d){
       the ENGINE could do about each. <b>not tradable</b> and <b>out of engine
       scope</b> were never evaluated by a gate, so no amount of freed capital
       reaches them — they need a vetting decision${o.scope?' or a wider <code>--rel-prefix</code> than <code>'+esc(o.scope)+'</code>':''}.
-      <b>no refusal seen</b> means the engine considered it and no gate fired:
-      the block, if any, is the APR bar rather than capital.${
+      <b>below bar</b> annualises under the APR bar the engine last reported, by
+      take-take's own formula (net edge over cost, to the pair's resolve date):
+      a thin edge on a long-dated pair, which no amount of capital makes worth
+      taking. <b>no refusal seen</b> clears that bar (or has no resolve date)
+      and no gate fired on it: take-take's other filters — direction, slippage,
+      its per-pair contract cap — are what is left.${
       d.constraints.some(c => !c.scoped && !c.everything) ? ` Except: ${
         d.constraints.filter(c => !c.scoped && !c.everything).map(c => '<b>'+esc(c.gate)+'</b>').join(', ')}
       refused a pair the engine did not name, and it may be one of these.` : ''}
@@ -1405,7 +1414,7 @@ const DRAW = {
     f.append(nowCapital(d));
     f.append(nowRecent(d));
     f.append(nowBooked(d));
-    const blocked = (d.opportunities.rows||[]).filter(r => r.verdict !== 'acted')
+    const blocked = (d.opportunities.rows||[]).filter(r => r.verdict !== 'acted' && r.verdict !== 'below bar')
       .reduce((a,r) => a + (r.edge_usd||0), 0);
     const e = d.engine;
     return (e.running ? (e.armed?'<span class="ok">armed</span>':'<span class="warn">dry-run</span>')
