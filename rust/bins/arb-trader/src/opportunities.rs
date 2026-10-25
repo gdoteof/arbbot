@@ -21,11 +21,12 @@
 //! and 6dp decimal strings of `src/arbbot/scan/scanner.py`'s, plus one field.
 //! Where a field means something different:
 //!
-//!   * `fees` charges every PM-US leg the schedule's 0.0695 coefficient. The
-//!     Python scanner used the venue's per-market `feeCoefficient` where its
-//!     tag catalog reported one, so on such a market the edge here runs
-//!     higher — and, since a basket is halved only until its edge turns
-//!     positive, `size` can differ as well.
+//!   * `fees` charges every PM-US leg the schedule's 0.0695 coefficient, which
+//!     is what every market object reports today. The Python scanner used the
+//!     venue's per-market `feeCoefficient` where its tag catalog reported one
+//!     (0.06 in its day), so a market's edge can differ from its records — and,
+//!     since a basket is halved only until its edge turns positive, `size` can
+//!     differ as well.
 //!   * `max_hold_close_time` is always null: there is no market catalog here.
 //!   * `bucket` is always `primary`: every leg's minimum order is taken as one
 //!     contract, and a basket with a Kalshi leg is sized in whole contracts.

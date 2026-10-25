@@ -358,9 +358,10 @@ mod tests {
     }
 
     /// The trap: Kalshi ceils its fee to $0.0001 PER ORDER, so per-contract
-    /// economics change with clip size even though no price moved.
+    /// economics change with clip size even though no price moved — by a
+    /// fraction of a cent at this rounding, and always against the small clip.
     #[test]
-    fn kalshi_fee_ceiling_makes_small_clips_much_worse_per_contract() {
+    fn kalshi_fee_ceiling_makes_small_clips_worse_per_contract() {
         let (mut cx, sched, wide) = setup();
         let (qa, qb) = (q("0.20", "0.22"), q("0.80", "0.83"));
         let one = cx.parse_exact("1");

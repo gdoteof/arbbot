@@ -48,9 +48,10 @@
 //!     fill above it. [`buy_limit`] solves the fixed point instead.
 //!   * **The fee is the schedule's, not the Python's approximation.** Kalshi
 //!     rounds a taker fee UP to $0.0001 over the whole clip
-//!     (`FeeSchedule::fee`); `kalshi_taker_fee` in the script quantizes
-//!     `0.07·p·(1-p)` to 4dp per contract and so under-states it on any clip
-//!     above one contract.
+//!     (`FeeSchedule::fee`); `kalshi_taker_fee` in the script rounds
+//!     `0.07·p·(1-p)` half-even to 4dp per contract, which can land on either
+//!     side of the venue's figure (0.0120 against 0.0121 for one contract at
+//!     0.22).
 //!   * **An empty side is not a price of zero.** Kalshi spells "no ask" as
 //!     `"0.0000"` (1,742 of the 35,640 market rows captured in
 //!     `data/catalogs/`), and `Decimal("0.0000") <= limit` is TRUE for every
@@ -322,6 +323,9 @@ fn leg_cost(
     market: &str,
     held: Held,
 ) -> Result<(D, String, String), LegSkip> {
+    // A maker basis is the market's: Kalshi charges resting orders only on
+    // some series (`fees::kalshi_charges_makers`).
+    let fees = &fees.for_market(venue, market);
     let legs = rec.get("legs").and_then(|v| v.as_array()).ok_or(LegSkip::Absent)?;
     let leg = legs
         .iter()
@@ -1177,8 +1181,9 @@ pub fn decide(
 /// So the leg restates the vouching leg VERBATIM — its `yes_price` and its
 /// `role` — rather than the cost derived from it. Both, or neither: a reader
 /// recovers the basis as `(1 - yes_price) + fee(role)`, and PM-US charges takers
-/// `0.06·p·(1-p)` and makers nothing, which at p=0.12 is 0.63c/ct — more than
-/// the 0.5c/ct floor this module trades against. Emitting `1 - basis` under a
+/// `0.0695·p·(1-p)` (to the cent per order) and makers nothing, which at p=0.12
+/// is about 0.73c/ct — more than the 0.5c/ct floor this module trades against.
+/// Emitting `1 - basis` under a
 /// `taker` role would therefore have booked a profitable completion as a loss.
 ///
 /// `k_px` is what Kalshi says the order TRADED at, which is not `o.limit`: a
@@ -1570,7 +1575,7 @@ mod tests {
     /// The fee is charged at the LIMIT, not at the ask. Basis 0.78 leaves 0.215
     /// of headroom after MIN_LOCK; on a penny ladder the fee-free bound floors
     /// to 0.21, and 0.78 + 0.21 + fee(0.21) + 0.005 is over a dollar because a
-    /// 1-lot's fee ceils to 2c — so the answer must be a tick lower.
+    /// 1-lot's fee ceils to 0.0117 — so the answer must be a tick lower.
     #[test]
     fn the_buy_limit_pays_for_the_fee_at_the_price_it_sends() {
         let (mut cx, fees) = ready();
@@ -1602,9 +1607,10 @@ mod tests {
         );
     }
 
-    /// A clip of 5 pays a smaller fee PER CONTRACT than a clip of 1, because
-    /// the venue ceils to the cent once over the whole order — so sizing has to
-    /// happen before pricing.
+    /// The venue ceils the fee to $0.0001 once over the whole order, so a clip
+    /// of 5 pays a different fee PER CONTRACT from a clip of 1 — by less than a
+    /// tick at this rounding, so the two limits usually agree, but sizing has
+    /// to happen before pricing and size must never price a clip lower.
     #[test]
     fn a_bigger_clip_can_afford_a_higher_limit() {
         let (mut cx, fees) = ready();

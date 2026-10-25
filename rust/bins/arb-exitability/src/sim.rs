@@ -33,6 +33,8 @@
 use crate::tape::Series;
 
 pub const KALSHI_TAKER: f64 = 0.07;
+/// What a rest pays on the series Kalshi flags (`fees::kalshi_charges_makers`);
+/// `simulate` takes the pair's coefficient, 0 elsewhere.
 pub const KALSHI_MAKER: f64 = 0.0175;
 /// PM-US's exchange-wide taker coefficient since 2026-09-19 (`fees.rs`).
 /// Applied to the whole window; before that date it was 0.06, so earlier exits
@@ -168,14 +170,14 @@ fn tick(k: &Series, p: &Series, t: usize) -> Option<Tick> {
 }
 
 /// The two entry shapes of one direction at one minute: (shape, cost, filled).
-fn entries_at(x: &Tick, dir: Dir) -> [(Shape, f64, bool); 2] {
+fn entries_at(x: &Tick, dir: Dir, k_maker: f64) -> [(Shape, f64, bool); 2] {
     let (qkb, qka) = (improve_bid(x.kb, x.ka), improve_ask(x.kb, x.ka));
     let (qpb, qpa) = (improve_bid(x.pb, x.pa), improve_ask(x.pb, x.pa));
     match dir {
         Dir::KYes => [
             (
                 Shape::RestKalshi,
-                qkb + (1.0 - x.pb) + fee(KALSHI_MAKER, qkb) + fee(PMUS_TAKER, x.pb),
+                qkb + (1.0 - x.pb) + fee(k_maker, qkb) + fee(PMUS_TAKER, x.pb),
                 filled_buy(qkb, x.kb, x.klo),
             ),
             (Shape::RestPmus, x.ka + (1.0 - qpa) + fee(KALSHI_TAKER, x.ka), filled_sell(qpa, x.pa, x.phi)),
@@ -183,7 +185,7 @@ fn entries_at(x: &Tick, dir: Dir) -> [(Shape, f64, bool); 2] {
         Dir::KNo => [
             (
                 Shape::RestKalshi,
-                (1.0 - qka) + x.pa + fee(KALSHI_MAKER, qka) + fee(PMUS_TAKER, x.pa),
+                (1.0 - qka) + x.pa + fee(k_maker, qka) + fee(PMUS_TAKER, x.pa),
                 filled_sell(qka, x.ka, x.khi),
             ),
             (Shape::RestPmus, (1.0 - x.kb) + qpb + fee(KALSHI_TAKER, x.kb), filled_buy(qpb, x.pb, x.plo)),
@@ -204,7 +206,7 @@ struct ExitAt {
 
 const NO_EXIT: ExitAt = ExitAt { cross: f64::NAN, cross_gate: f64::NAN, maker: f64::NAN };
 
-fn exit_at(x: &Tick, dir: Dir) -> ExitAt {
+fn exit_at(x: &Tick, dir: Dir, k_maker: f64) -> ExitAt {
     let (qkb, qka) = (improve_bid(x.kb, x.ka), improve_ask(x.kb, x.ka));
     let (qpb, qpa) = (improve_bid(x.pb, x.pa), improve_ask(x.pb, x.pa));
     let better = |a: Option<f64>, b: Option<f64>| [a, b].into_iter().flatten().fold(f64::NAN, f64::max);
@@ -213,7 +215,7 @@ fn exit_at(x: &Tick, dir: Dir) -> ExitAt {
             // Sell the Kalshi YES at `k`, buy the PM-US YES back at `pm`, both taken.
             let cross = |k: f64, pm: f64| k + (1.0 - pm) - fee(KALSHI_TAKER, k) - fee(PMUS_TAKER, pm);
             let maker_k = filled_sell(qka, x.ka, x.khi)
-                .then(|| qka + (1.0 - x.pa) - fee(KALSHI_MAKER, qka) - fee(PMUS_TAKER, x.pa));
+                .then(|| qka + (1.0 - x.pa) - fee(k_maker, qka) - fee(PMUS_TAKER, x.pa));
             let maker_p = filled_buy(qpb, x.pb, x.plo).then(|| x.kb + (1.0 - qpb) - fee(KALSHI_TAKER, x.kb));
             ExitAt { cross: cross(x.kb, x.pa), cross_gate: cross(x.kb - TICK, x.pa + TICK), maker: better(maker_k, maker_p) }
         }
@@ -221,7 +223,7 @@ fn exit_at(x: &Tick, dir: Dir) -> ExitAt {
             // Buy the Kalshi YES back at `k`, sell the PM-US YES at `pm`, both taken.
             let cross = |k: f64, pm: f64| (1.0 - k) + pm - fee(KALSHI_TAKER, k) - fee(PMUS_TAKER, pm);
             let maker_k = filled_buy(qkb, x.kb, x.klo)
-                .then(|| (1.0 - qkb) + x.pb - fee(KALSHI_MAKER, qkb) - fee(PMUS_TAKER, x.pb));
+                .then(|| (1.0 - qkb) + x.pb - fee(k_maker, qkb) - fee(PMUS_TAKER, x.pb));
             let maker_p = filled_sell(qpa, x.pa, x.phi).then(|| (1.0 - x.ka) + qpa - fee(KALSHI_TAKER, x.ka));
             ExitAt { cross: cross(x.ka, x.pb), cross_gate: cross(x.ka + TICK, x.pb - TICK), maker: better(maker_k, maker_p) }
         }
@@ -308,7 +310,7 @@ fn sd(xs: &[f64]) -> Option<f64> {
 /// Simulate every entry on `[0, end)` and its exit chances over the next
 /// `horizon` minutes. `hold(t)` is what holding to resolution is worth at
 /// minute `t`, at the hurdle.
-pub fn simulate(k: &Series, p: &Series, end: usize, horizon: usize, hold: impl Fn(usize) -> f64) -> PairSim {
+pub fn simulate(k: &Series, p: &Series, k_maker: f64, end: usize, horizon: usize, hold: impl Fn(usize) -> f64) -> PairSim {
     let end = end.min(k.bid.len()).min(p.bid.len());
     let ticks: Vec<Option<Tick>> = (0..end).map(|t| tick(k, p, t)).collect();
     let dirs = [Dir::KYes, Dir::KNo];
@@ -316,7 +318,7 @@ pub fn simulate(k: &Series, p: &Series, end: usize, horizon: usize, hold: impl F
     for (t, x) in ticks.iter().enumerate() {
         if let Some(x) = x {
             for (d, dir) in dirs.iter().enumerate() {
-                exits[d][t] = exit_at(x, *dir);
+                exits[d][t] = exit_at(x, *dir, k_maker);
             }
         }
     }
@@ -326,7 +328,7 @@ pub fn simulate(k: &Series, p: &Series, end: usize, horizon: usize, hold: impl F
     for (t, x) in ticks.iter().enumerate() {
         let Some(x) = x else { continue };
         for (d, dir) in dirs.iter().enumerate() {
-            for (s, (shape, cost, filled)) in entries_at(x, *dir).into_iter().enumerate() {
+            for (s, (shape, cost, filled)) in entries_at(x, *dir, k_maker).into_iter().enumerate() {
                 if !filled || 1.0 - cost < MIN_LOCK {
                     continue;
                 }
@@ -424,7 +426,7 @@ mod tests {
         for t in 7..n {
             (k.bid[t], k.ask[t]) = (0.60, 0.62);
         }
-        let s = simulate(&k, &p, n, n, |_| 0.94);
+        let s = simulate(&k, &p, KALSHI_MAKER, n, n, |_| 0.94);
         let e: Vec<&Entry> = s.entries.iter().filter(|e| e.dir == Dir::KYes).collect();
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].t, 1);
@@ -439,9 +441,9 @@ mod tests {
         assert_eq!(e[0].chances_par[0].minutes, 6, "0.60 + 0.48 - fees clears par at minute 7");
         assert_eq!(e[0].watched, n - 2);
         assert!(!e[0].cost_bound, "0.93 + 0.5c is under the 0.94 hold value, which is the floor");
-        assert!(simulate(&k, &p, n, n, |_| 0.9).entries[0].cost_bound, "and over a 0.90 one");
+        assert!(simulate(&k, &p, KALSHI_MAKER, n, n, |_| 0.9).entries[0].cost_bound, "and over a 0.90 one");
         // With resolution tomorrow holding is worth $1, and nothing short of par is worth selling for.
-        let s = simulate(&k, &p, n, n, |_| 1.0);
+        let s = simulate(&k, &p, KALSHI_MAKER, n, n, |_| 1.0);
         let e = s.entries.iter().find(|e| e.dir == Dir::KYes).unwrap();
         assert_eq!(e.chances_cross[0].minutes, 6);
     }
@@ -452,7 +454,7 @@ mod tests {
         let n = 200;
         let (mut k, p) = flat(n, (0.40, 0.45), (0.50, 0.52));
         k.lo = vec![0.40; n];
-        let s = simulate(&k, &p, n, n, |_| 0.0);
+        let s = simulate(&k, &p, KALSHI_MAKER, n, n, |_| 0.0);
         let ts: Vec<usize> = s.entries.iter().filter(|e| e.dir == Dir::KYes).map(|e| e.t).collect();
         assert_eq!(ts, vec![0, 60, 120, 180]);
         assert!(s.entries.iter().all(|e| e.chances.is_empty()), "the basis never closes");
@@ -463,14 +465,14 @@ mod tests {
         let n = 5;
         let (mut k, p) = flat(n, (0.50, 0.55), (0.50, 0.52));
         k.lo = vec![0.49; n];
-        assert!(simulate(&k, &p, n, n, |_| 0.0).entries.iter().all(|e| e.dir != Dir::KYes));
+        assert!(simulate(&k, &p, KALSHI_MAKER, n, n, |_| 0.0).entries.iter().all(|e| e.dir != Dir::KYes));
     }
 
     /// A crossed or one-sided book is not a price.
     #[test]
     fn a_crossed_book_is_no_minute_at_all() {
         let (k, p) = flat(3, (0.50, 0.45), (0.50, 0.52));
-        assert_eq!(simulate(&k, &p, 3, 3, |_| 0.0).valid_minutes, 0);
+        assert_eq!(simulate(&k, &p, KALSHI_MAKER, 3, 3, |_| 0.0).valid_minutes, 0);
     }
 
     /// A cross is admitted on its tick-worse price and paid at the touch; a
@@ -483,7 +485,7 @@ mod tests {
         for t in 3..n {
             (k.bid[t], k.ask[t]) = (0.46, 0.48);
         }
-        let s = simulate(&k, &p, n, n, |_| 0.0);
+        let s = simulate(&k, &p, KALSHI_MAKER, n, n, |_| 0.0);
         let x3 = s.exits[0][3];
         assert!(x3.cross - x3.cross_gate > 0.019, "two ticks between the touch and the gate");
         let first = |s: &PairSim, cost: f64, hold: f64| s.engine_chances(Dir::KYes, 0, cost, n, |_| hold).first().copied();
@@ -493,7 +495,7 @@ mod tests {
         assert_eq!(first(&s, x3.cross_gate - 0.006, 1.0), None, "under the hold value");
         // A Kalshi print at our 0.47 exit ask makes a maker exit available at minute 5.
         k.hi[5] = 0.47;
-        let s = simulate(&k, &p, n, n, |_| 0.0);
+        let s = simulate(&k, &p, KALSHI_MAKER, n, n, |_| 0.0);
         let m = s.exits[0][5].maker;
         assert!(m.is_finite() && m > x3.cross, "resting inside the spread beats crossing it");
         let x = first(&s, m - 0.01, 0.0).expect("half a cent clears a maker exit");
@@ -512,7 +514,7 @@ mod tests {
         for t in [250, 280] {
             (k.bid[t], k.ask[t]) = (0.60, 0.62);
         }
-        let s = simulate(&k, &p, n, n, |_| 0.0);
+        let s = simulate(&k, &p, KALSHI_MAKER, n, n, |_| 0.0);
         let mins: Vec<usize> = s.engine_chances(Dir::KYes, 0, 0.9, n, |_| 0.0).iter().map(|x| x.minutes).collect();
         assert_eq!(mins, vec![10, 61, 121, 250]);
         assert_eq!(s.engine_chances(Dir::KYes, 0, 0.9, 100, |_| 0.0).len(), 2, "cut at the limit");

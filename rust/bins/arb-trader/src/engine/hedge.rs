@@ -2839,6 +2839,8 @@ mod sell_back_tests {
     use crate::engine::{test_cfg, test_engine, RunCfg};
     use arb_core::model::Level;
 
+    /// "K" is on neither Kalshi series list, so a rest there is charged the
+    /// maker fee, as on the flagged series.
     fn entry(venue: Venue, side: BookSide, price: &str, role: Role) -> EntryLeg {
         EntryLeg { venue, market_id: "K".into(), side, price: price.into(), role }
     }
@@ -2875,7 +2877,7 @@ mod sell_back_tests {
         let lot30 = heisman(BookSide::Ask, "0.30");
         assert!(!ok(&lot30, "0.28", 5), "a profit under MIN_LOCK is not worth the trade");
         // On a series that does not charge makers the same lot keeps the 0.0184.
-        let free = entry(Venue::Kalshi, BookSide::Ask, "0.30", Role::Maker);
+        let free = EntryLeg { market_id: "KXTIME-26-POP".into(), ..entry(Venue::Kalshi, BookSide::Ask, "0.30", Role::Maker) };
         assert!(ok(&free, "0.28", 5), "0.10 gross less 0.0706 taker clears 0.025");
     }
 
@@ -2884,7 +2886,7 @@ mod sell_back_tests {
     #[test]
     fn the_direction_is_the_entrys() {
         let long = entry(Venue::Kalshi, BookSide::Bid, "0.40", Role::Maker);
-        // 5 x 0.05 = 0.25 gross, fees 0.03 + 0.09, net 0.13
+        // 5 x 0.05 = 0.25 gross, fees 0.021 + 0.0867, net 0.1423
         assert!(ok(&long, "0.45", 5));
         assert!(!ok(&long, "0.40", 5));
         assert!(!ok(&long, "0.35", 5), "selling a 0.40 long at 0.35 is a loss");
@@ -2898,17 +2900,17 @@ mod sell_back_tests {
     fn a_take_take_entry_pays_the_taker_fee_it_actually_paid() {
         let maker = entry(Venue::Kalshi, BookSide::Bid, "0.40", Role::Maker);
         let taker = entry(Venue::Kalshi, BookSide::Bid, "0.40", Role::Taker);
-        // 5 x 0.03 = 0.15 gross; maker 0.03 + 0.09 = +0.03, taker 0.09 + 0.09
+        // 5 x 0.03 = 0.15 gross; maker 0.021 + 0.0858 = +0.0432, taker 0.084 + 0.0858
         assert!(ok(&maker, "0.43", 5));
         assert!(!ok(&taker, "0.43", 5));
         assert!(ok(&taker, "0.45", 5));
     }
 
-    /// PM-US charges no maker fee and an unrounded taker fee.
+    /// PM-US charges no maker fee and a taker fee rounded to the cent.
     #[test]
     fn a_pmus_entry_prices_its_own_venues_fees() {
         let e = entry(Venue::PolymarketUs, BookSide::Ask, "0.30", Role::Maker);
-        // 10 x 0.02 = 0.20 gross, fees 0 + 0.12096, net 0.07904 >= 0.05
+        // 10 x 0.02 = 0.20 gross, fees 0 + round(0.140112) = 0.14, net 0.06 >= 0.05
         assert!(ok(&e, "0.28", 10));
         assert!(!ok(&e, "0.29", 10));
     }
@@ -3390,7 +3392,7 @@ mod adopt_tests {
         assert!(alarm.is_some(), "10 minutes naked against a 60s alarm");
 
         // The PM-US ask is 0.07 past the anchor; 0.22 against a 0.25 entry
-        // clears both Kalshi fees (the hand-worked jersmi lot).
+        // clears the Kalshi fees (the hand-worked jersmi lot).
         quote(&mut e, "0.20", "0.22");
         assert_eq!(plan(&mut e).1, HedgePlan::SellBack { qty: 8, price: "0.22".into() });
     }

@@ -5,6 +5,8 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use arb_core::fees::kalshi_charges_makers;
+
 use crate::sim::{Dir, KALSHI_MAKER, KALSHI_TAKER, PMUS_TAKER};
 
 /// The entry strategies that open a two-legged basket. Naked repairs, probes
@@ -68,7 +70,10 @@ fn basket(rec: &Value) -> Option<(Dir, f64)> {
         match text(l, "venue") {
             "kalshi" => {
                 kalshi = Some(yes);
-                cost += paid + fee(if maker { KALSHI_MAKER } else { KALSHI_TAKER });
+                // A rest pays only on the series Kalshi flags; a leg with no
+                // market id is charged, as the engine charges it.
+                let k_maker = if kalshi_charges_makers(text(l, "market_id")) { KALSHI_MAKER } else { 0.0 };
+                cost += paid + fee(if maker { k_maker } else { KALSHI_TAKER });
             }
             "polymarket_us" => {
                 pmus = Some(yes);
@@ -142,8 +147,17 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].dir, Dir::KYes);
         let want = 0.40 + KALSHI_MAKER * 0.24 + 0.50 + PMUS_TAKER * 0.25;
-        assert!((l[0].cost - want).abs() < 1e-12);
+        assert!((l[0].cost - want).abs() < 1e-12, "no market id: charged as a maker");
         assert_eq!(l[0].exit_ts, None);
+    }
+
+    #[test]
+    fn a_rest_on_a_series_that_charges_no_makers_pays_none() {
+        let mut e = entry(100.0, "bid", "ask");
+        e["legs"][0]["market_id"] = "KXTIME-26-POP".into();
+        let l = lots(&[e]);
+        let want = 0.40 + 0.50 + PMUS_TAKER * 0.25;
+        assert!((l[0].cost - want).abs() < 1e-12, "{}", l[0].cost);
     }
 
     #[test]

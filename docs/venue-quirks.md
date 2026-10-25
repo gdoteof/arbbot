@@ -105,8 +105,8 @@ double-entry books. Together they make the Kalshi account reconcile to
 - **Venue:** kalshi
 - **What the API does:** `GET /trade-api/v2/series/{series}` (public) reports `fee_type` — `quadratic` (takers only, 0.07) or `quadratic_with_maker_fees` (makers also pay, 0.0175) — and a `fee_multiplier` (1 everywhere we trade; 0.5 on KXMLBGAME, 0 on KXGREENLAND). Of the series in the registry on 2026-10-24, makers pay on KXPAYROLLS, KXCPI, KXCPIYOY, KXGDP, KXFEDDECISION, KXFED, KXHEISMAN, KXLLM1 and KXBTCMAX150; not on KXCPICORE, KXCPICOREYOY, KXTIME, KXTSLA, KXBRPRES, KXNOBELPEACE, KXRATECUT, KXBTCMAXY, KXFRENCHPRES, KXPRESNOMD, KXOSCARPIC or the rest. Every one of our 227 maker fills agrees (83 charged, all on the flagged series).
 - **Failure it caused:** `fees.rs` charged 0.0175 on every Kalshi rest, so rest-kalshi quotes and exits on the free series were priced ~0.4c/ct too wide, and the modelled fee total ran $65.91 against $57.98 charged.
-- **Current handling:** `arb_core::fees::KALSHI_MAKER_FEE_SERIES` is the list; `FeeSchedule::for_market` zeroes the maker coefficient off it. The list is static — re-run the query when a series enters the registry. The multiplier is not modelled.
-- **Port requirement:** Any fee model must know the series. Treat an unknown series as free, which is what the venue does for every unflagged series checked.
+- **Current handling:** `arb_core::fees::KALSHI_MAKER_FEE_SERIES` and `KALSHI_FREE_MAKER_SERIES` are the two lists; `FeeSchedule::for_market` zeroes the maker coefficient on the free list and charges a series on neither. The lists are static — query the endpoint before a series enters the registry; `arb-trader` names the series it does not know at boot. The multiplier is not modelled.
+- **Port requirement:** Any fee model must know the series. Treat an unknown series as charged: a fee guessed low prices a rest too tight, a fee guessed high only leaves it a tick wide.
 
 ### `kalshi-sell-no-is-closing-long-yes`
 - **Venue:** kalshi

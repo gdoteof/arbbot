@@ -473,7 +473,7 @@ impl Quoter {
         // The clip is PRICED, not just sized: both venues round the fee on
         // the whole order (`fees.rs`), so the per-contract fee moves with the
         // clip (`arb-scenario`'s
-        // `kalshi_fee_ceiling_makes_small_clips_much_worse_per_contract`).
+        // `kalshi_fee_ceiling_makes_small_clips_worse_per_contract`).
         let clip = cx.from_i64(clip);
         let metas = |l: &crate::scan::RelLeg| {
             let _ = l;

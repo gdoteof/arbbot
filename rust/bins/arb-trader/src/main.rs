@@ -492,6 +492,24 @@ fn load_quoters(registry: &str, rel_prefixes: &[String]) -> (Vec<Quoter>, Market
         quoters.len(),
     );
 
+    // The fee model knows a Kalshi series' maker fee from two static lists
+    // (`fees::KALSHI_MAKER_FEE_SERIES`, `KALSHI_FREE_MAKER_SERIES`). A series on
+    // neither is charged, which can leave its rests a tick wide: name them.
+    let mut unknown: Vec<&str> = quoters
+        .iter()
+        .flat_map(|q| q.rel.legs.iter())
+        .filter(|l| l.venue == Venue::Kalshi && !arb_core::fees::kalshi_series_fee_known(&l.market_id))
+        .map(|l| l.market_id.split('-').next().unwrap_or(""))
+        .collect();
+    unknown.sort_unstable();
+    unknown.dedup();
+    if !unknown.is_empty() {
+        eprintln!(
+            "[fees] Kalshi series with no known maker-fee type, charged as makers: {}",
+            unknown.join(" ")
+        );
+    }
+
     let mut by_market: MarketIndex = HashMap::new();
     for (qi, q) in quoters.iter().enumerate() {
         for leg in &q.rel.legs {

@@ -535,10 +535,10 @@ pub fn detect(
     //     rule argued for is `edge - real_fee > max_slip`. On the tail
     //     crossings this engine actually fires that gap is larger than the
     //     budget: nobel-peace-26-donaldtrump x5 at 0.04/0.08 pays a real
-    //     0.008416/ct (Kalshi ceil(0.07*5*0.04*0.96)=0.02 -> 0.004, PM-US
-    //     0.06*0.08*0.92 = 0.004416), so reported net 0.020000 understates true
-    //     net 0.031584 by 0.011584 — and the effective requirement in true-net
-    //     terms becomes 0.021584, i.e. 2.16x the nominal budget. Deliberate but
+    //     0.0087/ct (Kalshi ceil4(0.07*5*0.04*0.96)=0.0135 -> 0.0027, PM-US
+    //     round(0.0695*5*0.08*0.92)=0.03 -> 0.006), so reported net 0.020000
+    //     understates true net 0.0313 by 0.0113 — and the effective requirement
+    //     in true-net terms becomes 0.0213, i.e. 2.13x the nominal budget. Deliberate but
     //     not free: the floor stands in for PM-US's per-market `feeCoefficient`
     //     and for a clip that walks past its touch (see FEE_CT), and ten of the
     //     sixteen baskets ever booked sit in that floor-bound region. This is
@@ -951,9 +951,10 @@ mod tests {
     }
 
     /// Both venues round the fee PER ORDER — Kalshi ceils to $0.0001, PM-US
-    /// rounds to the cent — so the per-contract fee is not linear in the clip
-    /// and is not even monotone in it; what matters is where each rounding
-    /// lands. At Kalshi ask 0.47 / PM-US bid 0.53:
+    /// rounds to the cent — so the per-contract fee is not linear in the clip;
+    /// here it falls with size, and at other prices it is not even monotone
+    /// (`fees::tests::pmus_taker_is_0695_rounded_to_the_cent`). What matters
+    /// is where each rounding lands. At Kalshi ask 0.47 / PM-US bid 0.53:
     ///   clip  5: ceil4(0.07*5*0.47*0.53)  = 0.0872 -> 0.017440/ct
     ///            round(0.0695*5*0.53*0.47) = 0.09   -> 0.018000/ct
     ///   clip 20: 0.3488 -> 0.017440/ct;  0.35 -> 0.017500/ct

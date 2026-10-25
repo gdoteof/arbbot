@@ -36,11 +36,12 @@ pub enum Role {
 /// curl -s https://api.elections.kalshi.com/trade-api/v2/series/KXPAYROLLS | jq .series.fee_type
 /// ```
 ///
-/// [`FeeSchedule::for_market`] charges the maker fee on a listed series and
-/// models an UNLISTED one as free, which is what the venue does for every
-/// unflagged series checked. Re-run the query when a new series enters the
-/// registry. (`fee_multiplier` is also
-/// reported — 0.5 on KXMLBGAME, 0 on KXGREENLAND — and is not modelled.)
+/// [`FeeSchedule::for_market`] charges the maker fee on a series in this list,
+/// none on one in [`KALSHI_FREE_MAKER_SERIES`], and — the safe reading — charges
+/// it on a series in neither; `kalshi_series_fee_known` lets the trader name
+/// those at boot. Query the endpoint for a series before it enters the
+/// registry. (`fee_multiplier` is also reported — 0.5 on KXMLBGAME, 0 on
+/// KXGREENLAND, where nobody pays — and is not modelled.)
 pub const KALSHI_MAKER_FEE_SERIES: &[&str] = &[
     "KXATPMATCH",
     "KXBTCMAX150",
@@ -57,12 +58,53 @@ pub const KALSHI_MAKER_FEE_SERIES: &[&str] = &[
     "KXWTAMATCH",
 ];
 
-/// Whether Kalshi charges a resting order on this ticker. The series is the
-/// ticker's first dash-separated field (`KXCPI-26SEP-T0.4` → `KXCPI`), compared
-/// whole: `KXCPI` must not match `KXCPICORE`, which the venue leaves free.
+/// Series the endpoint reported as plain `quadratic` on 2026-10-24: makers pay
+/// nothing. With the list above this covers every Kalshi series in the live
+/// registry except KXNEWOUTBREAK, which the endpoint does not know.
+pub const KALSHI_FREE_MAKER_SERIES: &[&str] = &[
+    "KXALIENS",
+    "KXBRPRES",
+    "KXBTCMAXY",
+    "KXCPICORE",
+    "KXCPICOREYOY",
+    "KXF1",
+    "KXFRENCHPRES",
+    "KXGPT",
+    "KXGREENLAND",
+    "KXGREENTERRITORY",
+    "KXITFMATCH",
+    "KXITFWMATCH",
+    "KXLEADERSOUT",
+    "KXNOBELPEACE",
+    "KXOSCARPIC",
+    "KXPRESNOMD",
+    "KXPRESNOMR",
+    "KXPRESPERSON",
+    "KXRATECUT",
+    "KXTIME",
+    "KXTSLA",
+    "KXUSAIRANAGREEMENT",
+    "KXVENEZUELALEADER",
+];
+
+/// The series is the ticker's first dash-separated field (`KXCPI-26SEP-T0.4` →
+/// `KXCPI`), compared whole: `KXCPI` must not match `KXCPICORE`.
+fn kalshi_series(ticker: &str) -> &str {
+    ticker.split('-').next().unwrap_or("")
+}
+
+/// Whether either list names this ticker's series. A series on neither is
+/// charged as if it did; the trader names such series at boot.
+pub fn kalshi_series_fee_known(ticker: &str) -> bool {
+    let s = kalshi_series(ticker);
+    KALSHI_MAKER_FEE_SERIES.contains(&s) || KALSHI_FREE_MAKER_SERIES.contains(&s)
+}
+
+/// Whether Kalshi charges a resting order on this ticker: only a series on
+/// [`KALSHI_FREE_MAKER_SERIES`] is free. An unknown series, or an empty
+/// ticker, is charged — the reading that cannot price a rest too tight.
 pub fn kalshi_charges_makers(ticker: &str) -> bool {
-    let series = ticker.split('-').next().unwrap_or("");
-    KALSHI_MAKER_FEE_SERIES.contains(&series)
+    !KALSHI_FREE_MAKER_SERIES.contains(&kalshi_series(ticker))
 }
 
 #[derive(Clone, Copy)]
@@ -106,11 +148,12 @@ impl FeeSchedule {
         }
     }
 
-    /// The schedule for one market: on Kalshi, a ticker outside
-    /// [`KALSHI_MAKER_FEE_SERIES`] pays no maker fee. Other venues are
-    /// unchanged. Callers that price a Kalshi maker leg should go through here;
-    /// the plain schedule charges every Kalshi rest 0.0175, which over-states
-    /// the fee on most of the markets we quote.
+    /// The schedule for one market: on Kalshi, a ticker on
+    /// [`KALSHI_FREE_MAKER_SERIES`] pays no maker fee; one on
+    /// [`KALSHI_MAKER_FEE_SERIES`] or on neither list pays 0.0175. Other venues
+    /// are unchanged. Callers that price a Kalshi maker leg should go through
+    /// here; the plain schedule charges every Kalshi rest 0.0175, which
+    /// over-states the fee on most of the markets we quote.
     pub fn for_market(&self, venue: Venue, market_id: &str) -> FeeSchedule {
         let mut s = *self;
         if venue == Venue::Kalshi && !kalshi_charges_makers(market_id) {
@@ -186,7 +229,10 @@ pub fn leg_fee(cx: &mut Cx, schedule: &FeeSchedule, venue: Venue, role: Role, pr
             let a = cx.mul(k, price);
             let omp = cx.one_minus(price);
             let b = cx.mul(a, omp);
-            return cx.mul(b, size);
+            let raw = cx.mul(b, size);
+            // PM-US rounds the order's commission to the cent whatever the
+            // coefficient; intl's rounding is not established.
+            return if venue == Venue::PolymarketUs { cx.quantize_cent_even(raw) } else { raw };
         }
     }
     schedule.fee(cx, venue, role, price, size, category)
@@ -230,7 +276,18 @@ mod tests {
         assert!(kalshi_charges_makers("KXPAYROLLS-26OCT-T150"));
         assert!(!kalshi_charges_makers("KXCPICORE-26SEP-T0.3"));
         assert!(!kalshi_charges_makers("KXTIME-26-ZOH"));
-        assert!(!kalshi_charges_makers(""));
+        assert!(!kalshi_charges_makers("KXGREENLAND-26"), "multiplier 0: nobody pays there");
+        // A series on neither list, or no ticker at all, is charged.
+        assert!(kalshi_charges_makers("KXNEWOUTBREAK-26-EBOLA"));
+        assert!(!kalshi_series_fee_known("KXNEWOUTBREAK-26-EBOLA"));
+        assert!(kalshi_charges_makers(""));
+        assert!(kalshi_series_fee_known("KXCPI-26SEP-T0.4"));
+        assert!(kalshi_series_fee_known("KXTIME-26-ZOH"));
+        for s in KALSHI_MAKER_FEE_SERIES {
+            assert!(!KALSHI_FREE_MAKER_SERIES.contains(s), "{s} is on both lists");
+            assert!(!s.contains('-'), "{s} is a ticker, not a series");
+        }
+        assert!(KALSHI_FREE_MAKER_SERIES.iter().all(|s| !s.contains('-')));
 
         let cpi = s.for_market(Venue::Kalshi, "KXCPI-26SEP-T0.4");
         assert_eq!(fee6(&mut cx, &cpi, Venue::Kalshi, Role::Maker, "0.91", 25), "0.035900");
@@ -258,5 +315,15 @@ mod tests {
         // 1 @ 0.03: raw 0.00202245 → 0.00
         assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.03", 1), "0.000000");
         assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Maker, "0.50", 10), "0.000000");
+        // The cent rounding makes the per-contract fee non-monotone in the
+        // clip: 2 @ 0.50 pay 0.03 (1.5c/ct), 3 pay 0.05 (1.67c/ct).
+        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.50", 2), "0.030000");
+        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.50", 3), "0.050000");
+        // A per-market coefficient rounds the same way.
+        let p = cx.parse_exact("0.50");
+        let n = cx.from_i64(2);
+        let k = Some(cx.parse_exact("0.06"));
+        let f = leg_fee(&mut cx, &s, Venue::PolymarketUs, Role::Taker, p, n, "default", k);
+        assert_eq!(cx.emit_6dp(f), "0.030000", "0.03 raw, to the cent");
     }
 }
