@@ -9,15 +9,17 @@
 //!   make B       take A, rest an ask on B
 //!
 //! Fees are not a rounding detail here. Kalshi's maker coefficient is 0.0175
-//! against 0.07 taker — a 4x difference — and PM-US makers pay nothing at all.
-//! So the execution style can flip a basket from unprofitable to profitable
-//! without any price moving.
+//! against 0.07 taker — a 4x difference, and zero on the series the venue
+//! does not charge makers on — and PM-US makers pay nothing at all. So the
+//! execution style can flip a basket from unprofitable to profitable without
+//! any price moving. The schedule here is the unspecialised one, which charges
+//! every Kalshi rest 0.0175 (`fees::FeeSchedule::for_market` is the per-market
+//! view).
 //!
-//! SIZE MATTERS, and this is the subtle one: Kalshi ceils its fee to the cent
-//! PER ORDER (`fees.rs`, `quantize_ceil(x, 2)`). At clip 1 a 1.3-cent fee
-//! becomes 2 cents; at clip 25 the same curve costs 1.32 cents per contract.
-//! Quoting per-contract economics without fixing a clip size is meaningless,
-//! so callers must pass one.
+//! SIZE MATTERS: both venues round the fee PER ORDER (`fees.rs`: Kalshi ceils
+//! to $0.0001, PM-US rounds to the cent), so the per-contract fee depends on
+//! the clip. Quoting per-contract economics without fixing a clip size is
+//! meaningless, so callers must pass one.
 
 use arb_core::fees::{FeeSchedule, Role};
 use arb_core::model::Venue;
@@ -355,10 +357,11 @@ mod tests {
         assert_eq!(r.exit_b, "0.83");
     }
 
-    /// The trap: Kalshi ceils its fee to the cent PER ORDER, so per-contract
-    /// economics change with clip size even though no price moved.
+    /// The trap: Kalshi ceils its fee to $0.0001 PER ORDER, so per-contract
+    /// economics change with clip size even though no price moved — by a
+    /// fraction of a cent at this rounding, and always against the small clip.
     #[test]
-    fn kalshi_fee_ceiling_makes_small_clips_much_worse_per_contract() {
+    fn kalshi_fee_ceiling_makes_small_clips_worse_per_contract() {
         let (mut cx, sched, wide) = setup();
         let (qa, qb) = (q("0.20", "0.22"), q("0.80", "0.83"));
         let one = cx.parse_exact("1");

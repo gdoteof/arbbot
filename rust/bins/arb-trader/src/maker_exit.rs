@@ -781,10 +781,11 @@ impl Debounce {
 /// Gross of fees the two single-maker shapes differ by exactly
 /// `kalshi_spread - pmus_spread`: resting captures the spread on the venue you
 /// rest at and crossing pays it on the venue you cross. Fees tilt it a further
-/// 0.0075*p*(1-p) toward PM-US, because PM-US charges makers NOTHING
-/// (`fees.rs`, `Role::Maker => cx.zero()`) while Kalshi charges makers 0.0175.
-/// So the rule is "rest where the spread is wider", and on this book that is
-/// overwhelmingly PM-US.
+/// 0.017*p*(1-p) toward PM-US on the series where Kalshi charges makers
+/// 0.0175 (`fees::KALSHI_MAKER_FEE_SERIES`): 0.0175 + 0.0695 against the 0.07
+/// Kalshi taker and free PM-US maker of the mirror; where Kalshi makers are
+/// free the tilt runs 0.0005*p*(1-p) the other way. So the rule is "rest where the spread is wider", and on this
+/// book that is overwhelmingly PM-US.
 ///
 /// On the TOB tape for the eleven pairs this engine holds (`data/tob`,
 /// time-matched, forward-filled, dearest lot per pair), median Kalshi spread is
@@ -1710,6 +1711,9 @@ pub fn decide(
     take_ok: bool,
     claims: DepthClaims,
 ) -> Result<Order, String> {
+    // Kalshi charges makers on some series and not others (`fees.rs`); every
+    // price below is for this lot's market.
+    let fees = &fees.for_market(Venue::Kalshi, &cand.market_id);
     if !cand.actionable {
         return Err(refuse(format!(
             "{} is outside this process's --rel-prefix scope — it is not ours to exit \
@@ -2166,7 +2170,7 @@ pub fn close_record(o: &Order, rest_fill: &str, close_fill: &str, filled: i64, t
         (Role::Maker, Role::Maker) => ("maker", "maker"),
     };
     let mut cx = Cx::default();
-    let fees = FeeSchedule::new(&mut cx);
+    let fees = FeeSchedule::new(&mut cx).for_market(Venue::Kalshi, &o.market);
     let actual_lock = match (cx.parse(k_fill), cx.parse(pm_fill),
         cx.parse(&o.k_basis), cx.parse(&o.pm_basis)) {
         (Some(k), Some(p), Some(kb), Some(pb)) => {
@@ -3758,6 +3762,7 @@ fn still_pays(cx: &mut Cx, fees: &FeeSchedule, o: &Order, view: &EngineView) -> 
         order.limit = complement(cx, &o.limit).ok_or("inverse resting price does not parse")?;
         return still_pays(cx, fees, &order, &normalized);
     }
+    let fees = &fees.for_market(Venue::Kalshi, &o.market);
     let (Some(k_basis), Some(pm_basis), Some(resting)) =
         (cx.parse(&o.k_basis), cx.parse(&o.pm_basis), cx.parse(&o.limit))
     else {
@@ -4252,6 +4257,7 @@ fn price_close(
         let price = price_close(cx, fees, &order, filled, &normalized)?;
         return complement(cx, &price).ok_or("inverse close price does not parse".into());
     }
+    let fees = &fees.for_market(Venue::Kalshi, &o.market);
     let fill = cx.parse(&o.limit).ok_or("the fill price does not parse")?;
     let k_basis = cx.parse(&o.k_basis).ok_or("the kalshi basis does not parse")?;
     let pm_basis = cx.parse(&o.pm_basis).ok_or("the pm basis does not parse")?;
@@ -4788,18 +4794,18 @@ mod tests {
     /// leaves only a thin lock: resting still pays, crossing does not, and the
     /// exit rests exactly as it always did.
     ///
-    /// Against `MIN_EXIT_CT` (0.02) and not `MIN_LOCK` (0.005) on purpose:
-    /// `unwind::consider` already refused this lot at anything under 0.02, so a
-    /// cross that dropped below it would spend the spread to reach a trade the
-    /// selector had rejected.
+    /// The floor is the one `reservation_floor` hands `decide` — `MIN_LOCK`
+    /// (0.005) here, with no resolution date on the candidate.
     #[tokio::test]
     async fn a_cross_that_falls_under_the_selection_floor_is_refused() {
         let _g = allow_all().await;
         let (mut cx, fees) = ready();
         // The other side of the bracket: only the Kalshi basis moves, 0.43 ->
-        // 0.46. Resting still clears MIN_LOCK comfortably; crossing drops to
-        // ~0.005/ct, under the 0.02 selection floor, and is refused.
-        let recs = vec![open_basket(1.0, 5, "0.57", "0.46")];
+        // 0.465 (0.4694 with the 0.0044 maker fee in it). Resting still clears
+        // MIN_LOCK comfortably; crossing drops to about +0.0017/ct — still a
+        // profit (0.0067 at a 0.46 basis clears), but under the 0.005 floor —
+        // and is refused.
+        let recs = vec![open_basket(1.0, 5, "0.57", "0.465")];
         let q = quote(Some("0.16"), Some("0.24"));
         let vw = wide_pm_view("0.22", "0.20", "0.16");
         let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true, DepthClaims::default())
@@ -4964,7 +4970,8 @@ mod tests {
 
     /// The ledger record's ROLES are the shape's, not a fixed property of the
     /// venue. Getting this wrong misattributes every fee the record accounts
-    /// for — Kalshi maker is 0.0175 and Kalshi taker is 0.07, four times it.
+    /// for — Kalshi taker is 0.07, four times the 0.0175 a maker pays on the
+    /// series that charge one, and infinitely more than the nothing elsewhere.
     #[test]
     fn the_booked_roles_follow_the_shape_and_not_the_venue() {
         let mut o = resting_exit(5).order;
@@ -5032,7 +5039,7 @@ mod tests {
             "the price the IOC actually paid, not the rest's 0.20: {rec}"
         );
         assert_eq!(rec["maker_exit_planned_lock_ct"], "0.025704", "the placement plan: {rec}");
-        assert_eq!(rec["maker_exit_lock_ct"], "-0.040296", "recomputed from the supplied fills: {rec}");
+        assert_eq!(rec["maker_exit_lock_ct"], "-0.041880", "recomputed from the supplied fills: {rec}");
         assert!(
             rec["note"].as_str().expect("a note").contains("CROSSED"),
             "and the note describes what happened: {rec}"
@@ -5769,11 +5776,14 @@ mod tests {
         .expect("a priced exit");
         assert_eq!(o.qty, 34, "all remaining inventory in this lot may rest");
         assert_eq!(o.closes_ts, 1.0, "ONE lot, so ONE closes_ts — no split");
-        // 0.19 PLUS the Kalshi MAKER fee the schedule charges on a 34-lot at
-        // that price, per contract. The basis is all-in — `worst_lot` computes
-        // the fee when the ledger leg does not carry one — because a hedge or
-        // an exit that beats a fee-free basis has not beaten anything.
-        assert_eq!(o.k_basis, "0.192941");
+        // 0.19 plus the Kalshi MAKER fee the schedule charges on a 34-lot at
+        // that price, per contract: ceil4(0.0175·34·0.19·0.81) / 34 = 0.002694.
+        // `K-a` is on neither series list, so it is charged like the flagged
+        // series are (`fees::kalshi_charges_makers`); on KXTIME it would be
+        // nothing. The basis is all-in — `worst_lot` computes the fee when the
+        // ledger leg does not carry one — because a hedge or an exit that beats
+        // a fee-free basis has not beaten anything.
+        assert_eq!(o.k_basis, "0.192694");
         assert_eq!(o.pm_basis, "0.780000", "1 - 0.22, the cost of the NO");
         assert_eq!(o.pm_market, "p-a");
         assert!(o.limit.parse::<f64>().unwrap() > 0.10, "and it does not cross: {}", o.limit);
@@ -5899,17 +5909,19 @@ mod tests {
     /// The live shape, from `xvus-time-poty-26-artificialintelligence` on
     /// 2026-08-20: three open lots on one ticker, where the dearest KALSHI leg
     /// and the dearest PM-US leg are on DIFFERENT records. Kalshi fees ceil to
-    /// the cent on the leg TOTAL, so the per-contract basis depends on the
-    /// lot's size as well as its price:
+    /// $0.0001 on the leg TOTAL, and `K-a` (on neither series list) is charged
+    /// as a maker, so the per-contract basis depends on the lot's role and size
+    /// as well as its price:
     ///
     /// ```text
-    ///   ts 1.0  5x  kalshi 0.10 maker -> 0.1020   pm 0.104 -> 0.896  = 0.9980
-    ///   ts 2.0  5x  kalshi 0.10 taker -> 0.1080   pm 0.12  -> 0.880  = 0.9880
-    ///   ts 3.0  4x  kalshi 0.10 taker -> 0.1075   pm 0.18  -> 0.820  = 0.9275  <- chosen
+    ///   ts 1.0  5x  kalshi 0.10 maker -> 0.1016   pm 0.104 -> 0.896  = 0.9976
+    ///   ts 2.0  5x  kalshi 0.10 taker -> 0.1063   pm 0.12  -> 0.880  = 0.9863
+    ///   ts 3.0  4x  kalshi 0.10 taker -> 0.1063   pm 0.18  -> 0.820  = 0.9263  <- chosen
     /// ```
     ///
-    /// `worst_lot` per leg composes the 0.1080 with the 0.896 — a basket nobody
-    /// traded, and one dearer than the dollar the pair pays. It still produces
+    /// `worst_lot` per leg composes the 0.1063 (ts 2.0 and 3.0 tie; the earlier
+    /// wins) with the 0.896 — a basket nobody traded, and one dearer than the
+    /// dollar the pair pays. It still produces
     /// a LEGAL price, which is what made this survivable enough to ship and
     /// invisible enough to run for a month: `exit_limit` answers 0.08, and this
     /// fixture reproduces the live number to the cent. Against a book offering
@@ -5964,7 +5976,7 @@ mod tests {
             "the live mispricing, to the cent — an ask three rungs behind a 0.05 offer"
         );
 
-        // NOW the real one. `cand(4, 3.0)` names the 0.9275 lot; against a
+        // NOW the real one. `cand(4, 3.0)` names the 0.9263 lot; against a
         // PM-US ask of 0.05 its floor is the bottom rung, and the Kalshi bid of
         // 0.03 lifts it to 0.04 — at the front of a book offering 0.05.
         let o = decide(
@@ -5974,7 +5986,7 @@ mod tests {
         )
         .expect("the selected lot is exitable");
         assert_eq!(o.closes_ts, 3.0, "the record select named, not the dearest: {o:?}");
-        assert_eq!(o.k_basis, "0.107500");
+        assert_eq!(o.k_basis, "0.106300");
         assert_eq!(o.pm_basis, "0.820000");
         assert_eq!(o.qty, 4);
         assert_eq!(o.limit, "0.0400", "at the touch, not three ticks above the offer");
@@ -7718,9 +7730,12 @@ mod tests {
     }
 
     /// `decide` and `still_pays` read `exit_apr`, not `apr_bar`: with the bar
-    /// held at 60% in both views, ample cash (4%) rests higher than scarce cash
+    /// held at 60% in both views, ample cash (4%) locks more than scarce cash
     /// (60%) and records the higher floor; and a rest planned under ample cash
-    /// is pulled for re-planning once the view says cash is scarce.
+    /// is pulled for re-planning once the view says cash is scarce. (The two
+    /// floors can pick different shapes: the higher one pushes the Kalshi ask
+    /// up until its lock beats the PM-US rest's, so the lock is compared, not
+    /// the limit.)
     #[tokio::test]
     async fn exits_price_off_the_exit_discount_and_re_plan_when_it_rises() {
         let _g = allow_all().await;
@@ -7731,18 +7746,17 @@ mod tests {
         let today = (wall_now() / 86400.).floor() as i64;
         c.resolves_by = Some(arb_core::resolve::iso_from_day(today + 81));
         let q = quote(Some("0.10"), Some("0.20"));
-        let ample = EngineView { apr_bar: 60.0, exit_apr: crate::APR_FLOOR, ..view("0.20") };
-        let scarce = EngineView { apr_bar: 60.0, exit_apr: 60.0, ..view("0.20") };
+        // The view's Kalshi bid matches the quote's, so `still_pays` prices the
+        // rest-pmus close off the same rung `decide` did.
+        let ample = EngineView { apr_bar: 60.0, exit_apr: crate::APR_FLOOR, ..view_with("0.20", "0.19", "0.10") };
+        let scarce = EngineView { apr_bar: 60.0, exit_apr: 60.0, ..view_with("0.20", "0.19", "0.10") };
         let rich = decide(&mut cx, &fees, &recs, &c, "p-a", &q, &ample, Instant::now(), false,
             DepthClaims::default()).unwrap();
         let poor = decide(&mut cx, &fees, &recs, &c, "p-a", &q, &scarce, Instant::now(), false,
             DepthClaims::default()).unwrap();
-        assert_eq!(rich.shape, poor.shape, "{rich:?} vs {poor:?}");
-        let (rl, pl) = (rich.limit.parse::<f64>().unwrap(), poor.limit.parse::<f64>().unwrap());
-        match rich.shape {
-            Shape::RestKalshi => assert!(rl > pl, "ample cash must ask MORE: {rl} vs {pl}"),
-            Shape::RestPmUs => assert!(rl < pl, "ample cash must bid LESS: {rl} vs {pl}"),
-        }
+        let (rl, pl) = (rich.lock_ct.parse::<f64>().unwrap(), poor.lock_ct.parse::<f64>().unwrap());
+        // A tick higher on the ask, less the slightly larger maker fee there.
+        assert!(rl > pl + 0.005, "ample cash must lock MORE: {rich:?} vs {poor:?}");
         let rf = rich.floor_ct.as_deref().unwrap().parse::<f64>().unwrap();
         let pf = poor.floor_ct.as_deref().unwrap().parse::<f64>().unwrap();
         // At 60% the 81-day hold value sits under this basket's basis, so the

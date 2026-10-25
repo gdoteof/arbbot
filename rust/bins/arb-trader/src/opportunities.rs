@@ -21,11 +21,12 @@
 //! and 6dp decimal strings of `src/arbbot/scan/scanner.py`'s, plus one field.
 //! Where a field means something different:
 //!
-//!   * `fees` charges every PM-US leg the schedule's 0.06 coefficient. The
-//!     Python scanner used the venue's per-market `feeCoefficient` where its
-//!     tag catalog reported one, so on such a market the edge here runs
-//!     higher — and, since a basket is halved only until its edge turns
-//!     positive, `size` can differ as well.
+//!   * `fees` charges every PM-US leg the schedule's 0.0695 coefficient, which
+//!     is what every market object reports today. The Python scanner used the
+//!     venue's per-market `feeCoefficient` where its tag catalog reported one
+//!     (0.06 in its day), so a market's edge can differ from its records — and,
+//!     since a basket is halved only until its edge turns positive, `size` can
+//!     differ as well.
 //!   * `max_hold_close_time` is always null: there is no market catalog here.
 //!   * `bucket` is always `primary`: every leg's minimum order is taken as one
 //!     contract, and a basket with a Kalshi leg is sized in whole contracts.
@@ -697,8 +698,9 @@ mod tests {
             .collect()
     }
 
-    /// The record matches the Python scanner's field for field, with the
-    /// engine's own fee curves landing on the same numbers for this book.
+    /// The record matches the Python scanner's field for field, priced by the
+    /// engine's own fee curves: Kalshi ceiled to $0.0001 on the order, PM-US at
+    /// 0.0695 rounded to the cent (the Python line carried 0.08 and 0.054150).
     #[test]
     fn a_record_has_the_scanner_shape_and_the_engines_prices() {
         let mut scan = Scanner::new(vec![rel(EngineScope::Quoted)]);
@@ -710,12 +712,12 @@ mod tests {
             "relationship_id": "xvus-heisman-26-malachitoney", "tranche": "head",
             "basket": [
                 {"venue": "kalshi", "market_id": K, "buy_side": "no", "role": "taker",
-                 "vwap": "0.940000", "fee": "0.080000"},
+                 "vwap": "0.940000", "fee": "0.075100"},
                 {"venue": "polymarket_us", "market_id": P, "buy_side": "yes", "role": "taker",
-                 "vwap": "0.050000", "fee": "0.054150"}],
+                 "vwap": "0.050000", "fee": "0.060000"}],
             "signature": "xvus-heisman-26-malachitoney:NY", "size": "19",
-            "gross_cost": "18.810000", "fees": "0.134150", "min_payoff": "1.000000",
-            "net_edge_total": "0.055850", "net_edge_per_contract": "0.002939",
+            "gross_cost": "18.810000", "fees": "0.135100", "min_payoff": "1.000000",
+            "net_edge_total": "0.054900", "net_edge_per_contract": "0.002889",
             "bucket": "primary", "ts_local_ns": DAY0 + 5, "max_hold_close_time": null,
             "engine_scope": "quoted"
         });

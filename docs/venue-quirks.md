@@ -96,10 +96,17 @@ double-entry books. Together they make the Kalshi account reconcile to
 
 ### `kalshi-fills-are-the-fee-authority`
 - **Venue:** kalshi
-- **What the API does:** `GET /portfolio/fills` (paginated, cursor) returns every fill with `fill_id`, `order_id`, `count_fp`, `is_taker`, `yes_price_dollars`, `no_price_dollars`, and `fee_cost` — **the fee actually charged**, which is the per-order ceil-to-cent of the curve, not the raw curve value.
+- **What the API does:** `GET /portfolio/fills` (paginated, cursor) returns every fill with `fill_id`, `order_id`, `count_fp`, `is_taker`, `yes_price_dollars`, `no_price_dollars`, and `fee_cost` — **the fee actually charged**, which is the curve ceiled to $0.0001 per order (not to the cent: 238 of the 242 integer-count fills that can tell the two apart ceil to $0.0001, measured 2026-10-24 over 884 fills), prorated across a partially filled order's fills.
 - **Failure it caused:** nothing in the repo had ever read this endpoint. The ledger stored the raw un-ceiled `fees/curves.py` value, so every Kalshi fee was systematically light — **$11.51 actually charged vs $3.52 booked** across 217 fills.
 - **Current handling:** none in Python; this endpoint is unused. The Rust ledger importer is the first consumer.
 - **Port requirement:** Book `fee_cost` from the fill as the expense; compute the curve value only as a drift check. Never book a modelled fee when the venue reports the charged one.
+
+### `kalshi-maker-fee-is-per-series`
+- **Venue:** kalshi
+- **What the API does:** `GET /trade-api/v2/series/{series}` (public) reports `fee_type` — `quadratic` (takers only, 0.07) or `quadratic_with_maker_fees` (makers also pay, 0.0175) — and a `fee_multiplier` (1 everywhere we trade; 0.5 on KXMLBGAME, 0 on KXGREENLAND). Of the series in the registry on 2026-10-24, makers pay on KXPAYROLLS, KXCPI, KXCPIYOY, KXGDP, KXFEDDECISION, KXFED, KXHEISMAN, KXLLM1 and KXBTCMAX150; not on KXCPICORE, KXCPICOREYOY, KXTIME, KXTSLA, KXBRPRES, KXNOBELPEACE, KXRATECUT, KXBTCMAXY, KXFRENCHPRES, KXPRESNOMD, KXOSCARPIC or the rest. Every one of our 227 maker fills agrees (83 charged, all on the flagged series).
+- **Failure it caused:** `fees.rs` charged 0.0175 on every Kalshi rest, so rest-kalshi quotes and exits on the free series were priced ~0.4c/ct too wide, and the modelled fee total ran $65.91 against $57.98 charged.
+- **Current handling:** `arb_core::fees::KALSHI_MAKER_FEE_SERIES` and `KALSHI_FREE_MAKER_SERIES` are the two lists; `FeeSchedule::for_market` zeroes the maker coefficient on the free list and charges a series on neither. The lists are static — query the endpoint before a series enters the registry; `arb-trader` names the series it does not know at boot. The multiplier is not modelled.
+- **Port requirement:** Any fee model must know the series. Treat an unknown series as charged: a fee guessed low prices a rest too tight, a fee guessed high only leaves it a tick wide.
 
 ### `kalshi-sell-no-is-closing-long-yes`
 - **Venue:** kalshi
@@ -218,6 +225,13 @@ double-entry books. Together they make the Kalshi account reconcile to
 - **Failure it prevents:** treating it as per-contract multiplies the fee by the fill quantity (4x on the recorded Mamdani fixture).
 - **Current handling:** `src/arbbot/exec/main.py:82-84` (pre-divides by filled qty before the generic `* filled`).
 - **Port requirement:** Treat PM commission as an order-level total; divide by quantity before any per-contract math.
+
+### `pmus-taker-coefficient-0695-rounded-to-the-cent`
+- **Venue:** polymarket_us
+- **What the API does:** a taker execution's `commissionNotionalCollected` is `feeCoefficient × size × p × (1 − p)` for the order, rounded half-even to the cent. The coefficient was 0.06 until 2026-09-18 (405 of 425 taker fills fit) and has been 0.0695 since 2026-09-19 (404 of 420; the rest are prorated partial fills). Every market object reports `feeCoefficient: 0.0695`. Passive executions carried small negative commissions (rebates, ≤1c) until 2026-10-17 and zero since.
+- **Failure it caused:** the schedule's 0.06, unrounded, understated the taker leg by up to a cent on small orders; a 1-lot at 0.50 is charged 2c, not 1.5c.
+- **Current handling:** `fees.rs` uses 0.0695 and `Cx::quantize_cent_even`; makers are modelled at zero (the rebate is not).
+- **Port requirement:** Read the coefficient off the market where it is in hand (`taker_coef_override`), and round the order's commission to the cent.
 
 ### `pmus-ioc-fill-report-lag`
 - **Venue:** polymarket_us

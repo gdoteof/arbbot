@@ -353,10 +353,9 @@ fn top(cx: &mut Cx, books: &BookBuilder, venue: Venue, market: &str, now: f64) -
 /// close. This replaces a flat $0.01/ct Kalshi-only assumption that understated
 /// the real round trip by 1.3-3.3x (card b83b0449).
 ///
-/// PM-US uses the schedule's fallback taker coefficient: the venue-reported
-/// per-market `feeCoefficient` is not in hand on the exit path, and the fallback
-/// is deliberately conservative — it can over-state fees, never manufacture a
-/// profitable-looking exit.
+/// PM-US uses the schedule's taker coefficient, 0.0695 rounded to the cent per
+/// order — what every market object reports today; the per-market
+/// `feeCoefficient` is not in hand on the exit path.
 fn exit_fees_usd(cx: &mut Cx, fees: &FeeSchedule, k_yes: D, p_yes: D, qty: D) -> D {
     let k = leg_fee(cx, fees, Venue::Kalshi, Role::Taker, k_yes, qty, "default", None);
     let p = leg_fee(cx, fees, Venue::PolymarketUs, Role::Taker, p_yes, qty, "default", None);
@@ -364,9 +363,9 @@ fn exit_fees_usd(cx: &mut Cx, fees: &FeeSchedule, k_yes: D, p_yes: D, qty: D) ->
 }
 
 /// Fees on the OPPORTUNISTIC exit: the Kalshi leg rests as a maker ask, the PM
-/// NO leg closes taker-side on fill. Kalshi charges makers (0.0175 coef) — only
-/// Polymarket makers are free — so a passive exit is cheaper than the taker
-/// round trip, not free.
+/// NO leg closes taker-side on fill. Kalshi charges makers (0.0175 coef) on its
+/// maker-fee series — `fees` arrives specialised to this lot's market — so a
+/// passive exit is cheaper than the taker round trip, not free.
 fn maker_exit_fees_usd(cx: &mut Cx, fees: &FeeSchedule, k_yes: D, p_yes: D, qty: D) -> D {
     let k = leg_fee(cx, fees, Venue::Kalshi, Role::Maker, k_yes, qty, "default", None);
     let p = leg_fee(cx, fees, Venue::PolymarketUs, Role::Taker, p_yes, qty, "default", None);
@@ -376,8 +375,9 @@ fn maker_exit_fees_usd(cx: &mut Cx, fees: &FeeSchedule, k_yes: D, p_yes: D, qty:
 /// The same total for the MIRROR shape: the PM-US bid rests (PM charges makers
 /// nothing) and the Kalshi leg crosses as a TAKER (0.07, four times its maker
 /// coefficient). Gross of fees the two shapes differ by
-/// `kalshi_spread - pmus_spread`; this is the term that tilts the tie, and it
-/// tilts it toward PM-US by `0.0075 * p * (1 - p)`.
+/// `kalshi_spread - pmus_spread`; this is the term that tilts the tie, by
+/// `0.017 * p * (1 - p)` toward PM-US on Kalshi's maker-fee series (0.0175 +
+/// 0.0695 against 0.07) and `0.0005 * p * (1 - p)` toward Kalshi elsewhere.
 fn mirror_exit_fees_usd(cx: &mut Cx, fees: &FeeSchedule, k_yes: D, p_yes: D, qty: D) -> D {
     let k = leg_fee(cx, fees, Venue::Kalshi, Role::Taker, k_yes, qty, "default", None);
     let p = leg_fee(cx, fees, Venue::PolymarketUs, Role::Maker, p_yes, qty, "default", None);
@@ -510,7 +510,8 @@ fn leg_cost(cx: &mut Cx, fees: &FeeSchedule, venue: Venue, leg: &Value) -> Optio
                 Some("maker") => Role::Maker,
                 _ => Role::Taker,
             };
-            leg_fee(cx, fees, venue, role, px, size, "default", None)
+            let fees = fees.for_market(venue, str_of(leg, "market_id").unwrap_or(""));
+            leg_fee(cx, &fees, venue, role, px, size, "default", None)
         }
     };
     let fee_ct = cx.div(fee_total, size);
@@ -522,10 +523,10 @@ fn leg_cost(cx: &mut Cx, fees: &FeeSchedule, venue: Venue, leg: &Value) -> Optio
 /// `engine::fill::book_basket` writes `qty` and, per leg, `yes_price` / `role` /
 /// `side` / `qty` — everything [`leg_cost`] needs and no cost fields, because
 /// venue fees arrive on fill reports this process does not read (`fees_pending`).
-/// Both legs are therefore priced at the SCHEDULE, which is an upper bound on
-/// what we were actually charged, so the derived basis is dear and the derived
-/// locked profit is conservative. That is the right direction for a number the
-/// exit selector screens against.
+/// Both legs are therefore priced at the SCHEDULE, which reproduces the venues'
+/// charges to their own rounding (`fees.rs`), so the derived basis is what the
+/// basket cost and the derived locked profit is what the exit selector should
+/// screen against.
 ///
 /// The refusals, and each is a case where inventing a basis would be worse than
 /// having none:
@@ -583,6 +584,7 @@ pub fn compute_row(
     let rel = str_of(t, "relationship_id").unwrap_or_default().to_string();
     let legs = t.get("legs").and_then(|v| v.as_array()).map_or(&[][..], Vec::as_slice);
     let kleg = legs.iter().find(|l| str_of(l, "venue") == Some("kalshi"));
+    let fees = &fees.for_market(Venue::Kalshi, kleg.and_then(|l| str_of(l, "market_id")).unwrap_or(""));
     let zero = cx.zero();
     let qty = dec_of(cx, t, "qty").unwrap_or(zero);
     let cost = dec_of(cx, t, "cost_usd").unwrap_or(zero);
@@ -766,10 +768,10 @@ pub fn compute_row(
 
     // ------------------------------------------------ shape A: rest on Kalshi ---
     // Net of BOTH legs' fees (card b83b0449): the Kalshi ask rests as a MAKER
-    // (0.0175 coef — Kalshi charges makers, unlike PM) and the PM NO close pays
-    // TAKER. That is 1.2-1.9c/ct, so the fee-free version of this number called
-    // exits "profitable" at 0.5c/ct that were net losers, and a placer would
-    // rest real orders off this flag.
+    // (0.0175 on the series Kalshi flags, nothing elsewhere) and the PM NO close
+    // pays TAKER. That is up to 1.2-1.9c/ct, so the fee-free version of this
+    // number called exits "profitable" at 0.5c/ct that were net losers, and a
+    // placer would rest real orders off this flag.
     let k_exit_px = k_below(cx, ka);
     let p_close_px = cx.add(pa, tick);
     // Divergence 2: an out-of-band price is refused, not fed to a fee curve that
@@ -1191,25 +1193,27 @@ mod tests {
                      "side":"no","role":"taker","qty":1,"yes_price":"0.36"}]}"#)
     }
 
-    /// **THE PARITY TEST.** One real basket, at the quotes the live book carried
-    /// on 2026-07-31T18:24:49Z, against the row `mark_positions.py` published
-    /// for it at that instant — every field, to the last digit it printed.
+    /// **THE LIVE ROW.** One real basket, at the quotes the live book carried
+    /// on 2026-07-31T18:24:49Z — the row `mark_positions.py` published for it
+    /// at that instant, re-priced at the fees the venues charge.
     ///
     /// The quotes are `k_bid 0.05 / k_ask 0.08 / p_ask 0.09`, recovered from the
-    /// published row itself: `reverse_edge_c: -4.0` fixes `k_bid - p_ask`,
-    /// `liq_value_usd: 0.945086` fixes the pair through the fee curves, and
+    /// published row itself: `reverse_edge_c: -4.0` fixes `k_bid - p_ask`, its
+    /// `liq_value_usd: 0.945086` fixes the pair through the fee curves it used
+    /// (Kalshi ceiled to the cent, PM-US 0.06 unrounded), and its
     /// `maker_exit_ct: 0.2346` fixes `k_ask`. They are not invented inputs —
-    /// they are the only quotes that produce this row.
+    /// they are the only quotes that produce that row. Every field but the two
+    /// that pass through a fee curve still matches it digit for digit; those
+    /// two now say what the venues would charge (`fees.rs`).
     ///
-    /// This is the test that would catch the port drifting from the writer it
-    /// replaces. Every one of these numbers passes through a different piece of
-    /// the arithmetic: `liq_value_usd` through both taker fee curves (one of
-    /// which ceils to the cent), `converged_pct` through a Decimal division
-    /// whose 28-digit tail is printed in full, `forward_hold_apr` through the
-    /// resolve-date table and the day count, `maker_exit_ct` through the maker
-    /// curve and the two tick steps.
+    /// Every one of these numbers passes through a different piece of the
+    /// arithmetic: `liq_value_usd` through both taker fee curves and their
+    /// roundings, `converged_pct` through a Decimal division whose 28-digit
+    /// tail is printed in full, `forward_hold_apr` through the resolve-date
+    /// table and the day count, `maker_exit_ct` through the maker curve and the
+    /// two tick steps.
     #[test]
-    fn the_live_row_reproduces_the_python_writers_numbers() {
+    fn the_live_row_reprices_the_python_writers_quotes_at_venue_fees() {
         let mut cx = Cx::default();
         let fees = FeeSchedule::new(&mut cx);
         let now = at("2026-07-31", 18, 24, 49);
@@ -1224,15 +1228,20 @@ mod tests {
         assert_eq!(row.locked_profit_usd, 0.28);
         assert_eq!(row.resolves_by.as_deref(), Some("2026-10-09"), "the curated table wins");
         assert!(row.resolves_estimated, "and it flags itself a guess");
-        // Both taker curves, exactly: Kalshi ceils 0.07*0.05*0.95 to $0.01, PM-US
-        // charges 0.06*0.09*0.91 = 0.004914, off a 0.96/ct liquidation.
-        assert_eq!(row.liq_value_usd, Some(0.945_086));
-        assert_eq!(row.mark_pnl_usd, Some(0.225_086));
-        assert_eq!(row.converged_pct, Some(80.387_857_142_857_14));
-        assert_eq!(row.forward_hold_apr, Some(30.3), "70 days to 2026-10-09, UTC");
+        // Both taker curves, exactly: Kalshi ceils 0.07*0.05*0.95 to $0.0034,
+        // PM-US rounds 0.0695*0.09*0.91 to $0.01, off a 0.96/ct liquidation.
+        // (The Python writer, on the cent-ceiling 0.06 schedule, printed
+        // 0.945086 here; the venues charge what this row says.)
+        assert_eq!(row.liq_value_usd, Some(0.9466));
+        assert_eq!(row.mark_pnl_usd, Some(0.2266));
+        assert_eq!(row.converged_pct, Some(80.928_571_428_571_43));
+        assert_eq!(row.forward_hold_apr, Some(29.4), "70 days to 2026-10-09, UTC");
         assert_eq!(row.natural_hold_apr, Some(199.0));
         assert_eq!(row.reverse_edge_c, Some(-4.0));
-        assert_eq!(row.maker_exit_ct, Some(Some(0.2346)));
+        // Rest a Kalshi ask at 0.07 ("K" is on neither series list, so the
+        // maker fee ceil4(0.0175*0.07*0.93) = 0.0012 is charged), close the PM
+        // NO by buying YES at 0.10: 0.07 + 0.90 - 0.72 - 0.0012 - 0.01 PM-US taker.
+        assert_eq!(row.maker_exit_ct, Some(Some(0.2388)));
         assert!(!row.unwind_signal);
         assert!(!row.unwind_hard);
         assert!(!row.reverse_signal);
@@ -1351,7 +1360,7 @@ mod tests {
         assert_eq!(m.doc.positions.len(), 1, "only the priced basket is marked");
         assert_eq!(m.doc.totals.unpriced_positions, 1, "and the other is COUNTED, not dropped");
         assert_eq!(m.doc.totals.n_open, 2, "n_open is every open record");
-        assert_eq!(m.doc.positions[0].liq_value_usd, Some(0.945_086), "unchanged by its neighbour");
+        assert_eq!(m.doc.positions[0].liq_value_usd, Some(0.9466), "unchanged by its neighbour");
     }
 
     /// A basket THIS ENGINE WROTE, off `data/exec/trades.jsonl` — the
@@ -1374,10 +1383,10 @@ mod tests {
     /// ROW now, with a basis derived from its own legs.
     ///
     /// Kalshi long YES at 0.0400 costs 0.04 plus its taker fee —
-    /// `ceil_cents(0.07*5*0.04*0.96)` = $0.02 over 5 contracts, so 0.004/ct. The
+    /// `ceil4(0.07*5*0.04*0.96)` = $0.0135 over 5 contracts, so 0.0027/ct. The
     /// PM-US leg is SHORT yes at 0.0800, which costs the rest of the dollar,
-    /// 0.92, and a PM maker pays nothing. 0.964/ct over 5 contracts is $4.82,
-    /// against a $5.00 payoff: $0.18 locked.
+    /// 0.92, and a PM maker pays nothing. 0.9627/ct over 5 contracts is
+    /// $4.8135, against a $5.00 payoff: $0.1865 locked.
     ///
     /// The fields asserted at the end are what `unwind::consider` requires
     /// before it will consider a position at all — the five it destructures in
@@ -1394,10 +1403,10 @@ mod tests {
         assert_eq!(m.doc.positions.len(), 1, "the engine's own basket is marked");
         assert_eq!(m.doc.totals.unpriced_positions, 0, "and nothing is left uncounted");
         let row = &m.doc.positions[0];
-        assert_eq!(row.cost_usd, 4.82, "0.04 + 0.004 fee + 0.92, five contracts");
-        assert_eq!(row.locked_profit_usd, 0.18, "$5.00 payoff less the basis");
-        assert_eq!(m.doc.totals.cost_usd, 4.82, "the totals are the derived dollars");
-        assert_eq!(m.doc.totals.locked_profit_usd, 0.18);
+        assert_eq!(row.cost_usd, 4.8135, "0.04 + 0.0027 fee + 0.92, five contracts");
+        assert_eq!(row.locked_profit_usd, 0.1865, "$5.00 payoff less the basis");
+        assert_eq!(m.doc.totals.cost_usd, 4.81, "the totals are the derived dollars, to the cent");
+        assert_eq!(m.doc.totals.locked_profit_usd, 0.19);
 
         // The tuple `unwind::consider` destructures. Every one present, or the
         // basket is invisible to the exit selector.
@@ -1448,7 +1457,7 @@ mod tests {
 
         // EVERY record prices to ITS OWN legs, through the function the placer
         // actually calls.
-        let expect = [("0.044000", "0.920000"), ("0.034000", "0.940000")];
+        let expect = [("0.042700", "0.920000"), ("0.032040", "0.940000")];
         for (r, (ek, ep)) in recs.iter().zip(expect) {
             let ts = r.get("ts").and_then(|v| v.as_f64()).expect("ts");
             let k = crate::naked_act::lot_at(
@@ -1519,17 +1528,17 @@ mod tests {
         let m = build(&mut cx, &fees, vec![sudan], &bk, at("2026-07-31", 18, 24, 49), &Default::default());
         let row = &m.doc.positions[0];
 
-        // Short YES at 0.34 costs 0.66 plus ceil_cents(0.0175*5*0.34*0.66) =
-        // $0.02 maker fee; long YES at 0.30 costs 0.30 plus 0.06*0.30*0.70*5 =
-        // $0.063 taker. 0.9766/ct over five contracts. The SAME formula as the
-        // standard basket: exactly one leg of a two-sided basket pays the dollar
-        // either way round.
-        assert_eq!(row.cost_usd, 4.883);
-        assert_eq!(row.locked_profit_usd, 0.117);
+        // Short YES at 0.34 costs 0.66 plus ceil4(0.0175*0.34*0.66*5) = $0.0197
+        // maker ("K" is on neither series list, so it is charged); long YES at
+        // 0.30 costs 0.30 plus round(0.0695*0.30*0.70*5) = $0.07 taker. $4.8897
+        // over five contracts. The SAME formula as the standard basket: exactly
+        // one leg of a two-sided basket pays the dollar either way round.
+        assert_eq!(row.cost_usd, 4.8897);
+        assert_eq!(row.locked_profit_usd, 0.1103);
         // Liquidated the inverted way: sell the Kalshi NO at 1 - 0.36, sell the
         // PM YES at its bid. Read as standard it would have been 0.32 + (1 -
         // 0.34) = 0.98/ct instead.
-        assert_eq!(row.liq_value_usd, Some(4.547), "(1 - k_ask) + p_bid, less both taker fees");
+        assert_eq!(row.liq_value_usd, Some(4.5493), "(1 - k_ask) + p_bid, less both taker fees");
         assert_eq!(row.reverse_edge_c, Some(-6.0), "p_bid - k_ask, not k_bid - p_ask");
         assert_eq!(row.maker_exit_direction.as_deref(), Some("inverse"));
         assert!(row.maker_exit_ct.flatten().is_some(), "inverse inventory is priceable");
@@ -1656,10 +1665,10 @@ mod tests {
             (q(&mut cx, "0.05"), q(&mut cx, "0.08"), q(&mut cx, "0.40"), q(&mut cx, "0.42"));
         let row = compute_row(&mut cx, &fees, &inv, kb, ka, pb, pa, now, None);
         // Sell the Kalshi NO at 1 - 0.08 = 0.92, sell the PM YES at 0.40.
-        // 1.32/ct gross, less ceil_cents(0.07*0.08*0.92) = 0.01 Kalshi taker and
-        // 0.06*0.40*0.60 = 0.0144 PM-US taker. Both legs' fees are priced off
-        // the YES price of the leg being closed, whichever side we close.
-        assert_eq!(row.liq_value_usd, Some(1.2956));
+        // 1.32/ct gross, less ceil4(0.07*0.08*0.92) = 0.0052 Kalshi taker and
+        // round(0.0695*0.40*0.60) = 0.02 PM-US taker. Both legs' fees are priced
+        // off the YES price of the leg being closed, whichever side we close.
+        assert_eq!(row.liq_value_usd, Some(1.2948));
         assert_eq!(row.reverse_edge_c, Some(32.0), "p_bid - k_ask, not k_bid - p_ask");
         assert!(row.reverse_signal, "and it clears the 3c floor");
         assert_eq!(row.maker_exit_direction.as_deref(), Some("inverse"));

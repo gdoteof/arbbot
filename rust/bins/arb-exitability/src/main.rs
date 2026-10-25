@@ -247,7 +247,8 @@ fn run(a: &Args) -> Result<String, String> {
             let end = resolve_min(p)
                 .map_or(n as i64, |r| r - RESOLVE_GUARD_DAYS * DAY_MINUTES as i64)
                 .clamp(0, n as i64) as usize;
-            Some((p, sim::simulate(k, m, end, fit::HORIZON_MIN as usize, hold_for(p))))
+            let k_maker = if arb_core::fees::kalshi_charges_makers(&p.kalshi) { sim::KALSHI_MAKER } else { 0.0 };
+            Some((p, sim::simulate(k, m, k_maker, end, fit::HORIZON_MIN as usize, hold_for(p))))
         })
         .filter(|(_, s)| s.valid_minutes > 0)
         .collect();
@@ -405,6 +406,7 @@ fn run(a: &Args) -> Result<String, String> {
         "prior_days": fit::PRIOR_DAYS, "calibration_hurdle_pct": a.hurdle_pct,
         "exit_floor": sim::EXIT_FLOOR, "clear_step": sim::CLEAR_STEP,
         "fees": {"kalshi_taker": sim::KALSHI_TAKER, "kalshi_maker": sim::KALSHI_MAKER,
+                 "kalshi_maker_free_series": arb_core::fees::KALSHI_FREE_MAKER_SERIES,
                  "pmus_taker": sim::PMUS_TAKER, "pmus_maker": 0.0},
         "missing_days": {"kalshi": k_missing, "polymarket_us": p_missing},
         "calibration": {"share": round(c.share, 3), "rate": round(c.rate, 3), "lots": cal.lots,

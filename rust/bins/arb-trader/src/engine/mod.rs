@@ -4014,7 +4014,7 @@ mod feed_wiring_tests {
         std::fs::write(&marks, marks_at(wall_now())).unwrap();
 
         // Kalshi ask 0.03 / PM-US bid 0.06 at clip 5: edge 0.03, real fee
-        // 0.007384/ct so the 0.02 floor binds, net EXACTLY the 0.01 budget.
+        // 0.00604/ct so the 0.02 floor binds, net EXACTLY the 0.01 budget.
         let out = scratch("slip-intents.jsonl");
         let feed = [
             snapshot("kalshi", "K", "0.02", "0.03", ts),

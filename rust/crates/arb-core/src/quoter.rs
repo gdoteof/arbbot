@@ -470,10 +470,10 @@ impl Quoter {
         };
         let explicit_grid = configured_grid.is_some();
         let tick = cx.parse_exact("0.01");
-        // The clip is PRICED, not just sized: Kalshi's fee ceils to the cent
-        // on the whole order, so a bigger clip amortises it and affords a
-        // keener quote (`arb-scenario`'s
-        // `kalshi_fee_ceiling_makes_small_clips_much_worse_per_contract`).
+        // The clip is PRICED, not just sized: both venues round the fee on
+        // the whole order (`fees.rs`), so the per-contract fee moves with the
+        // clip (`arb-scenario`'s
+        // `kalshi_fee_ceiling_makes_small_clips_worse_per_contract`).
         let clip = cx.from_i64(clip);
         let metas = |l: &crate::scan::RelLeg| {
             let _ = l;

@@ -923,12 +923,19 @@ fn verified_entry_and_exit_fees_are_each_charged_once() {
 /// both modelled fees, banked rather than open.
 #[test]
 fn a_naked_sell_back_prices_as_the_spread_less_both_fees() {
-    let rec = r#"{"ts":1785250000.0,"relationship_id":"xvus-synth","qty":5,"strategy":"naked-sellback","status":"realized","source":"arb-trader","fees_pending":true,"legs":[{"venue":"kalshi","market_id":"K","side":"bid","role":"maker","qty":5,"yes_price":"0.38","order_id":"m1"},{"venue":"kalshi","market_id":"K","side":"ask","role":"taker","qty":5,"yes_price":"0.45","order_id":"h9"}]}"#;
+    let rec = r#"{"ts":1785250000.0,"relationship_id":"xvus-synth","qty":5,"strategy":"naked-sellback","status":"realized","source":"arb-trader","fees_pending":true,"legs":[{"venue":"kalshi","market_id":"KXTIME-26-POP","side":"bid","role":"maker","qty":5,"yes_price":"0.38","order_id":"m1"},{"venue":"kalshi","market_id":"KXTIME-26-POP","side":"ask","role":"taker","qty":5,"yes_price":"0.45","order_id":"h9"}]}"#;
     let out = build(rec, "default", 1785250000.0);
     let r = &out["rows"][0];
     assert_eq!(r["hedged"], true, "{r}");
-    // 5 x (0.45 - 0.38) = 0.35, less Kalshi maker 0.03 and taker 0.09
-    assert!((r["net_usd"].as_f64().unwrap() - 0.23).abs() < 1e-9, "{}", r["net_usd"]);
+    // 5 x (0.45 - 0.38) = 0.35, less the Kalshi taker fee ceil(0.07*5*0.45*0.55)
+    // = 0.0867; KXTIME charges makers nothing, so the resting entry paid nothing.
+    assert!((r["net_usd"].as_f64().unwrap() - 0.2633).abs() < 1e-9, "{}", r["net_usd"]);
     assert_eq!(out["totals"]["realized_trades"], 1);
     assert_eq!(out["totals"]["open_trades"], 0, "a close is not a working position");
+
+    // The same sell-back on a series that charges makers: the resting entry
+    // paid ceil4(0.0175*5*0.38*0.62) = 0.0207 as well.
+    let charged = rec.replace("KXTIME-26-POP", "KXHEISMAN-27-JSMIT");
+    let r = &build(&charged, "default", 1785250000.0)["rows"][0];
+    assert!((r["net_usd"].as_f64().unwrap() - 0.2426).abs() < 1e-9, "{}", r["net_usd"]);
 }

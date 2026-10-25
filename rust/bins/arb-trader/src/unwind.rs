@@ -306,11 +306,11 @@ const TICK_CT: f64 = 0.01;
 /// re-price at FILL time, and that is §5's fourth bullet, and it does not exist
 /// here.
 ///
-/// THE FEE TERM IS NOT SMOOTH, either. `curves.py` applies `ceil_cents` to the
-/// Kalshi MAKER leg's TOTAL, so per contract the fee steps by `$0.01/qty` — a
-/// full tick at `qty=1`. The unit-coefficient derivation above is exact between
-/// steps and off by one step across one; it is a good guide to the size of this
-/// floor, not an identity.
+/// THE FEE TERM IS NOT SMOOTH, either. `fees.rs` ceils the Kalshi MAKER leg's
+/// TOTAL to $0.0001 and rounds the PM-US leg's to the cent, so per contract the
+/// fee steps by `$0.0001/qty` and `$0.01/qty`. The unit-coefficient derivation
+/// above is exact between steps and off by one step across one; it is a good
+/// guide to the size of this floor, not an identity.
 ///
 /// A candidate that clears this by less than a tick is reported as
 /// [`Exit::near_floor`]: noise even by the weak reading above.
