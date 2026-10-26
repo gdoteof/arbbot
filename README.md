@@ -1,10 +1,10 @@
 # arbbot
+<img width="2875" height="1677" alt="image" src="https://github.com/user-attachments/assets/82ace6f1-c4a9-4001-befb-c1d711b93b79" />
 
-Personal Polymarket/Kalshi prediction-market arbitrage bot. Staged autonomous
-stack: it ships as a measuring instrument, validates its edge against recorded
+## Personal Polymarket/Kalshi prediction-market arbitrage bot. 
+
+Staged autonomous stack: it ships as a measuring instrument, validates its edge against recorded
 reality, and earns live trading stage by stage.
-
-**Design doc (source of truth):** kept locally, outside the repo.
 
 ## Architecture
 
