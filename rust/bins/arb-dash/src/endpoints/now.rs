@@ -440,6 +440,39 @@ fn yaml_num(v: &Option<serde_yaml::Value>) -> Option<f64> {
     }
 }
 
+/// Orders placed and not since cancelled, over the WHOLE tail, not the window.
+///
+/// Resting is a state, not an event: a quote the engine is content with is not
+/// re-placed, so after fifteen quiet minutes the window holds no line for it.
+/// Folding only the window reported "0 resting" beside a live entry bid.
+///
+/// Two kinds of `place` end without a `cancel` line. A reprice names the order
+/// it `replaces`, which is gone from then on. A `taker` (hedge, take-take) is
+/// IOC: it never rests at all.
+fn resting_orders(lines: &[Value]) -> BTreeMap<String, Value> {
+    let mut resting = BTreeMap::new();
+    for l in lines {
+        let Some(id) = l.get("order_id").and_then(Value::as_str) else { continue };
+        if let Some(market) = l.get("place").and_then(Value::as_str) {
+            if let Some(old) = l.get("replaces").and_then(Value::as_str) {
+                resting.remove(old);
+            }
+            if l.get("taker").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            resting.insert(
+                id.to_string(),
+                json!({ "order_id": id, "market": market, "ts": l.get("ts"),
+                        "venue": l.get("venue"), "side": l.get("side"),
+                        "price": l.get("price"), "count": l.get("count") }),
+            );
+        } else if l.get("cancel").is_some() {
+            resting.remove(id);
+        }
+    }
+    resting
+}
+
 // ---------------------------------------------------------------------------
 
 pub fn json(a: &Args) -> String {
@@ -505,7 +538,7 @@ pub fn json(a: &Args) -> String {
     let truncated = all.len() > lines.len();
 
     let (mut places, mut cancels) = (0u64, 0u64);
-    let mut resting: BTreeMap<String, Value> = BTreeMap::new();
+    let resting = resting_orders(&all);
     let mut gates: BTreeMap<(String, Option<String>), Gate> = BTreeMap::new();
     let mut named = Named::new();
     let mut acted_markets: HashMap<String, f64> = HashMap::new();
@@ -542,14 +575,6 @@ pub fn json(a: &Args) -> String {
         if let Some(market) = l.get("place").and_then(Value::as_str) {
             places += 1;
             acted_markets.insert(market.to_string(), ts);
-            if let Some(id) = l.get("order_id").and_then(Value::as_str) {
-                resting.insert(
-                    id.to_string(),
-                    json!({ "order_id": id, "market": market, "ts": ts,
-                            "venue": l.get("venue"), "side": l.get("side"),
-                            "price": l.get("price"), "count": l.get("count") }),
-                );
-            }
             recent.push(json!({ "kind": "place", "ts": ts, "text": format!(
                 "{} {} {} @ {}", market,
                 l.get("side").and_then(Value::as_str).unwrap_or(""),
@@ -557,9 +582,6 @@ pub fn json(a: &Args) -> String {
                 l.get("price").and_then(Value::as_str).unwrap_or("")) }));
         } else if let Some(market) = l.get("cancel").and_then(Value::as_str) {
             cancels += 1;
-            if let Some(id) = l.get("order_id").and_then(Value::as_str) {
-                resting.remove(id);
-            }
             recent.push(json!({ "kind": "cancel", "ts": ts,
                                 "text": format!("{market} ({})",
                                 l.get("order_id").and_then(Value::as_str).unwrap_or("")) }));
@@ -847,6 +869,27 @@ fn is_booked_basket(r: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-10-29: `/now` said "0 resting" while an entry bid was live, because
+    /// its place line had aged out of the window. The reprice and the hedge
+    /// IOC are the two ways a `place` line ends without a `cancel`; folding
+    /// the live tail without either left hundreds of phantom resting rows.
+    #[test]
+    fn a_quiet_quote_is_still_resting_and_a_replaced_or_taker_one_is_not() {
+        let lines: Vec<Value> = [
+            r#"{"count":10,"order_id":"m1","place":"KXPAYROLLS-26OCT-T100000","price":"0.3000","side":"bid","ts":1000.0,"venue":"kalshi"}"#,
+            r#"{"count":5,"order_id":"m2","place":"KXPAYROLLS-26OCT-T0","price":"0.7000","side":"ask","ts":1001.0,"venue":"kalshi"}"#,
+            r#"{"count":5,"old_price":"0.7000","order_id":"m3","place":"KXPAYROLLS-26OCT-T0","price":"0.6900","replaces":"m2","side":"ask","ts":1002.0,"venue":"kalshi"}"#,
+            r#"{"cancel":"KXPAYROLLS-26OCT-T0","order_id":"m3","price":"0.6900","side":"ask","ts":1004.0,"venue":"kalshi"}"#,
+            r#"{"count":2,"order_id":"h1","place":"nfpc-usnfp-sa-october-2026-11-06-gt0","price":"0.7500","side":"bid","tag":"hedge","taker":true,"ts":1003.0,"venue":"polymarket_us"}"#,
+        ]
+        .iter()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+        let resting = resting_orders(&lines);
+        assert_eq!(resting.keys().collect::<Vec<_>>(), vec!["m1"]);
+        assert_eq!(resting["m1"]["count"], 10);
+    }
 
     /// A CORRECTION IS NOT A FILL, and the `/now` tab showed nothing else for
     /// the eight slots it has on 2026-08-25 — ten corrections appended in one

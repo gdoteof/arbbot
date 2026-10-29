@@ -1441,11 +1441,15 @@ const DRAW = {
     f.append(nowBooked(d));
     const blocked = (d.opportunities.rows||[]).filter(r => r.verdict !== 'acted' && r.verdict !== 'below bar')
       .reduce((a,r) => a + (r.edge_usd||0), 0);
+    const below = (d.opportunities.rows||[]).filter(r => r.verdict === 'below bar').length;
+    const bar = d.opportunities.bar_apr;
     const e = d.engine;
     return (e.running ? (e.armed?'<span class="ok">armed</span>':'<span class="warn">dry-run</span>')
                       : '<b class="bad">no engine</b>') +
       ` &middot; ${d.window.places} placed in ${dur(d.window.seconds)}` +
-      ` &middot; <b class="warn">${usd0(blocked)}</b> of edge not taken`;
+      ` &middot; ${d.window.resting.length} resting` +
+      ` &middot; <b class="warn">${usd0(blocked)}</b> of edge refused by a gate` +
+      (below ? ` &middot; ${below} crossing(s) under the ${bar==null?'APR':bar.toFixed(0)+'%'} bar` : '');
   },
   '/architecture': (f) => {
     const d = S.data.arch;
