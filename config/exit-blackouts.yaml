@@ -86,3 +86,42 @@
   from: 2026-11-06T05:00:00Z   # 2026-11-06 00:00 ET
   why: BLS October Employment Situation release 2026-11-06 08:30 ET
   entries: true
+
+# Same shape as nfp-26oct: the same Employment Situation release.
+- family: u3-26oct
+  from: 2026-11-06T05:00:00Z   # 2026-11-06 00:00 ET
+  why: BLS October Employment Situation release 2026-11-06 08:30 ET
+  entries: true
+
+- family: mlb-26-roy
+  from: 2026-11-09T05:00:00Z   # 2026-11-09 00:00 ET
+  why: BBWAA Rookie of the Year announcement 2026-11-09 evening ET
+  entries: true
+
+- family: mlb-26-mvp
+  from: 2026-11-12T05:00:00Z   # 2026-11-12 00:00 ET
+  why: BBWAA MVP announcement 2026-11-12 evening ET
+  entries: true
+
+# Take-Two reports 10 days before the scheduled release, and that call is the
+# last scheduled chance to move the date. A delay takes the book to the floor
+# with the hedge already gone, so entries stay off through the release. Delete
+# the row once GTA VI has released and both rungs have settled.
+- family: gta6-26
+  from: 2026-11-09T21:00:00Z   # 2026-11-09 16:00 ET
+  why: Take-Two Q2 FY27 results 2026-11-09 16:30 ET, then GTA VI release 2026-11-19
+  entries: true
+
+# Spotify does not announce the day. Wrapped has dropped as early as 11-29.
+- family: spotify-26
+  from: 2026-11-29T05:00:00Z   # 2026-11-29 00:00 ET
+  why: Spotify Wrapped release, day unannounced, 2023-2025 fell 11-29 to 12-04
+  entries: true
+
+# Covers every midterm pair, Vermont included. The Vermont governor and
+# lieutenant governor rows can stay unsettled into January if a race goes to the
+# General Assembly; delete this row only once the last of them has settled.
+- family: mid26
+  from: 2026-11-03T05:00:00Z   # 2026-11-03 00:00 ET
+  why: US midterm elections 2026-11-03, first polls close 23:00Z
+  entries: true
