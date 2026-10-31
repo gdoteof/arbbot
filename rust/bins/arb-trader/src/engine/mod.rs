@@ -4554,13 +4554,12 @@ mod toxgate_reload_tests {
 /// there and then: a quote at a good price is never re-checked by the quoter.
 #[cfg(test)]
 mod fill_pull_tests {
-    use super::fill::MakerOrder;
     use super::*;
-    use arb_core::fill::HedgeAnchor;
     use arb_core::scan::{RelLeg, RelType};
 
     const A: &str = "xvus-mid26-gov-nv-r";
     const B: &str = "xvus-mid26-gov-ia-d";
+    const C: &str = "xvus-gas-26-x";
 
     fn rel(id: &str, k: &str, p: &str) -> Rel {
         Rel {
@@ -4592,14 +4591,27 @@ mod fill_pull_tests {
                 ("kalshi".to_string(), "1000".to_string()),
                 ("polymarket_us".to_string(), "1000".to_string()),
             ],
-            HashMap::from([(A.to_string(), "low".to_string()), (B.to_string(), "low".to_string())]),
+            [A, B, C].iter().map(|r| (r.to_string(), "low".to_string())).collect(),
         ))
     }
 
-    /// Both relationships resting a Kalshi bid, with a fill of A's about to land.
-    fn resting(budget: u32) -> (Engine, Vec<Quoter>, ByMarket, Arc<crate::risk::RiskView>) {
+    struct Rig {
+        eng: Engine,
+        quoters: Vec<Quoter>,
+        by_market: ByMarket,
+        rv: Arc<crate::risk::RiskView>,
+        intents: std::path::PathBuf,
+    }
+
+    /// Three relationships, each resting its PM-US bid: `m1` on A, `m2` on B and
+    /// `m3` on C, whose topic is not the one A and B share.
+    fn resting(budget: u32) -> Rig {
         let rv = risk(budget);
-        let mut quoters = vec![Quoter::new(rel(A, "KA", "PA")), Quoter::new(rel(B, "KB", "PB"))];
+        let mut quoters = vec![
+            Quoter::new(rel(A, "KA", "PA")),
+            Quoter::new(rel(B, "KB", "PB")),
+            Quoter::new(rel(C, "KC", "PC")),
+        ];
         for q in &mut quoters {
             q.set_risk(Some(rv.clone()));
         }
@@ -4608,42 +4620,53 @@ mod fill_pull_tests {
             ((Venue::PolymarketUs, "PA".to_string()), vec![0usize]),
             ((Venue::Kalshi, "KB".to_string()), vec![1usize]),
             ((Venue::PolymarketUs, "PB".to_string()), vec![1usize]),
+            ((Venue::Kalshi, "KC".to_string()), vec![2usize]),
+            ((Venue::PolymarketUs, "PC".to_string()), vec![2usize]),
         ]);
+        let intents = std::env::temp_dir().join(format!(
+            "arb-trader-fill-pull-{}-{budget}.intents",
+            std::process::id()
+        ));
         let mut cfg = test_cfg();
         cfg.risk = Some(rv.clone());
         let mut eng = test_engine(cfg);
+        eng.out = Some(std::io::BufWriter::new(std::fs::File::create(&intents).unwrap()));
         for (venue, market, bid) in [
             ("kalshi", "KA", "0.60"),
             ("polymarket_us", "PA", "0.30"),
             ("kalshi", "KB", "0.60"),
             ("polymarket_us", "PB", "0.30"),
+            ("kalshi", "KC", "0.60"),
+            ("polymarket_us", "PC", "0.30"),
         ] {
             eng.on_feed(snapshot(venue, market, bid), 0, &mut quoters, &by_market);
         }
-        eng.fills.register_order(
-            "fa",
-            "KA",
-            50,
-            Some(HedgeAnchor {
-                venue: Venue::PolymarketUs,
-                market_id: "PA".into(),
-                side: BookSide::Bid,
-                price: "0.40".into(),
-            }),
-        );
-        eng.order_rel.insert(
-            "fa".into(),
-            MakerOrder {
-                rel_id: A.into(),
-                class: "cross-venue-equivalent",
-                venue: "kalshi".into(),
-                market_id: "KA".into(),
-                side: BookSide::Bid,
-                price: "0.31".into(),
-                strategy: "maker-hedge",
-            },
-        );
-        (eng, quoters, by_market, rv)
+        assert_eq!(rv.reserved_ct(), 150.0, "three 50-lots rest");
+        Rig { eng, quoters, by_market, rv, intents }
+    }
+
+    impl Rig {
+        /// `m1` fills whole.
+        fn fill(&mut self) {
+            let m = serde_json::json!({
+                "kind": "fill", "venue": "polymarket_us", "market_id": "PA",
+                "order_id": "m1", "cum": 50, "ts_local_ns": 2_000_000_000i64});
+            let m = FeedMsg { line: m.to_string(), t_read: std::time::Instant::now() };
+            self.eng.on_feed(m, 0, &mut self.quoters, &self.by_market);
+        }
+
+        /// The markets the engine cancelled a quote on, in order.
+        fn cancels(&mut self) -> Vec<String> {
+            self.eng.out.as_mut().unwrap().flush().unwrap();
+            std::fs::read_to_string(&self.intents)
+                .unwrap()
+                .lines()
+                .filter_map(|l| {
+                    let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                    Some(v.get("cancel")?.as_str()?.to_string())
+                })
+                .collect()
+        }
     }
 
     fn snapshot(venue: &str, market: &str, bid: &str) -> FeedMsg {
@@ -4658,37 +4681,26 @@ mod fill_pull_tests {
         }
     }
 
-    fn fill() -> FeedMsg {
-        FeedMsg {
-            line: serde_json::json!({
-                "kind": "fill", "venue": "kalshi", "market_id": "KA",
-                "order_id": "fa", "cum": 50, "ts_local_ns": 2_000_000_000i64})
-            .to_string(),
-            t_read: std::time::Instant::now(),
-        }
-    }
-
+    /// The quote that fill leaves over the cap comes off and nothing else does:
+    /// not the filled one, which has nothing left, and not the other topic's.
     #[test]
-    fn a_fill_that_reaches_a_tail_cap_pulls_the_quotes_it_leaves_over_it() {
-        let (mut eng, mut quoters, by_market, rv) = resting(60);
-        assert!(rv.reserved_ct() >= 2.0, "both quotes rest: {}", rv.reserved_ct());
+    fn a_fill_that_reaches_a_tail_cap_pulls_only_the_quote_it_leaves_over_it() {
+        let mut rig = resting(60);
+        rig.fill();
 
-        eng.on_feed(fill(), 0, &mut quoters, &by_market);
-
-        assert_eq!(rv.open_ct(A), 50.0);
-        assert_eq!(rv.reserved_ct(), 0.0, "50 filled + a clip > 60, so nothing stays resting");
+        assert_eq!(rig.rv.open_ct(A), 50.0);
+        assert_eq!(rig.cancels(), ["PB"]);
+        assert_eq!(rig.rv.reserved_ct(), 50.0, "the other topic's quote stays resting");
     }
 
     #[test]
     fn a_fill_with_room_left_leaves_the_quotes_resting() {
-        let (mut eng, mut quoters, by_market, rv) = resting(500);
-        let before = rv.reserved_ct();
-        assert!(before >= 2.0, "both quotes rest: {before}");
+        let mut rig = resting(500);
+        rig.fill();
 
-        eng.on_feed(fill(), 0, &mut quoters, &by_market);
-
-        assert_eq!(rv.open_ct(A), 50.0);
-        assert!(rv.reserved_ct() > 0.0, "the topic has room, so the sibling stays");
+        assert_eq!(rig.rv.open_ct(A), 50.0);
+        assert!(rig.cancels().is_empty());
+        assert_eq!(rig.rv.reserved_ct(), 100.0);
     }
 }
 
