@@ -128,6 +128,38 @@ const RULES: &[(&str, &str, bool)] = &[
     // Dated on each release day like the September CPI row.
     ("xvus-cpi-26oct", "2026-11-10", true),
     ("xvus-nfp-26oct", "2026-11-06", true),
+    // Added 2026-10-30 (Claude, agent greenlight). Dated on each announcement:
+    // the BLS October Employment Situation, the BBWAA awards (Rookie of the
+    // Year 11-09, MVP 11-12, per MLB's schedule), NFL Honors, the 99th Oscars
+    // with the Best Picture row's pad, Spotify Wrapped (PM-US event end; the
+    // day is not announced) and GTA VI's scheduled release. A GTA VI delay past
+    // 11-19 settles the 11-19 rung No on the day and leaves the 12-31 rung
+    // open, so its date is the expected hold, not the bound.
+    ("xvus-u3-26oct", "2026-11-06", true),
+    ("xvus-mlb-26-roy", "2026-11-09", true),
+    ("xvus-mlb-26-mvp", "2026-11-12", true),
+    ("xvus-nfl-27", "2027-02-11", true),
+    ("xvus-oscars-bestactor-27", "2027-03-16", true),
+    ("xvus-oscars-bestactress-27", "2027-03-16", true),
+    ("xvus-spotify-26", "2026-12-03", true),
+    ("xvus-gta6-26", "2026-11-19", true),
+    // Both legs' own deadlines, "before Jan 1, 2027" on Kalshi.
+    ("xvus-cryptoleg-26-12-31", "2027-01-01", false),
+    ("xvus-gashi-26", "2027-01-01", false),
+    // November 3 midterms. Both venues settle on media calls (Kalshi at 4 of 8
+    // designated sources, PM-US on tertiary-source consensus), so the hold is
+    // days, not the January swearing-in Kalshi's expiry reads as. Dated three
+    // days past the election for the slow counts; PM-US and Kalshi paid the
+    // Brazil runoff within five hours of the polls closing.
+    //
+    // Vermont sends a race with no majority to the General Assembly, which
+    // sits in January, and Kalshi's `KXVTGOVOUTRIGHT` prices that near 30%.
+    // Both contracts follow that vote, so these two rows carry the expected
+    // hold rather than the bound. They precede the `xvus-mid26` row because
+    // the first prefix hit wins.
+    ("xvus-mid26-gov-vt", "2026-11-24", true),
+    ("xvus-mid26-ltgov-vt", "2026-11-24", true),
+    ("xvus-mid26", "2026-11-06", true),
 ];
 
 /// `-> (YYYY-MM-DD, estimated)`. `None` when the family is unknown, which
@@ -296,6 +328,34 @@ mod tests {
         assert_eq!(resolve_date("xvus-cpi-26oct-coremom-gt0p3"), Some(("2026-11-10", true)));
         assert_eq!(resolve_date("xvus-nfp-26oct-gt100k"), Some(("2026-11-06", true)));
         assert_eq!(resolve_date("xvus-btc150k-ladder-07-31-2026"), None);
+    }
+
+    /// A tradable family with no date here quotes with no hurdle at all.
+    #[test]
+    fn the_volume_families_resolve() {
+        assert_eq!(resolve_date("xvus-u3-26oct-gt4p1"), Some(("2026-11-06", true)));
+        assert_eq!(resolve_date("xvus-mlb-26-roy-nl-salstewart"), Some(("2026-11-09", true)));
+        assert_eq!(resolve_date("xvus-mlb-26-mvp-al-yordanalvarez"), Some(("2026-11-12", true)));
+        assert_eq!(resolve_date("xvus-nfl-27-mvp-joshallen"), Some(("2027-02-11", true)));
+        assert_eq!(resolve_date("xvus-oscars-bestactor-27-mattdamon"), Some(("2027-03-16", true)));
+        assert_eq!(resolve_date("xvus-oscars-bestactress-27-annehathaway"), Some(("2027-03-16", true)));
+        assert_eq!(resolve_date("xvus-spotify-26-song-us-choosintexas"), Some(("2026-12-03", true)));
+        assert_eq!(resolve_date("xvus-gta6-26-by-nov19"), Some(("2026-11-19", true)));
+        assert_eq!(resolve_date("xvus-cryptoleg-26-12-31"), Some(("2027-01-01", false)));
+        assert_eq!(resolve_date("xvus-gashi-26-gt4p6"), Some(("2027-01-01", false)));
+    }
+
+    /// Vermont's statewide rows must win over the general midterm row, and the
+    /// rest of the midterm family, Vermont's House seat included, must not
+    /// pick up their later date.
+    #[test]
+    fn vermont_statewide_races_carry_the_general_assembly_hold() {
+        assert_eq!(resolve_date("xvus-mid26-gov-vt-r"), Some(("2026-11-24", true)));
+        assert_eq!(resolve_date("xvus-mid26-ltgov-vt-mollygray"), Some(("2026-11-24", true)));
+        assert_eq!(resolve_date("xvus-mid26-house-vt-al-d"), Some(("2026-11-06", true)));
+        assert_eq!(resolve_date("xvus-mid26-sen-tx-d"), Some(("2026-11-06", true)));
+        assert_eq!(resolve_date("xvus-mid26-control-senate-d"), Some(("2026-11-06", true)));
+        assert_eq!(resolve_date("xvus-mid26-ref-ca-wealthtax"), Some(("2026-11-06", true)));
     }
 
     #[test]
