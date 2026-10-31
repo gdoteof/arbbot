@@ -15,7 +15,7 @@ use arb_venue::error::Retry;
 use arb_venue::gateway::{CancelBy, CancelRequest, PlaceRequest};
 use arb_core::clock::now_ns;
 use arb_core::model::Venue;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -165,6 +165,10 @@ pub const EXIT_ORDERS_LEFT_RESTING: i32 = 17;
 /// a page nobody read. Running the procedure finds it; asking "which way round
 /// does this page" does not.
 pub const EXIT_BOOK_UNCONFIRMED: i32 = 18;
+
+/// How many commands one venue's executor holds in each of its two buffers: the
+/// channel the engine writes to, and the `waiting` list [`next_cmd`] picks from.
+const EXEC_QUEUE: usize = 1024;
 
 /// Wall-clock budget for in-flight PLACES to settle before we verify.
 ///
@@ -1041,7 +1045,7 @@ pub fn spawn_executors(
     for venue in [Venue::Kalshi, Venue::Polymarket, Venue::PolymarketUs] {
         let sink = sinks.remove(&venue);
         let acks = acks.clone();
-        let (tx, rx) = mpsc::channel::<ExecCmd>(1024);
+        let (tx, rx) = mpsc::channel::<ExecCmd>(EXEC_QUEUE);
         let st = stats.clone();
         let h = halt().clone();
         let peers = peers.clone();
@@ -1049,6 +1053,34 @@ pub fn spawn_executors(
         txs.insert(venue, tx);
     }
     (txs, stats)
+}
+
+/// The next command for a venue: the oldest TAKER in `waiting` if there is one,
+/// otherwise the oldest command. A hedge closes a naked leg and a cancel or a
+/// quote only maintains the book, so at 8 commands a second a hedge must not
+/// wait behind a burst of them. Takers keep their order among themselves, which
+/// is what a hedge chain's retries rely on. `waiting` reads `EXEC_QUEUE` commands
+/// ahead, so a taker further back than that waits its turn.
+async fn next_cmd(
+    rx: &mut mpsc::Receiver<ExecCmd>,
+    waiting: &mut VecDeque<ExecCmd>,
+) -> Option<ExecCmd> {
+    while waiting.len() < EXEC_QUEUE {
+        match rx.try_recv() {
+            Ok(cmd) => waiting.push_back(cmd),
+            Err(_) => break,
+        }
+    }
+    let taker = waiting
+        .iter()
+        .position(|c| matches!(&c.action, Action::Place { req, .. } if is_taker(req)));
+    match taker {
+        Some(i) => waiting.remove(i),
+        None => match waiting.pop_front() {
+            Some(cmd) => Some(cmd),
+            None => rx.recv().await,
+        },
+    }
 }
 
 /// One venue's executor loop. A free function rather than an inline closure so
@@ -1074,7 +1106,8 @@ async fn run_executor(
     // a write. Grows with places made, never pruned: forgetting an id we once
     // claimed is the direction that adopts the wrong order.
     let mut claimed: HashSet<String> = HashSet::new();
-    while let Some(cmd) = rx.recv().await {
+    let mut waiting = VecDeque::new();
+    while let Some(cmd) = next_cmd(&mut rx, &mut waiting).await {
         st.hop.record(cmd.t_read.elapsed().as_nanos() as u64);
         // `placed`/`cancelled` are dequeue counters — `would_place` has always
         // counted commands that never reached a venue (that is what dry-run IS),
@@ -1456,6 +1489,8 @@ mod tests {
     /// adds to it, so "a place slipped out" is observable as a dirty book.
     #[derive(Default)]
     struct Recorder {
+        /// Places and cancels together, in the order they reached the venue.
+        calls: Mutex<Vec<String>>,
         placed: Mutex<Vec<String>>,
         cancelled: Mutex<Vec<String>>,
         sweeps: Mutex<u32>,
@@ -1491,6 +1526,7 @@ mod tests {
 
     impl OrderSink for Recorder {
         fn place(&self, r: &PlaceRequest) -> Result<String, VenueError> {
+            self.calls.lock().unwrap().push(r.client_order_id.clone());
             let n = {
                 let mut p = self.placed.lock().unwrap();
                 p.push(r.client_order_id.clone());
@@ -1514,6 +1550,7 @@ mod tests {
             let id = match &r.by {
                 CancelBy::VenueId(s) | CancelBy::ClientId(s) => s.clone(),
             };
+            self.calls.lock().unwrap().push(id.clone());
             self.cancelled.lock().unwrap().push(id);
             if self.refuse_cancels {
                 return Err(VenueError::Status {
@@ -1654,6 +1691,17 @@ mod tests {
                 attempt: 1,
             },
         }
+    }
+
+    /// A fill that reaches a cap queues a burst of cancels, and the next fill's
+    /// hedge must not wait out that burst at 8 a second.
+    #[tokio::test]
+    async fn a_queued_taker_goes_ahead_of_cancels_and_quotes() {
+        let sink = Arc::new(Recorder::default());
+        let cmds =
+            vec![cancel("c1"), place("q1"), taker_place("h1"), cancel("c2"), taker_place("h2")];
+        drain(sink.clone(), Arc::new(Halt::default()), cmds).await;
+        assert_eq!(*sink.calls.lock().unwrap(), ["h1", "h2", "c1", "q1", "c2"]);
     }
 
     fn stats() -> Arc<ExecStats> {
@@ -1963,7 +2011,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(*sink.placed.lock().unwrap(), vec!["m1", "h1"], "both go straight out");
+        assert_eq!(*sink.placed.lock().unwrap(), vec!["h1", "m1"], "both go straight out");
         assert!(
             sink.status_reads.lock().unwrap().is_empty(),
             "not one venue read: a first attempt supersedes nothing to verify"

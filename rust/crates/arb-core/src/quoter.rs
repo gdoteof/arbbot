@@ -71,9 +71,10 @@ pub trait RiskGate: Send + Sync {
     /// check RESERVES `notional` against it. Without that this call is a pure
     /// read: the quoter consults the gate once per (leg, side) and then rests
     /// the order, and every other resting quote in the process consults the
-    /// same unchanged number — so a cap with headroom for one clip authorises
-    /// one clip per quoting side, all live at the venue at once. `None` is an
-    /// order that does NOT rest (a marketable IOC), which reserves nothing.
+    /// same unchanged number — so a capital cap with headroom for one clip
+    /// authorises one clip per quoting side, all live at the venue at once.
+    /// `None` is an order that does NOT rest (a marketable IOC), which reserves
+    /// nothing.
     ///
     /// A slot that already holds a reservation does not count against itself:
     /// an amend replaces the quote on its own slot rather than adding to it.
@@ -84,6 +85,18 @@ pub trait RiskGate: Send + Sync {
         notional: i64,
         rests_on: Option<(&str, BookSide)>,
     ) -> RiskVerdict;
+
+    /// Would [`RiskGate::check`] still allow this quote resting on this (market,
+    /// side)? A pure read: it reserves nothing, and it is how a quote that is
+    /// not repricing gets re-asked after a fill moves the exposure it was
+    /// admitted against.
+    fn admits(
+        &self,
+        rel: &Rel,
+        venue: Venue,
+        notional: i64,
+        rests_on: (&str, BookSide),
+    ) -> bool;
 
     /// The quote reserved on this (market, side) is no longer resting, so give
     /// its capital back. A slot holding no reservation is a no-op, which is
@@ -632,7 +645,46 @@ impl Quoter {
     /// Cancel every resting quote (kill switch / shutdown), emitting cancel
     /// intents in deterministic (leg, side) order. Mirrors Python cancel_all.
     pub fn cancel_all(&mut self, cx: &mut Cx, now: f64, intents: &mut Vec<Intent>) {
-        let mut keys: Vec<(usize, BookSide)> = self.resting.keys().copied().collect();
+        let keys: Vec<_> = self.resting.keys().copied().collect();
+        for key in &keys {
+            self.last_quote_ts.remove(key);
+        }
+        self.cancel_keys(keys, cx, now, intents);
+    }
+
+    /// Cancel every resting quote the gate would no longer admit, at once and
+    /// not after [`CAP_REFUSAL_PULL_S`]: that clock only runs for a quote trying
+    /// to move, and one sitting at a good price would otherwise stay fillable
+    /// past a tail cap indefinitely. It keeps `last_quote_ts`, as `on_book`'s
+    /// cancel does, so the side re-enters on the requote throttle: one rest per
+    /// `min_requote_s` however many fills land near the cap.
+    ///
+    /// It asks about the whole clip. The quoter has no fill path, and the gate's
+    /// slot cannot say what is left of THIS order, because a superseded order's
+    /// fill consumes the slot its replacement owns. So a partial fill's
+    /// remainder can come off when it would have fit, and a quote that filled
+    /// whole can draw a cancel with nothing left to cancel.
+    pub fn pull_refused(&mut self, cx: &mut Cx, now: f64, intents: &mut Vec<Intent>) {
+        let Some(gate) = &self.risk else { return };
+        let refused = self
+            .resting
+            .iter()
+            .filter(|(&(i, side), curq)| {
+                let leg = &self.rel.legs[i];
+                !gate.admits(&self.rel, leg.venue, curq.count, (&leg.market_id, side))
+            })
+            .map(|(&key, _)| key)
+            .collect();
+        self.cancel_keys(refused, cx, now, intents);
+    }
+
+    fn cancel_keys(
+        &mut self,
+        mut keys: Vec<(usize, BookSide)>,
+        cx: &mut Cx,
+        now: f64,
+        intents: &mut Vec<Intent>,
+    ) {
         // By the WIRE spelling, so `ask` comes before `bid` — the order these
         // cancels have always gone out in, and one the golden digest hashes.
         // `BookSide` is deliberately not `Ord` so that this cannot quietly
@@ -641,11 +693,11 @@ impl Quoter {
         keys.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.as_str().cmp(b.1.as_str())));
         for key in keys {
             let curq = self.resting.remove(&key).expect("key from keys()");
-            // RELEASE. This has exactly two production callers — the kill
-            // switch and the feed-stale pull — and capital reserved for a quote
-            // either of them is pulling is capital nothing will ever spend. NOT
-            // the shutdown sweep, which is venue-level and reaches no quoter;
-            // there the process is exiting and the map goes with it.
+            // RELEASE. The kill switch, the feed-stale pull and `pull_refused`
+            // all come through here, and capital reserved for a quote any of
+            // them is pulling is capital nothing will ever spend. NOT the
+            // shutdown sweep, which is venue-level and reaches no quoter; there
+            // the process is exiting and the map goes with it.
             if let Some(gate) = &self.risk {
                 gate.release(&self.rel.id, &self.rel.legs[key.0].market_id, key.1);
             }
@@ -658,7 +710,6 @@ impl Quoter {
                 ts: now,
                 venue: leg.venue,
             }));
-            self.last_quote_ts.remove(&key);
             self.refused_since.remove(&key);
         }
     }
@@ -683,9 +734,9 @@ impl Quoter {
             // Both sides then fall through to `target` None, which is the
             // existing cancel path, and that is deliberate: a book we can no
             // longer trust is a book we cannot leave a quote resting against.
-            // (Contrast the risk gate below, which cancels only on DURATION —
-            // a cap refusal is a reason not to add exposure, and on its own is
-            // not evidence that the resting price is wrong.)
+            // (Contrast the risk gate below, which on this path cancels only
+            // on DURATION — a cap refusal is a reason not to add exposure, and
+            // on its own is not evidence that the resting price is wrong.)
             let crossed = self.crossed_reason(books, i);
             if let Some(reason) = &crossed {
                 intents.push(Intent::Skip(intent::Skip {
@@ -876,14 +927,13 @@ impl Quoter {
                 // quoter has REJECTED. It does not, and cannot, stop a fill on
                 // a correctly-priced quote from carrying exposure past a
                 // breached cap — such a quote is held by the hysteresis check
-                // above and never reaches this line. Pulling those too would be
-                // cancel-all-on-cap-breach, a different and much larger policy.
+                // above and never reaches this line. `pull_refused` takes those
+                // off, on the fill that moved the exposure.
                 //
                 // "The cap refuses more exposure" and "this resting price is
-                // stale" are different facts. The first is not grounds to
-                // cancel and never becomes so; the second is, and it is what
-                // the duration measures. A cancel is a REDUCTION of exposure,
-                // which no cap has an interest in refusing.
+                // stale" are different facts, and this path acts on the second,
+                // which is what the duration measures. A cancel is a REDUCTION
+                // of exposure, which no cap has an interest in refusing.
                 if let Some(gate) = &self.risk {
                     let mut v = gate.check(
                         &self.rel,
@@ -1468,6 +1518,16 @@ mod risk_gate_tests {
     }
 
     impl RiskGate for Always {
+        fn admits(
+            &self,
+            _rel: &Rel,
+            _venue: Venue,
+            _notional: i64,
+            _rests_on: (&str, BookSide),
+        ) -> bool {
+            self.allows()
+        }
+
         fn check(
             &self,
             _rel: &Rel,
@@ -1553,6 +1613,58 @@ mod risk_gate_tests {
             cancel_on(&intents, "P").is_none(),
             "the resting quote must NOT be pulled: {intents:?}"
         );
+    }
+
+    /// After a fill moves the exposure, a quote the gate no longer admits comes
+    /// off at once, with no book event and no pull delay, and gives its slot back.
+    #[test]
+    fn pull_refused_cancels_a_refused_quote_and_releases_its_slot() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        let gate = Always::new(true);
+        q.set_risk(Some(gate.clone()));
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert!(place_on(&intents, "P").is_some(), "{intents:?}");
+
+        intents.clear();
+        q.pull_refused(&mut cx, 100.0, &mut intents);
+        assert!(intents.is_empty(), "the gate still admits it: {intents:?}");
+
+        gate.set(false);
+        q.pull_refused(&mut cx, 100.0, &mut intents);
+        assert!(cancel_on(&intents, "P").is_some(), "{intents:?}");
+        assert!(gate.log().iter().any(|l| l.starts_with('-')), "{:?}", gate.log());
+
+        intents.clear();
+        q.pull_refused(&mut cx, 100.0, &mut intents);
+        assert!(intents.is_empty(), "one cancel per quote: {intents:?}");
+    }
+
+    /// A pulled side comes back on the requote throttle. Without that, every
+    /// sibling near a cap re-rests on its next book event and the next fill
+    /// pulls them all again, two venue calls per quote per fill.
+    #[test]
+    fn a_pulled_side_re_enters_on_the_requote_throttle() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let mut oid = 0;
+        let mut intents = Vec::new();
+        let gate = Always::new(true);
+        q.set_risk(Some(gate.clone()));
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert!(place_on(&intents, "P").is_some(), "{intents:?}");
+
+        gate.set(false);
+        q.pull_refused(&mut cx, 101.0, &mut intents);
+        gate.set(true);
+        intents.clear();
+        q.on_book(&mut cx, &fees, &bb, 102.0, &mut oid, &mut intents);
+        assert!(place_on(&intents, "P").is_none(), "inside the throttle: {intents:?}");
+
+        q.on_book(&mut cx, &fees, &bb, 116.0, &mut oid, &mut intents);
+        assert!(place_on(&intents, "P").is_some(), "{intents:?}");
     }
 
     /// **A cap that stays breached must PULL the quote it has frozen.**
@@ -1741,6 +1853,16 @@ mod risk_gate_tests {
     }
 
     impl RiskGate for Budgeted {
+        fn admits(
+            &self,
+            _rel: &Rel,
+            _venue: Venue,
+            notional: i64,
+            _rests_on: (&str, BookSide),
+        ) -> bool {
+            notional <= self.room
+        }
+
         fn check(
             &self,
             _rel: &Rel,

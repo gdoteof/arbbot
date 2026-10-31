@@ -575,6 +575,9 @@ struct Engine {
     /// (`entry_blackout_tick`): every entry quote on them is suppressed and
     /// take-take passes them over.
     blacked_out: std::collections::BTreeSet<String>,
+    /// A fill opened exposure since the last feed line finished, so resting
+    /// quotes may no longer pass the gate (`pull_refused_quotes`).
+    entry_filled: bool,
     /// Each Kalshi market's latest valid tick ladder from the `price_grid` feed,
     /// for exit pricing (`marks`, `maker_exit`). Absent = unknown = the flat cent.
     kalshi_ladders: std::collections::BTreeMap<String, Vec<(String, String, String)>>,
@@ -918,6 +921,7 @@ impl Engine {
             maker_exit_asked: std::collections::HashSet::new(),
             distrusted: std::collections::BTreeSet::new(),
             blacked_out: std::collections::BTreeSet::new(),
+            entry_filled: false,
             kalshi_ladders: std::collections::BTreeMap::new(),
             unwind_seen: None,
             unwind_refused: None,
@@ -1124,6 +1128,15 @@ impl Engine {
         self.owe_sweeps(why);
         for q in quoters.iter_mut() {
             q.cancel_all(&mut self.cx, self.last_now, &mut self.intents);
+            self.drain_intents(Some(&q.rel));
+        }
+    }
+
+    /// The tail caps read fills, so a fill is what can take one past a resting
+    /// quote's clip: ask every quoter on that fill, not on a timer.
+    fn pull_refused_quotes(&mut self, quoters: &mut [Quoter]) {
+        for q in quoters.iter_mut() {
+            q.pull_refused(&mut self.cx, self.last_now, &mut self.intents);
             self.drain_intents(Some(&q.rel));
         }
     }
@@ -2025,6 +2038,9 @@ impl Engine {
         self.queue_wait.record(m.t_read.elapsed().as_nanos() as u64);
         let t_deq = std::time::Instant::now();
         self.on_feed_line(&m.line, quoters, by_market);
+        if std::mem::take(&mut self.entry_filled) {
+            self.pull_refused_quotes(quoters);
+        }
         self.decision.record(t_deq.elapsed().as_nanos() as u64);
         if self.exit_dirty_at.is_some_and(|t| queued == 0 || t.elapsed() >= EXIT_FLUSH_MAX_DELAY) {
             self.flush_exit_books();
@@ -4531,6 +4547,205 @@ mod toxgate_reload_tests {
             eng.n_int > 0,
             "a model that never scored this side must not silence it"
         );
+    }
+}
+
+/// The fill that takes a tail cap past a resting clip has to pull that quote
+/// there and then: a quote at a good price is never re-checked by the quoter.
+#[cfg(test)]
+mod fill_pull_tests {
+    use super::*;
+    use arb_core::scan::{RelLeg, RelType};
+
+    const A: &str = "xvus-mid26-gov-nv-r";
+    const B: &str = "xvus-mid26-gov-ia-d";
+    const C: &str = "xvus-gas-26-x";
+
+    fn rel(id: &str, k: &str, p: &str) -> Rel {
+        Rel {
+            id: id.into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: k.into() },
+                RelLeg { venue: Venue::PolymarketUs, market_id: p.into() },
+            ],
+        }
+    }
+
+    fn risk(budget: u32) -> Arc<crate::risk::RiskView> {
+        let d = std::env::temp_dir().join(format!(
+            "arb-trader-fill-pull-{}-{budget}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        let exec = d.join("exec.yaml");
+        std::fs::write(&exec, "bankroll_usd: 2000\nper_class_cap: 0.5\n").unwrap();
+        let topics = d.join("topics.yaml");
+        std::fs::write(&topics, format!("topics:\n  - {{family: mid26, budget_usd: {budget}}}\ndefault_topic_budget: 300\n"))
+            .unwrap();
+        Arc::new(crate::risk::RiskView::load(
+            &exec.to_string_lossy(),
+            &topics.to_string_lossy(),
+            vec![
+                ("kalshi".to_string(), "1000".to_string()),
+                ("polymarket_us".to_string(), "1000".to_string()),
+            ],
+            [A, B, C].iter().map(|r| (r.to_string(), "low".to_string())).collect(),
+        ))
+    }
+
+    struct Rig {
+        eng: Engine,
+        quoters: Vec<Quoter>,
+        by_market: ByMarket,
+        rv: Arc<crate::risk::RiskView>,
+        intents: std::path::PathBuf,
+    }
+
+    /// Three relationships, each resting its PM-US bid: `m1` on A, `m2` on B and
+    /// `m3` on C, whose topic is not the one A and B share.
+    fn resting(budget: u32) -> Rig {
+        let rv = risk(budget);
+        let mut quoters = vec![
+            Quoter::new(rel(A, "KA", "PA")),
+            Quoter::new(rel(B, "KB", "PB")),
+            Quoter::new(rel(C, "KC", "PC")),
+        ];
+        for q in &mut quoters {
+            q.set_risk(Some(rv.clone()));
+        }
+        let by_market: ByMarket = HashMap::from([
+            ((Venue::Kalshi, "KA".to_string()), vec![0usize]),
+            ((Venue::PolymarketUs, "PA".to_string()), vec![0usize]),
+            ((Venue::Kalshi, "KB".to_string()), vec![1usize]),
+            ((Venue::PolymarketUs, "PB".to_string()), vec![1usize]),
+            ((Venue::Kalshi, "KC".to_string()), vec![2usize]),
+            ((Venue::PolymarketUs, "PC".to_string()), vec![2usize]),
+        ]);
+        let intents = std::env::temp_dir().join(format!(
+            "arb-trader-fill-pull-{}-{}.intents",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let mut cfg = test_cfg();
+        cfg.risk = Some(rv.clone());
+        let mut eng = test_engine(cfg);
+        eng.out = Some(std::io::BufWriter::new(std::fs::File::create(&intents).unwrap()));
+        for (venue, market, bid) in [
+            ("kalshi", "KA", "0.60"),
+            ("polymarket_us", "PA", "0.30"),
+            ("kalshi", "KB", "0.60"),
+            ("polymarket_us", "PB", "0.30"),
+            ("kalshi", "KC", "0.60"),
+            ("polymarket_us", "PC", "0.30"),
+        ] {
+            eng.on_feed(snapshot(venue, market, bid), 0, &mut quoters, &by_market);
+        }
+        assert_eq!(rv.reserved_ct(), 150.0, "three 50-lots rest");
+        Rig { eng, quoters, by_market, rv, intents }
+    }
+
+    impl Rig {
+        /// `m1` fills whole.
+        fn fill(&mut self) {
+            let m = serde_json::json!({
+                "kind": "fill", "venue": "polymarket_us", "market_id": "PA",
+                "order_id": "m1", "cum": 50, "ts_local_ns": 2_000_000_000i64});
+            let m = FeedMsg { line: m.to_string(), t_read: std::time::Instant::now() };
+            self.eng.on_feed(m, 0, &mut self.quoters, &self.by_market);
+        }
+
+        /// The markets the engine cancelled a quote on, in order.
+        fn cancels(&mut self) -> Vec<String> {
+            self.eng.out.as_mut().unwrap().flush().unwrap();
+            std::fs::read_to_string(&self.intents)
+                .unwrap()
+                .lines()
+                .filter_map(|l| {
+                    let v: serde_json::Value = serde_json::from_str(l).ok()?;
+                    Some(v.get("cancel")?.as_str()?.to_string())
+                })
+                .collect()
+        }
+    }
+
+    fn snapshot(venue: &str, market: &str, bid: &str) -> FeedMsg {
+        FeedMsg {
+            line: serde_json::json!({
+                "kind": "snapshot", "venue": venue, "market_id": market,
+                "bids": [{"price": bid, "size": "500"}],
+                "asks": [{"price": "0.99", "size": "1"}],
+                "seq": 1, "ts_local_ns": 1_000_000_000i64})
+            .to_string(),
+            t_read: std::time::Instant::now(),
+        }
+    }
+
+    /// What that fill leaves over the cap comes off, and the other topic's quote
+    /// does not. PA's cancel is for the order that just filled: the quoter
+    /// cannot tell, and the venue has nothing to act on.
+    #[test]
+    fn a_fill_that_reaches_a_tail_cap_pulls_only_what_it_leaves_over_it() {
+        let mut rig = resting(60);
+        rig.fill();
+
+        assert_eq!(rig.rv.open_ct(A), 50.0);
+        assert_eq!(rig.cancels(), ["PA", "PB"]);
+        assert_eq!(rig.rv.reserved_ct(), 50.0, "the other topic's quote stays resting");
+    }
+
+    /// A superseded order's fill consumes the slot its replacement owns, so the
+    /// gate holds nothing for that replacement, and it must still be asked about.
+    #[test]
+    fn a_superseded_orders_fill_still_pulls_its_replacement() {
+        let mut rig = resting(60);
+        let moved = serde_json::json!({
+            "kind": "snapshot", "venue": "polymarket_us", "market_id": "PA",
+            "bids": [{"price": "0.35", "size": "500"}],
+            "asks": [{"price": "0.99", "size": "1"}],
+            "seq": 2, "ts_local_ns": 31_000_000_000i64});
+        let moved = FeedMsg { line: moved.to_string(), t_read: std::time::Instant::now() };
+        rig.eng.on_feed(moved, 0, &mut rig.quoters, &rig.by_market);
+        assert_eq!(rig.rv.reserved_ct(), 150.0, "A's slot now belongs to the replacement");
+
+        rig.fill();
+
+        assert_eq!(rig.rv.open_ct(A), 50.0);
+        assert_eq!(rig.cancels(), ["PA", "PB"]);
+    }
+
+    /// The quote's reservation went when its cancel was decided, and the order
+    /// stays live until that cancel leaves the queue. A fill in that gap still
+    /// owes a hedge, so it charges the cash all the same.
+    #[test]
+    fn a_fill_racing_its_cancel_still_charges_its_hedge() {
+        let mut rig = resting(500);
+        rig.rv.release(A, "PA", BookSide::Bid);
+        rig.fill();
+
+        rig.rv
+            .set_live_balances(vec![
+                ("kalshi".to_string(), "120".to_string()),
+                ("polymarket_us".to_string(), "1000".to_string()),
+            ])
+            .unwrap();
+        let d = rig.rv.check(&rel(C, "KC", "PC"), Venue::PolymarketUs, 1, None);
+        assert!(
+            d.reasons.iter().any(|r| r == "insufficient kalshi balance: 151 > 120"),
+            "{:?}",
+            d.reasons
+        );
+    }
+
+    #[test]
+    fn a_fill_with_room_left_leaves_the_quotes_resting() {
+        let mut rig = resting(500);
+        rig.fill();
+
+        assert_eq!(rig.rv.open_ct(A), 50.0);
+        assert!(rig.cancels().is_empty());
+        assert_eq!(rig.rv.reserved_ct(), 100.0);
     }
 }
 

@@ -446,7 +446,11 @@ impl Engine {
                         } else {
                             rv.consume_ioc(&mo.rel_id, oid, mo.side, ob.qty() as f64);
                         }
+                        if let Some(a) = ob.anchor() {
+                            rv.charge_hedge(a.venue, ob.qty() as f64);
+                        }
                     }
+                    self.entry_filled = true;
                     // No anchor => no hedge target. The obligation is
                     // deliberately left unconsumed so the ledger's
                     // dropped_unconsumed() alarm surfaces it instead of
