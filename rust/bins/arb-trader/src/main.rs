@@ -1884,12 +1884,14 @@ async fn balance_loop(
         // the same abandoned path as a 503 and leaves the previous figure
         // ageing rather than replacing it with something that would panic the
         // engine at the next quote.
+        let started = std::time::Instant::now();
         let cycle = match capital::read(&kalshi, &pmus).await {
             Ok(accounts) => risk.set_live_capital(&accounts).map(|()| accounts),
             Err(e) => Err(e),
         };
         match cycle {
             Ok(accounts) => {
+                risk.hedges_read(started);
                 let pairs: Vec<_> = accounts.iter().map(|(v,a)|(v.clone(),a.available_cash_usd.clone())).collect();
                 if let Err(e) = capital::publish("data/exec/capital.json", &accounts, &risk) {
                     eprintln!("[capital] snapshot write failed: {e}");

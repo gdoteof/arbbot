@@ -86,12 +86,17 @@ pub trait RiskGate: Send + Sync {
         rests_on: Option<(&str, BookSide)>,
     ) -> RiskVerdict;
 
-    /// Would [`RiskGate::check`] still allow what is left of the quote reserved
-    /// on this (market, side)? A pure read: it reserves nothing, and it is how a
-    /// quote that is not repricing gets re-asked after a fill moves the exposure
-    /// it was admitted against. Nothing reserved there means the quote filled
-    /// and there is nothing left to pull, so the answer is yes.
-    fn admits(&self, rel: &Rel, venue: Venue, rests_on: (&str, BookSide)) -> bool;
+    /// Would [`RiskGate::check`] still allow this quote resting on this (market,
+    /// side)? A pure read: it reserves nothing, and it is how a quote that is
+    /// not repricing gets re-asked after a fill moves the exposure it was
+    /// admitted against.
+    fn admits(
+        &self,
+        rel: &Rel,
+        venue: Venue,
+        notional: i64,
+        rests_on: (&str, BookSide),
+    ) -> bool;
 
     /// The quote reserved on this (market, side) is no longer resting, so give
     /// its capital back. A slot holding no reservation is a no-op, which is
@@ -653,16 +658,22 @@ impl Quoter {
     /// past a tail cap indefinitely. It keeps `last_quote_ts`, as `on_book`'s
     /// cancel does, so the side re-enters on the requote throttle: one rest per
     /// `min_requote_s` however many fills land near the cap.
+    ///
+    /// It asks about the whole clip. The quoter has no fill path, and the gate's
+    /// slot cannot say what is left of THIS order, because a superseded order's
+    /// fill consumes the slot its replacement owns. So a partial fill's
+    /// remainder can come off when it would have fit, and a quote that filled
+    /// whole can draw a cancel with nothing left to cancel.
     pub fn pull_refused(&mut self, cx: &mut Cx, now: f64, intents: &mut Vec<Intent>) {
         let Some(gate) = &self.risk else { return };
         let refused = self
             .resting
-            .keys()
-            .filter(|&&(i, side)| {
+            .iter()
+            .filter(|(&(i, side), curq)| {
                 let leg = &self.rel.legs[i];
-                !gate.admits(&self.rel, leg.venue, (&leg.market_id, side))
+                !gate.admits(&self.rel, leg.venue, curq.count, (&leg.market_id, side))
             })
-            .copied()
+            .map(|(&key, _)| key)
             .collect();
         self.cancel_keys(refused, cx, now, intents);
     }
@@ -1507,7 +1518,13 @@ mod risk_gate_tests {
     }
 
     impl RiskGate for Always {
-        fn admits(&self, _rel: &Rel, _venue: Venue, _rests_on: (&str, BookSide)) -> bool {
+        fn admits(
+            &self,
+            _rel: &Rel,
+            _venue: Venue,
+            _notional: i64,
+            _rests_on: (&str, BookSide),
+        ) -> bool {
             self.allows()
         }
 
@@ -1836,8 +1853,14 @@ mod risk_gate_tests {
     }
 
     impl RiskGate for Budgeted {
-        fn admits(&self, _rel: &Rel, _venue: Venue, _rests_on: (&str, BookSide)) -> bool {
-            true
+        fn admits(
+            &self,
+            _rel: &Rel,
+            _venue: Venue,
+            notional: i64,
+            _rests_on: (&str, BookSide),
+        ) -> bool {
+            notional <= self.room
         }
 
         fn check(

@@ -28,8 +28,9 @@
 //! whatever the gate would no longer admit (`Quoter::pull_refused`). A take-take
 //! IOC is a fill in flight and counts as filled. What bounds the overfill is the
 //! cash check: every reservation also charges the venue its fill would have to
-//! hedge on, and a fill stays charged until a balance reading can show it, so no
-//! more rests than the other venue can fund.
+//! hedge on, and a fill stays charged until a balance reading that began after
+//! it, so no more rests than the other venue can fund. A hedge still unsent at
+//! that reading drops out of the charge, and the naked limit bounds those.
 //!
 //! Config comes from the same files the Python runner used (`config/exec.yaml`,
 //! `config/topics.yaml`) so the caps are one source of truth, not a second
@@ -385,11 +386,11 @@ pub struct RiskView {
     /// them and terminal venue reads release the unfilled remainder. Unknown
     /// execution outcomes keep their reservation; dry-run checks reserve nothing.
     reserved: Mutex<HashMap<Slot, Reservation>>,
-    /// Contracts filled off a reservation since the last balance reading, by the
-    /// venue their hedge spends. A fill leaves `reserved` at once and the
-    /// balance shows the hedge only at the next poll, so until then this is
-    /// what keeps that cash charged.
-    hedges_unread: Mutex<HashMap<&'static str, f64>>,
+    /// Hedges minted by a fill and not yet in a balance reading: when, the venue
+    /// the hedge spends, and contracts. A fill leaves `reserved` at once, or had
+    /// already left it if its cancel lost the race, and the balance shows the
+    /// hedge only at the next poll, so until then this keeps that cash charged.
+    hedges_unread: Mutex<Vec<(Instant, &'static str, f64)>>,
     /// Open baskets by direction, `(standard, inverse)`, from the ledger
     /// (`ledger::open_by_direction`), refreshed with each ledger read. What
     /// `exposure` holds beyond it — a fill the ledger has not booked yet, an
@@ -692,7 +693,7 @@ impl RiskView {
             exposure: Mutex::new(Exposure::default()),
             released: Mutex::new(HashSet::new()),
             reserved: Mutex::new(HashMap::new()),
-            hedges_unread: Mutex::new(HashMap::new()),
+            hedges_unread: Mutex::new(Vec::new()),
             directed: Mutex::new(HashMap::new()),
             checked: Mutex::new((0, 0)),
             naked_worst: Mutex::new(None),
@@ -824,7 +825,6 @@ impl RiskView {
             return Err(format!("{v} answered {b:?}, which is not an amount of money"));
         }
         *self.balances.lock().expect("balances") = Cash::Live { pairs, at: Instant::now() };
-        self.hedges_unread.lock().expect("hedges_unread").clear();
         Ok(())
     }
 
@@ -994,20 +994,23 @@ impl RiskView {
     pub fn consume(&self, rel_id: &str, market_id: &str, side: BookSide, qty: f64) {
         let mut r = self.reserved.lock().expect("reserved");
         let key = (rel_id.to_string(), market_id.to_string(), side);
-        if let Some((_, left, _, hedge)) = r.get_mut(&key) {
-            if let Some(h) = hedge {
-                *self
-                    .hedges_unread
-                    .lock()
-                    .expect("hedges_unread")
-                    .entry(h.as_str())
-                    .or_default() += qty.min(*left);
-            }
+        if let Some((_, left, _, _)) = r.get_mut(&key) {
             *left -= qty;
             if *left <= 0.0 {
                 r.remove(&key);
             }
         }
+    }
+
+    /// A fill just minted a hedge of `qty` on `venue`.
+    pub fn charge_hedge(&self, venue: Venue, qty: f64) {
+        self.hedges_unread.lock().expect("hedges_unread").push((Instant::now(), venue.as_str(), qty));
+    }
+
+    /// A balance reading that began at `started` has landed, so it shows what
+    /// traded before then. A fill after that is not in it and stays charged.
+    pub fn hedges_read(&self, started: Instant) {
+        self.hedges_unread.lock().expect("hedges_unread").retain(|(at, ..)| *at >= started);
     }
 
     /// Contracts currently held against the caps by quotes that are resting and
@@ -1366,7 +1369,10 @@ impl RiskView {
         // cancel would refuse repricing exactly when the book is fullest, which
         // is when a stale quote is most dangerous.
         let mine = rests_on.map(|(m, s)| (rel.id.clone(), m.to_string(), s));
-        let mut hedge_cash = self.hedges_unread.lock().expect("hedges_unread").clone();
+        let mut hedge_cash: HashMap<&'static str, f64> = HashMap::new();
+        for (_, venue, qty) in self.hedges_unread.lock().expect("hedges_unread").iter() {
+            *hedge_cash.entry(venue).or_default() += qty;
+        }
         {
             let r = self.reserved.lock().expect("reserved");
             for (slot, (class, qty, dir, hedge)) in r.iter() {
@@ -1530,10 +1536,14 @@ impl RiskGate for RiskView {
         verdict
     }
 
-    fn admits(&self, rel: &Rel, venue: Venue, rests_on: (&str, BookSide)) -> bool {
-        let slot = (rel.id.clone(), rests_on.0.to_string(), rests_on.1);
-        let left = self.reserved.lock().expect("reserved").get(&slot).map(|r| r.1);
-        left.is_none_or(|q| self.assess(rel, venue, q.ceil() as i64, Some(rests_on)).0.allowed)
+    fn admits(
+        &self,
+        rel: &Rel,
+        venue: Venue,
+        notional: i64,
+        rests_on: (&str, BookSide),
+    ) -> bool {
+        self.assess(rel, venue, notional, Some(rests_on)).0.allowed
     }
 
     fn release(&self, rel_id: &str, market_id: &str, side: BookSide) {
@@ -3020,9 +3030,10 @@ mod tests {
     }
 
     /// A fill leaves the reservations at once and the balance only moves at the
-    /// next poll, so its hedge stays charged across that gap, partial or whole.
+    /// next poll, so its hedge stays charged across that gap, partial or whole,
+    /// and a reading already under way when it filled does not clear it.
     #[test]
-    fn a_filled_quotes_hedge_stays_charged_until_a_balance_reading() {
+    fn a_filled_quotes_hedge_stays_charged_until_a_reading_that_began_after_it() {
         let mut o = HashMap::new();
         for r in ["r1", "r2", "r3"] {
             o.insert(r.to_string(), "low".to_string());
@@ -3042,12 +3053,18 @@ mod tests {
         };
         assert!(refused(&v));
 
+        let under_way = Instant::now();
         v.consume("r1", "K", BookSide::Bid, 15.0);
+        v.charge_hedge(Venue::PolymarketUs, 15.0);
         assert!(refused(&v), "a partial fill");
         v.consume("r1", "K", BookSide::Bid, 25.0);
+        v.charge_hedge(Venue::PolymarketUs, 25.0);
         assert!(refused(&v), "the whole clip");
 
-        v.set_live_balances(balances()).unwrap();
+        v.hedges_read(under_way);
+        assert!(refused(&v), "that reading began before the fill");
+
+        v.hedges_read(Instant::now());
         assert!(v.check(&rel("r3"), Venue::Kalshi, 40, Some(("K", BookSide::Bid))).allowed);
     }
 
@@ -3086,32 +3103,13 @@ mod tests {
         assert!(v.check(&rel(b), Venue::Kalshi, 50, Some(("K", BookSide::Bid))).allowed);
         let (before, reserved) = (v.stats(), v.reserved_ct());
 
-        assert!(v.admits(&rel(b), Venue::Kalshi, ("K", BookSide::Bid)));
+        assert!(v.admits(&rel(b), Venue::Kalshi, 50, ("K", BookSide::Bid)));
         v.record_open(a, "cross-venue-equivalent", 50.0);
-        assert!(!v.admits(&rel(b), Venue::Kalshi, ("K", BookSide::Bid)));
+        assert!(!v.admits(&rel(b), Venue::Kalshi, 50, ("K", BookSide::Bid)));
+        assert!(!v.admits(&rel(a), Venue::Kalshi, 50, ("K", BookSide::Ask)));
+        assert!(v.admits(&rel(b), Venue::Kalshi, 10, ("K", BookSide::Bid)));
 
         assert_eq!((v.stats(), v.reserved_ct()), (before, reserved));
-    }
-
-    /// The gate is asked about what is still resting, not the clip it rested
-    /// with: a partial fill's remainder fits a budget its full clip would not,
-    /// and a quote that filled whole has nothing left to pull.
-    #[test]
-    fn admits_reads_what_is_left_of_the_quote() {
-        let p = write_topics("admits-left", "topics:\n  - {family: mid26, budget_usd: 60}\ndefault_topic_budget: 300\n");
-        let (a, b) = ("xvus-mid26-gov-nv-r", "xvus-mid26-gov-ia-d");
-        let v = view_topics_low(p.to_str().unwrap(), &[a, b]);
-        assert!(v.check(&rel(a), Venue::Kalshi, 50, Some(("K", BookSide::Bid))).allowed);
-        assert!(v.check(&rel(b), Venue::Kalshi, 50, Some(("K", BookSide::Bid))).allowed);
-
-        v.record_open(a, "cross-venue-equivalent", 15.0);
-        v.consume(a, "K", BookSide::Bid, 15.0);
-        assert!(v.admits(&rel(a), Venue::Kalshi, ("K", BookSide::Bid)), "15 filled + 35 left");
-        assert!(!v.admits(&rel(b), Venue::Kalshi, ("K", BookSide::Bid)), "15 filled + 50");
-
-        v.record_open(a, "cross-venue-equivalent", 35.0);
-        v.consume(a, "K", BookSide::Bid, 35.0);
-        assert!(v.admits(&rel(a), Venue::Kalshi, ("K", BookSide::Bid)), "nothing left");
     }
 
     /// Over the cap, an order that does not grow the tail still opens: it is

@@ -166,7 +166,8 @@ pub const EXIT_ORDERS_LEFT_RESTING: i32 = 17;
 /// does this page" does not.
 pub const EXIT_BOOK_UNCONFIRMED: i32 = 18;
 
-/// How many commands one venue's executor holds queued.
+/// How many commands one venue's executor holds in each of its two buffers: the
+/// channel the engine writes to, and the `waiting` list [`next_cmd`] picks from.
 const EXEC_QUEUE: usize = 1024;
 
 /// Wall-clock budget for in-flight PLACES to settle before we verify.
@@ -1054,11 +1055,12 @@ pub fn spawn_executors(
     (txs, stats)
 }
 
-/// The next command for a venue: the oldest TAKER if any is queued, otherwise
-/// the oldest command. A hedge closes a naked leg and a cancel or a quote only
-/// maintains the book, so at 8 commands a second a hedge must not wait behind a
-/// burst of them. Takers keep their order among themselves, which is what a
-/// hedge chain's retries rely on.
+/// The next command for a venue: the oldest TAKER in `waiting` if there is one,
+/// otherwise the oldest command. A hedge closes a naked leg and a cancel or a
+/// quote only maintains the book, so at 8 commands a second a hedge must not
+/// wait behind a burst of them. Takers keep their order among themselves, which
+/// is what a hedge chain's retries rely on. `waiting` reads `EXEC_QUEUE` commands
+/// ahead, so a taker further back than that waits its turn.
 async fn next_cmd(
     rx: &mut mpsc::Receiver<ExecCmd>,
     waiting: &mut VecDeque<ExecCmd>,

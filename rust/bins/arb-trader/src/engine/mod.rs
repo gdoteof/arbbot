@@ -4624,8 +4624,9 @@ mod fill_pull_tests {
             ((Venue::PolymarketUs, "PC".to_string()), vec![2usize]),
         ]);
         let intents = std::env::temp_dir().join(format!(
-            "arb-trader-fill-pull-{}-{budget}.intents",
-            std::process::id()
+            "arb-trader-fill-pull-{}-{}.intents",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
         ));
         let mut cfg = test_cfg();
         cfg.risk = Some(rv.clone());
@@ -4681,16 +4682,60 @@ mod fill_pull_tests {
         }
     }
 
-    /// The quote that fill leaves over the cap comes off and nothing else does:
-    /// not the filled one, which has nothing left, and not the other topic's.
+    /// What that fill leaves over the cap comes off, and the other topic's quote
+    /// does not. PA's cancel is for the order that just filled: the quoter
+    /// cannot tell, and the venue has nothing to act on.
     #[test]
-    fn a_fill_that_reaches_a_tail_cap_pulls_only_the_quote_it_leaves_over_it() {
+    fn a_fill_that_reaches_a_tail_cap_pulls_only_what_it_leaves_over_it() {
         let mut rig = resting(60);
         rig.fill();
 
         assert_eq!(rig.rv.open_ct(A), 50.0);
-        assert_eq!(rig.cancels(), ["PB"]);
+        assert_eq!(rig.cancels(), ["PA", "PB"]);
         assert_eq!(rig.rv.reserved_ct(), 50.0, "the other topic's quote stays resting");
+    }
+
+    /// A superseded order's fill consumes the slot its replacement owns, so the
+    /// gate holds nothing for that replacement, and it must still be asked about.
+    #[test]
+    fn a_superseded_orders_fill_still_pulls_its_replacement() {
+        let mut rig = resting(60);
+        let moved = serde_json::json!({
+            "kind": "snapshot", "venue": "polymarket_us", "market_id": "PA",
+            "bids": [{"price": "0.35", "size": "500"}],
+            "asks": [{"price": "0.99", "size": "1"}],
+            "seq": 2, "ts_local_ns": 31_000_000_000i64});
+        let moved = FeedMsg { line: moved.to_string(), t_read: std::time::Instant::now() };
+        rig.eng.on_feed(moved, 0, &mut rig.quoters, &rig.by_market);
+        assert_eq!(rig.rv.reserved_ct(), 150.0, "A's slot now belongs to the replacement");
+
+        rig.fill();
+
+        assert_eq!(rig.rv.open_ct(A), 50.0);
+        assert_eq!(rig.cancels(), ["PA", "PB"]);
+    }
+
+    /// The quote's reservation went when its cancel was decided, and the order
+    /// stays live until that cancel leaves the queue. A fill in that gap still
+    /// owes a hedge, so it charges the cash all the same.
+    #[test]
+    fn a_fill_racing_its_cancel_still_charges_its_hedge() {
+        let mut rig = resting(500);
+        rig.rv.release(A, "PA", BookSide::Bid);
+        rig.fill();
+
+        rig.rv
+            .set_live_balances(vec![
+                ("kalshi".to_string(), "120".to_string()),
+                ("polymarket_us".to_string(), "1000".to_string()),
+            ])
+            .unwrap();
+        let d = rig.rv.check(&rel(C, "KC", "PC"), Venue::PolymarketUs, 1, None);
+        assert!(
+            d.reasons.iter().any(|r| r == "insufficient kalshi balance: 151 > 120"),
+            "{:?}",
+            d.reasons
+        );
     }
 
     #[test]
