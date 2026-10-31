@@ -19,6 +19,17 @@
 //! sees. Every way one is given back is enumerated on the `reserved` field
 //! below — not linked, because it is private and the link would be dead.
 //!
+//! WHICH CAPS A RESERVATION CHARGES. The class and global caps bound capital,
+//! and a resting quote commits capital, so they count it. The per-relationship
+//! tail cap, the topic budget and the per-event loss cap bound what a rule
+//! divergence can cost, and only a filled contract can lose that money, so they
+//! read fills. Those three are lines we stop adding at, not hard maxima: quotes
+//! admitted side by side can overfill them, and the fill that reaches one pulls
+//! whatever the gate would no longer admit (`Quoter::pull_refused`). A take-take
+//! IOC is a fill in flight and counts as filled. What bounds the overfill is the
+//! cash check: every reservation also charges the venue its fill would have to
+//! hedge on, so no more rests than the other venue can fund.
+//!
 //! Config comes from the same files the Python runner used (`config/exec.yaml`,
 //! `config/topics.yaml`) so the caps are one source of truth, not a second
 //! transcription.
@@ -161,9 +172,17 @@ impl Tail {
 /// reprice REPLACES its own reservation rather than stacking a second one.
 type Slot = (String, String, BookSide);
 
-/// What a slot holds against the caps: its class, its contracts, and the
-/// basket a fill of it opens.
-type Reservation = (&'static str, f64, Option<Direction>);
+/// What a slot holds against the caps: its class, its contracts, the basket a
+/// fill of it opens, and the venue that fill would have to hedge on.
+type Reservation = (&'static str, f64, Option<Direction>, Option<Venue>);
+
+/// Where resting quotes sit in `by_relationship`. No relationship has this id,
+/// so the per-relationship cap never reads it and the global cap's sum does.
+const RESTING_QUOTES: &str = "(resting quotes)";
+
+/// How a take-take IOC's reservation is told from a resting quote's: the slot's
+/// market is this prefix and the order id.
+const IOC_SLOT: &str = "ioc/";
 
 /// How old a balance figure may be and still authorise spending, whatever its
 /// provenance. Three poll cycles (`main::BALANCE_POLL` is 60s).
@@ -312,8 +331,9 @@ pub struct RiskView {
     /// breath as the seed (see [`Self::seed_released`]).
     released: Mutex<HashSet<(String, u64)>>,
     /// Capital COMMITTED by a quote that is resting and has not filled, by the
-    /// slot it rests on -> (class, contracts). Folded into the exposure every
-    /// `check` sees, so headroom can be spent only once.
+    /// slot it rests on. Every `check` folds it into the class and global caps,
+    /// so that headroom can be spent only once, and into the cash its hedge
+    /// would need. The tail caps read fills; see the module header.
     ///
     /// EVERY WAY A RESTING QUOTE GOES AWAY, and which of them releases:
     ///   * FILLED — `consume`, from the engine's fill path, moves the filled
@@ -945,21 +965,21 @@ impl RiskView {
     /// A slot with nothing left is dropped, and a slot that was never reserved
     /// (a take-take IOC, or a fill on an order this run inherited) is a no-op.
     pub fn check_ioc(&self, rel: &Rel, venue: Venue, qty: i64, oid: &str, side: BookSide) -> RiskVerdict {
-        self.check(rel, venue, qty, Some((&format!("ioc/{oid}"), side)))
+        self.check(rel, venue, qty, Some((&format!("{IOC_SLOT}{oid}"), side)))
     }
 
     pub fn finish_ioc(&self, rel: &str, oid: &str, side: BookSide) {
-        self.release(rel, &format!("ioc/{oid}"), side);
+        self.release(rel, &format!("{IOC_SLOT}{oid}"), side);
     }
 
     pub fn consume_ioc(&self, rel: &str, oid: &str, side: BookSide, qty: f64) {
-        self.consume(rel, &format!("ioc/{oid}"), side, qty);
+        self.consume(rel, &format!("{IOC_SLOT}{oid}"), side, qty);
     }
 
     pub fn consume(&self, rel_id: &str, market_id: &str, side: BookSide, qty: f64) {
         let mut r = self.reserved.lock().expect("reserved");
         let key = (rel_id.to_string(), market_id.to_string(), side);
-        if let Some((_, left, _)) = r.get_mut(&key) {
+        if let Some((_, left, _, _)) = r.get_mut(&key) {
             *left -= qty;
             if *left <= 0.0 {
                 r.remove(&key);
@@ -975,7 +995,7 @@ impl RiskView {
     /// and `risk_reserved` that only ever rises is a reservation leak — the one
     /// failure of this mechanism that is worse than the bug it fixes.
     pub fn reserved_ct(&self) -> f64 {
-        self.reserved.lock().expect("reserved").values().map(|(_, q, _)| q).sum()
+        self.reserved.lock().expect("reserved").values().map(|(_, q, _, _)| q).sum()
     }
 
     /// Install the ledger's open baskets by direction for the per-event cap,
@@ -1275,24 +1295,16 @@ fn venue_costs(rel: &Rel, quoted: Venue, notional: &str) -> Vec<(String, String)
     out
 }
 
-impl RiskGate for RiskView {
-    /// Gates OPENING risk only.
-    ///
-    /// INVARIANT: never consult this for a HEDGE. Refusing a hedge leaves the
-    /// first leg naked, which is strictly worse than being a little over
-    /// budget — the cap exists to bound how much we open, and the hedge is what
-    /// makes what we already opened safe. The engine's hedge path consults risk
-    /// nowhere (`grep -n 'risk' engine.rs`: stats, `record_open`, `open_ct`, and
-    /// this check on the take-take ENTRY), and it must stay that way. Gating
-    /// both legs' cash here is what keeps that honest: the hedge's venue is
-    /// proven fundable BEFORE the entry that obliges us to hedge.
-    fn check(
+impl RiskView {
+    /// What [`RiskGate::check`] would decide, and the basket a fill would open.
+    /// A pure read: nothing is reserved and nothing is counted.
+    fn assess(
         &self,
         rel: &Rel,
         venue: Venue,
         notional: i64,
         rests_on: Option<(&str, BookSide)>,
-    ) -> RiskVerdict {
+    ) -> (RiskVerdict, Option<Direction>) {
         let n = notional.to_string();
         let e = self.exposure.lock().expect("exposure");
         let mut by_rel = e.by_rel.clone();
@@ -1324,25 +1336,39 @@ impl RiskGate for RiskView {
         }
         // Capital already committed by quotes that are RESTING. Without this
         // the gate is a pure read and every resting quote in the process spends
-        // the same headroom — see the module header.
+        // the same capital — see the module header.
         //
         // This slot's own reservation is skipped, because a reprice on it
         // REPLACES that quote: charging the amend for the order it is about to
         // cancel would refuse repricing exactly when the book is fullest, which
         // is when a stale quote is most dangerous.
         let mine = rests_on.map(|(m, s)| (rel.id.clone(), m.to_string(), s));
+        let mut hedge_cash: HashMap<&'static str, f64> = HashMap::new();
         {
             let r = self.reserved.lock().expect("reserved");
-            for (slot, (class, qty, dir)) in r.iter() {
+            for (slot, (class, qty, dir, hedge)) in r.iter() {
                 if Some(slot) == mine.as_ref() {
+                    continue;
+                }
+                *by_class.entry((*class).to_string()).or_default() += qty;
+                if let Some(h) = hedge {
+                    *hedge_cash.entry(h.as_str()).or_default() += qty;
+                }
+                if !slot.1.starts_with(IOC_SLOT) {
+                    *by_rel.entry(RESTING_QUOTES.to_string()).or_default() += qty;
                     continue;
                 }
                 if event_of(&slot.0) == event {
                     tails.entry(slot.0.clone()).or_default().rest(*dir, *qty);
                 }
                 *by_rel.entry(slot.0.clone()).or_default() += qty;
-                *by_class.entry((*class).to_string()).or_default() += qty;
                 *by_topic.entry(topic_of(&slot.0, &self.topics)).or_default() += qty;
+            }
+        }
+        let mut costs = venue_costs(rel, venue, &n);
+        for (name, cost) in &mut costs {
+            if let Some(held) = hedge_cash.get(name.as_str()) {
+                *cost = (notional as f64 + held).to_string();
             }
         }
         let pairs = |m: &HashMap<String, f64>| -> Vec<(String, String)> {
@@ -1368,7 +1394,7 @@ impl RiskGate for RiskView {
             },
             balances: self.spendable(),
             notional: n.clone(),
-            venue_costs: venue_costs(rel, venue, &n),
+            venue_costs: costs,
             // The maker path passes no APR, so the great-opportunity overflow
             // never applies to a resting quote (quoter.py:302 — only the
             // take-take path supplies one).
@@ -1379,9 +1405,8 @@ impl RiskGate for RiskView {
             kill: false,
         };
         let mut d = check_order(&inp);
-        // The two tail limits, over the same post-reservation `by_rel` the
-        // topic budget reads, so a resting quote on one candidate spends the
-        // whole event's room the way it spends the topic's.
+        // The two tail limits, over what is filled, as the topic budget reads:
+        // this order's own clip counts, and a sibling's resting quote does not.
         let nav = inp.config.bankroll.parse::<f64>().unwrap_or(0.0);
         let dir = direction_of(rel, venue, rests_on.map(|(_, s)| s));
         let tail_before: f64 = tails.values().map(Tail::worst).sum();
@@ -1413,24 +1438,6 @@ impl RiskGate for RiskView {
             }
         }
         d.allowed = d.reasons.is_empty();
-        // RESERVE. The quoter rests the order the instant this returns allowed
-        // — there is no branch between them — so this is the moment the capital
-        // is committed, and it stays committed until the quote fills or comes
-        // off. An amend overwrites its own slot rather than adding to it.
-        if d.allowed {
-            if let Some(slot) = mine {
-                self.reserved
-                    .lock()
-                    .expect("reserved")
-                    .insert(slot, (rel.rtype.as_str(), notional as f64, dir));
-            }
-        }
-        let mut c = self.checked.lock().expect("checked");
-        if d.allowed {
-            c.0 += 1;
-        } else {
-            c.1 += 1;
-        }
         // Contracts, floored: the gate counts a prediction-market basket as
         // ~$1, and a fractional contract is not orderable. Floor rather than
         // round so the resize can never ask for more room than the topic has.
@@ -1455,7 +1462,59 @@ impl RiskGate for RiskView {
                 .and_then(|h| h.parse::<f64>().ok())
                 .map_or(event_room, |h| (h.floor().max(0.0) as i64).min(event_room)),
         );
-        RiskVerdict { allowed: d.allowed, reasons: d.reasons, topic_headroom }
+        (RiskVerdict { allowed: d.allowed, reasons: d.reasons, topic_headroom }, dir)
+    }
+}
+
+impl RiskGate for RiskView {
+    /// Gates OPENING risk only.
+    ///
+    /// INVARIANT: never consult this for a HEDGE. Refusing a hedge leaves the
+    /// first leg naked, which is strictly worse than being a little over
+    /// budget — the cap exists to bound how much we open, and the hedge is what
+    /// makes what we already opened safe. The engine's hedge path consults risk
+    /// nowhere (`grep -n 'risk' engine.rs`: stats, `record_open`, `open_ct`, and
+    /// this check on the take-take ENTRY), and it must stay that way. Gating
+    /// both legs' cash here is what keeps that honest: the hedge's venue is
+    /// proven fundable BEFORE the entry that obliges us to hedge.
+    fn check(
+        &self,
+        rel: &Rel,
+        venue: Venue,
+        notional: i64,
+        rests_on: Option<(&str, BookSide)>,
+    ) -> RiskVerdict {
+        let (verdict, dir) = self.assess(rel, venue, notional, rests_on);
+        // RESERVE. The quoter rests the order the instant this returns allowed
+        // — there is no branch between them — so this is the moment the capital
+        // is committed, and it stays committed until the quote fills or comes
+        // off. An amend overwrites its own slot rather than adding to it.
+        if verdict.allowed {
+            if let Some((market, side)) = rests_on {
+                let hedge = rel.legs.iter().map(|l| l.venue).find(|v| *v != venue);
+                self.reserved.lock().expect("reserved").insert(
+                    (rel.id.clone(), market.to_string(), side),
+                    (rel.rtype.as_str(), notional as f64, dir, hedge),
+                );
+            }
+        }
+        let mut c = self.checked.lock().expect("checked");
+        if verdict.allowed {
+            c.0 += 1;
+        } else {
+            c.1 += 1;
+        }
+        verdict
+    }
+
+    fn admits(
+        &self,
+        rel: &Rel,
+        venue: Venue,
+        notional: i64,
+        rests_on: (&str, BookSide),
+    ) -> bool {
+        self.assess(rel, venue, notional, Some(rests_on)).0.allowed
     }
 
     fn release(&self, rel_id: &str, market_id: &str, side: BookSide) {
@@ -1553,15 +1612,6 @@ mod tests {
         P.get_or_init(|| write_exec("exec-wide", "bankroll_usd: 2000\nper_class_cap: 0.35\n"))
             .to_string_lossy()
             .into_owned()
-    }
-
-    fn funded_wide() -> RiskView {
-        view_with_configs(
-            &wide_exec(),
-            "/nonexistent/topics.yaml",
-            vec![("kalshi", "1000"), ("polymarket_us", "1000")],
-            "low",
-        )
     }
 
     /// FAIL-CLOSED: an unconfigured venue balance reads as $0 cash, so the
@@ -1976,31 +2026,29 @@ mod tests {
         assert_eq!(v.reserved_ct(), 5.0, "and a refusal reserves nothing");
     }
 
-    /// ...and the four (leg, side) quotes of ONE relationship are four quotes
-    /// too. This is the same defect inside a single `Quoter::on_book` call,
-    /// where nothing between the checks could ever have moved the exposure —
-    /// there is no fill in that window by construction.
+    /// The per-relationship tail cap reads fills, so the four (leg, side) quotes
+    /// of one relationship all rest, and it binds once contracts have filled.
     ///
-    /// Clip 40 against the $150 per-relationship cap: three fit, the fourth
-    /// does not.
+    /// Clip 40 against the $150 cap.
     #[test]
-    fn the_four_sides_of_one_relationship_cannot_each_spend_the_per_rel_cap() {
+    fn the_per_rel_cap_reads_fills_so_all_four_sides_rest() {
         let v = funded("low");
         let r = rel("r1");
-        for (market, side) in
-            [("K", BookSide::Bid), ("K", BookSide::Ask), ("P", BookSide::Bid)]
-        {
+        for (market, side) in [
+            ("K", BookSide::Bid),
+            ("K", BookSide::Ask),
+            ("P", BookSide::Bid),
+            ("P", BookSide::Ask),
+        ] {
             let d = v.check(&r, Venue::Kalshi, 40, Some((market, side)));
             assert!(d.allowed, "{market}/{}: {:?}", side.as_str(), d.reasons);
         }
-        let fourth = v.check(&r, Venue::Kalshi, 40, Some(("P", BookSide::Ask)));
-        assert!(!fourth.allowed, "3x40 resting + 40 > 150: {:?}", fourth.reasons);
-        assert!(
-            fourth.reasons.iter().any(|r| r.contains("per-relationship")),
-            "{:?}",
-            fourth.reasons
-        );
-        assert_eq!(v.reserved_ct(), 120.0);
+        assert_eq!(v.reserved_ct(), 160.0);
+
+        v.record_open("r1", "cross-venue-equivalent", 120.0);
+        let d = v.check(&r, Venue::Kalshi, 40, Some(("K", BookSide::Bid)));
+        assert!(!d.allowed, "120 filled + 40 > 150: {:?}", d.reasons);
+        assert!(d.reasons.iter().any(|r| r.contains("per-relationship")), "{:?}", d.reasons);
     }
 
     /// RELEASE ON CANCEL — the path the quoter drives. A cap that never gives
@@ -2008,8 +2056,8 @@ mod tests {
     /// worse than the overshoot the reservation exists to stop.
     #[test]
     fn a_released_slot_gives_its_capital_back() {
-        let v = funded_wide();
-        v.record_open("r1", "cross-venue-equivalent", 145.0); // 5 of headroom left
+        let v = funded("low");
+        v.record_open("already-open", "cross-venue-equivalent", 335.0); // $343 class cap
         assert!(v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
         assert!(
             !v.check(&rel("r1"), Venue::Kalshi, 5, Some(("P", BookSide::Bid))).allowed,
@@ -2030,8 +2078,8 @@ mod tests {
     /// most dangerous — and would leak a reservation per reprice besides.
     #[test]
     fn repricing_is_not_charged_for_the_quote_it_replaces() {
-        let v = funded_wide();
-        v.record_open("r1", "cross-venue-equivalent", 145.0);
+        let v = funded("low");
+        v.record_open("already-open", "cross-venue-equivalent", 335.0); // $343 class cap
         assert!(v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
 
         let amend = v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid)));
@@ -2791,24 +2839,25 @@ mod tests {
         assert!(d.topic_headroom.unwrap() >= 142, "{:?}", d.topic_headroom);
     }
 
-    /// A quote RESTING on one candidate spends the event's room like one that
-    /// filled, for the reason it spends the topic's: the quoter rests the moment
-    /// the gate allows, so a second candidate checked before the first fills
-    /// must see it.
+    /// Only a filled contract can lose money on a rule divergence, so a quote
+    /// resting on one candidate leaves the event's room to its sibling, and the
+    /// event stops adding when fills reach the cap. $147 cap.
     #[test]
-    fn a_resting_quote_on_a_sibling_candidate_spends_the_events_room() {
+    fn a_resting_quote_on_a_sibling_candidate_leaves_the_events_room_alone() {
         let (a, b) = ("xvus-tsla-q3-deliv-q3-above-440k", "xvus-tsla-q3-deliv-q3-above-460k");
         let v = view_topics_low("/nonexistent/topics.yaml", &[a, b]);
         v.record_open(a, "cross-venue-equivalent", 140.0);
         assert!(v.check(&rel(a), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
-        let d = v.check(&rel(b), Venue::Kalshi, 5, Some(("K", BookSide::Bid)));
+        assert!(v.check(&rel(b), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
+
+        v.record_open(a, "cross-venue-equivalent", 5.0);
+        v.consume(a, "K", BookSide::Bid, 5.0);
+        let d = v.check(&rel(b), Venue::Kalshi, 5, Some(("K", BookSide::Ask)));
         assert!(
-            d.reasons.iter().any(|r| r.starts_with("per-event loss cap [xvus-tsla-q3-deliv-q3-above]: 145.00+5")),
+            d.reasons.iter().any(|r| r.starts_with("per-event loss cap [xvus-tsla-q3-deliv-q3-above]")),
             "{:?}",
             d.reasons
         );
-        v.release(a, "K", BookSide::Bid);
-        assert!(v.check(&rel(b), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
     }
 
     /// A STANDARD AND AN INVERSE BASKET LOSE IN OPPOSITE BRANCHES, so a quote
@@ -2840,17 +2889,17 @@ mod tests {
         }
     }
 
-    /// TWO-SIDED QUOTING RESERVES ITS WORSE SIDE, NOT BOTH: a bid and an ask on
-    /// one pair can each fill, but every fill of the ask shrinks the branch the
-    /// bid grows.
+    /// A take-take IOC is a fill in flight, so it counts on the tail caps, and
+    /// two in flight on one pair spend the event's room on their worse side: every
+    /// fill of the ask shrinks the branch the bid grows.
     #[test]
-    fn a_two_sided_quote_spends_the_events_room_once() {
+    fn in_flight_iocs_spend_the_events_room_on_their_worse_side() {
         let (a, b) = ("xvus-time-poty-26-zohranmamdani", "xvus-time-poty-26-ai");
         let v = view_topics_low("/nonexistent/topics.yaml", &[a, b]);
         v.record_open(a, "cross-venue-equivalent", 100.0);
         v.set_directed(HashMap::from([(a.to_string(), (100.0, 0.0))]));
-        assert!(v.check(&rel(a), Venue::Kalshi, 25, Some(("K", BookSide::Bid))).allowed);
-        assert!(v.check(&rel(a), Venue::Kalshi, 25, Some(("K", BookSide::Ask))).allowed);
+        assert!(v.check_ioc(&rel(a), Venue::Kalshi, 25, "t1", BookSide::Bid).allowed);
+        assert!(v.check_ioc(&rel(a), Venue::Kalshi, 25, "t2", BookSide::Ask).allowed);
         // 100 + 25 on the standard branch; the ask's 25 sits on the other one.
         let d = v.check(&rel(b), Venue::Kalshi, 25, Some(("K", BookSide::Bid)));
         assert!(
@@ -2859,6 +2908,115 @@ mod tests {
             d.reasons
         );
         assert_eq!(d.topic_headroom, Some(22));
+    }
+
+    /// The topic budget reads fills: two clips rest on a budget with room for
+    /// one, and it stops adding once one of them has filled.
+    #[test]
+    fn a_resting_quote_does_not_spend_a_topic_budget() {
+        let p = write_topics("rest-topic", "topics:\n  - {family: mid26, budget_usd: 60}\ndefault_topic_budget: 300\n");
+        let (a, b) = ("xvus-mid26-gov-nv-r", "xvus-mid26-gov-ia-d");
+        let v = view_topics_low(p.to_str().unwrap(), &[a, b]);
+        assert!(v.check(&rel(a), Venue::Kalshi, 50, Some(("K", BookSide::Bid))).allowed);
+        assert!(v.check(&rel(b), Venue::Kalshi, 50, Some(("K", BookSide::Bid))).allowed);
+
+        v.record_open(a, "cross-venue-equivalent", 50.0);
+        v.consume(a, "K", BookSide::Bid, 50.0);
+        let d = v.check(&rel(b), Venue::Kalshi, 50, Some(("K", BookSide::Ask)));
+        assert!(
+            d.reasons.iter().any(|r| r == "topic budget [mid26]: 50+50 > 60"),
+            "{:?}",
+            d.reasons
+        );
+    }
+
+    /// ...while a take-take IOC about to fill does spend it.
+    #[test]
+    fn an_in_flight_ioc_spends_the_topic_budget_and_the_per_rel_cap() {
+        let p = write_topics("ioc-topic", "topics:\n  - {family: mid26, budget_usd: 60}\ndefault_topic_budget: 300\n");
+        let (a, b) = ("xvus-mid26-gov-nv-r", "xvus-mid26-gov-ia-d");
+        let v = view_topics_low(p.to_str().unwrap(), &[a, b]);
+        assert!(v.check_ioc(&rel(a), Venue::Kalshi, 50, "t1", BookSide::Bid).allowed);
+        let d = v.check_ioc(&rel(b), Venue::Kalshi, 50, "t2", BookSide::Bid);
+        assert!(
+            d.reasons.iter().any(|r| r == "topic budget [mid26]: 50+50 > 60"),
+            "{:?}",
+            d.reasons
+        );
+
+        let w = funded("low");
+        assert!(w.check_ioc(&rel("r1"), Venue::Kalshi, 100, "t1", BookSide::Bid).allowed);
+        let d = w.check_ioc(&rel("r1"), Venue::Kalshi, 100, "t2", BookSide::Bid);
+        assert!(d.reasons.iter().any(|r| r.contains("per-relationship")), "{:?}", d.reasons);
+    }
+
+    /// Resting quotes commit capital, so the global cap still counts them even
+    /// though no relationship's own tail cap does. $980 bankroll x 0.50.
+    #[test]
+    fn resting_quotes_still_spend_the_global_cap() {
+        let exec = write_exec("rest-global", "bankroll_usd: 980\nper_class_cap: 5\n");
+        let rels = ["r1", "r2", "r3", "r4", "r5"];
+        let v = view_topics_low_on(exec.to_str().unwrap(), "/nonexistent/topics.yaml", &rels);
+        for r in &rels[..4] {
+            assert!(v.check(&rel(r), Venue::Kalshi, 100, Some(("K", BookSide::Bid))).allowed);
+        }
+        let d = v.check(&rel("r5"), Venue::Kalshi, 100, Some(("K", BookSide::Bid)));
+        assert!(d.reasons.iter().any(|r| r.contains("global cap: 400+100")), "{:?}", d.reasons);
+    }
+
+    /// Every resting quote may fill, and each fill must be hedged on the other
+    /// venue, so resting quotes charge that venue's cash cumulatively. The
+    /// balance alone cannot see them: nothing has left the account yet.
+    #[test]
+    fn resting_quotes_charge_the_cash_their_hedges_would_need() {
+        let rels = ["r1", "r2", "r3"];
+        let mut o = HashMap::new();
+        for r in rels {
+            o.insert(r.to_string(), "low".to_string());
+        }
+        let v = RiskView::load(
+            &valid_exec(),
+            "/nonexistent/topics.yaml",
+            vec![
+                ("kalshi".to_string(), "1000".to_string()),
+                ("polymarket_us".to_string(), "100".to_string()),
+            ],
+            o,
+        );
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 40, Some(("K", BookSide::Bid))).allowed);
+        assert!(v.check(&rel("r2"), Venue::Kalshi, 40, Some(("K", BookSide::Bid))).allowed);
+        let d = v.check(&rel("r3"), Venue::Kalshi, 40, Some(("K", BookSide::Bid)));
+        assert!(
+            d.reasons.iter().any(|r| r == "insufficient polymarket_us balance: 120 > 100"),
+            "{:?}",
+            d.reasons
+        );
+
+        let amend = v.check(&rel("r1"), Venue::Kalshi, 40, Some(("K", BookSide::Bid)));
+        assert!(amend.allowed, "an amend is not charged for itself: {:?}", amend.reasons);
+
+        v.release("r2", "K", BookSide::Bid);
+        assert!(v.check(&rel("r3"), Venue::Kalshi, 40, Some(("K", BookSide::Bid))).allowed);
+    }
+
+    /// `admits` asks what `check` would decide and changes nothing, so a sweep
+    /// of the resting book can neither reserve nor skew the gauges.
+    #[test]
+    fn admits_reads_the_gate_without_reserving_or_counting() {
+        let p = write_topics("admits", "topics:\n  - {family: mid26, budget_usd: 60}\ndefault_topic_budget: 300\n");
+        let (a, b) = ("xvus-mid26-gov-nv-r", "xvus-mid26-gov-ia-d");
+        let v = view_topics_low(p.to_str().unwrap(), &[a, b]);
+        assert!(v.check(&rel(a), Venue::Kalshi, 50, Some(("K", BookSide::Bid))).allowed);
+        assert!(v.check(&rel(b), Venue::Kalshi, 50, Some(("K", BookSide::Bid))).allowed);
+        let (before, reserved) = (v.stats(), v.reserved_ct());
+
+        assert!(v.admits(&rel(b), Venue::Kalshi, 50, ("K", BookSide::Bid)));
+        v.record_open(a, "cross-venue-equivalent", 50.0);
+        assert!(!v.admits(&rel(b), Venue::Kalshi, 50, ("K", BookSide::Bid)));
+        assert!(!v.admits(&rel(a), Venue::Kalshi, 50, ("K", BookSide::Ask)));
+        assert!(v.admits(&rel(b), Venue::Kalshi, 10, ("K", BookSide::Bid)));
+
+        assert_eq!((v.stats(), v.reserved_ct()), (before, reserved));
     }
 
     /// Over the cap, an order that does not grow the tail still opens: it is
