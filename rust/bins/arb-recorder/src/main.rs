@@ -203,26 +203,38 @@ async fn main() -> Result<()> {
 
     // PM-US universe from tags (credential-free public catalog)
     let mut pmus_slugs: Vec<String> = Vec::new();
+    let mut registry_pmus = universe.pmus_slugs.clone();
     if !cfg.polymarket_us_tags.is_empty() {
         match pmus_catalog.markets_by_tags(&cfg.polymarket_us_tags).await {
             Ok(markets) => {
                 pmus_slugs =
                     markets.iter().filter(|m| !m.closed).map(|m| m.slug.clone()).collect();
+                let (open, closed) = pmus::drop_closed(&universe.pmus_slugs, &markets);
+                if !closed.is_empty() {
+                    println!(
+                        "polymarket_us: -{} registry market(s) the tag listing reports CLOSED, \
+                         not subscribed: {}{}",
+                        closed.len(),
+                        closed.iter().take(6).cloned().collect::<Vec<_>>().join(", "),
+                        if closed.len() > 6 { " …" } else { "" }
+                    );
+                }
+                registry_pmus = open;
             }
             Err(e) => eprintln!("[recorder] pmus catalog failed at startup: {e:#}"),
         }
     }
     // A REGISTRY market is subscribed whether or not the tag listing returns
-    // it — see `Universe::pmus_slugs` for the four days that cost. These carry
-    // no catalog metadata (PM-US has no by-slug metadata endpoint, which is why
-    // the universe is tag-driven at all), so they are exempt from
-    // close-eviction: a closed one keeps a frozen book. That is the bounded
-    // cost, and it is cheaper than not recording a market we hold.
+    // it — see `Universe::pmus_slugs` for the four days that cost. One the
+    // listing reports closed is dropped above. One the listing does not return
+    // carries no metadata here, so it is exempt from close-eviction and a
+    // closed one keeps a frozen book until the registry drops it. That is the
+    // bounded cost: `/market/slug/{slug}` would say, at a request per market
+    // on every startup, and not recording a market we hold costs more.
     {
         let known: std::collections::HashSet<&str> =
             pmus_slugs.iter().map(String::as_str).collect();
-        let untagged: Vec<String> = universe
-            .pmus_slugs
+        let untagged: Vec<String> = registry_pmus
             .iter()
             .filter(|s| !known.contains(s.as_str()))
             .cloned()
@@ -236,7 +248,7 @@ async fn main() -> Result<()> {
                 if untagged.len() > 6 { " …" } else { "" }
             );
         }
-        pmus_slugs = pmus::registry_first(&universe.pmus_slugs, &pmus_slugs);
+        pmus_slugs = pmus::registry_first(&registry_pmus, &pmus_slugs);
         if pmus_slugs.len() > pmus::WS_MARKET_CAP {
             eprintln!(
                 "[recorder] WARNING polymarket_us: {} markets subscribed but the venue streams \
@@ -245,8 +257,8 @@ async fn main() -> Result<()> {
                 pmus_slugs.len(),
                 pmus::WS_MARKET_CAP,
                 pmus_slugs.len() - pmus::WS_MARKET_CAP,
-                universe.pmus_slugs.len(),
-                if universe.pmus_slugs.len() > pmus::WS_MARKET_CAP {
+                registry_pmus.len(),
+                if registry_pmus.len() > pmus::WS_MARKET_CAP {
                     " — and THEY EXCEED THE CAP, so registry markets will freeze"
                 } else {
                     ""
@@ -402,28 +414,18 @@ async fn main() -> Result<()> {
         tasks.push(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1800)).await;
-                if let Ok(statuses) = kalshi_catalog.statuses(&kalshi_tickers).await {
-                    for (ticker, status) in statuses {
-                        // Symmetric, and the symmetry is the point. This is a
-                        // WHITELIST of live spellings, so anything the venue
-                        // invents evicts — which is the right way to fail, but
-                        // eviction now also removes the market from the 300s
-                        // integrity sweep. Kalshi's vocabulary is wider than
-                        // the terminal states (`inactive` appears in this
-                        // repo's captured catalog on markets whose close time
-                        // is years away), and the whitelist needing BOTH
-                        // "active" and "open" is evidence it has drifted
-                        // before. One-way, a single poll returning a spelling
-                        // this list has not learned would cost that market its
-                        // heal cadence for the life of the process. The else
-                        // branch costs one line and bounds that at one cycle.
-                        if matches!(status.as_str(), "active" | "open" | "") {
-                            core.restore_book(Venue::Kalshi, &ticker);
-                        } else {
-                            core.evict_book(Venue::Kalshi, &ticker, &format!("status {status:?}"));
-                        }
-                    }
+                let poll = kalshi_catalog.statuses(&kalshi_tickers).await;
+                if let Some(first) = poll.errors.first() {
+                    eprintln!(
+                        "[recorder] kalshi status poll: {} of {} ticker(s) unanswered ({} \
+                         request(s) failed, first: {first}); they are neither evicted nor \
+                         restored this cycle",
+                        poll.unanswered.len(),
+                        kalshi_tickers.len(),
+                        poll.errors.len()
+                    );
                 }
+                kalshi::apply_status_poll(&core, &kalshi_tickers, &poll);
                 // No symmetry available here: `closed_tokens` reports only the
                 // closed ones, so a token's absence is not a statement that it
                 // is live. Polymarket eviction stays one-way — and pmintl's

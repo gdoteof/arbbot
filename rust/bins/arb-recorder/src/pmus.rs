@@ -40,6 +40,19 @@ pub fn registry_first(registry: &[String], tagged: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Registry markets split by what the tag listing says: `(subscribe, closed)`.
+///
+/// `registry_first` puts every registry market ahead of the cap, so a resolved
+/// one held a streaming slot from a live market for as long as the registry
+/// named it. On 11-05, 137 of the 373 registry markets the listing reported
+/// closed were subscribed anyway. A market the listing does not return stays in
+/// `subscribe`: no metadata is not evidence that it closed.
+pub fn drop_closed(registry: &[String], listed: &[PmusMarket]) -> (Vec<String>, Vec<String>) {
+    let closed: std::collections::HashSet<&str> =
+        listed.iter().filter(|m| m.closed).map(|m| m.slug.as_str()).collect();
+    registry.iter().cloned().partition(|s| !closed.contains(s.as_str()))
+}
+
 /// Unwrap PM-US's money type, `{"currency":"USD","value":"5.0000"}`.
 ///
 /// The `currency` label travels with the WRAPPER, not with the meaning: the
@@ -558,5 +571,20 @@ mod tests {
         assert_eq!(out.iter().filter(|x| *x == "reg-listed").count(), 1);
         assert_eq!(out[2], "tag-0", "tag remainder keeps the listing's order");
         assert!(out[..WS_MARKET_CAP].iter().any(|x| x == "reg-untagged"));
+    }
+
+    #[test]
+    fn a_registry_market_the_listing_reports_closed_takes_no_slot() {
+        let m = |slug: &str, closed| PmusMarket { slug: slug.into(), closed };
+        let listed = [m("reg-resolved", true), m("reg-live", false), m("tag-closed", true)];
+        let registry: Vec<String> =
+            ["reg-resolved", "reg-live", "reg-unlisted"].iter().map(|s| s.to_string()).collect();
+        let (open, closed) = drop_closed(&registry, &listed);
+        assert_eq!(closed, vec!["reg-resolved"]);
+        assert_eq!(open, vec!["reg-live", "reg-unlisted"], "unlisted is not closed; order kept");
+
+        let tagged = vec!["reg-live".to_string(), "tag-live".to_string()];
+        let out = registry_first(&open, &tagged);
+        assert_eq!(out, vec!["reg-live", "reg-unlisted", "tag-live"]);
     }
 }

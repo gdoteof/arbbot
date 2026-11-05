@@ -20,7 +20,7 @@ use arb_core::dec::Dec;
 use arb_core::model::{now_local_ns, BookSide, Level, TakerSide, TapeEvent, Venue};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -209,27 +209,83 @@ impl KalshiCatalog {
         Ok(v.get("orderbook_fp").cloned().unwrap_or(Value::Object(Default::default())))
     }
 
-    /// ticker -> status string, in batches of 50 (for universe eviction).
-    pub async fn statuses(&self, tickers: &[String]) -> Result<HashMap<String, String>> {
-        let mut out = HashMap::new();
+    /// Every ticker's status, in batches of 50 (for universe eviction).
+    ///
+    /// A failed batch costs its own 50 tickers, not the poll: one 429 used to
+    /// abort the whole call, and the caller dropped the error, so a poll could
+    /// fail for hours without a line saying so.
+    pub async fn statuses(&self, tickers: &[String]) -> StatusPoll {
+        let mut poll = StatusPoll::default();
         for chunk in tickers.chunks(50) {
-            let r = self
-                .client
-                .get(format!("{}/markets", self.base))
-                .query(&[("tickers", chunk.join(","))])
-                .send()
-                .await?
-                .error_for_status()?;
-            let v: Value = r.json().await?;
-            for m in v.get("markets").and_then(Value::as_array).unwrap_or(&vec![]) {
-                if let (Some(t), Some(s)) =
-                    (m.get("ticker").and_then(Value::as_str), m.get("status").and_then(Value::as_str))
-                {
-                    out.insert(t.to_owned(), s.to_owned());
+            match self.status_batch(chunk).await {
+                Ok(found) => poll.statuses.extend(found),
+                Err(e) => {
+                    poll.unanswered.extend(chunk.iter().cloned());
+                    poll.errors.push(format!("{e:#}"));
                 }
             }
         }
+        poll
+    }
+
+    async fn status_batch(&self, chunk: &[String]) -> Result<HashMap<String, String>> {
+        let r = self
+            .client
+            .get(format!("{}/markets", self.base))
+            .query(&[("tickers", chunk.join(","))])
+            .send()
+            .await?
+            .error_for_status()?;
+        let v: Value = r.json().await?;
+        let mut out = HashMap::new();
+        for m in v.get("markets").and_then(Value::as_array).unwrap_or(&vec![]) {
+            if let (Some(t), Some(s)) =
+                (m.get("ticker").and_then(Value::as_str), m.get("status").and_then(Value::as_str))
+            {
+                out.insert(t.to_owned(), s.to_owned());
+            }
+        }
         Ok(out)
+    }
+}
+
+/// One universe status poll.
+#[derive(Debug, Default)]
+pub struct StatusPoll {
+    /// ticker -> status, for every ticker the venue listed.
+    pub statuses: HashMap<String, String>,
+    /// Tickers whose batch FAILED. The poll says nothing about them either way.
+    pub unanswered: HashSet<String>,
+    pub errors: Vec<String>,
+}
+
+/// Evict or restore each universe ticker on what one poll said about it.
+///
+/// Symmetric, and the symmetry is the point. Live is a WHITELIST of spellings,
+/// so anything the venue invents evicts — which is the right way to fail, but
+/// eviction also removes the market from the 300s integrity sweep. Kalshi's
+/// vocabulary is wider than the terminal states (`inactive` appears in this
+/// repo's captured catalog on markets whose close time is years away), and the
+/// whitelist needing BOTH "active" and "open" is evidence it has drifted
+/// before. One-way, a single poll returning a spelling this list has not
+/// learned would cost that market its heal cadence for the life of the process.
+/// The restore costs one line and bounds that at one cycle.
+///
+/// A ticker its batch was asked about and the venue did NOT list is gone:
+/// Kalshi purges old markets, and `/markets/{t}` then answers 404. Those were
+/// never evicted, so the sweep asked for each of them every 300s and logged it
+/// as a book that "did NOT refresh". If one does reappear, the restore above
+/// takes it back. A ticker whose batch failed is left alone.
+pub fn apply_status_poll(core: &Core, tickers: &[String], poll: &StatusPoll) {
+    for t in tickers {
+        if poll.unanswered.contains(t) {
+            continue;
+        }
+        match poll.statuses.get(t).map(String::as_str) {
+            Some("active" | "open" | "") => core.restore_book(Venue::Kalshi, t),
+            Some(status) => core.evict_book(Venue::Kalshi, t, &format!("status {status:?}")),
+            None => core.evict_book(Venue::Kalshi, t, "the venue no longer lists it"),
+        }
     }
 }
 
@@ -735,6 +791,86 @@ mod tests {
             asked.lock().expect("asked lock").iter().any(|r| r.contains("/markets/B/")),
             "the sweep never asked the venue for the restored ticker"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ticker the venue has purged is asked about and simply not listed. It
+    /// must leave the sweep like a settled one, and come back if it is listed
+    /// live again. On 11-05, 13 registry tickers were in this state, each asked
+    /// for every 300s and logged as a book that "did NOT refresh".
+    #[test]
+    fn a_ticker_the_venue_no_longer_lists_is_evicted_until_it_is_listed_live() {
+        let (core, dir) = test_core("delisted");
+        let tickers: Vec<String> = ["LIVE", "SETTLED", "GONE"].iter().map(|t| (*t).to_owned()).collect();
+        let mut poll = StatusPoll::default();
+        poll.statuses.insert("LIVE".into(), "active".into());
+        poll.statuses.insert("SETTLED".into(), "finalized".into());
+        apply_status_poll(&core, &tickers, &poll);
+        assert!(!core.is_evicted(Venue::Kalshi, "LIVE"));
+        assert!(core.is_evicted(Venue::Kalshi, "SETTLED"));
+        assert!(core.is_evicted(Venue::Kalshi, "GONE"), "a ticker the venue no longer lists stays in the sweep");
+
+        poll.statuses.insert("GONE".into(), "active".into());
+        apply_status_poll(&core, &tickers, &poll);
+        assert!(!core.is_evicted(Venue::Kalshi, "GONE"), "listed live again, it must rejoin the sweep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One failed batch used to abort the whole poll, and the caller dropped
+    /// the error. Now it costs only its own tickers, which are neither evicted
+    /// nor restored, and the other batches still act.
+    #[tokio::test]
+    async fn one_failed_status_batch_costs_only_its_own_tickers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // 51 tickers: T00..T49 fill the first batch of 50, FAIL is the second.
+        let mut tickers: Vec<String> = (0..50).map(|i| format!("T{i:02}")).collect();
+        tickers.push("FAIL".into());
+        // The first batch's answer: T07 has settled and T08 is not listed.
+        let markets: Vec<Value> = (0..50)
+            .filter(|i| *i != 8)
+            .map(|i| json!({"ticker": format!("T{i:02}"), "status": if i == 7 { "finalized" } else { "active" }}))
+            .collect();
+        let body = json!({"markets": markets, "cursor": ""}).to_string();
+
+        let http = TcpListener::bind("127.0.0.1:0").await.expect("bind http");
+        let base = format!("http://{}", http.local_addr().expect("http addr"));
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = http.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = s.read(&mut buf).await.unwrap_or(0);
+                    let resp = if String::from_utf8_lossy(&buf[..n]).contains("FAIL") {
+                        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+                    } else {
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    let _ = s.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let catalog = KalshiCatalog {
+            client: reqwest::Client::builder().timeout(Duration::from_secs(5)).build().expect("client"),
+            base,
+        };
+
+        let poll = catalog.statuses(&tickers).await;
+        assert_eq!(poll.errors.len(), 1, "exactly the second batch failed: {:?}", poll.errors);
+        assert_eq!(poll.unanswered, ["FAIL".to_string()].into_iter().collect());
+        assert_eq!(poll.statuses.len(), 49, "the first batch's answer survives the second's failure");
+
+        let (core, dir) = test_core("batch");
+        apply_status_poll(&core, &tickers, &poll);
+        assert!(core.is_evicted(Venue::Kalshi, "T07"), "settled");
+        assert!(core.is_evicted(Venue::Kalshi, "T08"), "no longer listed");
+        assert!(!core.is_evicted(Venue::Kalshi, "T00"));
+        assert!(!core.is_evicted(Venue::Kalshi, "FAIL"), "a failed batch is no statement about its tickers");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
