@@ -27,6 +27,8 @@ use std::time::Duration;
 pub const REST_BASE: &str = "https://api.elections.kalshi.com/trade-api/v2";
 pub const WS_URL: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
 pub const WS_PATH: &str = "/trade-api/ws/v2";
+/// Pause between the universe status poll's batch requests; see `statuses`.
+const STATUS_BATCH_SPACING: Duration = Duration::from_secs(1);
 
 // ---------- normalization ----------
 
@@ -214,9 +216,16 @@ impl KalshiCatalog {
     /// A failed batch costs its own 50 tickers, not the poll: one 429 used to
     /// abort the whole call, and the caller dropped the error, so a poll could
     /// fail for hours without a line saying so.
+    ///
+    /// Paced, because back to back they are rate-limited: the first poll that
+    /// logged its failures (11-05 14:09) had 5 of its 7 requests answer 429,
+    /// sharing the public budget with the 300s integrity sweep's own requests.
     pub async fn statuses(&self, tickers: &[String]) -> StatusPoll {
         let mut poll = StatusPoll::default();
-        for chunk in tickers.chunks(50) {
+        for (i, chunk) in tickers.chunks(50).enumerate() {
+            if i > 0 {
+                tokio::time::sleep(STATUS_BATCH_SPACING).await;
+            }
             match self.status_batch(chunk).await {
                 Ok(found) => poll.statuses.extend(found),
                 Err(e) => {
