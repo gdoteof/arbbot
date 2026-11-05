@@ -31,6 +31,7 @@ nohup.out
 # the vetted registry (trading pair set) stays private
 config/registry.yaml
 config/registry-rejected.yaml
+config/registry-settled.yaml
 config/registry.yaml.bak*
 # topic capital budgets reveal the trading-family strategy — same treatment
 config/topics.yaml
