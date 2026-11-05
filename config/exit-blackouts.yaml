@@ -125,3 +125,35 @@
   from: 2026-11-03T05:00:00Z   # 2026-11-03 00:00 ET
   why: US midterm elections 2026-11-03, first polls close 23:00Z
   entries: true
+- family: cong120-hrmin
+  from: 2026-11-10T05:00:00Z   # 2026-11-10 00:00 ET
+  why: House Republican leadership elections 2026-11-10 (minority leader, 120th Congress)
+  entries: true
+- family: cong120-senmin
+  from: 2026-11-10T05:00:00Z   # 2026-11-10 00:00 ET
+  why: Senate Republican leadership elections 2026-11-10 (minority leader, 120th Congress)
+  entries: true
+- family: grammynom-27
+  from: 2026-11-16T05:00:00Z   # 2026-11-16 00:00 ET
+  why: 69th Grammy nominations announced 2026-11-16 07:45 ET
+  entries: true
+- family: cma-26
+  from: 2026-11-18T05:00:00Z   # 2026-11-18 00:00 ET
+  why: 60th CMA Awards, live on ABC 2026-11-18 20:00 ET
+  entries: true
+- family: fedgt25-26
+  from: 2026-12-09T05:00:00Z   # 2026-12-09 00:00 ET
+  why: FOMC decision 2026-12-09 14:00 ET
+  entries: true
+- family: btcye-26
+  from: 2027-01-01T03:00:00Z   # 2026-12-31 22:00 ET
+  why: BRTI year-end print 2027-01-01 00:00 ET; the venues average its last minute differently
+  entries: true
+- family: oscarnom-27
+  from: 2027-01-21T05:00:00Z   # 2027-01-21 00:00 ET
+  why: 99th Academy Award nominations announced 2027-01-21 morning ET
+  entries: true
+- family: grammy-27
+  from: 2027-02-07T05:00:00Z   # 2027-02-07 00:00 ET
+  why: 69th Grammy Awards ceremony 2027-02-07
+  entries: true
