@@ -1500,6 +1500,17 @@ impl Engine {
                 }
             }
         }
+        // Past its resolve date a pair is open only because the venue has not
+        // settled it, and the APR hurdle floors its horizon at one day, so any
+        // edge there clears the bar. Nothing new opens on it until its date in
+        // `arb_core::resolve` is moved.
+        let today = arb_core::resolve::today_iso(now);
+        for q in quoters.iter() {
+            if let Some(rd) = arb_core::resolve::past_resolve(&q.rel.id, &today) {
+                why.entry(q.rel.id.clone())
+                    .or_insert_with(|| format!("resolve date {rd} has passed and the pair is still open"));
+            }
+        }
         let next: std::collections::BTreeSet<String> = why.keys().cloned().collect();
         if next == self.blacked_out {
             return;
@@ -6013,6 +6024,42 @@ mod entry_blackout_tests {
         eng.entry_blackout_tick(&mut quoters);
         assert!(eng.blacked_out.is_empty(), "a closed window holds nothing");
         assert!(quotes_kalshi_ask(&mut quoters, &books), "quoting returns when the window closes");
+    }
+
+    /// A pair past its resolve date takes no new entry with no blackout row
+    /// at all; a pair with no date is untouched. `nobel-peace-26` resolved
+    /// 2026-10-09, so it is past for every run of this test.
+    #[test]
+    fn a_pair_past_its_resolve_date_takes_no_entries() {
+        use arb_core::scan::{RelLeg, RelType};
+        let p = scratch("past-resolve");
+        std::fs::write(&p, "").unwrap();
+        // Each pair on its own markets: suppression is installed per market
+        // side, so pairs sharing legs would silence each other.
+        let rel = |id: &str, k: &str, pm: &str| Rel {
+            id: id.into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: k.into() },
+                RelLeg { venue: Venue::PolymarketUs, market_id: pm.into() },
+            ],
+        };
+        let mut books = books_where_the_kalshi_ask_pays();
+        let lvl = |p: &str, s: &str| Level { price: p.into(), size: s.into() };
+        books.apply_snapshot(Venue::Kalshi, "K2", vec![lvl("0.60", "500")], vec![lvl("0.99", "500")],
+            1, 1_000_000_000, None);
+        books.apply_snapshot(Venue::PolymarketUs, "P2", vec![lvl("0.10", "500")],
+            vec![lvl("0.20", "500")], 1, 1_000_000_000, None);
+        let past = || Quoter::new(rel("xvus-nobel-peace-26-test", "K2", "P2"));
+        assert!(places_anything(&mut [past()], &books), "the fixture must quote without the refusal");
+
+        let mut quoters = vec![Quoter::new(rel("xvus-undated-family-test", "K", "P")), past()];
+        let mut eng = engine_reading(&p);
+        eng.entry_blackout_tick(&mut quoters);
+        assert_eq!(eng.blacked_out.iter().collect::<Vec<_>>(), ["xvus-nobel-peace-26-test"]);
+        assert!(!places_anything(&mut quoters[1..], &books), "a pair past its date opens nothing");
+        assert!(quotes_kalshi_ask(&mut quoters[..1], &books), "an undated pair still quotes");
     }
 
     /// A family that does not match is untouched, and a damaged file pauses

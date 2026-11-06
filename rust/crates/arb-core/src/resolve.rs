@@ -266,6 +266,17 @@ pub fn years_to(rel_id: &str, today_iso: &str) -> Option<f64> {
     Some(days.max(1) as f64 / 365.25)
 }
 
+/// The family's resolve date when `today_iso` is already past it. A pair still
+/// open after its date is waiting on the venue to settle it, and [`years_to`]
+/// floors the horizon at one day, so any edge there would read as a huge APR
+/// and clear any bar. Callers refuse new entries on it; a pair that really is
+/// still live needs a later date in `RULES`. On the date itself the pair is
+/// not past: that is the day it is expected to settle.
+pub fn past_resolve(rel_id: &str, today_iso: &str) -> Option<&'static str> {
+    let (rd, _) = resolve_date(rel_id)?;
+    (parse_iso(rd)? < parse_iso(today_iso)?).then_some(rd)
+}
+
 /// Years between two `YYYY-MM-DD` dates, floored at one day. For callers that
 /// already know the resolve date (a ledger record can carry its own).
 pub fn years_between(from_iso: &str, to_iso: &str) -> Option<f64> {
@@ -457,6 +468,16 @@ mod tests {
         // 2028 is a leap year, 2100 is not.
         assert_eq!(iso_from_day(parse_iso("2028-02-28").unwrap() + 1), "2028-02-29");
         assert_eq!(iso_from_day(parse_iso("2100-02-28").unwrap() + 1), "2100-03-01");
+    }
+
+    #[test]
+    fn a_pair_is_past_its_resolve_date_from_the_day_after() {
+        let id = "xvus-nobel-peace-26-elonmusk";
+        assert_eq!(past_resolve(id, "2026-10-08"), None);
+        assert_eq!(past_resolve(id, "2026-10-09"), None, "the date itself is the settle day");
+        assert_eq!(past_resolve(id, "2026-10-10"), Some("2026-10-09"));
+        assert_eq!(past_resolve("xvus-unknown-family-99", "2099-01-01"), None, "no date, nothing to pass");
+        assert_eq!(past_resolve(id, "not a date"), None);
     }
 
     #[test]
