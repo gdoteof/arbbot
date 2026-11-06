@@ -1002,6 +1002,13 @@ async fn advance(
                 };
                 let limit = kalshi_step(cx, ladder, touch, selling)
                     .ok_or("no legal hedge price through the touch")?;
+                // A tick through a 0.99 PM-US offer, or a 0.01 bid, is off the
+                // end of its ladder; the touch itself is the marketable price.
+                let limit = match (venue, selling) {
+                    (Venue::PolymarketUs, false) => under_a_dollar(cx, limit),
+                    (Venue::PolymarketUs, true) => over_zero(cx, limit),
+                    _ => limit,
+                };
                 if !cx.is_pos(limit) || cx.cmp(limit, cx.one) != Ordering::Less {
                     return Err("hedge price outside (0, 1)".into());
                 }
@@ -1465,6 +1472,33 @@ mod tests {
         let mut crossed = lot.clone();
         crossed.cross = Some(Cross { limit: "0.9900".into(), lock_ct: "0.05".into() });
         assert_eq!(hedge_limit(&mut cx, &fees, &crossed, 8, &view("0.98")).unwrap(), "0.9900");
+    }
+
+    /// Past the profitable window the heal crosses a tick through the touch,
+    /// which through a 0.99 PM-US offer is 1.00, a price PM-US does not have.
+    /// The heal goes out at 0.99 instead of refusing to flatten at all.
+    #[tokio::test]
+    async fn a_heal_through_a_99c_offer_crosses_at_99c() {
+        let _g = crate::naked_act::TEST_SERIAL.lock().await;
+        let _v = test_serial();
+        reset_view();
+        let f = Fixture::new();
+        let mut a = f.owner(1., 3);
+        f.place(&mut a, 1., 3, Shape::RestKalshi).await;
+        let k: Sink = f.k.clone();
+        let p: Sink = f.p.clone();
+        f.k.fill(&id(&a), 3, true);
+        let mut out = Vec::new();
+        for _ in 0..(HEAL_PROFITABLE_CYCLES + 3) {
+            out = manage(&mut a, Some(&view("0.99")), &k, &p).await;
+            if !f.p.iocs().is_empty() {
+                break;
+            }
+        }
+        let iocs = f.p.iocs();
+        assert_eq!(iocs.len(), 1, "never crossed out: {out:?}");
+        assert_eq!(iocs[0].price, "0.9900");
+        reset_view();
     }
 
     #[tokio::test]
