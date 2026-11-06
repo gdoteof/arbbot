@@ -106,7 +106,9 @@ pub struct RunCfg {
     pub maker_exit_view: bool,
     /// `--exit-blackouts`, read again for its `entries: true` rows
     /// (`entry_blackout_tick`). `None` = never read, which is bench/replay:
-    /// a window is a wall-clock fact no pinned tape can reproduce.
+    /// a window is a wall-clock fact no pinned tape can reproduce. `None` also
+    /// turns off the tick's other wall-clock rule, the refusal of pairs past
+    /// their resolve date.
     pub entry_blackouts: Option<String>,
     /// Whether the venue order path is live. Reported in the stats `mode`.
     ///
@@ -571,10 +573,11 @@ struct Engine {
     /// Relationships whose hedge book has lied (`hedge::distrusted_rels`); every
     /// entry quote on them is suppressed until the obligation is discharged.
     distrusted: std::collections::BTreeSet<String>,
-    /// Relationships inside an `entries: true` announcement window
-    /// (`entry_blackout_tick`): every entry quote on them is suppressed and
+    /// Relationships held out of new entries, with the reason: inside an
+    /// `entries: true` announcement window, or past their resolve date
+    /// (`entry_blackout_tick`). Every entry quote on them is suppressed and
     /// take-take passes them over.
-    blacked_out: std::collections::BTreeSet<String>,
+    blacked_out: std::collections::BTreeMap<String, String>,
     /// A fill opened exposure since the last feed line finished, so resting
     /// quotes may no longer pass the gate (`pull_refused_quotes`).
     entry_filled: bool,
@@ -920,7 +923,7 @@ impl Engine {
             maker_exit_suppressed: std::collections::BTreeMap::new(),
             maker_exit_asked: std::collections::HashSet::new(),
             distrusted: std::collections::BTreeSet::new(),
-            blacked_out: std::collections::BTreeSet::new(),
+            blacked_out: std::collections::BTreeMap::new(),
             entry_filled: false,
             kalshi_ladders: std::collections::BTreeMap::new(),
             unwind_seen: None,
@@ -1412,7 +1415,7 @@ impl Engine {
         want.extend(self.maker_exit_asked.iter().cloned());
         for q in quoters
             .iter()
-            .filter(|q| self.distrusted.contains(&q.rel.id) || self.blacked_out.contains(&q.rel.id))
+            .filter(|q| self.distrusted.contains(&q.rel.id) || self.blacked_out.contains_key(&q.rel.id))
         {
             for leg in &q.rel.legs {
                 want.insert((leg.market_id.clone(), BookSide::Bid));
@@ -1472,14 +1475,17 @@ impl Engine {
     /// book event can pull it first, because there is no lead venue to react
     /// to. The window is a clock fact, so a clock enforces it.
     ///
+    /// A pair past its resolve date is held the same way, with no row: see
+    /// `arb_core::resolve::past_resolve`.
+    ///
     /// Edge-triggered like `distrust_tick`: entering pulls what rests at once,
     /// and leaving needs nothing because the quoter returns on its next book
     /// event. A file that exists and cannot be read pauses EVERY entry, as it
     /// already holds every exit. Hedges, sell-backs and maker exits are not
-    /// this tick's business and keep running.
-    pub(super) fn entry_blackout_tick(&mut self, quoters: &mut [Quoter]) {
+    /// this tick's business and keep running. `now` is epoch seconds, passed
+    /// in so a test can pin it.
+    pub(super) fn entry_blackout_tick(&mut self, quoters: &mut [Quoter], now: f64) {
         let Some(path) = self.cfg.entry_blackouts.as_deref() else { return };
-        let now = arb_core::clock::now_s();
         let mut why: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
         match crate::maker_exit::read_entry_blackouts(path) {
             Err(e) => {
@@ -1500,11 +1506,22 @@ impl Engine {
                 }
             }
         }
-        let next: std::collections::BTreeSet<String> = why.keys().cloned().collect();
-        if next == self.blacked_out {
+        // Past its resolve date a pair is open only because the venue has not
+        // settled it, and the APR hurdle floors its horizon at one day, so any
+        // edge there clears the bar. Nothing new opens on it until its date in
+        // `arb_core::resolve` is moved.
+        let today = arb_core::resolve::today_iso(now);
+        for q in quoters.iter() {
+            if let Some(rd) = arb_core::resolve::past_resolve(&q.rel.id, &today) {
+                why.entry(q.rel.id.clone()).or_insert_with(|| {
+                    format!("resolve date {rd} has passed — move it in arb_core::resolve if the pair is still live")
+                });
+            }
+        }
+        if why == self.blacked_out {
             return;
         }
-        let entered: Vec<String> = next.difference(&self.blacked_out).cloned().collect();
+        let entered: Vec<String> = why.keys().filter(|r| !self.blacked_out.contains_key(*r)).cloned().collect();
         // One line per reason, not per relationship: a family is dozens of
         // strikes entering together.
         let mut by_why: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
@@ -1514,7 +1531,19 @@ impl Engine {
         for (w, rels) in &by_why {
             eprintln!("[blackout] {w} — entries pulled on {} relationship(s): {}", rels.len(), rels.join(" "));
         }
-        let lifted: Vec<&String> = self.blacked_out.difference(&next).collect();
+        // A relationship can stay held while its reason changes: its row is
+        // deleted once the event passes and it is now past its resolve date.
+        // Without a line here, deleting the row looks like it did nothing.
+        let mut moved: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+        for (rel, w) in &why {
+            if self.blacked_out.get(rel).is_some_and(|old| old != w) {
+                moved.entry(w.as_str()).or_default().push(rel.as_str());
+            }
+        }
+        for (w, rels) in &moved {
+            eprintln!("[blackout] {w} — entries stay pulled on {} relationship(s): {}", rels.len(), rels.join(" "));
+        }
+        let lifted: Vec<&String> = self.blacked_out.keys().filter(|r| !why.contains_key(*r)).collect();
         if !lifted.is_empty() {
             eprintln!(
                 "[blackout] entries resume on {} relationship(s): {}",
@@ -1522,7 +1551,7 @@ impl Engine {
                 lifted.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ")
             );
         }
-        self.blacked_out = next;
+        self.blacked_out = why;
         self.install_suppress(quoters);
         for q in quoters.iter_mut().filter(|q| entered.contains(&q.rel.id)) {
             q.cancel_all(&mut self.cx, self.last_now, &mut self.intents);
@@ -2363,9 +2392,10 @@ impl Engine {
             if !self.tt_feasible[qi] {
                 continue;
             }
-            // Inside an announcement window nothing new opens by either path:
-            // a crossing seen across a print is one venue's stale book.
-            if self.blacked_out.contains(&quoters[qi].rel.id) {
+            // Inside an announcement window, or past its resolve date, nothing
+            // new opens by either path: a crossing seen across a print is one
+            // venue's stale book.
+            if self.blacked_out.contains_key(&quoters[qi].rel.id) {
                 continue;
             }
             let open =
@@ -2992,7 +3022,7 @@ pub async fn run(
     }
     // Before the first book event: a restart inside a window must not quote
     // into it for the second it takes the timer arm to come round.
-    eng.entry_blackout_tick(&mut quoters);
+    eng.entry_blackout_tick(&mut quoters, arb_core::clock::now_s());
 
     let mut kill_iv = tokio::time::interval(std::time::Duration::from_secs(1));
     kill_iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3050,7 +3080,7 @@ pub async fn run(
             _ = kill_iv.tick() => { let t = std::time::Instant::now(); eng.kill_tick(&mut quoters); eng.record_tick("kill", t); }
             _ = hedge_iv.tick(), if hedge_retry && !bench => { let t = std::time::Instant::now(); eng.hedge_tick(); eng.distrust_tick(&mut quoters); eng.record_tick("hedge", t); }
             // Off in bench/replay: it reads the wall clock against a file.
-            _ = blackout_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.entry_blackout_tick(&mut quoters); eng.record_tick("blackout", t); }
+            _ = blackout_iv.tick(), if !bench => { let t = std::time::Instant::now(); eng.entry_blackout_tick(&mut quoters, arb_core::clock::now_s()); eng.record_tick("blackout", t); }
             // Fills held for an `order_ack` that has not come. Bench has no live
             // ack path at all and must stay byte-deterministic, so it relies on
             // the flush after the loop instead of this deadline.
@@ -5921,6 +5951,10 @@ mod entry_blackout_tests {
     use crate::engine::maker_exit_seam_tests::{books_where_the_kalshi_ask_pays, quotes_kalshi_ask};
     use crate::engine::toxgate_reload_tests::quoter_and_books;
 
+    /// Every tick here runs at this instant, not the wall clock, so no row or
+    /// resolve date in a test can pass on its own: 2026-11-06T00:00:00Z.
+    const NOW: f64 = 1_793_923_200.0;
+
     fn scratch(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("entry-blackout-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
@@ -5957,12 +5991,12 @@ mod entry_blackout_tests {
         std::fs::write(&p, row("2020-01-01T00:00:00Z", false)).unwrap();
         let (mut quoters, _) = quoter_and_books();
         let mut eng = engine_reading(&p);
-        eng.entry_blackout_tick(&mut quoters);
+        eng.entry_blackout_tick(&mut quoters, NOW);
         assert!(eng.blacked_out.is_empty(), "a row without `entries` is the exit side's alone");
 
         // Entries, not yet open: still quoting.
         std::fs::write(&p, row("2099-01-01T00:00:00Z", true)).unwrap();
-        eng.entry_blackout_tick(&mut quoters);
+        eng.entry_blackout_tick(&mut quoters, NOW);
         assert!(eng.blacked_out.is_empty());
         let books = books_where_the_kalshi_ask_pays();
         assert!(quotes_kalshi_ask(&mut quoters, &books), "the fixture must quote");
@@ -5975,18 +6009,18 @@ mod entry_blackout_tests {
         let placed = eng.n_int;
         assert!(placed > 0, "the fixture must rest something to pull");
         std::fs::write(&p, row("2020-01-01T00:00:00Z", true)).unwrap();
-        eng.entry_blackout_tick(&mut quoters);
-        assert_eq!(eng.blacked_out.iter().collect::<Vec<_>>(), ["xvus-france-pres-27-test"]);
+        eng.entry_blackout_tick(&mut quoters, NOW);
+        assert_eq!(eng.blacked_out.keys().collect::<Vec<_>>(), ["xvus-france-pres-27-test"]);
         assert!(eng.n_int > placed, "opening the window must cancel what rests");
         let pulled = eng.n_int;
-        eng.entry_blackout_tick(&mut quoters);
+        eng.entry_blackout_tick(&mut quoters, NOW);
         eng.quote(&mut quoters, &[0], wall_now());
         assert_eq!(eng.n_int, pulled, "a steady window neither re-places nor re-cancels");
         assert!(!places_anything(&mut quoters, &books), "no leg, no side may open");
 
         // The row is deleted once the market settles: quoting comes back.
         std::fs::write(&p, "").unwrap();
-        eng.entry_blackout_tick(&mut quoters);
+        eng.entry_blackout_tick(&mut quoters, NOW);
         assert!(eng.blacked_out.is_empty());
         assert!(quotes_kalshi_ask(&mut quoters, &books), "release needs no restart");
     }
@@ -6005,14 +6039,68 @@ mod entry_blackout_tests {
         let (mut quoters, _) = quoter_and_books();
         let mut eng = engine_reading(&p);
         std::fs::write(&p, row("2099-01-01T00:00:00Z")).unwrap();
-        eng.entry_blackout_tick(&mut quoters);
-        assert_eq!(eng.blacked_out.iter().collect::<Vec<_>>(), ["xvus-france-pres-27-test"]);
+        eng.entry_blackout_tick(&mut quoters, NOW);
+        assert_eq!(eng.blacked_out.keys().collect::<Vec<_>>(), ["xvus-france-pres-27-test"]);
         let books = books_where_the_kalshi_ask_pays();
         assert!(!places_anything(&mut quoters, &books), "an open window holds every leg");
         std::fs::write(&p, row("2021-01-01T00:00:00Z")).unwrap();
-        eng.entry_blackout_tick(&mut quoters);
+        eng.entry_blackout_tick(&mut quoters, NOW);
         assert!(eng.blacked_out.is_empty(), "a closed window holds nothing");
         assert!(quotes_kalshi_ask(&mut quoters, &books), "quoting returns when the window closes");
+    }
+
+    /// A pair past its resolve date takes no new entry with no blackout row
+    /// at all; a pair with no date is untouched. `nobel-peace-26` resolved
+    /// 2026-10-09: on that day it is not past, from the next it is. A row's
+    /// reason wins over the date's, and deleting the row leaves the pair held
+    /// under the date rather than lifted.
+    #[test]
+    fn a_pair_past_its_resolve_date_takes_no_entries() {
+        use arb_core::scan::{RelLeg, RelType};
+        let p = scratch("past-resolve");
+        std::fs::write(&p, "").unwrap();
+        // Each pair on its own markets: suppression is installed per market
+        // side, so pairs sharing legs would silence each other.
+        let rel = |id: &str, k: &str, pm: &str| Rel {
+            id: id.into(),
+            rtype: RelType::CrossVenueEquivalent,
+            tranche: "head".into(),
+            legs: vec![
+                RelLeg { venue: Venue::Kalshi, market_id: k.into() },
+                RelLeg { venue: Venue::PolymarketUs, market_id: pm.into() },
+            ],
+        };
+        let mut books = books_where_the_kalshi_ask_pays();
+        let lvl = |p: &str, s: &str| Level { price: p.into(), size: s.into() };
+        books.apply_snapshot(Venue::Kalshi, "K2", vec![lvl("0.60", "500")], vec![lvl("0.99", "500")],
+            1, 1_000_000_000, None);
+        books.apply_snapshot(Venue::PolymarketUs, "P2", vec![lvl("0.10", "500")],
+            vec![lvl("0.20", "500")], 1, 1_000_000_000, None);
+        let past = || Quoter::new(rel("xvus-nobel-peace-26-test", "K2", "P2"));
+        assert!(places_anything(&mut [past()], &books), "the fixture must quote without the refusal");
+
+        let mut quoters = vec![Quoter::new(rel("xvus-undated-family-test", "K", "P")), past()];
+        let mut eng = engine_reading(&p);
+        eng.entry_blackout_tick(&mut quoters, NOW);
+        assert_eq!(eng.blacked_out.keys().collect::<Vec<_>>(), ["xvus-nobel-peace-26-test"]);
+        assert!(!places_anything(&mut quoters[1..], &books), "a pair past its date opens nothing");
+        assert!(quotes_kalshi_ask(&mut quoters[..1], &books), "an undated pair still quotes");
+
+        let nobel = "xvus-nobel-peace-26-test";
+        std::fs::write(&p, "- family: nobel-peace-26\n  from: 2020-01-01T00:00:00Z\n  why: prize\n  entries: true\n")
+            .unwrap();
+        eng.entry_blackout_tick(&mut quoters, NOW);
+        assert!(eng.blacked_out[nobel].starts_with("entry blackout on `nobel-peace-26`"), "the row's reason wins");
+        std::fs::write(&p, "").unwrap();
+        eng.entry_blackout_tick(&mut quoters, NOW);
+        assert!(eng.blacked_out[nobel].starts_with("resolve date 2026-10-09 has passed"), "held, not lifted");
+
+        let mut early = engine_reading(&p);
+        let mut one = vec![past()];
+        early.entry_blackout_tick(&mut one, 1_791_547_200.0); // 2026-10-09T12:00:00Z
+        assert!(early.blacked_out.is_empty(), "the resolve date itself is the settle day");
+        early.entry_blackout_tick(&mut one, 1_791_590_400.0); // 2026-10-10T00:00:00Z
+        assert_eq!(early.blacked_out.keys().collect::<Vec<_>>(), [nobel]);
     }
 
     /// A family that does not match is untouched, and a damaged file pauses
@@ -6024,12 +6112,12 @@ mod entry_blackout_tests {
         let (mut quoters, _) = quoter_and_books();
         let mut eng = engine_reading(&p);
         std::fs::write(&p, "- family: cpi-26sep\n  from: 2020-01-01T00:00:00Z\n  entries: true\n").unwrap();
-        eng.entry_blackout_tick(&mut quoters);
+        eng.entry_blackout_tick(&mut quoters, NOW);
         assert!(eng.blacked_out.is_empty());
         assert!(quotes_kalshi_ask(&mut quoters, &books));
 
         std::fs::write(&p, "- family: cpi-26sep\n  from: 2026-10-14\n  entries: true\n").unwrap();
-        eng.entry_blackout_tick(&mut quoters);
+        eng.entry_blackout_tick(&mut quoters, NOW);
         assert_eq!(eng.blacked_out.len(), 1, "an unparseable `from` must not read as no window");
         assert!(!places_anything(&mut quoters, &books));
     }
@@ -6046,9 +6134,9 @@ mod entry_blackout_tests {
         let mut eng = test_engine(cfg);
         let (mut quoters, _) = quoter_and_books();
         std::fs::write(&p, "- family: france-pres-27\n  from: 2020-01-01T00:00:00Z\n  entries: true\n").unwrap();
-        eng.entry_blackout_tick(&mut quoters);
+        eng.entry_blackout_tick(&mut quoters, NOW);
         std::fs::write(&p, "").unwrap();
-        eng.entry_blackout_tick(&mut quoters);
+        eng.entry_blackout_tick(&mut quoters, NOW);
         assert!(eng.blacked_out.is_empty());
         assert!(!quotes_kalshi_ask(&mut quoters, &books), "the declared side must stay yielded");
     }
@@ -6084,7 +6172,7 @@ mod entry_blackout_tests {
         assert_eq!(eng.n_tt, 1, "the control: this crossing is one take-take finds");
 
         std::fs::write(&p, "- family: france-pres-27\n  from: 2020-01-01T00:00:00Z\n  entries: true\n").unwrap();
-        eng.entry_blackout_tick(&mut quoters);
+        eng.entry_blackout_tick(&mut quoters, NOW);
         eng.take_take_scan(&mut quoters, &[0], wall_now());
         assert_eq!(eng.n_tt, 1, "inside the window the same crossing must not be taken");
     }

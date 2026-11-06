@@ -32,6 +32,10 @@
 # sell-backs that are owed keep running. A row without `until` belongs only on
 # an announcement that resolves the market; on a row like brazil-pres-26 (first
 # round, not resolution) it would stop entries until the row is deleted.
+#
+# Deleting a row does not reopen a pair that is past its resolve date
+# (`arb_core::resolve`): arb-trader takes no new entry on such a pair with or
+# without a row, and logs the hand-over when a row goes.
 
 - family: tsla-q3-deliv
   from: 2026-10-01T04:00:00Z   # 2026-10-01 00:00 ET
