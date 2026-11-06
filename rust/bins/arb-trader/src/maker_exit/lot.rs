@@ -1080,7 +1080,7 @@ fn hedge_limit(
             if cx.cmp(ask, limit) == Ordering::Greater {
                 return Err("PM ask exceeds close ceiling".into());
             }
-            limit
+            under_a_dollar(cx, limit)
         }
         Shape::RestPmUs => {
             let ladder = v.k_ladder.get(&o.market).cloned()
@@ -1435,6 +1435,36 @@ mod tests {
             assert_ne!(cx.cmp(group, price), Ordering::Greater);
         }
         assert!(allocate(active.members(), 9, 2).is_err());
+    }
+
+    /// The hedge a filled lot sends is a price PM-US accepts. This lot's
+    /// Kalshi leg sold at 0.99 on a 0.90 basis against a PM-US short whose NO
+    /// cost 0.0425, so the lock allows buying the YES back at about 1.04, and
+    /// PM-US refuses any limit of a dollar or more.
+    #[test]
+    fn a_hedge_whose_ceiling_clears_a_dollar_goes_out_at_the_dearest_pm_us_price() {
+        let mut lot = member(1., 8);
+        lot.limit = "0.9900".into();
+        lot.k_basis = "0.900000".into();
+        lot.pm_basis = "0.042500".into();
+        let mut cx = Cx::default();
+        let fees = FeeSchedule::new(&mut cx);
+        let active = Active {
+            order: aggregate(&[lot.clone()]).unwrap(),
+            allocations: vec![lot.clone()],
+            regroup: false,
+            rest: Receipt::new(lot.limit.clone(), 8),
+            filled: Some(8),
+            hedged: 0,
+            hedge: None,
+            attempts: 0,
+        };
+        assert_eq!(group_hedge_limit(&mut cx, &fees, &active, 8, &view("0.98")).unwrap(), "0.9900");
+
+        // The crossed first leg prices its hedge on the other solver path.
+        let mut crossed = lot.clone();
+        crossed.cross = Some(Cross { limit: "0.9900".into(), lock_ct: "0.05".into() });
+        assert_eq!(hedge_limit(&mut cx, &fees, &crossed, 8, &view("0.98")).unwrap(), "0.9900");
     }
 
     #[tokio::test]

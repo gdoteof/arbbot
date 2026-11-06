@@ -1318,6 +1318,20 @@ pub fn close_limit(
     Err("the close limit search did not converge — refusing rather than guessing".into())
 }
 
+/// The dearest price a PM-US order can carry: one tick under the dollar.
+///
+/// A [`close_limit`] ceiling above it says the Kalshi leg banked more than the
+/// lock needs, so any ask at all pays. The ceiling itself is not a price,
+/// though: PM-US refuses a limit of a dollar or more outright (HTTP 400, "The
+/// server was unable to process your request"), so a close sent at it never
+/// goes out, however often it is retried. A buy that closes a lot pays the
+/// ceiling or this, whichever is less.
+fn under_a_dollar(cx: &mut Cx, limit: D) -> D {
+    let tick = cx.parse_exact(TICK);
+    let top = cx.one_minus(tick);
+    if cx.cmp(limit, top) == Ordering::Greater { top } else { limit }
+}
+
 /// The largest multiple of `tick` at or below `x`. PM-US has one flat cent
 /// ladder, so there is no rung to be relative to.
 fn quantize_down(cx: &mut Cx, x: D, tick: D) -> D {
@@ -4286,7 +4300,8 @@ fn price_close(
             }
             // The limit, not the ask: we send at or above the touch, so the
             // worst fill is the limit, and the limit is the price the lock was
-            // solved for.
+            // solved for, or the dearest price PM-US has when that is dearer.
+            let limit = under_a_dollar(cx, limit);
             Ok(cx.quantize_4dp(limit).to_standard_notation_string())
         }
         // The PM-US bid filled at `fill`; solve for the cheapest Kalshi YES we
@@ -5296,6 +5311,29 @@ mod tests {
         dark.k_bid.insert("K-a".to_string(), "0.02".to_string());
         let why = price_close(&mut cx, &fees, &o, 5, &dark).expect_err("does not pay");
         assert!(why.contains("Kalshi bid"), "{why}");
+    }
+
+    /// A Kalshi leg that banked more than the lock needs leaves a close
+    /// ceiling over a dollar. Kalshi YES held at 0.90 sold at 0.99, against a
+    /// PM-US short whose NO cost 0.0425: buying the YES back at anything up to
+    /// about 1.04 still locks, and 1.04 is what went out. PM-US refuses a limit
+    /// of a dollar or more, so the close was refused on every retry and the
+    /// lot stayed one-legged. It goes out at 0.99.
+    #[test]
+    fn a_close_ceiling_over_a_dollar_buys_at_the_dearest_pm_us_price() {
+        let (mut cx, fees) = ready();
+        let mut o = resting_exit(8).order;
+        o.limit = "0.9900".into();
+        o.k_basis = "0.900000".into();
+        o.pm_basis = "0.042500".into();
+        let (fill, kb, pb) = (cx.parse_exact("0.99"), cx.parse_exact("0.90"), cx.parse_exact("0.0425"));
+        let ceiling = close_limit(&mut cx, &fees, fill, kb, pb, 8, Role::Maker, Role::Taker, MIN_LOCK)
+            .expect("closes");
+        let one = cx.one;
+        assert!(cx.cmp(ceiling, one) == Ordering::Greater, "the fixture must clear a dollar: {}", cx.emit_6dp(ceiling));
+
+        let px = price_close(&mut cx, &fees, &o, 8, &view("0.98")).expect("priced");
+        assert_eq!(px, "0.9900");
     }
 
     /// THE 3AM LINE. The naked alarm must name the side we are ACTUALLY naked
