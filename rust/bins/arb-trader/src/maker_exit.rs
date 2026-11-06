@@ -1332,6 +1332,13 @@ fn under_a_dollar(cx: &mut Cx, limit: D) -> D {
     if cx.cmp(limit, top) == Ordering::Greater { top } else { limit }
 }
 
+/// The cheapest price a PM-US order can carry: one tick over zero. The
+/// mirror of [`under_a_dollar`], for a sell stepped through a 0.01 bid.
+fn over_zero(cx: &mut Cx, limit: D) -> D {
+    let tick = cx.parse_exact(TICK);
+    if cx.cmp(limit, tick) == Ordering::Less { tick } else { limit }
+}
+
 /// The largest multiple of `tick` at or below `x`. PM-US has one flat cent
 /// ladder, so there is no rung to be relative to.
 fn quantize_down(cx: &mut Cx, x: D, tick: D) -> D {
@@ -2052,9 +2059,13 @@ pub fn decide(
                 // The leg that would have rested is the one crossed FIRST, at its
                 // marketable price; the other is closed by `close_leg` exactly as it
                 // is after a resting fill, re-priced against the book at that moment.
+                //
+                // `pm_take` is a tick through the offer, which through a 0.99
+                // offer is a price PM-US does not have; the lock above was
+                // priced there, so taking at 0.99 locks at least that.
                 let first = match shape {
                     Shape::RestKalshi => k_take,
-                    Shape::RestPmUs => pm_take,
+                    Shape::RestPmUs => under_a_dollar(cx, pm_take),
                 };
                 return Some((Cross {
                     limit: cx.quantize_4dp(first).to_standard_notation_string(),
@@ -4773,6 +4784,24 @@ mod tests {
         let rested: f64 = o.lock_ct.parse().expect("a decimal");
         assert!(crossed < rested, "crossing pays the spread: {c:?} vs {}", o.lock_ct);
         assert!(crossed >= 0.02, "and still clears the 0.02 selection floor: {c:?}");
+    }
+
+    /// A rest-pmus cross takes the PM-US offer a tick through, and through a
+    /// 0.99 offer that is 1.00, a price PM-US refuses outright. It takes at
+    /// 0.99. Kalshi is a one-tick 0.97/0.98 book here, so the wider PM-US
+    /// spread wins the shape.
+    #[tokio::test]
+    async fn a_rest_pmus_cross_through_a_99c_offer_takes_at_99c() {
+        let _g = allow_all().await;
+        let (mut cx, fees) = ready();
+        let recs = vec![open_basket(1.0, 5, "0.95", "0.85")];
+        let q = quote(Some("0.97"), Some("0.98"));
+        let vw = wide_pm_view("0.99", "0.90", "0.97");
+        let o = decide(&mut cx, &fees, &recs, &cand(5, 1.0), "p-a", &q, &vw, Instant::now(), true, DepthClaims::default())
+            .expect("the resting shape pays");
+        assert_eq!(o.shape, Shape::RestPmUs, "the wider spread is PM-US's: {o:?}");
+        let c = o.cross.as_ref().expect("crossing clears the floor here: {o:?}");
+        assert_eq!(c.limit, "0.9900", "{o:?}");
     }
 
     /// **A CROSS INTO OUR OWN QUOTE IS CANCELLED, NOT FILLED**, so the side it
