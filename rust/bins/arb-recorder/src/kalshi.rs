@@ -219,7 +219,7 @@ impl KalshiCatalog {
     ///
     /// Paced, because back to back they are rate-limited: the first poll that
     /// logged its failures (11-05 14:09) had 5 of its 7 requests answer 429,
-    /// sharing the public budget with the 300s integrity sweep's own requests.
+    /// sharing the public budget with the integrity sweep's own requests.
     pub async fn statuses(&self, tickers: &[String]) -> StatusPoll {
         let mut poll = StatusPoll::default();
         for (i, chunk) in tickers.chunks(50).enumerate() {
@@ -272,7 +272,7 @@ pub struct StatusPoll {
 ///
 /// Symmetric, and the symmetry is the point. Live is a WHITELIST of spellings,
 /// so anything the venue invents evicts — which is the right way to fail, but
-/// eviction also removes the market from the 300s integrity sweep. Kalshi's
+/// eviction also removes the market from the integrity sweep. Kalshi's
 /// vocabulary is wider than the terminal states (`inactive` appears in this
 /// repo's captured catalog on markets whose close time is years away), and the
 /// whitelist needing BOTH "active" and "open" is evidence it has drifted
@@ -319,12 +319,24 @@ fn ws_subscribe_frame(tickers: &[String]) -> String {
 ///
 /// It sweeps by REST now, the same call the gap handler uses. Doing all 191
 /// tickers in one burst would block the WS read for ~19s, so the universe is
-/// covered a slice at a time: every `RESNAP_TICK_S` a tenth of it is refreshed,
-/// which keeps the blocking window ~2s while still bounding every book's age at
-/// `RESNAP_FULL_S`. Same reasoning as pacing the broadcaster's rebroadcast —
-/// a periodic burst sized like the whole universe is a burst that hurts.
-const RESNAP_FULL_S: u64 = 300;
-const RESNAP_CHUNKS: usize = 10;
+/// covered a slice at a time: every `RESNAP_TICK_S` a twentieth of it is
+/// refreshed, which keeps the blocking window short while still bounding every
+/// book's age at `RESNAP_FULL_S`. Same reasoning as pacing the broadcaster's
+/// rebroadcast — a periodic burst sized like the whole universe is a burst that
+/// hurts.
+///
+/// The slice is held at the size it was measured at, not sized to the bound.
+/// At 300s in ten slices a 333-ticker universe sent 34 requests back to back
+/// every 30s, the WS unread while they ran, and about 1.6% of them failed (379
+/// of ~23,600 on 2026-11-05 after the 13:39 ET restart). The 11-05 census takes
+/// the universe to 717 tickers: 72 a slice at that shape, twice the request
+/// rate on the public budget the status poll shares and twice as long with the
+/// socket unread. Nothing measured says 72 would fail more, so twenty slices
+/// over 600s keep both where they were measured. The backstop bound doubles;
+/// WS deltas and the gap handler's own REST resnapshot keep a book live
+/// between sweeps.
+const RESNAP_FULL_S: u64 = 600;
+const RESNAP_CHUNKS: usize = 20;
 const RESNAP_TICK_S: u64 = RESNAP_FULL_S / RESNAP_CHUNKS as u64;
 
 /// How many tickers one resnapshot tick refreshes. Rounds UP, so `RESNAP_CHUNKS`
@@ -360,6 +372,7 @@ async fn resnap_slice(
 ) -> usize {
     let batch = resnap_batch(tickers.len(), RESNAP_CHUNKS);
     let (mut tried, mut failed) = (0usize, 0usize);
+    let mut first: Option<String> = None;
     for i in 0..batch {
         let t = &tickers[(cursor + i) % tickers.len()];
         if core.is_evicted(Venue::Kalshi, t) {
@@ -373,16 +386,21 @@ async fn resnap_slice(
                     core.on_event(&snap);
                 }
             }
-            Err(_) => failed += 1,
+            Err(e) => {
+                failed += 1;
+                first.get_or_insert_with(|| format!("{e:#}"));
+            }
         }
     }
     // A silent failure here is a book that keeps whatever state it was left in,
     // which is how one reached 74,082s old against a 300s interval. Counted,
-    // not logged per ticker.
+    // not logged per ticker; the first error says whether it was the budget
+    // (429), a purged market (404) or the network.
     if failed > 0 {
         eprintln!(
             "[kalshi-ws] resnapshot slice: {failed}/{tried} books did NOT refresh — \
-             their age is now unbounded"
+             their age is now unbounded (first: {})",
+            first.unwrap_or_default()
         );
     }
     batch
@@ -771,7 +789,7 @@ mod tests {
     ///
     /// Leaving the sweep is the expensive half of eviction: the only heal left
     /// to a market outside it is the resnapshot a `NotSynced` delta triggers,
-    /// so its bound stretches from 300s to the universe poll's 1800s. The
+    /// so its bound stretches from `RESNAP_FULL_S` to the universe poll's 1800s. The
     /// predicate that evicts is a whitelist of live spellings, and Kalshi's
     /// vocabulary is wider than the states that are terminal — `inactive`
     /// appears in this repo's captured catalog on a market whose close time is

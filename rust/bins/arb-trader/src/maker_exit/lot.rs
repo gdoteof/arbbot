@@ -2055,7 +2055,7 @@ mod tests {
         let f = Fixture::new();
         let mut a = f.owner(1., 3);
         f.place(&mut a, 1., 3, Shape::RestKalshi).await;
-        react::set_blackouts(Ok(vec![("r1".into(), 0.0, "announcement".into())]));
+        react::set_blackouts(Ok(vec![("r1".into(), 0.0, f64::INFINITY, "announcement".into())]));
         let out = f.manage(&mut a).await;
         react::set_blackouts(Ok(Vec::new()));
         let why = out.iter().find(|l| l.contains("PULLING")).unwrap_or_else(|| panic!("{out:?}"));

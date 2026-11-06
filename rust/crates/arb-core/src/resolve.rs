@@ -146,6 +146,36 @@ const RULES: &[(&str, &str, bool)] = &[
     // Both legs' own deadlines, "before Jan 1, 2027" on Kalshi.
     ("xvus-cryptoleg-26-12-31", "2027-01-01", false),
     ("xvus-gashi-26", "2027-01-01", false),
+    // Each leg's own deadline: BTC's 2027-01-01 00:00 ET print, the year-end
+    // AAA, Fed and Putin-Zelenskyy windows, and AAA's 11-30 figure (Kalshi
+    // expires 12-01 05:15Z on the monthly max and min).
+    ("xvus-btcye-26", "2027-01-01", false),
+    ("xvus-gaslo-26", "2027-01-01", false),
+    ("xvus-fedgt25-26", "2027-01-01", false),
+    ("xvus-putzel-26", "2027-01-01", false),
+    ("xvus-gas-26nov", "2026-12-01", false),
+    // Scheduled announcements, dated the day after: Grammy nominations 11-16
+    // 07:45 ET, the CMA show 11-18 20:00 ET, Oscar nominations 2027-01-21,
+    // the Grammys 2027-02-07. House and Senate Republicans elect their leaders
+    // 11-10. Senate Democrats have not set a date: AP expected their vote the
+    // week after Election Day, other reporting early December. The
+    // majority-leader row takes the later 12-10, which understates APR if the
+    // vote comes first, and entries stop at 11-10 either way. The Speaker is the
+    // 2027-01-03 floor vote. A Billboard No waits for Kalshi's expiry: 11-28
+    // for the Hot 100 window, 12-27 for the album market. Google's Year in
+    // Search fell 12-10 in 2024 and 12-04 in 2025.
+    ("xvus-grammynom-27", "2026-11-17", true),
+    ("xvus-cma-26", "2026-11-19", true),
+    ("xvus-oscarnom-27", "2027-01-22", true),
+    ("xvus-grammy-27", "2027-02-08", true),
+    ("xvus-cong120-hrmin", "2026-11-11", true),
+    ("xvus-cong120-senmin", "2026-11-11", true),
+    ("xvus-cong120-senmaj", "2026-12-10", true),
+    ("xvus-cong120-speaker", "2027-01-04", true),
+    ("xvus-bbsong-26nov28", "2026-11-28", true),
+    ("xvus-bbalbum-26", "2026-12-27", true),
+    ("xvus-gsearch-26", "2026-12-10", true),
+    ("xvus-bestai-26nov", "2026-12-01", true),
     // November 3 midterms. Both venues settle on media calls (Kalshi at 4 of 8
     // designated sources, PM-US on tertiary-source consensus), so the hold is
     // days, not the January swearing-in Kalshi's expiry reads as. Dated three
@@ -343,6 +373,45 @@ mod tests {
         assert_eq!(resolve_date("xvus-gta6-26-by-nov19"), Some(("2026-11-19", true)));
         assert_eq!(resolve_date("xvus-cryptoleg-26-12-31"), Some(("2027-01-01", false)));
         assert_eq!(resolve_date("xvus-gashi-26-gt4p6"), Some(("2027-01-01", false)));
+    }
+
+    /// Every family onboarded 2026-11-05 is dated, and the families it extends
+    /// (TIME, Spotify, NFL, Oscars Best Picture) keep their existing rows.
+    #[test]
+    fn the_november_families_resolve() {
+        for (id, date, est) in [
+            ("xvus-btcye-26-b77500", "2027-01-01", false),
+            ("xvus-btcye-26-above150k", "2027-01-01", false),
+            ("xvus-gaslo-26-lt3p60", "2027-01-01", false),
+            ("xvus-fedgt25-26-12-31", "2027-01-01", false),
+            ("xvus-putzel-26-12-31", "2027-01-01", false),
+            ("xvus-gas-26nov-on30-gt3p70", "2026-12-01", false),
+            ("xvus-gas-26nov-max-gt4p25", "2026-12-01", false),
+            ("xvus-gas-26nov-min-lt3p90", "2026-12-01", false),
+            ("xvus-grammynom-27-aoty-lux", "2026-11-17", true),
+            ("xvus-cma-26-eoty-ellalangley", "2026-11-19", true),
+            ("xvus-oscarnom-27-bestpic-theodyssey", "2027-01-22", true),
+            ("xvus-grammy-27-aoty-lux", "2027-02-08", true),
+            ("xvus-cong120-hrmin-jimjordan", "2026-11-11", true),
+            ("xvus-cong120-senmin-johnthune", "2026-11-11", true),
+            ("xvus-cong120-senmaj-chuckschumer", "2026-12-10", true),
+            ("xvus-cong120-speaker-hakeemjeffries", "2027-01-04", true),
+            ("xvus-bbsong-26nov28-dracula", "2026-11-28", true),
+            ("xvus-bbalbum-26-taylorswift", "2026-12-27", true),
+            ("xvus-gsearch-26-donaldtrump", "2026-12-10", true),
+            ("xvus-bestai-26nov-google", "2026-12-01", true),
+            ("xvus-time-poty-26-xijinping", "2026-12-09", true),
+            ("xvus-spotify-26-artist-us-badbunny", "2026-12-03", true),
+            ("xvus-nfl-27-opoy-joshallen", "2027-02-11", true),
+            ("xvus-oscars-bestpic-27-youcanseeeverything", "2027-03-16", true),
+        ] {
+            assert_eq!(resolve_date(id), Some((date, est)), "{id}");
+        }
+        // The new rows sit beside older families sharing a stem and must not
+        // capture them: the first prefix hit wins.
+        assert_eq!(resolve_date("xvus-gashi-26-gt4p6"), Some(("2027-01-01", false)));
+        assert_eq!(resolve_date("xvus-bestai-26dec-anthropic"), Some(("2027-01-05", true)));
+        assert_eq!(resolve_date("xvus-oscars-bestactor-27-mattdamon"), Some(("2027-03-16", true)));
     }
 
     /// Vermont's statewide rows must win over the general midterm row, and the

@@ -301,7 +301,7 @@ impl Core {
     /// Loud, and REVERSIBLE, because it now costs more than a map entry.
     /// Dropping a book is cheap — the next sweep rebuilds it. Leaving the sweep
     /// is not: that market's only remaining heal is the REST resnapshot a
-    /// `NotSynced` delta triggers, so its bound goes from the sweep's 300s to
+    /// `NotSynced` delta triggers, so its bound goes from the sweep's interval to
     /// however often it is evicted again. Kalshi's status vocabulary is wider
     /// than the terminal states — this repo's own captured catalog has 20
     /// markets at `inactive`, one of them with a 2029 close time and no result

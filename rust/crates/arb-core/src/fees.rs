@@ -43,6 +43,7 @@ pub enum Role {
 /// registry. (`fee_multiplier` is also reported — 0.5 on KXMLBGAME, 0 on
 /// KXGREENLAND, where nobody pays — and is not modelled.)
 pub const KALSHI_MAKER_FEE_SERIES: &[&str] = &[
+    "KXAAAGASM",
     "KXATPMATCH",
     "KXBTCMAX150",
     "KXCPI",
@@ -84,12 +85,18 @@ pub const KALSHI_FREE_MAKER_SERIES: &[&str] = &[
     "GOVPARTYVT",
     "GOVPARTYWI",
     "GTA6",
+    "KX1ALBUM",
     "KXAAAGASMAX",
+    "KXAAAGASMAXM",
+    "KXAAAGASMIN",
+    "KXAAAGASMINM",
     "KXALIENS",
     "KXBALANCEPOWERCOMBO",
     "KXBRPRES",
     "KXBTCMAXY",
+    "KXBTCY",
     "KXCAWEALTHTAX",
+    "KXCMA",
     "KXCPICORE",
     "KXCPICOREYOY",
     "KXCRYPTOSTRUCTURE",
@@ -97,26 +104,57 @@ pub const KALSHI_FREE_MAKER_SERIES: &[&str] = &[
     "KXFLPROPERTYTAX",
     "KXFRENCHPRES",
     "KXGPT",
+    "KXGRAMAOTY",
+    "KXGRAMBNA",
+    "KXGRAMMYNOMAOTY",
+    "KXGRAMMYNOMBRA",
+    "KXGRAMMYNOMNAOTY",
+    "KXGRAMMYNOMROTY",
+    "KXGRAMMYNOMSOTY",
     "KXGREENLAND",
     "KXGREENTERRITORY",
     "KXGTA6ONTIME",
     "KXHOUSERACE",
     "KXITFMATCH",
     "KXITFWMATCH",
+    "KXLARGECUT",
     "KXLEADERSOUT",
     "KXLTGOVVT",
+    "KXMINLEAD120",
     "KXMLBALMVP",
     "KXMLBALROTY",
     "KXMLBNLROTY",
     "KXNOBELPEACE",
     "KXOSCARACTO",
     "KXOSCARACTR",
+    "KXOSCARNOMACTO",
+    "KXOSCARNOMACTR",
+    "KXOSCARNOMASPLAY",
+    "KXOSCARNOMBCASTING",
+    "KXOSCARNOMCIN",
+    "KXOSCARNOMDIR",
+    "KXOSCARNOMDOCU",
+    "KXOSCARNOMINTERFILM",
+    "KXOSCARNOMMAKEUP",
+    "KXOSCARNOMPIC",
+    "KXOSCARNOMSBANIMATEDF",
+    "KXOSCARNOMSCORE",
+    "KXOSCARNOMSPLAY",
+    "KXOSCARNOMSUPACTO",
+    "KXOSCARNOMSUPACTR",
+    "KXOSCARNOMVISUAL",
     "KXOSCARPIC",
     "KXPRESNOMD",
     "KXPRESNOMR",
     "KXPRESPERSON",
+    "KXPUTINZELMEET",
+    "KXRANKLIST1SONG",
+    "KXRANKLISTGOOGLESEARCH",
     "KXRATECUT",
     "KXSENATELA",
+    "KXSENMAJ",
+    "KXSENMIN",
+    "KXSPEAKER120",
     "KXTIME",
     "KXTOPARTIST",
     "KXTOPARTISTUSA",
@@ -334,6 +372,13 @@ mod tests {
         assert!(kalshi_charges_makers(""));
         assert!(kalshi_series_fee_known("KXCPI-26SEP-T0.4"));
         assert!(kalshi_series_fee_known("KXTIME-26-ZOH"));
+        // The AAA gas series share a stem and differ: only the point-in-time
+        // monthly series charges makers.
+        assert!(kalshi_charges_makers("KXAAAGASM-26NOV30-3.70"));
+        assert!(!kalshi_charges_makers("KXAAAGASMAXM-26NOV30-4.25"));
+        assert!(!kalshi_charges_makers("KXAAAGASMINM-26NOV30-3.90"));
+        assert!(!kalshi_charges_makers("KXAAAGASMIN-26DEC31-3.60"));
+        assert!(!kalshi_charges_makers("KXBTCY-27JAN0100-B77500"));
         for s in KALSHI_MAKER_FEE_SERIES {
             assert!(!KALSHI_FREE_MAKER_SERIES.contains(s), "{s} is on both lists");
             assert!(!s.contains('-'), "{s} is a ticker, not a series");
