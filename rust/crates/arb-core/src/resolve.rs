@@ -157,20 +157,20 @@ const RULES: &[(&str, &str, bool)] = &[
     // Scheduled announcements, dated the day after: Grammy nominations 11-16
     // 07:45 ET, the CMA show 11-18 20:00 ET, Oscar nominations 2027-01-21,
     // the Grammys 2027-02-07. House and Senate Republicans elect their leaders
-    // 11-10. Senate Democrats have not set a date, so the majority-leader row
-    // takes 12-01; the Speaker is the 2027-01-03 floor vote. Billboard posts
-    // the chart dated 11-28 on 11-24 and the 12-26 chart on 12-22; Kalshi
-    // closes the album market 12-27. Google's Year in Search fell 12-10 in
-    // 2024 and 12-04 in 2025.
+    // 11-10. Senate Democrats have not set a date and are reported to vote in
+    // early December, so the majority-leader row takes 12-10; the Speaker is the
+    // 2027-01-03 floor vote. A Billboard No waits for Kalshi's expiry: 11-28
+    // for the Hot 100 window, 12-27 for the album market. Google's Year in
+    // Search fell 12-10 in 2024 and 12-04 in 2025.
     ("xvus-grammynom-27", "2026-11-17", true),
     ("xvus-cma-26", "2026-11-19", true),
     ("xvus-oscarnom-27", "2027-01-22", true),
     ("xvus-grammy-27", "2027-02-08", true),
     ("xvus-cong120-hrmin", "2026-11-11", true),
     ("xvus-cong120-senmin", "2026-11-11", true),
-    ("xvus-cong120-senmaj", "2026-12-01", true),
+    ("xvus-cong120-senmaj", "2026-12-10", true),
     ("xvus-cong120-speaker", "2027-01-04", true),
-    ("xvus-bbsong-26nov28", "2026-11-25", true),
+    ("xvus-bbsong-26nov28", "2026-11-28", true),
     ("xvus-bbalbum-26", "2026-12-27", true),
     ("xvus-gsearch-26", "2026-12-10", true),
     ("xvus-bestai-26nov", "2026-12-01", true),
@@ -392,9 +392,9 @@ mod tests {
             ("xvus-grammy-27-aoty-lux", "2027-02-08", true),
             ("xvus-cong120-hrmin-jimjordan", "2026-11-11", true),
             ("xvus-cong120-senmin-johnthune", "2026-11-11", true),
-            ("xvus-cong120-senmaj-chuckschumer", "2026-12-01", true),
+            ("xvus-cong120-senmaj-chuckschumer", "2026-12-10", true),
             ("xvus-cong120-speaker-hakeemjeffries", "2027-01-04", true),
-            ("xvus-bbsong-26nov28-dracula", "2026-11-25", true),
+            ("xvus-bbsong-26nov28-dracula", "2026-11-28", true),
             ("xvus-bbalbum-26-taylorswift", "2026-12-27", true),
             ("xvus-gsearch-26-donaldtrump", "2026-12-10", true),
             ("xvus-bestai-26nov-google", "2026-12-01", true),

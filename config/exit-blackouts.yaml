@@ -147,7 +147,7 @@
   entries: true
 - family: btcye-26
   from: 2027-01-01T03:00:00Z   # 2026-12-31 22:00 ET
-  why: BRTI year-end print 2027-01-01 00:00 ET; the venues average its last minute differently
+  why: BRTI year-end print 2027-01-01 00:00 ET; no entry rests into the minute both venues read
   entries: true
 - family: oscarnom-27
   from: 2027-01-21T05:00:00Z   # 2027-01-21 00:00 ET
@@ -156,4 +156,44 @@
 - family: grammy-27
   from: 2027-02-07T05:00:00Z   # 2027-02-07 00:00 ET
   why: 69th Grammy Awards ceremony 2027-02-07
+  entries: true
+- family: bbsong-26nov28
+  from: 2026-11-23T05:00:00Z   # 2026-11-23 00:00 ET
+  why: Billboard previews the Hot 100 dated 11-28, the window's last chart, 2026-11-23; PM-US closes 11-25
+  entries: true
+- family: bestai-26nov
+  from: 2026-11-30T05:00:00Z   # 2026-11-30 00:00 ET
+  why: Kalshi stops trading KXLLM1-26NOV30 at 10:00 ET 11-30, PM-US trades on past its 12:00 ET snapshot
+  entries: true
+- family: cong120-senmaj
+  from: 2026-12-01T05:00:00Z   # 2026-12-01 00:00 ET
+  why: Senate Democratic leader vote, unscheduled, reported for early December; move once it is set
+  entries: true
+- family: gsearch-26
+  from: 2026-12-01T05:00:00Z   # 2026-12-01 00:00 ET
+  why: Google Year in Search release, day unannounced, 12-10 in 2024 and 12-04 in 2025
+  entries: true
+- family: time-poty-26
+  from: 2026-12-06T05:00:00Z   # 2026-12-06 00:00 ET
+  why: TIME Person of the Year reveal, day unannounced, 12-06 in 2023 and 12-12 in 2024
+  entries: true
+- family: bbalbum-26
+  from: 2026-12-20T05:00:00Z   # 2026-12-20 00:00 ET
+  why: Billboard reveals the No. 1 on the 12-26 Billboard 200, the last chart counted, 2026-12-20
+  entries: true
+- family: bestai-26dec
+  from: 2026-12-31T05:00:00Z   # 2026-12-31 00:00 ET
+  why: Kalshi stops trading KXLLM1-26DEC31 at 10:00 ET 12-31, PM-US trades on past its 12:00 ET snapshot
+  entries: true
+- family: gaslo-26
+  from: 2026-12-31T05:00:00Z   # 2026-12-31 00:00 ET
+  why: Kalshi stops trading KXAAAGASMIN-26DEC31 at 01:25 ET 12-31; PM-US trades all day and the 12-31 AAA print counts on both
+  entries: true
+- family: gashi-26
+  from: 2026-12-31T05:00:00Z   # 2026-12-31 00:00 ET
+  why: Kalshi stops trading KXAAAGASMAX-26DEC31 at 01:25 ET 12-31; PM-US trades all day and the 12-31 AAA print counts on both
+  entries: true
+- family: cong120-speaker
+  from: 2027-01-03T05:00:00Z   # 2027-01-03 00:00 ET
+  why: House floor vote for Speaker of the 120th Congress, 2027-01-03
   entries: true

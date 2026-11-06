@@ -219,7 +219,7 @@ impl KalshiCatalog {
     ///
     /// Paced, because back to back they are rate-limited: the first poll that
     /// logged its failures (11-05 14:09) had 5 of its 7 requests answer 429,
-    /// sharing the public budget with the 300s integrity sweep's own requests.
+    /// sharing the public budget with the integrity sweep's own requests.
     pub async fn statuses(&self, tickers: &[String]) -> StatusPoll {
         let mut poll = StatusPoll::default();
         for (i, chunk) in tickers.chunks(50).enumerate() {
@@ -272,7 +272,7 @@ pub struct StatusPoll {
 ///
 /// Symmetric, and the symmetry is the point. Live is a WHITELIST of spellings,
 /// so anything the venue invents evicts — which is the right way to fail, but
-/// eviction also removes the market from the 300s integrity sweep. Kalshi's
+/// eviction also removes the market from the integrity sweep. Kalshi's
 /// vocabulary is wider than the terminal states (`inactive` appears in this
 /// repo's captured catalog on markets whose close time is years away), and the
 /// whitelist needing BOTH "active" and "open" is evidence it has drifted
@@ -319,12 +319,21 @@ fn ws_subscribe_frame(tickers: &[String]) -> String {
 ///
 /// It sweeps by REST now, the same call the gap handler uses. Doing all 191
 /// tickers in one burst would block the WS read for ~19s, so the universe is
-/// covered a slice at a time: every `RESNAP_TICK_S` a tenth of it is refreshed,
-/// which keeps the blocking window ~2s while still bounding every book's age at
-/// `RESNAP_FULL_S`. Same reasoning as pacing the broadcaster's rebroadcast —
-/// a periodic burst sized like the whole universe is a burst that hurts.
-const RESNAP_FULL_S: u64 = 300;
-const RESNAP_CHUNKS: usize = 10;
+/// covered a slice at a time: every `RESNAP_TICK_S` a twentieth of it is
+/// refreshed, which keeps the blocking window short while still bounding every
+/// book's age at `RESNAP_FULL_S`. Same reasoning as pacing the broadcaster's
+/// rebroadcast — a periodic burst sized like the whole universe is a burst that
+/// hurts.
+///
+/// The slice is sized to the request rate the public budget takes, not to the
+/// bound. At 300s over ten slices, 333 tickers already cost 34 back-to-back
+/// requests every 30s and 7.2% of them failed (1,547 of 21,602 on 2026-11-05,
+/// on 608 slices). The 11-05 census takes the universe to 717 tickers, and at
+/// the old shape that is 72 requests a slice. Twenty slices over 600s keeps a
+/// slice at 36 and the rate where it was; the backstop bound doubles, while WS
+/// deltas and the gap handler's own REST resnapshot keep books live in between.
+const RESNAP_FULL_S: u64 = 600;
+const RESNAP_CHUNKS: usize = 20;
 const RESNAP_TICK_S: u64 = RESNAP_FULL_S / RESNAP_CHUNKS as u64;
 
 /// How many tickers one resnapshot tick refreshes. Rounds UP, so `RESNAP_CHUNKS`
@@ -771,7 +780,7 @@ mod tests {
     ///
     /// Leaving the sweep is the expensive half of eviction: the only heal left
     /// to a market outside it is the resnapshot a `NotSynced` delta triggers,
-    /// so its bound stretches from 300s to the universe poll's 1800s. The
+    /// so its bound stretches from `RESNAP_FULL_S` to the universe poll's 1800s. The
     /// predicate that evicts is a whitelist of live spellings, and Kalshi's
     /// vocabulary is wider than the states that are terminal — `inactive`
     /// appears in this repo's captured catalog on a market whose close time is
