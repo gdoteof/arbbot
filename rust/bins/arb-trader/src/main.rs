@@ -3508,8 +3508,8 @@ mod undischarged_seed_tests {
     use arb_core::scan::{Rel, RelLeg, RelType};
 
     /// The 2026-07-29 incident's pair, already named in `arb_core`'s own
-    /// crossed-book fixtures. The qty is sized so that the $150
-    /// per-relationship cap is the thing that answers; it is not the live one.
+    /// crossed-book fixtures. Its qty is sized against the 300-contract
+    /// per-relationship cap; it is not the live one.
     const REL: &str = "xvus-fedcut-26-usfed-2026-cut";
     const KMKT: &str = "KXRATECUT-26DEC31";
     const MAKER: &str = "t1785282065001";
@@ -3544,7 +3544,7 @@ mod undischarged_seed_tests {
 
     /// A fresh risk view, as `build_risk_view` makes one: $980 bankroll, both
     /// venues funded, this relationship classified `low` (so the per-rel cap is
-    /// the full $150).
+    /// the full 300).
     fn view(d: &std::path::Path) -> risk::RiskView {
         risk::RiskView::load(
             d.join("exec.yaml").to_str().unwrap(),
@@ -3578,15 +3578,18 @@ mod undischarged_seed_tests {
         )])
     }
 
-    /// THE DEFECT. The obligation is 148 contracts against a $150 cap, so a
+    /// THE DEFECT. The obligation is 298 contracts against a 300 cap, so a
     /// clip of 5 must be refused — and was allowed, because the census reached
     /// a gauge and not the gate.
     #[test]
     fn an_undischarged_obligation_does_not_re_authorise_the_per_rel_cap() {
         let d = dir("no-reauth");
-        let found = orphan::undischarged(&mint(148), vec![]);
+        // $4,000 puts the per-event cap at $600, so the per-relationship cap
+        // is the only limit 298 + 5 crosses.
+        std::fs::write(d.join("exec.yaml"), "bankroll_usd: 4000\nper_class_cap: 0.35\n").unwrap();
+        let found = orphan::undischarged(&mint(298), vec![]);
         assert_eq!(found.len(), 1, "the census still finds it");
-        assert_eq!(found[0].missing(), 148);
+        assert_eq!(found[0].missing(), 298);
 
         // Unseeded — the state every restart came up in.
         let flat = view(&d);
@@ -3597,9 +3600,9 @@ mod undischarged_seed_tests {
 
         let v = view(&d);
         seed_exposure_from_census(&v, &found, &class_of());
-        assert_eq!(v.open_ct(REL), 148.0, "the leg is real at the venue");
+        assert_eq!(v.open_ct(REL), 298.0, "the leg is real at the venue");
         let dec = v.check(&rel(), Venue::Kalshi, 5, None);
-        assert!(!dec.allowed, "148 open against a 150 cap leaves no room for 5");
+        assert!(!dec.allowed, "298 open against a 300 cap leaves no room for 5");
         assert!(
             dec.reasons.iter().any(|r| r.contains("per-relationship")),
             "{:?}",
