@@ -20,17 +20,20 @@
 //! below — not linked, because it is private and the link would be dead.
 //!
 //! WHICH CAPS A RESERVATION CHARGES. The class and global caps bound capital,
-//! and a resting quote commits capital, so they count it. The per-relationship
+//! and a resting quote commits capital, so they count it — but only up to a
+//! burst of [`RESTING_BURST_CT`] contracts, since resting quotes fill a few at a
+//! time and each fill pulls what no longer fits. The per-relationship
 //! tail cap, the topic budget and the per-event loss cap bound what a rule
 //! divergence can cost, and only a filled contract can lose that money, so they
 //! read fills. Those three are lines we stop adding at, not hard maxima: quotes
 //! admitted side by side can overfill them, and the fill that reaches one pulls
 //! whatever the gate would no longer admit (`Quoter::pull_refused`). A take-take
 //! IOC is a fill in flight and counts as filled. What bounds the overfill is the
-//! cash check: every reservation also charges the venue its fill would have to
-//! hedge on, and a fill stays charged until a balance reading that began after
-//! it, so no more rests than the other venue can fund. A hedge still unsent at
-//! that reading drops out of the charge, and the naked limit bounds those.
+//! pull on every fill and the cash check: resting quotes charge the venue their
+//! fills would have to hedge on, up to the same burst, and a fill's hedge stays
+//! charged in full until a balance reading that began after it. A hedge still
+//! unsent at that reading drops out of the charge, and the naked limit bounds
+//! those.
 //!
 //! Config comes from the same files the Python runner used (`config/exec.yaml`,
 //! `config/topics.yaml`) so the caps are one source of truth, not a second
@@ -189,6 +192,19 @@ const RESTING_QUOTES: &str = "(resting quotes)";
 /// How a take-take IOC's reservation is told from a resting quote's: the slot's
 /// market is this prefix and the order id.
 const IOC_SLOT: &str = "ioc/";
+
+/// The most resting-quote contracts the class cap, the global cap and each
+/// hedge venue's cash count, however many rest: three full maker clips.
+///
+/// A resting quote spends nothing until it fills, and each fill pulls whatever
+/// the gate would no longer admit (`Quoter::pull_refused`), so what the
+/// reservation has to cover is the fills that land before those cancels do.
+/// Counting every resting quote in full assumed they all fill at once. Over
+/// every maker fill in the ledger to 2026-11-05, no 60s window held more than
+/// two pairs (25 contracts) and no second more than 58 contracts on one pair;
+/// three clips is over twice the worst of those, and the 15% of NAV the global
+/// cap leaves uncommitted sits above it.
+const RESTING_BURST_CT: f64 = 3.0 * arb_core::quoter::MAX_CLIP as f64;
 
 /// How old a balance figure may be and still authorise spending, whatever its
 /// provenance. Three poll cycles (`main::BALANCE_POLL` is 60s).
@@ -1360,9 +1376,11 @@ impl RiskView {
                 }
             }
         }
-        // Capital already committed by quotes that are RESTING. Without this
-        // the gate is a pure read and every resting quote in the process spends
-        // the same capital — see the module header.
+        // Capital committed by quotes that are RESTING, which the class and
+        // global caps and the hedge venue's cash count up to
+        // [`RESTING_BURST_CT`] each, and an in-flight IOC, which they count in
+        // full. Without this the gate is a pure read and every resting quote in
+        // the process spends the same capital — see the module header.
         //
         // This slot's own reservation is skipped, because a reprice on it
         // REPLACES that quote: charging the amend for the order it is about to
@@ -1374,24 +1392,40 @@ impl RiskView {
             *hedge_cash.entry(venue).or_default() += qty;
         }
         {
+            let mut resting = 0.0;
+            let mut resting_class: HashMap<&'static str, f64> = HashMap::new();
+            let mut resting_hedge: HashMap<&'static str, f64> = HashMap::new();
             let r = self.reserved.lock().expect("reserved");
             for (slot, (class, qty, dir, hedge)) in r.iter() {
                 if Some(slot) == mine.as_ref() {
+                    continue;
+                }
+                if !slot.1.starts_with(IOC_SLOT) {
+                    resting += qty;
+                    *resting_class.entry(class).or_default() += qty;
+                    if let Some(h) = hedge {
+                        *resting_hedge.entry(h.as_str()).or_default() += qty;
+                    }
                     continue;
                 }
                 *by_class.entry((*class).to_string()).or_default() += qty;
                 if let Some(h) = hedge {
                     *hedge_cash.entry(h.as_str()).or_default() += qty;
                 }
-                if !slot.1.starts_with(IOC_SLOT) {
-                    *by_rel.entry(RESTING_QUOTES.to_string()).or_default() += qty;
-                    continue;
-                }
                 if event_of(&slot.0) == event {
                     tails.entry(slot.0.clone()).or_default().rest(*dir, *qty);
                 }
                 *by_rel.entry(slot.0.clone()).or_default() += qty;
                 *by_topic.entry(topic_of(&slot.0, &self.topics)).or_default() += qty;
+            }
+            if resting > 0.0 {
+                *by_rel.entry(RESTING_QUOTES.to_string()).or_default() += resting.min(RESTING_BURST_CT);
+            }
+            for (class, qty) in resting_class {
+                *by_class.entry(class.to_string()).or_default() += qty.min(RESTING_BURST_CT);
+            }
+            for (venue, qty) in resting_hedge {
+                *hedge_cash.entry(venue).or_default() += qty.min(RESTING_BURST_CT);
             }
         }
         let mut costs = venue_costs(rel, venue, &n);
@@ -2999,18 +3033,55 @@ mod tests {
         assert!(d.reasons.iter().any(|r| r.contains("per-relationship")), "{:?}", d.reasons);
     }
 
-    /// Resting quotes commit capital, so the global cap still counts them even
-    /// though no relationship's own tail cap does. $980 bankroll x 0.50.
+    /// Resting quotes spend the global cap, even though no relationship's own
+    /// tail cap counts them, but only up to [`RESTING_BURST_CT`]: four resting
+    /// 100-lots count as 150, so a fifth still rests, and a filled book adds in
+    /// full on top of the burst. $980 bankroll x 0.50.
     #[test]
-    fn resting_quotes_still_spend_the_global_cap() {
+    fn resting_quotes_spend_the_global_cap_only_up_to_the_burst() {
         let exec = write_exec("rest-global", "bankroll_usd: 980\nper_class_cap: 5\n");
-        let rels = ["r1", "r2", "r3", "r4", "r5"];
+        let rels = ["r1", "r2", "r3", "r4", "r5", "r6"];
         let v = view_topics_low_on(exec.to_str().unwrap(), "/nonexistent/topics.yaml", &rels);
-        for r in &rels[..4] {
-            assert!(v.check(&rel(r), Venue::Kalshi, 100, Some(("K", BookSide::Bid))).allowed);
+        for r in &rels[..5] {
+            assert!(v.check(&rel(r), Venue::Kalshi, 100, Some(("K", BookSide::Bid))).allowed, "{r}");
         }
-        let d = v.check(&rel("r5"), Venue::Kalshi, 100, Some(("K", BookSide::Bid)));
+        v.record_open("f1", "cross-venue-equivalent", 125.0);
+        v.record_open("f2", "cross-venue-equivalent", 125.0);
+        let d = v.check(&rel("r6"), Venue::Kalshi, 100, Some(("K", BookSide::Bid)));
         assert!(d.reasons.iter().any(|r| r.contains("global cap: 400+100")), "{:?}", d.reasons);
+    }
+
+    /// A resting quote's hedge charges that venue's cash up to the same burst,
+    /// not cumulatively, while a fill's hedge counts in full: on $200 of PM-US
+    /// cash, six 50-lots hedged there all rest (50 + 150 <= 200), and one 10-lot
+    /// fill's hedge on top refuses the seventh.
+    #[test]
+    fn resting_hedges_charge_the_hedge_venue_only_up_to_the_burst() {
+        let rels = ["r1", "r2", "r3", "r4", "r5", "r6", "r7"];
+        let mut o = HashMap::new();
+        for r in rels {
+            o.insert(r.to_string(), "low".to_string());
+        }
+        let v = RiskView::load(
+            &valid_exec(),
+            "/nonexistent/topics.yaml",
+            vec![
+                ("kalshi".to_string(), "1000".to_string()),
+                ("polymarket_us".to_string(), "200".to_string()),
+            ],
+            o,
+        );
+        for r in &rels[..6] {
+            let d = v.check(&rel(r), Venue::Kalshi, 50, Some(("K", BookSide::Bid)));
+            assert!(d.allowed, "{r}: {:?}", d.reasons);
+        }
+        v.charge_hedge(Venue::PolymarketUs, 10.0);
+        let d = v.check(&rel("r7"), Venue::Kalshi, 50, Some(("K", BookSide::Bid)));
+        assert!(
+            d.reasons.iter().any(|r| r == "insufficient polymarket_us balance: 210 > 200"),
+            "{:?}",
+            d.reasons
+        );
     }
 
     /// Every resting quote may fill, and each fill must be hedged on the other
