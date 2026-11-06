@@ -417,8 +417,8 @@ async fn main() -> Result<()> {
                 let poll = kalshi_catalog.statuses(&kalshi_tickers).await;
                 if let Some(first) = poll.errors.first() {
                     eprintln!(
-                        "[recorder] kalshi status poll: {} of {} ticker(s) unanswered ({} \
-                         request(s) failed, first: {first}); they are neither evicted nor \
+                        "[recorder] kalshi status poll: {} of {} ticker(s) unanswered ({} batch(es) \
+                         failed every attempt, first: {first}); they are neither evicted nor \
                          restored this cycle",
                         poll.unanswered.len(),
                         kalshi_tickers.len(),
