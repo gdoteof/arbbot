@@ -402,6 +402,9 @@ impl Engine {
             }
             None => match self.fills.observe_cum_fill(oid, cum) {
                 arb_core::fill::FillOutcome::Minted(ob) => {
+                    // The quoter that rests this order learns what filled
+                    // (`Quoter::on_fill`), whatever order it turns out to be.
+                    self.quote_fills.push((oid.to_string(), ob.qty(), now));
                     // Book the new exposure BEFORE the hedge intent, so
                     // the next quote sees capital this fill just spent.
                     if let (Some(rv), Some(mo)) = (self.cfg.risk.as_ref(), self.order_rel.get(oid))

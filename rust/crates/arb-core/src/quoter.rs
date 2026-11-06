@@ -479,9 +479,11 @@ impl Quoter {
     /// we undercut back, the 500 joined behind again, and the cycle ran 880
     /// amends a side in 7.6 hours.
     ///
-    /// A level showing no more than our own count has nobody behind us — a
-    /// partial fill leaves less — so the quote is free to follow the
-    /// competition away as before.
+    /// A level showing no more than our own count has nobody behind us, so the
+    /// quote is free to follow the competition away as before. `count` is what
+    /// is still resting, because [`Quoter::on_fill`] takes filled contracts off
+    /// it; against the placed size, a partly filled quote with a queue behind
+    /// it would read as alone.
     fn leads_a_queue(&self, cx: &mut Cx, books: &BookBuilder, i: usize, side: BookSide) -> bool {
         let Some(rq) = self.resting.get(&(i, side)) else { return false };
         if !rq.first_at_price {
@@ -613,11 +615,15 @@ impl Quoter {
 
     /// `price`, unless taking it would RETREAT a quote off the front of a queue
     /// ([`Quoter::leads_a_queue`]). Then the answer is the price that quote
-    /// already rests at, for as long as that price still clears `limit` and
-    /// still rests passively against the far side of the book.
+    /// already rests at, for as long as that price still clears `limit`.
     ///
     /// Only the retreat is held. A `price` at least as aggressive as the
     /// resting one — an outbid answered, or no move at all — is returned as is.
+    ///
+    /// The held price needs no check against the far side of the book: the
+    /// queue we lead is a level at that price, so an opposite touch at or
+    /// through it is a locked or crossed book, and `on_book` never asks
+    /// `target` about one (`crossed_reason`).
     fn hold_the_front(
         &self,
         cx: &mut Cx,
@@ -635,18 +641,6 @@ impl Quoter {
         };
         if cx.cmp(price, cur.price) != behind || cx.cmp(cur.price, limit) == behind.reverse() {
             return Some(price);
-        }
-        let leg = &self.rel.legs[i];
-        let book = books.get(leg.venue, &leg.market_id)?;
-        let far = match side {
-            BookSide::Bid => book.asks.first(),
-            BookSide::Ask => book.bids.first(),
-        };
-        if let Some(far) = far {
-            let far = cx.parse(&far.price)?;
-            if cx.cmp(cur.price, far) != behind {
-                return Some(price); // holding would lock or cross the book
-            }
         }
         if self.leads_a_queue(cx, books, i, side) { Some(cur.price) } else { Some(price) }
     }
@@ -750,11 +744,10 @@ impl Quoter {
     /// cancel does, so the side re-enters on the requote throttle: one rest per
     /// `min_requote_s` however many fills land near the cap.
     ///
-    /// It asks about the whole clip. The quoter has no fill path, and the gate's
-    /// slot cannot say what is left of THIS order, because a superseded order's
-    /// fill consumes the slot its replacement owns. So a partial fill's
-    /// remainder can come off when it would have fit, and a quote that filled
-    /// whole can draw a cancel with nothing left to cancel.
+    /// It asks about what is left of each quote, which [`Quoter::on_fill`] keeps
+    /// current; a quote that filled whole is already gone and draws no cancel.
+    /// It cannot ask the gate's slot instead, because a superseded order's fill
+    /// consumes the slot its replacement owns.
     pub fn pull_refused(&mut self, cx: &mut Cx, now: f64, intents: &mut Vec<Intent>) {
         let Some(gate) = &self.risk else { return };
         let refused = self
@@ -767,6 +760,50 @@ impl Quoter {
             .map(|(&key, _)| key)
             .collect();
         self.cancel_keys(refused, cx, now, intents);
+    }
+
+    /// `qty` more contracts of the quote resting as `order_id` filled, at `now`.
+    ///
+    /// `count` is what is still resting, so it shrinks by what filled. And a
+    /// quote that has filled at all is FIRST at its price: both venues match a
+    /// price level in time order, so everything that was ahead of it there
+    /// traded first, and whatever rests at that price now arrived after it.
+    ///
+    /// A quote that filled whole is dropped. Nothing of it rests at the venue,
+    /// and kept here it would be a ghost: [`Quoter::leads_a_queue`] reads the
+    /// queue that was behind it as one we still lead, and `target` holds a
+    /// price no order of ours is at. The fill's `consume` has already emptied
+    /// the gate's slot, so the `release` here is the same harmless call every
+    /// other way a quote goes away makes.
+    ///
+    /// Dropping it also restarts the side's requote throttle from the fill.
+    /// The hedge for those contracts is in flight against a hedge book that
+    /// does not show it yet, and `hedge_clip` and the limit both read that
+    /// book: re-entering on the next event would size and price a second clip
+    /// off depth the first hedge is about to take, and two clips of a side
+    /// could be one-legged at once where `MAX_CLIP` budgets one. The side
+    /// comes back `min_requote_s` after the fill.
+    ///
+    /// `false` for an id that is not resting here: a superseded order, a
+    /// take-take or exit order, another relationship's quote.
+    pub fn on_fill(&mut self, order_id: &str, qty: i64, now: f64) -> bool {
+        let Some(key) =
+            self.resting.iter().find(|(_, rq)| rq.order_id == order_id).map(|(&k, _)| k)
+        else {
+            return false;
+        };
+        let rq = self.resting.get_mut(&key).expect("key just found");
+        rq.count -= qty;
+        rq.first_at_price = true;
+        if rq.count <= 0 {
+            self.resting.remove(&key);
+            self.refused_since.remove(&key);
+            self.last_quote_ts.insert(key, now);
+            if let Some(gate) = &self.risk {
+                gate.release(&self.rel.id, &self.rel.legs[key.0].market_id, key.1);
+            }
+        }
+        true
     }
 
     fn cancel_keys(
@@ -980,10 +1017,9 @@ impl Quoter {
                 // TAPE time, which starts near zero, so a 0.0 default would throttle
                 // the very first quote of every side.
                 //
-                // INVARIANT for the P4 fill path: a FILL must clear last_quote_ts
-                // for its key, so a filled side re-quotes at once instead of
-                // serving out a re-entry throttle. The quoter has no fill path
-                // today; whoever adds one owns this.
+                // A quote that FILLED WHOLE restarts this clock from the fill
+                // (`on_fill`), so its side waits out a full window while the
+                // hedge for those contracts lands.
                 if let Some(&last) = self.last_quote_ts.get(&key) {
                     if now - last < self.min_requote_s {
                         continue;
@@ -1658,6 +1694,26 @@ mod risk_gate_tests {
         q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
         assert_eq!(intents.len(), 1);
         assert!(place_on(&intents, "P").is_some(), "{intents:?}");
+    }
+
+    /// A partial fill leaves the slot reserved, because the rest still rests;
+    /// the fill that empties the quote releases it.
+    #[test]
+    fn a_fill_releases_the_slot_only_when_it_empties_the_quote() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let gate = Always::new(true);
+        q.set_risk(Some(gate.clone()));
+        let (mut oid, mut intents) = (0, Vec::new());
+        pm_bid(&mut bb, "0.30", 1, 2_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        let p = place_on(&intents, "P").expect("a place");
+        let (order, n) = (p.order_id.clone(), p.count);
+        assert_eq!(gate.log(), ["+P/bid"]);
+
+        assert!(q.on_fill(&order, n - 1, 110.0));
+        assert_eq!(gate.log(), ["+P/bid"], "released a slot still resting");
+        assert!(q.on_fill(&order, 1, 111.0));
+        assert_eq!(gate.log(), ["+P/bid", "-P/bid"]);
     }
 
     /// A refused ENTRY places nothing and says why.
@@ -2841,17 +2897,109 @@ mod queue_priority_tests {
         assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.21", "held a price past its limit");
     }
 
-    /// Nor a price the far side has reached: an offer down at our 0.25 means
-    /// holding there would rest a bid that locks the book.
+    /// The ask mirror of the limit guard. Kalshi's offer rises from 0.30 to
+    /// 0.74, which takes the least we may ask on P to 0.76, over the 0.75 we
+    /// lead at; the answer is the one tick under the 0.90 offer.
     #[test]
-    fn a_queue_behind_us_does_not_hold_a_bid_the_offer_has_reached() {
-        let (mut cx, fees, mut bb, q, _) = resting_at_25();
-        let queued = (rests(&q, BookSide::Bid) + 500).to_string();
+    fn a_queue_behind_us_does_not_hold_an_offer_the_hedge_no_longer_pays() {
+        let (mut cx, fees, mut bb, mut q) = ask_fixture(vec![lvl("0.76", "3")]);
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(place_on(&intents, "P").map(|p| p.price.as_str()), Some("0.75"), "{intents:?}");
+        let queued = (rests(&q, BookSide::Ask) + 500).to_string();
         bb.apply_snapshot(
-            Venue::PolymarketUs, "P",
-            vec![lvl("0.25", &queued), lvl("0.20", "3")], vec![lvl("0.25", "1")],
+            Venue::Kalshi, "K", vec![lvl("0.20", "500")], vec![lvl("0.74", "500")],
             2, 130_000_000_000, None,
         );
-        assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.21", "held a bid onto the offer");
+        pm_asks(&mut bb, vec![lvl("0.75", &queued), lvl("0.90", "3")], 2, 130_000_000_000);
+        assert_eq!(ask_target(&q, &mut cx, &fees, &bb), "0.89", "held an offer under its limit");
+    }
+
+    /// A quote that filled whole is gone, and the queue that was behind it is
+    /// now somebody else's level. Without the fill reaching the quoter, the
+    /// book below reads exactly like the hold above: a ghost of ours "leading"
+    /// 500 lots at 0.25, held there with nothing of ours resting. With it the
+    /// side re-enters, one tick over that foreign 0.25, as a fresh order rather
+    /// than an amend of the one that filled.
+    ///
+    /// Not on the next event, though: the quote rested 20s, past the requote
+    /// window counted from its place, and the fill restarts that window so
+    /// the hedge can land before a second clip rests.
+    #[test]
+    fn a_quote_that_filled_whole_is_not_held_as_a_ghost() {
+        let (mut cx, fees, mut bb, mut q, mut oid) = resting_at_25();
+        let n = rests(&q, BookSide::Bid);
+        let order = q.resting[&(1, BookSide::Bid)].order_id.clone();
+        assert!(q.on_fill(&order, n, 120.0), "the fill was not this quoter's");
+        assert!(!q.resting.contains_key(&(1, BookSide::Bid)), "kept a quote that filled whole");
+
+        let mut intents = Vec::new();
+        pm(&mut bb, vec![lvl("0.25", "500"), lvl("0.20", "3")], 2, 120_100_000_000);
+        q.on_book(&mut cx, &fees, &bb, 120.1, &mut oid, &mut intents);
+        assert!(quiet(&intents), "re-entered while the hedge was in flight: {intents:?}");
+
+        pm(&mut bb, vec![lvl("0.25", "500"), lvl("0.20", "3")], 3, 135_100_000_000);
+        q.on_book(&mut cx, &fees, &bb, 135.1, &mut oid, &mut intents);
+        let p = place_on(&intents, "P").expect("re-entry");
+        assert_eq!((p.price.as_str(), p.replaces.as_deref()), ("0.26", None), "{intents:?}");
+    }
+
+    /// A fill on a quote that JOINED a level means everything ahead of it
+    /// there has traded, so it is at the front now. We join 100 lots at 0.25
+    /// (the limit lands exactly on it), 20 more join behind us, and a taker
+    /// takes 130: their 100, then 30 of ours. The hedge then improves so the
+    /// limit could afford 0.26. Read as still joined, the 20 behind us net to
+    /// 20 lots "ahead" and the quote steps over them to 0.26, giving up the
+    /// front for a tick; first at its price, it holds.
+    #[test]
+    fn a_joined_quote_that_fills_is_at_the_front() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let k = |bb: &mut BookBuilder, px: &str, seq: u64| {
+            bb.apply_snapshot(
+                Venue::Kalshi, "K", vec![lvl(px, "500")], vec![lvl("0.99", "1")],
+                seq, 1_000_000_000, None,
+            )
+        };
+        k(&mut bb, "0.27", 2);
+        pm(&mut bb, vec![lvl("0.25", "100"), lvl("0.20", "3")], 1, 1_000_000_000);
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(place_on(&intents, "P").map(|p| p.price.as_str()), Some("0.25"), "{intents:?}");
+        assert!(!q.resting[&(1, BookSide::Bid)].first_at_price, "should have joined");
+        let order = q.resting[&(1, BookSide::Bid)].order_id.clone();
+
+        assert!(q.on_fill(&order, 30, 110.0));
+        k(&mut bb, "0.60", 3);
+        pm(&mut bb, vec![lvl("0.25", "40"), lvl("0.20", "3")], 2, 130_000_000_000);
+        assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.25", "stepped off the front");
+    }
+
+    /// Partly filled, the quote still leads whatever queued behind it. 40 lots
+    /// join behind our 50 and 45 of ours fill: the level shows 45, under the 50
+    /// we placed, and against that the quote would read as alone and retreat.
+    /// Against the 5 still resting it leads 40.
+    #[test]
+    fn a_partly_filled_quote_still_holds_the_front_of_its_queue() {
+        let (mut cx, fees, mut bb, mut q, mut oid) = resting_at_25();
+        assert_eq!(rests(&q, BookSide::Bid), 50, "the fixture's clip moved");
+        let order = q.resting[&(1, BookSide::Bid)].order_id.clone();
+        assert!(q.on_fill(&order, 45, 120.0));
+        assert_eq!(rests(&q, BookSide::Bid), 5);
+
+        let mut intents = Vec::new();
+        pm(&mut bb, vec![lvl("0.25", "45"), lvl("0.20", "3")], 2, 130_000_000_000);
+        assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.25", "retreated behind our own queue");
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        assert!(quiet(&intents), "{intents:?}");
+    }
+
+    /// A fill on an id that is not resting here (a superseded order, another
+    /// relationship's quote) changes nothing.
+    #[test]
+    fn a_fill_on_an_order_that_is_not_resting_here_changes_nothing() {
+        let (_, _, _, mut q, _) = resting_at_25();
+        let n = rests(&q, BookSide::Bid);
+        assert!(!q.on_fill("m-not-ours", n, 120.0));
+        assert_eq!(rests(&q, BookSide::Bid), n);
     }
 }

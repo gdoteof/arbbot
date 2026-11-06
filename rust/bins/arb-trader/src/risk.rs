@@ -362,7 +362,9 @@ pub struct RiskView {
     ///   * FILLED — `consume`, from the engine's fill path, moves the filled
     ///     contracts out of the reservation and into real exposure
     ///     (`record_open`). A partial fill leaves the remainder reserved,
-    ///     because the remainder is still resting.
+    ///     because the remainder is still resting. A quote that filled whole is
+    ///     dropped by `Quoter::on_fill`, which releases the slot `consume` has
+    ///     just emptied. YES.
     ///   * CANCELLED — `Quoter::on_book`'s cancel arm calls `release` as it
     ///     drops its `resting` entry. YES.
     ///   * PULLED FOR A STALE CAP REFUSAL — `CAP_REFUSAL_PULL_S` (#35) takes a
@@ -2197,9 +2199,9 @@ mod tests {
     }
 
     /// A slot holding nothing is released harmlessly, and that is load-bearing
-    /// rather than defensive: a fully filled quote's slot is already gone when
-    /// the quoter next cancels it (the quoter has no fill path and still
-    /// believes it rests), so this is the ordinary sequence, not an edge.
+    /// rather than defensive: a fully filled quote's slot is already empty when
+    /// `Quoter::on_fill` drops the quote and releases it, so this is the
+    /// ordinary sequence, not an edge.
     #[test]
     fn releasing_a_slot_that_holds_nothing_is_harmless() {
         let v = funded("low");
