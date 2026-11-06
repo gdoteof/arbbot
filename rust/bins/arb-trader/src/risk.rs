@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 /// bankroll and per_class_cap are file-driven; the rest are code defaults there
 /// and are pinned here so the two cannot drift silently.
 const TAIL_FRACTION: &str = "0.02";
-const PER_REL_CAP: &str = "150";
+const PER_REL_CAP: &str = "300";
 const GLOBAL_CAP: &str = "0.50";
 /// The share of NET ASSET VALUE this engine may hold as open positions, when
 /// the venues have told us what the cash actually is (see
@@ -1228,7 +1228,7 @@ impl RiskView {
     /// separate constraint that file deliberately removed — class would bind
     /// first, at 0.50 x NAV.
     ///
-    /// `per_rel_cap` does NOT move. It is an absolute 150 contracts, not a
+    /// `per_rel_cap` does NOT move. It is an absolute 300 contracts, not a
     /// fraction of anything, and it is the concentration limit that should not
     /// grow just because the account did.
     fn config_over_book(&self, book: f64) -> ConfigIn {
@@ -1582,6 +1582,18 @@ mod tests {
         view(vec![("kalshi", "1000"), ("polymarket_us", "1000")], oracle)
     }
 
+    /// `funded` on a bankroll whose per-event cap ($600) sits above the
+    /// per-relationship cap, for fixtures that must be refused by the
+    /// per-relationship cap and nothing else.
+    fn funded_deep(oracle: &str) -> RiskView {
+        view_with_configs(
+            &deep_exec(),
+            "/nonexistent/topics.yaml",
+            vec![("kalshi", "1000"), ("polymarket_us", "1000")],
+            oracle,
+        )
+    }
+
     fn view_with_topics(topics: &str, balances: Vec<(&str, &str)>, oracle: &str) -> RiskView {
         view_with_configs(&valid_exec(), topics, balances, oracle)
     }
@@ -1631,7 +1643,7 @@ mod tests {
     }
 
     /// For fixtures pinned to the per-relationship cap or a topic budget.
-    /// `valid_exec`'s $980 puts the per-event cap at $147, under the $150
+    /// `valid_exec`'s $980 puts the per-event cap at $147, under the $300
     /// per-relationship cap, so any fixture that loads one relationship past
     /// 142 contracts is refused by the event cap first and tests the wrong
     /// cap. $2,000 moves the event cap to $300. The per-relationship cap is
@@ -1639,6 +1651,15 @@ mod tests {
     fn wide_exec() -> String {
         static P: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         P.get_or_init(|| write_exec("exec-wide", "bankroll_usd: 2000\nper_class_cap: 0.35\n"))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// $4,000: the per-event cap is $600, above the 300-contract
+    /// per-relationship cap. See [`funded_deep`].
+    fn deep_exec() -> String {
+        static P: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        P.get_or_init(|| write_exec("exec-deep", "bankroll_usd: 4000\nper_class_cap: 0.35\n"))
             .to_string_lossy()
             .into_owned()
     }
@@ -1955,15 +1976,15 @@ mod tests {
     }
 
     /// Exposure accumulates across fills and eventually closes the per-rel cap
-    /// ($150 at oracle_risk=low). This is the whole point of the engine owning
+    /// ($300 at oracle_risk=low). This is the whole point of the engine owning
     /// one view: per-quoter copies would each spend the same headroom.
     #[test]
     fn accumulated_exposure_eventually_refuses() {
-        let v = funded("low");
+        let v = funded_deep("low");
         assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
-        v.record_open("r1", "cross-venue-equivalent", 150.0);
+        v.record_open("r1", "cross-venue-equivalent", 300.0);
         let d = v.check(&rel("r1"), Venue::Kalshi, 5, None);
-        assert!(!d.allowed, "150 open against a 150 cap leaves no headroom");
+        assert!(!d.allowed, "300 open against a 300 cap leaves no headroom");
         assert!(d.reasons.iter().any(|r| r.contains("per-relationship")), "{:?}", d.reasons);
     }
 
@@ -1972,10 +1993,10 @@ mod tests {
     #[test]
     fn oracle_risk_scales_the_cap() {
         for (oracle, open, want_allowed) in
-            // caps: low 150, medium 75, high 37.5; a clip of 5 needs that much headroom
-            [("low", 100.0, true), ("medium", 100.0, false), ("high", 35.0, false)]
+            // caps: low 300, medium 150, high 75; a clip of 5 needs that much headroom
+            [("low", 200.0, true), ("medium", 200.0, false), ("high", 72.0, false)]
         {
-            let v = funded(oracle);
+            let v = funded_deep(oracle);
             v.record_open("r1", "cross-venue-equivalent", open);
             assert_eq!(
                 v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed,
@@ -1990,7 +2011,7 @@ mod tests {
     #[test]
     fn an_unclassified_relationship_gets_the_tightest_cap() {
         let v = funded("low");
-        v.record_open("unknown-rel", "cross-venue-equivalent", 30.0);
+        v.record_open("unknown-rel", "cross-venue-equivalent", 70.0);
         let d = v.check(&rel("unknown-rel"), Venue::Kalshi, 10, None);
         assert!(!d.allowed, "unknown => high risk => 0.25x cap: {:?}", d.reasons);
     }
@@ -2000,15 +2021,15 @@ mod tests {
     /// rather than handing out headroom no position backs.
     #[test]
     fn a_close_gives_back_the_headroom_and_floors_at_zero() {
-        let v = funded("low");
-        v.record_open("r1", "cross-venue-equivalent", 150.0);
+        let v = funded_deep("low");
+        v.record_open("r1", "cross-venue-equivalent", 300.0);
         assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed);
-        v.record_close("r1", "cross-venue-equivalent", 150.0);
+        v.record_close("r1", "cross-venue-equivalent", 300.0);
         assert_eq!(v.open_ct("r1"), 0.0);
         assert!(v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed, "the cap is free again");
         v.record_close("r1", "cross-venue-equivalent", 40.0);
         assert_eq!(v.open_ct("r1"), 0.0, "never negative");
-        v.record_open("r1", "cross-venue-equivalent", 150.0);
+        v.record_open("r1", "cross-venue-equivalent", 300.0);
         assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, None).allowed, "no phantom headroom");
     }
 
@@ -2016,7 +2037,7 @@ mod tests {
     fn allowed_and_rejected_are_counted_for_the_stats_line() {
         let v = funded("low");
         v.check(&rel("r1"), Venue::Kalshi, 5, None);
-        v.record_open("r1", "cross-venue-equivalent", 150.0); // fills the per-rel cap
+        v.record_open("r1", "cross-venue-equivalent", 300.0); // fills the per-rel cap
         v.check(&rel("r1"), Venue::Kalshi, 5, None); // => refused
         assert_eq!(v.stats(), (1, 1));
     }
@@ -2059,10 +2080,10 @@ mod tests {
     /// The per-relationship tail cap reads fills, so the four (leg, side) quotes
     /// of one relationship all rest, and it binds once contracts have filled.
     ///
-    /// Clip 40 against the $150 cap.
+    /// Clip 40 against the $300 cap.
     #[test]
     fn the_per_rel_cap_reads_fills_so_all_four_sides_rest() {
-        let v = funded("low");
+        let v = funded_deep("low");
         let r = rel("r1");
         for (market, side) in [
             ("K", BookSide::Bid),
@@ -2075,9 +2096,9 @@ mod tests {
         }
         assert_eq!(v.reserved_ct(), 160.0);
 
-        v.record_open("r1", "cross-venue-equivalent", 120.0);
+        v.record_open("r1", "cross-venue-equivalent", 270.0);
         let d = v.check(&r, Venue::Kalshi, 40, Some(("K", BookSide::Bid)));
-        assert!(!d.allowed, "120 filled + 40 > 150: {:?}", d.reasons);
+        assert!(!d.allowed, "270 filled + 40 > 300: {:?}", d.reasons);
         assert!(d.reasons.iter().any(|r| r.contains("per-relationship")), "{:?}", d.reasons);
     }
 
@@ -2162,7 +2183,7 @@ mod tests {
     #[test]
     fn a_refused_check_reserves_nothing_so_a_full_cap_does_not_ratchet() {
         let v = funded("low");
-        v.record_open("r1", "cross-venue-equivalent", 150.0); // per-rel cap, exactly
+        v.record_open("r1", "cross-venue-equivalent", 300.0); // per-rel cap, exactly
         for _ in 0..10 {
             assert!(!v.check(&rel("r1"), Venue::Kalshi, 5, Some(("K", BookSide::Bid))).allowed);
         }
@@ -2674,10 +2695,10 @@ mod tests {
     }
 
     /// A view with real per-topic budgets whose named relationships are all
-    /// `oracle_risk=low`, so the per-rel TAIL cap (150) is not what refuses —
+    /// `oracle_risk=low`, so the per-rel TAIL cap (300) is not what refuses —
     /// these tests are about the topic budget and must not pass or fail on a
     /// different gate. `view_with_topics` registers only `r1`, and everything
-    /// else defaults to `high` (tail cap 37.50).
+    /// else defaults to `high` (tail cap 75).
     fn view_topics_low(topics: &str, rels: &[&str]) -> RiskView {
         view_topics_low_on(&valid_exec(), topics, rels)
     }
@@ -2807,9 +2828,7 @@ mod tests {
             "release-poty",
             "topics:\n  - {family: time-poty-26, budget_usd: 185}\ndefault_topic_budget: 30\n",
         );
-        // The live book's own shape: one family, three relationships. Spread
-        // matters — 185 on ONE id would trip the per-rel cap (150) first and
-        // the test would pass for the wrong reason.
+        // The live book's own shape: one family, three relationships.
         let (pope, mamdani, ai) = (
             "xvus-time-poty-26-popeleoxiv",
             "xvus-time-poty-26-zohranmamdani",
@@ -2974,9 +2993,9 @@ mod tests {
             d.reasons
         );
 
-        let w = funded("low");
-        assert!(w.check_ioc(&rel("r1"), Venue::Kalshi, 100, "t1", BookSide::Bid).allowed);
-        let d = w.check_ioc(&rel("r1"), Venue::Kalshi, 100, "t2", BookSide::Bid);
+        let w = funded_deep("low");
+        assert!(w.check_ioc(&rel("r1"), Venue::Kalshi, 160, "t1", BookSide::Bid).allowed);
+        let d = w.check_ioc(&rel("r1"), Venue::Kalshi, 160, "t2", BookSide::Bid);
         assert!(d.reasons.iter().any(|r| r.contains("per-relationship")), "{:?}", d.reasons);
     }
 
@@ -3301,7 +3320,7 @@ mod tests {
     /// the gate enforces and the one the hurdle divides by are ONE number.
     ///
     /// The book is spread over three relationships because 400 contracts on
-    /// ONE would breach the 150 per-rel cap first, and the test would pass
+    /// ONE would breach the 300 per-rel cap first, and the test would pass
     /// while proving nothing about the global ceiling.
     #[test]
     fn the_nav_ceiling_reaches_the_gate_not_only_the_hurdle() {
@@ -3340,17 +3359,17 @@ mod tests {
         assert!(d.allowed, "{:?}", d.reasons);
     }
 
-    /// The per-relationship cap is an absolute 150 contracts, not a fraction of
+    /// The per-relationship cap is an absolute 300 contracts, not a fraction of
     /// anything. A bigger account must not widen a CONCENTRATION limit.
     #[test]
     fn the_per_relationship_cap_does_not_grow_with_nav() {
         let v = view_topics_low("/nonexistent/topics.yaml", &["r1"]);
-        v.record_open("r1", "cross-venue-equivalent", 140.0);
+        v.record_open("r1", "cross-venue-equivalent", 290.0);
         live_both(&v, "9000");
         let d = v.check(&rel("r1"), Venue::Kalshi, 25, None);
         assert!(
             d.reasons.iter().any(|r| r.contains("per-relationship tail cap")),
-            "150 is absolute however rich we get: {:?}",
+            "300 is absolute however rich we get: {:?}",
             d.reasons
         );
     }
