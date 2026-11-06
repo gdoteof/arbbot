@@ -419,6 +419,12 @@ impl Quoter {
     /// So the skip asks who was here first, and only the case the tape actually
     /// shows — a level we opened, joined later by someone behind us — is exempt
     /// from the netting.
+    ///
+    /// The skip answers "whom must we beat to stay first", and nothing more. It
+    /// makes the queue behind us invisible, so on its own it would let `target`
+    /// RETREAT off that level as soon as the competition beyond it thinned — to
+    /// a price behind everyone queued there. [`Quoter::leads_a_queue`] is what
+    /// stops that.
     fn touch_excl_self(
         &self,
         cx: &mut Cx,
@@ -457,6 +463,45 @@ impl Quoter {
             }
         }
         None
+    }
+
+    /// Whether the quote resting on (`i`, `side`) opened its level AND somebody
+    /// has queued behind it there since — the book shows more at our price than
+    /// the quote we placed.
+    ///
+    /// Such a quote holds the front of a queue, and `target` must not reprice
+    /// it to a LESS aggressive level: every order behind us would be ahead of
+    /// us at the better price, which hands them the next fill. Measured on
+    /// `gsrc-gsearch-1person-2026-erlhaa:ask` (2026-11-06): we rested 38 first
+    /// at 0.41, a 500-lot order joined behind us, the 0.42 offer beyond us left,
+    /// and `target` walked us out to 0.43, one tick inside the next foreign
+    /// offer and behind those 500 lots. Their companion order then undercut us,
+    /// we undercut back, the 500 joined behind again, and the cycle ran 880
+    /// amends a side in 7.6 hours.
+    ///
+    /// A level showing no more than our own count has nobody behind us — a
+    /// partial fill leaves less — so the quote is free to follow the
+    /// competition away as before.
+    fn leads_a_queue(&self, cx: &mut Cx, books: &BookBuilder, i: usize, side: BookSide) -> bool {
+        let Some(rq) = self.resting.get(&(i, side)) else { return false };
+        if !rq.first_at_price {
+            return false;
+        }
+        let leg = &self.rel.legs[i];
+        let Some(book) = books.get(leg.venue, &leg.market_id) else { return false };
+        let levels = match side {
+            BookSide::Bid => &book.bids,
+            BookSide::Ask => &book.asks,
+        };
+        let ours = cx.from_i64(rq.count);
+        for lvl in levels {
+            let Some(p) = cx.parse(&lvl.price) else { return false };
+            if cx.cmp(p, rq.price) == Ordering::Equal {
+                let Some(size) = cx.parse(&lvl.size) else { return false };
+                return cx.cmp(size, ours) == Ordering::Greater;
+            }
+        }
+        false
     }
 
     fn target(
@@ -524,7 +569,10 @@ impl Quoter {
                 return None; // too tight to post passively
             }
             let price = if explicit_grid { grid.floor(cx, raw)? } else { cx.quantize_cent(raw, false) };
-            (cx.cmp(price, comp) != Ordering::Less).then_some(price)
+            if cx.cmp(price, comp) == Ordering::Less {
+                return None;
+            }
+            self.hold_the_front(cx, books, i, side, price, p_max)
         } else {
             let quote = if self.price_grids.contains_key(&leg.market_id) { maker_ask_quote_limit } else { maker_ask_quote };
             let mut p_min = quote(cx, fees, &self.rel, i, books, &metas, clip)?;
@@ -556,8 +604,51 @@ impl Quoter {
                 return None;
             }
             let price = if explicit_grid { grid.ceil(cx, raw)? } else { cx.quantize_cent(raw, true) };
-            (cx.cmp(price, comp) != Ordering::Greater).then_some(price)
+            if cx.cmp(price, comp) == Ordering::Greater {
+                return None;
+            }
+            self.hold_the_front(cx, books, i, side, price, p_min)
         }
+    }
+
+    /// `price`, unless taking it would RETREAT a quote off the front of a queue
+    /// ([`Quoter::leads_a_queue`]). Then the answer is the price that quote
+    /// already rests at, for as long as that price still clears `limit` and
+    /// still rests passively against the far side of the book.
+    ///
+    /// Only the retreat is held. A `price` at least as aggressive as the
+    /// resting one — an outbid answered, or no move at all — is returned as is.
+    fn hold_the_front(
+        &self,
+        cx: &mut Cx,
+        books: &BookBuilder,
+        i: usize,
+        side: BookSide,
+        price: D,
+        limit: D,
+    ) -> Option<D> {
+        let Some(cur) = self.resting.get(&(i, side)) else { return Some(price) };
+        // "Less aggressive than" on this side: a lower bid, a higher offer.
+        let behind = match side {
+            BookSide::Bid => Ordering::Less,
+            BookSide::Ask => Ordering::Greater,
+        };
+        if cx.cmp(price, cur.price) != behind || cx.cmp(cur.price, limit) == behind.reverse() {
+            return Some(price);
+        }
+        let leg = &self.rel.legs[i];
+        let book = books.get(leg.venue, &leg.market_id)?;
+        let far = match side {
+            BookSide::Bid => book.asks.first(),
+            BookSide::Ask => book.bids.first(),
+        };
+        if let Some(far) = far {
+            let far = cx.parse(&far.price)?;
+            if cx.cmp(cur.price, far) != behind {
+                return Some(price); // holding would lock or cross the book
+            }
+        }
+        if self.leads_a_queue(cx, books, i, side) { Some(cur.price) } else { Some(price) }
     }
 
     /// CROSSED-BOOK GUARD for the maker path (audit C5, 2026-07-28).
@@ -2657,5 +2748,110 @@ mod queue_priority_tests {
         );
         q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
         assert_eq!(place_on(&intents, "P").map(|p| p.price.as_str()), Some("0.74"), "{intents:?}");
+    }
+
+    /// The size of the quote resting on the P leg's `side`.
+    fn rests(q: &Quoter, side: BookSide) -> i64 {
+        q.resting.get(&(1, side)).expect("a resting quote").count
+    }
+
+    /// We opened 0.25, a queue formed behind us there, and then the 0.24 bid
+    /// under us left for 0.20. The old rule repriced to 0.21 — one tick over
+    /// the new competition, and behind every lot queued at 0.25. The front of
+    /// that queue is worth more than four ticks: whoever leads it is filled
+    /// first.
+    #[test]
+    fn a_queue_behind_our_bid_holds_it_when_the_bid_under_it_leaves() {
+        let (mut cx, fees, mut bb, mut q, mut oid) = resting_at_25();
+        let queued = (rests(&q, BookSide::Bid) + 500).to_string();
+        let mut intents = Vec::new();
+        pm(&mut bb, vec![lvl("0.25", &queued), lvl("0.24", "3")], 2, 130_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        assert!(quiet(&intents), "requoted on the join: {intents:?}");
+
+        intents.clear();
+        pm(&mut bb, vec![lvl("0.25", &queued), lvl("0.20", "3")], 3, 160_000_000_000);
+        assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.25", "retreated behind our own queue");
+        q.on_book(&mut cx, &fees, &bb, 160.0, &mut oid, &mut intents);
+        assert!(quiet(&intents), "{intents:?}");
+    }
+
+    /// The ask mirror, in the shape of the erlhaa cycle: we opened 0.75, a
+    /// queue formed behind us, the 0.76 offer beyond us left for 0.80, and the
+    /// old rule walked our offer out to 0.79 behind that queue.
+    #[test]
+    fn a_queue_behind_our_ask_holds_it_when_the_offer_over_it_leaves() {
+        let (mut cx, fees, mut bb, mut q) = ask_fixture(vec![lvl("0.76", "3")]);
+        let mut oid = 0u64;
+        let mut intents = Vec::new();
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(place_on(&intents, "P").map(|p| p.price.as_str()), Some("0.75"), "{intents:?}");
+        let queued = (rests(&q, BookSide::Ask) + 500).to_string();
+
+        intents.clear();
+        pm_asks(&mut bb, vec![lvl("0.75", &queued), lvl("0.76", "3")], 2, 130_000_000_000);
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        assert!(quiet(&intents), "requoted on the join: {intents:?}");
+
+        intents.clear();
+        pm_asks(&mut bb, vec![lvl("0.75", &queued), lvl("0.80", "3")], 3, 160_000_000_000);
+        assert_eq!(ask_target(&q, &mut cx, &fees, &bb), "0.75", "retreated behind our own queue");
+        q.on_book(&mut cx, &fees, &bb, 160.0, &mut oid, &mut intents);
+        assert!(quiet(&intents), "{intents:?}");
+    }
+
+    /// Alone at our level there is no queue to lose, so the quote still
+    /// follows the competition away and pays less. A level holding exactly
+    /// our own size is alone: equality is not a queue.
+    #[test]
+    fn alone_at_our_level_the_bid_still_follows_the_competition_down() {
+        let (mut cx, fees, mut bb, mut q, mut oid) = resting_at_25();
+        let ours = rests(&q, BookSide::Bid).to_string();
+        let mut intents = Vec::new();
+        pm(&mut bb, vec![lvl("0.25", &ours), lvl("0.20", "3")], 2, 130_000_000_000);
+        assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.21");
+        q.on_book(&mut cx, &fees, &bb, 130.0, &mut oid, &mut intents);
+        let p = place_on(&intents, "P").expect("a reprice");
+        assert_eq!((p.price.as_str(), p.old_price.as_deref()), ("0.21", Some("0.25")), "{intents:?}");
+    }
+
+    /// The hold only refuses a RETREAT. Outbid while leading a queue, the
+    /// quote still steps over the new bid.
+    #[test]
+    fn a_queue_behind_us_does_not_stop_us_answering_an_outbid() {
+        let (mut cx, fees, mut bb, q, _) = resting_at_25();
+        let queued = (rests(&q, BookSide::Bid) + 500).to_string();
+        pm(&mut bb, vec![lvl("0.26", "5"), lvl("0.25", &queued)], 2, 130_000_000_000);
+        assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.27");
+    }
+
+    /// Nor does it hold a price the hedge no longer pays. Kalshi's bid falls
+    /// from 0.60 to 0.26, which takes the most we may bid on P to 0.24, under
+    /// the 0.25 we lead at; the answer is the one tick over the 0.20 bid that
+    /// the limit still affords.
+    #[test]
+    fn a_queue_behind_us_does_not_hold_a_bid_the_hedge_no_longer_pays() {
+        let (mut cx, fees, mut bb, q, _) = resting_at_25();
+        let queued = (rests(&q, BookSide::Bid) + 500).to_string();
+        bb.apply_snapshot(
+            Venue::Kalshi, "K", vec![lvl("0.26", "500")], vec![lvl("0.99", "1")],
+            2, 130_000_000_000, None,
+        );
+        pm(&mut bb, vec![lvl("0.25", &queued), lvl("0.20", "3")], 2, 130_000_000_000);
+        assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.21", "held a price past its limit");
+    }
+
+    /// Nor a price the far side has reached: an offer down at our 0.25 means
+    /// holding there would rest a bid that locks the book.
+    #[test]
+    fn a_queue_behind_us_does_not_hold_a_bid_the_offer_has_reached() {
+        let (mut cx, fees, mut bb, q, _) = resting_at_25();
+        let queued = (rests(&q, BookSide::Bid) + 500).to_string();
+        bb.apply_snapshot(
+            Venue::PolymarketUs, "P",
+            vec![lvl("0.25", &queued), lvl("0.20", "3")], vec![lvl("0.25", "1")],
+            2, 130_000_000_000, None,
+        );
+        assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.21", "held a bid onto the offer");
     }
 }
