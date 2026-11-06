@@ -238,7 +238,8 @@ struct Blackout {
     #[serde(default)]
     why: String,
     /// The window also stops ENTRIES (`crate::engine`'s entry blackout): from
-    /// `from` on, no entry quote rests and no take-take fires on the family.
+    /// `from` until `until`, no entry quote rests and no take-take fires on the
+    /// family.
     /// Exits read every row whatever this says.
     #[serde(default)]
     entries: bool,
@@ -378,6 +379,15 @@ mod tests {
         let from = |family: &str| rows.iter().find(|(f, _, _, _)| f == family).unwrap().1;
         assert_eq!(from("cpi-26oct"), 1_794_286_800.0, "2026-11-10T05:00:00Z");
         assert_eq!(from("nfp-26oct"), 1_793_941_200.0, "2026-11-06T05:00:00Z");
+        // A bounded row covers a reveal that does not decide its family, so
+        // some later open row must cover the reveal that does: without one the
+        // family trades straight through its own resolution.
+        for (f, _, until, _) in rows.iter().filter(|r| r.2.is_finite()) {
+            assert!(
+                rows.iter().any(|(g, from, end, _)| end.is_infinite() && f.contains(g.as_str()) && from >= until),
+                "`{f}` has a bounded row and no open row after it"
+            );
+        }
     }
 
     /// `entries` is opt-in per row and changes nothing about exits: a row

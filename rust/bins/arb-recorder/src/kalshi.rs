@@ -328,7 +328,7 @@ fn ws_subscribe_frame(tickers: &[String]) -> String {
 /// The slice is held at the size it was measured at, not sized to the bound.
 /// At 300s in ten slices a 333-ticker universe sent 34 requests back to back
 /// every 30s, the WS unread while they ran, and about 1.6% of them failed (379
-/// of ~23,600 on 2026-11-05 after the 13:39Z restart). The 11-05 census takes
+/// of ~23,600 on 2026-11-05 after the 13:39 ET restart). The 11-05 census takes
 /// the universe to 717 tickers: 72 a slice at that shape, twice the request
 /// rate on the public budget the status poll shares and twice as long with the
 /// socket unread. Nothing measured says 72 would fail more, so twenty slices
@@ -388,7 +388,7 @@ async fn resnap_slice(
             }
             Err(e) => {
                 failed += 1;
-                first.get_or_insert_with(|| e.to_string());
+                first.get_or_insert_with(|| format!("{e:#}"));
             }
         }
     }
