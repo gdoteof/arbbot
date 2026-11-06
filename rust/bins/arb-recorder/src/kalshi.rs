@@ -29,6 +29,9 @@ pub const WS_URL: &str = "wss://api.elections.kalshi.com/trade-api/ws/v2";
 pub const WS_PATH: &str = "/trade-api/ws/v2";
 /// Pause between the universe status poll's batch requests; see `statuses`.
 const STATUS_BATCH_SPACING: Duration = Duration::from_secs(1);
+/// How long the status poll waits before each re-ask of a failed batch; see
+/// `statuses`.
+const STATUS_BATCH_RETRY_WAITS: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(15)];
 
 // ---------- normalization ----------
 
@@ -220,13 +223,32 @@ impl KalshiCatalog {
     /// Paced, because back to back they are rate-limited: the first poll that
     /// logged its failures (11-05 14:09) had 5 of its 7 requests answer 429,
     /// sharing the public budget with the integrity sweep's own requests.
+    ///
+    /// Pacing alone did not hold: the first paced poll (11-05 20:42) still had
+    /// 8 of its 15 requests answer 429, and an integrity-sweep slice drew 429s
+    /// in the same few seconds. So a failed batch is asked again after 5s and
+    /// then 15s. The sweep runs every 30s, so the two re-asks fall at different
+    /// points in its cycle. The poll runs every 30 minutes and nothing waits on
+    /// it, so the extra delay costs nothing.
     pub async fn statuses(&self, tickers: &[String]) -> StatusPoll {
+        self.statuses_retrying(tickers, &STATUS_BATCH_RETRY_WAITS).await
+    }
+
+    async fn statuses_retrying(&self, tickers: &[String], retry_waits: &[Duration]) -> StatusPoll {
         let mut poll = StatusPoll::default();
         for (i, chunk) in tickers.chunks(50).enumerate() {
             if i > 0 {
                 tokio::time::sleep(STATUS_BATCH_SPACING).await;
             }
-            match self.status_batch(chunk).await {
+            let mut answer = self.status_batch(chunk).await;
+            for wait in retry_waits {
+                if answer.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(*wait).await;
+                answer = self.status_batch(chunk).await;
+            }
+            match answer {
                 Ok(found) => poll.statuses.extend(found),
                 Err(e) => {
                     poll.unanswered.extend(chunk.iter().cloned());
@@ -845,9 +867,11 @@ mod tests {
 
     /// One failed batch used to abort the whole poll, and the caller dropped
     /// the error. Now it costs only its own tickers, which are neither evicted
-    /// nor restored, and the other batches still act.
+    /// nor restored, and the other batches still act. A batch that fails and
+    /// then answers on a re-ask counts as answered.
     #[tokio::test]
     async fn one_failed_status_batch_costs_only_its_own_tickers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -861,15 +885,26 @@ mod tests {
             .collect();
         let body = json!({"markets": markets, "cursor": ""}).to_string();
 
+        // FAIL's batch answers 429 every time; the first batch answers 429 once.
+        let (fail_asks, first_asks) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
         let http = TcpListener::bind("127.0.0.1:0").await.expect("bind http");
         let base = format!("http://{}", http.local_addr().expect("http addr"));
+        let (fail_seen, first_seen) = (fail_asks.clone(), first_asks.clone());
         tokio::spawn(async move {
             while let Ok((mut s, _)) = http.accept().await {
                 let body = body.clone();
+                let (fail_seen, first_seen) = (fail_seen.clone(), first_seen.clone());
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let n = s.read(&mut buf).await.unwrap_or(0);
-                    let resp = if String::from_utf8_lossy(&buf[..n]).contains("FAIL") {
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let throttled = if req.contains("FAIL") {
+                        fail_seen.fetch_add(1, Ordering::SeqCst);
+                        true
+                    } else {
+                        first_seen.fetch_add(1, Ordering::SeqCst) == 0
+                    };
+                    let resp = if throttled {
                         "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
                     } else {
                         format!(
@@ -887,7 +922,9 @@ mod tests {
             base,
         };
 
-        let poll = catalog.statuses(&tickers).await;
+        let poll = catalog.statuses_retrying(&tickers, &[Duration::from_millis(1); 2]).await;
+        assert_eq!(first_asks.load(Ordering::SeqCst), 2, "the first batch answered on its first re-ask");
+        assert_eq!(fail_asks.load(Ordering::SeqCst), 3, "asked once, then once per retry wait");
         assert_eq!(poll.errors.len(), 1, "exactly the second batch failed: {:?}", poll.errors);
         assert_eq!(poll.unanswered, ["FAIL".to_string()].into_iter().collect());
         assert_eq!(poll.statuses.len(), 49, "the first batch's answer survives the second's failure");
