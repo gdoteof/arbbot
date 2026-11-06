@@ -1492,8 +1492,8 @@ impl Engine {
             }
             Ok(rows) => {
                 for q in quoters.iter() {
-                    if let Some((family, _, w)) =
-                        rows.iter().find(|(family, from, _)| now >= *from && q.rel.id.contains(family.as_str()))
+                    if let Some((family, _, _, w)) =
+                        rows.iter().find(|w| crate::maker_exit::window_holds(w, &q.rel.id, now))
                     {
                         why.insert(q.rel.id.clone(), format!("entry blackout on `{family}`: {w}"));
                     }
@@ -5989,6 +5989,30 @@ mod entry_blackout_tests {
         eng.entry_blackout_tick(&mut quoters);
         assert!(eng.blacked_out.is_empty());
         assert!(quotes_kalshi_ask(&mut quoters, &books), "release needs no restart");
+    }
+
+    /// A bounded window holds entries only until `until`: once it closes the
+    /// relationship quotes again, as if its row had been deleted.
+    #[test]
+    fn a_closed_window_gives_entries_back() {
+        let p = scratch("bounded");
+        let row = |until: &str| {
+            format!(
+                "- family: france-pres-27\n  from: 2020-01-01T00:00:00Z\n  until: {until}\n  why: chart\n  \
+                 entries: true\n"
+            )
+        };
+        let (mut quoters, _) = quoter_and_books();
+        let mut eng = engine_reading(&p);
+        std::fs::write(&p, row("2099-01-01T00:00:00Z")).unwrap();
+        eng.entry_blackout_tick(&mut quoters);
+        assert_eq!(eng.blacked_out.iter().collect::<Vec<_>>(), ["xvus-france-pres-27-test"]);
+        let books = books_where_the_kalshi_ask_pays();
+        assert!(!places_anything(&mut quoters, &books), "an open window holds every leg");
+        std::fs::write(&p, row("2021-01-01T00:00:00Z")).unwrap();
+        eng.entry_blackout_tick(&mut quoters);
+        assert!(eng.blacked_out.is_empty(), "a closed window holds nothing");
+        assert!(quotes_kalshi_ask(&mut quoters, &books), "quoting returns when the window closes");
     }
 
     /// A family that does not match is untouched, and a damaged file pauses

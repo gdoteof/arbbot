@@ -325,13 +325,16 @@ fn ws_subscribe_frame(tickers: &[String]) -> String {
 /// rebroadcast — a periodic burst sized like the whole universe is a burst that
 /// hurts.
 ///
-/// The slice is sized to the request rate the public budget takes, not to the
-/// bound. At 300s over ten slices, 333 tickers already cost 34 back-to-back
-/// requests every 30s and 7.2% of them failed (1,547 of 21,602 on 2026-11-05,
-/// on 608 slices). The 11-05 census takes the universe to 717 tickers, and at
-/// the old shape that is 72 requests a slice. Twenty slices over 600s keeps a
-/// slice at 36 and the rate where it was; the backstop bound doubles, while WS
-/// deltas and the gap handler's own REST resnapshot keep books live in between.
+/// The slice is held at the size it was measured at, not sized to the bound.
+/// At 300s in ten slices a 333-ticker universe sent 34 requests back to back
+/// every 30s, the WS unread while they ran, and about 1.6% of them failed (379
+/// of ~23,600 on 2026-11-05 after the 13:39Z restart). The 11-05 census takes
+/// the universe to 717 tickers: 72 a slice at that shape, twice the request
+/// rate on the public budget the status poll shares and twice as long with the
+/// socket unread. Nothing measured says 72 would fail more, so twenty slices
+/// over 600s keep both where they were measured. The backstop bound doubles;
+/// WS deltas and the gap handler's own REST resnapshot keep a book live
+/// between sweeps.
 const RESNAP_FULL_S: u64 = 600;
 const RESNAP_CHUNKS: usize = 20;
 const RESNAP_TICK_S: u64 = RESNAP_FULL_S / RESNAP_CHUNKS as u64;
@@ -369,6 +372,7 @@ async fn resnap_slice(
 ) -> usize {
     let batch = resnap_batch(tickers.len(), RESNAP_CHUNKS);
     let (mut tried, mut failed) = (0usize, 0usize);
+    let mut first: Option<String> = None;
     for i in 0..batch {
         let t = &tickers[(cursor + i) % tickers.len()];
         if core.is_evicted(Venue::Kalshi, t) {
@@ -382,16 +386,21 @@ async fn resnap_slice(
                     core.on_event(&snap);
                 }
             }
-            Err(_) => failed += 1,
+            Err(e) => {
+                failed += 1;
+                first.get_or_insert_with(|| e.to_string());
+            }
         }
     }
     // A silent failure here is a book that keeps whatever state it was left in,
     // which is how one reached 74,082s old against a 300s interval. Counted,
-    // not logged per ticker.
+    // not logged per ticker; the first error says whether it was the budget
+    // (429), a purged market (404) or the network.
     if failed > 0 {
         eprintln!(
             "[kalshi-ws] resnapshot slice: {failed}/{tried} books did NOT refresh — \
-             their age is now unbounded"
+             their age is now unbounded (first: {})",
+            first.unwrap_or_default()
         );
     }
     batch

@@ -125,6 +125,11 @@
   from: 2026-11-03T05:00:00Z   # 2026-11-03 00:00 ET
   why: US midterm elections 2026-11-03, first polls close 23:00Z
   entries: true
+# A family decided over several reveals takes one bounded row per reveal and
+# trades between them: Grammy and Oscar winners lose every name the nominations
+# leave off, and the Oscar nominee categories that shortlist lose every film the
+# shortlist leaves off. The ceremony row, or the nominations row for the nominee
+# families, has no `until`.
 - family: cong120-hrmin
   from: 2026-11-10T05:00:00Z   # 2026-11-10 00:00 ET
   why: House Republican leadership elections 2026-11-10 (minority leader, 120th Congress)
@@ -132,6 +137,15 @@
 - family: cong120-senmin
   from: 2026-11-10T05:00:00Z   # 2026-11-10 00:00 ET
   why: Senate Republican leadership elections 2026-11-10 (minority leader, 120th Congress)
+  entries: true
+- family: cong120-senmaj
+  from: 2026-11-10T05:00:00Z   # 2026-11-10 00:00 ET
+  why: Senate Democratic leader vote, unscheduled; AP expected it the week after Election Day. Move it once a date is set
+  entries: true
+- family: grammy-27
+  from: 2026-11-16T05:00:00Z   # 2026-11-16 00:00 ET
+  until: 2026-11-18T05:00:00Z
+  why: 69th Grammy nominations 2026-11-16 07:45 ET; an artist left off cannot win
   entries: true
 - family: grammynom-27
   from: 2026-11-16T05:00:00Z   # 2026-11-16 00:00 ET
@@ -141,45 +155,64 @@
   from: 2026-11-18T05:00:00Z   # 2026-11-18 00:00 ET
   why: 60th CMA Awards, live on ABC 2026-11-18 20:00 ET
   entries: true
-- family: fedgt25-26
-  from: 2026-12-09T05:00:00Z   # 2026-12-09 00:00 ET
-  why: FOMC decision 2026-12-09 14:00 ET
-  entries: true
-- family: btcye-26
-  from: 2027-01-01T03:00:00Z   # 2026-12-31 22:00 ET
-  why: BRTI year-end print 2027-01-01 00:00 ET; no entry rests into the minute both venues read
-  entries: true
-- family: oscarnom-27
-  from: 2027-01-21T05:00:00Z   # 2027-01-21 00:00 ET
-  why: 99th Academy Award nominations announced 2027-01-21 morning ET
-  entries: true
-- family: grammy-27
-  from: 2027-02-07T05:00:00Z   # 2027-02-07 00:00 ET
-  why: 69th Grammy Awards ceremony 2027-02-07
-  entries: true
-- family: bbsong-26nov28
-  from: 2026-11-23T05:00:00Z   # 2026-11-23 00:00 ET
-  why: Billboard previews the Hot 100 dated 11-28, the window's last chart, 2026-11-23; PM-US closes 11-25
-  entries: true
 - family: bestai-26nov
   from: 2026-11-30T05:00:00Z   # 2026-11-30 00:00 ET
   why: Kalshi stops trading KXLLM1-26NOV30 at 10:00 ET 11-30, PM-US trades on past its 12:00 ET snapshot
-  entries: true
-- family: cong120-senmaj
-  from: 2026-12-01T05:00:00Z   # 2026-12-01 00:00 ET
-  why: Senate Democratic leader vote, unscheduled, reported for early December; move once it is set
   entries: true
 - family: gsearch-26
   from: 2026-12-01T05:00:00Z   # 2026-12-01 00:00 ET
   why: Google Year in Search release, day unannounced, 12-10 in 2024 and 12-04 in 2025
   entries: true
 - family: time-poty-26
-  from: 2026-12-06T05:00:00Z   # 2026-12-06 00:00 ET
-  why: TIME Person of the Year reveal, day unannounced, 12-06 in 2023 and 12-12 in 2024
+  from: 2026-12-01T05:00:00Z   # 2026-12-01 00:00 ET
+  why: TIME Person of the Year, day unannounced; a shortlist comes days before the reveal, which fell 12-06 in 2023, 12-12 in 2024 and 12-11 in 2025
   entries: true
-- family: bbalbum-26
-  from: 2026-12-20T05:00:00Z   # 2026-12-20 00:00 ET
-  why: Billboard reveals the No. 1 on the 12-26 Billboard 200, the last chart counted, 2026-12-20
+- family: fedgt25-26
+  from: 2026-12-09T05:00:00Z   # 2026-12-09 00:00 ET
+  why: FOMC decision 2026-12-09 14:00 ET
+  entries: true
+- family: oscarnom-27-casting
+  from: 2026-12-15T05:00:00Z   # 2026-12-15 00:00 ET
+  until: 2026-12-17T05:00:00Z
+  why: 99th Oscars shortlists 2026-12-15; a film left off cannot be nominated
+  entries: true
+- family: oscarnom-27-cine
+  from: 2026-12-15T05:00:00Z   # 2026-12-15 00:00 ET
+  until: 2026-12-17T05:00:00Z
+  why: 99th Oscars shortlists 2026-12-15; a film left off cannot be nominated
+  entries: true
+- family: oscarnom-27-doc
+  from: 2026-12-15T05:00:00Z   # 2026-12-15 00:00 ET
+  until: 2026-12-17T05:00:00Z
+  why: 99th Oscars shortlists 2026-12-15; a film left off cannot be nominated
+  entries: true
+- family: oscarnom-27-intl
+  from: 2026-12-15T05:00:00Z   # 2026-12-15 00:00 ET
+  until: 2026-12-17T05:00:00Z
+  why: 99th Oscars shortlists 2026-12-15; a film left off cannot be nominated
+  entries: true
+- family: oscarnom-27-makeup
+  from: 2026-12-15T05:00:00Z   # 2026-12-15 00:00 ET
+  until: 2026-12-17T05:00:00Z
+  why: 99th Oscars shortlists 2026-12-15; a film left off cannot be nominated
+  entries: true
+- family: oscarnom-27-score
+  from: 2026-12-15T05:00:00Z   # 2026-12-15 00:00 ET
+  until: 2026-12-17T05:00:00Z
+  why: 99th Oscars shortlists 2026-12-15; a film left off cannot be nominated
+  entries: true
+- family: oscarnom-27-vfx
+  from: 2026-12-15T05:00:00Z   # 2026-12-15 00:00 ET
+  until: 2026-12-17T05:00:00Z
+  why: 99th Oscars shortlists 2026-12-15; a film left off cannot be nominated
+  entries: true
+- family: aliens-26
+  from: 2026-12-31T05:00:00Z   # 2026-12-31 00:00 ET
+  why: deadline 12-31 23:59 ET; the PM-US event ends there and Kalshi trades on to 10:00 ET 01-01
+  entries: true
+- family: cryptoleg-26
+  from: 2026-12-31T05:00:00Z   # 2026-12-31 00:00 ET
+  why: deadline 12-31 23:59 ET; the PM-US event ends there and Kalshi trades on to 10:00 ET 01-01
   entries: true
 - family: bestai-26dec
   from: 2026-12-31T05:00:00Z   # 2026-12-31 00:00 ET
@@ -193,7 +226,106 @@
   from: 2026-12-31T05:00:00Z   # 2026-12-31 00:00 ET
   why: Kalshi stops trading KXAAAGASMAX-26DEC31 at 01:25 ET 12-31; PM-US trades all day and the 12-31 AAA print counts on both
   entries: true
+- family: btcye-26
+  from: 2027-01-01T03:00:00Z   # 2026-12-31 22:00 ET
+  why: BRTI year-end print 2027-01-01 00:00 ET; no entry rests into the minute both venues read
+  entries: true
 - family: cong120-speaker
   from: 2027-01-03T05:00:00Z   # 2027-01-03 00:00 ET
   why: House floor vote for Speaker of the 120th Congress, 2027-01-03
+  entries: true
+- family: nfl-27
+  from: 2027-01-10T05:00:00Z   # 2027-01-10 00:00 ET
+  why: the regular season ends 2027-01-10; AP finalists then knock out every other name before NFL Honors 2027-02-11
+  entries: true
+- family: oscarnom-27
+  from: 2027-01-21T05:00:00Z   # 2027-01-21 00:00 ET
+  why: 99th Academy Award nominations announced 2027-01-21 morning ET
+  entries: true
+- family: oscars-bestpic-27
+  from: 2027-01-21T05:00:00Z   # 2027-01-21 00:00 ET
+  until: 2027-01-23T05:00:00Z
+  why: 99th Oscar nominations 2027-01-21; a film or performer not nominated cannot win
+  entries: true
+- family: oscars-bestactor-27
+  from: 2027-01-21T05:00:00Z   # 2027-01-21 00:00 ET
+  until: 2027-01-23T05:00:00Z
+  why: 99th Oscar nominations 2027-01-21; a film or performer not nominated cannot win
+  entries: true
+- family: oscars-bestactress-27
+  from: 2027-01-21T05:00:00Z   # 2027-01-21 00:00 ET
+  until: 2027-01-23T05:00:00Z
+  why: 99th Oscar nominations 2027-01-21; a film or performer not nominated cannot win
+  entries: true
+- family: grammy-27
+  from: 2027-02-07T05:00:00Z   # 2027-02-07 00:00 ET
+  why: 69th Grammy Awards ceremony 2027-02-07
+  entries: true
+- family: oscars-bestpic-27
+  from: 2027-03-14T05:00:00Z   # 2027-03-14 00:00 ET
+  why: 99th Academy Awards 2027-03-14 (US clocks move at 02:00 that day; 00:00 is still EST)
+  entries: true
+- family: oscars-bestactor-27
+  from: 2027-03-14T05:00:00Z   # 2027-03-14 00:00 ET
+  why: 99th Academy Awards 2027-03-14 (US clocks move at 02:00 that day; 00:00 is still EST)
+  entries: true
+- family: oscars-bestactress-27
+  from: 2027-03-14T05:00:00Z   # 2027-03-14 00:00 ET
+  why: 99th Academy Awards 2027-03-14 (US clocks move at 02:00 that day; 00:00 is still EST)
+  entries: true
+
+# Billboard decides these a chart at a time. Kalshi's Hot 100 window counts the
+# charts dated 11-07 through 11-28 and PM-US every chart dated in November; the
+# album markets count every Billboard 200 chart in 2026, the last dated 12-26. A
+# No. 1 settles its market the week it charts. Billboard reveals the Billboard
+# 200 top 10 on Sunday and the Hot 100 top 10 on Monday, with full charts on
+# Tuesday, a day later in a holiday week, so each window runs Sunday 00:00 ET to
+# Wednesday 00:00 ET. The last chart counted ends its family and has no `until`.
+- family: bbsong-26nov28
+  from: 2026-11-08T05:00:00Z   # 2026-11-08 00:00 ET
+  until: 2026-11-11T05:00:00Z
+  why: Billboard reveals the Hot 100 dated 11-14
+  entries: true
+- family: bbsong-26nov28
+  from: 2026-11-15T05:00:00Z   # 2026-11-15 00:00 ET
+  until: 2026-11-18T05:00:00Z
+  why: Billboard reveals the Hot 100 dated 11-21
+  entries: true
+- family: bbsong-26nov28
+  from: 2026-11-22T05:00:00Z   # 2026-11-22 00:00 ET
+  why: Billboard reveals the Hot 100 dated 11-28, the window's last chart; the PM-US event ends 11-24 23:59 ET
+  entries: true
+- family: bbalbum-26
+  from: 2026-11-08T05:00:00Z   # 2026-11-08 00:00 ET
+  until: 2026-11-11T05:00:00Z
+  why: Billboard reveals the Billboard 200 dated 11-14
+  entries: true
+- family: bbalbum-26
+  from: 2026-11-15T05:00:00Z   # 2026-11-15 00:00 ET
+  until: 2026-11-18T05:00:00Z
+  why: Billboard reveals the Billboard 200 dated 11-21
+  entries: true
+- family: bbalbum-26
+  from: 2026-11-22T05:00:00Z   # 2026-11-22 00:00 ET
+  until: 2026-11-25T05:00:00Z
+  why: Billboard reveals the Billboard 200 dated 11-28
+  entries: true
+- family: bbalbum-26
+  from: 2026-11-29T05:00:00Z   # 2026-11-29 00:00 ET
+  until: 2026-12-02T05:00:00Z
+  why: Billboard reveals the Billboard 200 dated 12-05
+  entries: true
+- family: bbalbum-26
+  from: 2026-12-06T05:00:00Z   # 2026-12-06 00:00 ET
+  until: 2026-12-09T05:00:00Z
+  why: Billboard reveals the Billboard 200 dated 12-12
+  entries: true
+- family: bbalbum-26
+  from: 2026-12-13T05:00:00Z   # 2026-12-13 00:00 ET
+  until: 2026-12-16T05:00:00Z
+  why: Billboard reveals the Billboard 200 dated 12-19
+  entries: true
+- family: bbalbum-26
+  from: 2026-12-20T05:00:00Z   # 2026-12-20 00:00 ET
+  why: Billboard reveals the Billboard 200 dated 12-26, the last chart counted
   entries: true

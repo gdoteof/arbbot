@@ -157,8 +157,10 @@ const RULES: &[(&str, &str, bool)] = &[
     // Scheduled announcements, dated the day after: Grammy nominations 11-16
     // 07:45 ET, the CMA show 11-18 20:00 ET, Oscar nominations 2027-01-21,
     // the Grammys 2027-02-07. House and Senate Republicans elect their leaders
-    // 11-10. Senate Democrats have not set a date and are reported to vote in
-    // early December, so the majority-leader row takes 12-10; the Speaker is the
+    // 11-10. Senate Democrats have not set a date: AP expected their vote the
+    // week after Election Day, other reporting early December. The
+    // majority-leader row takes the later 12-10, which understates APR if the
+    // vote comes first, and entries stop at 11-10 either way. The Speaker is the
     // 2027-01-03 floor vote. A Billboard No waits for Kalshi's expiry: 11-28
     // for the Hot 100 window, 12-27 for the album market. Google's Year in
     // Search fell 12-10 in 2024 and 12-04 in 2025.

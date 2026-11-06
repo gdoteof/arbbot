@@ -220,14 +220,21 @@ pub(super) fn reset() {
 
 // ------------------------------------------------------------------ blackouts ---
 
-/// No exit may rest on a family from `from` on. A scheduled announcement moves
-/// both venues at the same instant, so no book event can pull a resting exit
-/// before the winning side lifts it at its pre-announcement price.
+/// No exit may rest on a family from `from` on, until `until` when the row has
+/// one. A scheduled announcement moves both venues at the same instant, so no
+/// book event can pull a resting exit before the winning side lifts it at its
+/// pre-announcement price.
 #[derive(serde::Deserialize)]
 struct Blackout {
     family: String,
     /// UTC, `YYYY-MM-DDTHH:MM:SSZ`.
     from: String,
+    /// UTC, same format, exclusive. A row without one never ends, which fits
+    /// the announcement that decides a family. A family decided over several
+    /// reveals — a weekly chart, nominations before a ceremony — takes one
+    /// bounded row per reveal and trades between them.
+    #[serde(default)]
+    until: Option<String>,
     #[serde(default)]
     why: String,
     /// The window also stops ENTRIES (`crate::engine`'s entry blackout): from
@@ -237,8 +244,17 @@ struct Blackout {
     entries: bool,
 }
 
-/// Parsed windows `(family, from_epoch_s, why)`.
-type Windows = Vec<(String, f64, String)>;
+/// Parsed windows `(family, from_epoch_s, until_epoch_s, why)`; a row with no
+/// `until` ends at infinity.
+type Window = (String, f64, f64, String);
+type Windows = Vec<Window>;
+
+/// Whether `w` holds `rel_id` at `now`. The one predicate both readers use, so
+/// the exit side and the entry side cannot disagree about when a window is open.
+pub fn window_holds(w: &Window, rel_id: &str, now: f64) -> bool {
+    let (family, from, until, _) = w;
+    now >= *from && now < *until && rel_id.contains(family.as_str())
+}
 
 /// `Ok` = the parsed windows; `Err` = a file that exists and cannot be
 /// trusted, which blacks out EVERY exit until fixed.
@@ -263,8 +279,16 @@ fn parse_rows(text: &str, entries_only: bool) -> Result<Windows, String> {
         }
         let from = crate::taketake::parse_iso8601_z(&b.from)
             .ok_or_else(|| format!("{}: `from` must be YYYY-MM-DDTHH:MM:SSZ, got {:?}", b.family, b.from))?;
+        let until = match &b.until {
+            None => f64::INFINITY,
+            Some(u) => crate::taketake::parse_iso8601_z(u)
+                .ok_or_else(|| format!("{}: `until` must be YYYY-MM-DDTHH:MM:SSZ, got {u:?}", b.family))?,
+        };
+        if until <= from {
+            return Err(format!("{}: `until` {:?} is not after `from` {:?}", b.family, b.until, b.from));
+        }
         if b.entries || !entries_only {
-            out.push((b.family, from, b.why));
+            out.push((b.family, from, until, b.why));
         }
     }
     Ok(out)
@@ -309,8 +333,8 @@ pub(super) fn blackout(rel_id: &str, now: f64) -> Option<String> {
         Err(e) => Some(format!("the exit blackout file is damaged ({e}) — no exit rests until it is fixed")),
         Ok(rows) => rows
             .iter()
-            .find(|(family, from, _)| now >= *from && rel_id.contains(family.as_str()))
-            .map(|(family, _, why)| format!("exit blackout on `{family}`: {why}")),
+            .find(|w| window_holds(w, rel_id, now))
+            .map(|(family, _, _, why)| format!("exit blackout on `{family}`: {why}")),
     }
 }
 
@@ -341,17 +365,17 @@ mod tests {
     fn the_shipped_blackout_file_parses() {
         let text = include_str!("../../../../../config/exit-blackouts.yaml");
         let rows = parse_blackouts(text).unwrap();
-        assert!(rows.iter().any(|(f, _, _)| f == "tsla-q3-deliv"));
-        assert!(rows.iter().any(|(f, _, _)| f == "nobel-peace-26"));
+        assert!(rows.iter().any(|(f, _, _, _)| f == "tsla-q3-deliv"));
+        assert!(rows.iter().any(|(f, _, _, _)| f == "nobel-peace-26"));
         // Kalshi stops trading CPI at 08:25 ET and PM-US trades on past the
         // 08:30 print, so these two families must never be quoted into it.
         let entries = parse_rows(text, true).unwrap();
         for family in ["cpi-26sep", "gdp-26q3", "cpi-26oct", "nfp-26oct"] {
-            assert!(entries.iter().any(|(f, _, _)| f == family), "{family} must black out entries");
-            assert!(rows.iter().any(|(f, _, _)| f == family), "{family} must black out exits too");
+            assert!(entries.iter().any(|(f, _, _, _)| f == family), "{family} must black out entries");
+            assert!(rows.iter().any(|(f, _, _, _)| f == family), "{family} must black out exits too");
         }
         // 00:00 EST on each release day: US clocks leave DST on 2026-11-01.
-        let from = |family: &str| rows.iter().find(|(f, _, _)| f == family).unwrap().1;
+        let from = |family: &str| rows.iter().find(|(f, _, _, _)| f == family).unwrap().1;
         assert_eq!(from("cpi-26oct"), 1_794_286_800.0, "2026-11-10T05:00:00Z");
         assert_eq!(from("nfp-26oct"), 1_793_941_200.0, "2026-11-06T05:00:00Z");
     }
@@ -363,9 +387,9 @@ mod tests {
         let text = "- family: a\n  from: 2026-10-01T04:00:00Z\n\
                     - family: b\n  from: 2026-10-02T04:00:00Z\n  entries: true\n  why: print\n";
         let all = parse_blackouts(text).unwrap();
-        assert_eq!(all.iter().map(|(f, _, _)| f.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        assert_eq!(all.iter().map(|(f, _, _, _)| f.as_str()).collect::<Vec<_>>(), ["a", "b"]);
         let entries = parse_rows(text, true).unwrap();
-        assert_eq!(entries, [("b".to_string(), 1_790_913_600.0, "print".to_string())]);
+        assert_eq!(entries, [("b".to_string(), 1_790_913_600.0, f64::INFINITY, "print".to_string())]);
         // A bad row anywhere damages both readers, never just one.
         let bad = format!("{text}- family: c\n  from: tomorrow\n");
         assert!(parse_rows(&bad, true).is_err() && parse_blackouts(&bad).is_err());
@@ -387,13 +411,40 @@ mod tests {
     #[test]
     fn a_blackout_starts_at_its_instant_and_a_damaged_file_blacks_out_everything() {
         let _g = super::super::test_serial();
-        set_blackouts(Ok(vec![("tsla-q3".into(), 100.0, "report".into())]));
+        set_blackouts(Ok(vec![("tsla-q3".into(), 100.0, f64::INFINITY, "report".into())]));
         assert!(blackout("xvus-tsla-q3-deliv-q3-above-480k", 99.0).is_none());
         assert!(blackout("xvus-tsla-q3-deliv-q3-above-480k", 100.0).is_some());
         assert!(blackout("xvus-nobel-peace-26-unrwa", 100.0).is_none());
         set_blackouts(Err("bad yaml".into()));
         assert!(blackout("xvus-nobel-peace-26-unrwa", 0.0).is_some());
         set_blackouts(Ok(Vec::new()));
+    }
+
+    /// A bounded window holds from `from` up to, not including, `until`; both
+    /// readers see the same bound; a window that closes before it opens, or an
+    /// `until` that does not parse, damages the file like any other bad row.
+    #[test]
+    fn a_bounded_window_holds_between_from_and_until() {
+        let _g = super::super::test_serial();
+        let text = "- family: bbalbum-26\n  from: 2026-11-08T05:00:00Z\n  until: 2026-11-11T05:00:00Z\n  \
+                    entries: true\n  why: chart\n";
+        let rows = parse_blackouts(text).unwrap();
+        let (from, until) = (rows[0].1, rows[0].2);
+        assert_eq!(until - from, 3.0 * 86_400.0);
+        assert_eq!(parse_rows(text, true).unwrap(), rows, "the entry reader sees the same bound");
+        let id = "xvus-bbalbum-26-taylorswift";
+        assert!(!window_holds(&rows[0], id, from - 1.0));
+        assert!(window_holds(&rows[0], id, from));
+        assert!(window_holds(&rows[0], id, until - 1.0));
+        assert!(!window_holds(&rows[0], id, until));
+        set_blackouts(Ok(rows));
+        assert!(blackout(id, from).is_some());
+        assert!(blackout(id, until).is_none(), "exits rest again once the window closes");
+        set_blackouts(Ok(Vec::new()));
+        let row = |until: &str| format!("- family: x\n  from: 2026-11-08T05:00:00Z\n  until: {until}\n");
+        assert!(parse_blackouts(&row("2026-11-08T05:00:00Z")).is_err(), "an empty window");
+        assert!(parse_blackouts(&row("2026-11-07T05:00:00Z")).is_err(), "a backwards window");
+        assert!(parse_blackouts(&row("2026-11-11")).is_err(), "an `until` without a time");
     }
 
     #[test]
