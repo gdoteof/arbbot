@@ -581,6 +581,10 @@ struct Engine {
     /// A fill opened exposure since the last feed line finished, so resting
     /// quotes may no longer pass the gate (`pull_refused_quotes`).
     entry_filled: bool,
+    /// (order id, contracts, fill time) of every entry fill since the last
+    /// feed line finished, for the quoter resting that order
+    /// (`Quoter::on_fill`).
+    quote_fills: Vec<(String, i64, f64)>,
     /// Each Kalshi market's latest valid tick ladder from the `price_grid` feed,
     /// for exit pricing (`marks`, `maker_exit`). Absent = unknown = the flat cent.
     kalshi_ladders: std::collections::BTreeMap<String, Vec<(String, String, String)>>,
@@ -925,6 +929,7 @@ impl Engine {
             distrusted: std::collections::BTreeSet::new(),
             blacked_out: std::collections::BTreeMap::new(),
             entry_filled: false,
+            quote_fills: Vec::new(),
             kalshi_ladders: std::collections::BTreeMap::new(),
             unwind_seen: None,
             unwind_refused: None,
@@ -2067,6 +2072,14 @@ impl Engine {
         self.queue_wait.record(m.t_read.elapsed().as_nanos() as u64);
         let t_deq = std::time::Instant::now();
         self.on_feed_line(&m.line, quoters, by_market);
+        // Before the gate is re-asked, so it is asked about what is left.
+        for (oid, qty, at) in std::mem::take(&mut self.quote_fills) {
+            for q in quoters.iter_mut() {
+                if q.on_fill(&oid, qty, at) {
+                    break;
+                }
+            }
+        }
         if std::mem::take(&mut self.entry_filled) {
             self.pull_refused_quotes(quoters);
         }
@@ -4604,9 +4617,13 @@ mod fill_pull_tests {
     }
 
     fn risk(budget: u32) -> Arc<crate::risk::RiskView> {
+        // Per test, like the rig's intents file: two tests sharing a budget run
+        // in parallel, and one rewriting these files while the other loads them
+        // failed the rig's own setup.
         let d = std::env::temp_dir().join(format!(
-            "arb-trader-fill-pull-{}-{budget}",
-            std::process::id()
+            "arb-trader-fill-pull-{}-{}-{budget}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
         ));
         std::fs::create_dir_all(&d).unwrap();
         let exec = d.join("exec.yaml");
@@ -4713,15 +4730,15 @@ mod fill_pull_tests {
     }
 
     /// What that fill leaves over the cap comes off, and the other topic's quote
-    /// does not. PA's cancel is for the order that just filled: the quoter
-    /// cannot tell, and the venue has nothing to act on.
+    /// does not. PA draws no cancel: its order is the one that filled whole, and
+    /// the fill reached its quoter before the gate was re-asked.
     #[test]
     fn a_fill_that_reaches_a_tail_cap_pulls_only_what_it_leaves_over_it() {
         let mut rig = resting(60);
         rig.fill();
 
         assert_eq!(rig.rv.open_ct(A), 50.0);
-        assert_eq!(rig.cancels(), ["PA", "PB"]);
+        assert_eq!(rig.cancels(), ["PB"]);
         assert_eq!(rig.rv.reserved_ct(), 50.0, "the other topic's quote stays resting");
     }
 
