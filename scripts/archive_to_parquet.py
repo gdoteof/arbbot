@@ -61,11 +61,61 @@ def content_digests(src: Path, pq: Path) -> tuple[str, str]:
     return h_jl.hexdigest(), h_pq.hexdigest()
 
 
+def strip_crash_nuls(src: Path, dst: Path) -> int:
+    """Copy src to dst with each line's leading NUL run removed, dropping lines
+    that were nothing else; returns how many lines carried a NUL run.
+
+    A host crash leaves the blocks a writer had not yet flushed as a run of
+    NUL bytes. The next boot appends after it, so the run ends at a newline or
+    runs straight into that boot's first record. The NULs held no data. A NUL
+    after data on a line means a damaged record, so this raises rather than
+    guess at it."""
+    hit = 0
+    with open(src, "rb") as f, open(dst, "wb") as out:
+        for n, line in enumerate(f, start=1):
+            if b"\x00" not in line:
+                out.write(line)
+                continue
+            rest = line.lstrip(b"\x00")
+            if b"\x00" in rest:
+                raise ValueError(f"line {n} has a NUL after data")
+            hit += 1
+            if rest.strip():
+                out.write(rest)
+    return hit
+
+
+def has_nul(src: Path) -> bool:
+    with open(src, "rb") as f:
+        while chunk := f.read(1 << 24):
+            if b"\x00" in chunk:
+                return True
+    return False
+
+
 def archive_one(con, src: Path, day: str, out_dir: Path, keep: bool) -> tuple[str, int]:
     pq = out_dir / f"{src.stem}.parquet"  # src.stem already '<stem>-<day>'
     if pq.exists() and not src.exists():
         return ("already-archived", 0)
     is_raw = src.parent.name == "raw" or src.stem.rsplit("-", 3)[0] in RAW_STEMS
+    if not has_nul(src):
+        return _archive(con, src, src, pq, is_raw, keep, "")
+    clean = src.with_name(src.stem + ".nul-stripped.jsonl")
+    try:
+        hit = strip_crash_nuls(src, clean)
+    except ValueError as e:
+        clean.unlink(missing_ok=True)
+        return (f"NUL-DAMAGED {e} — kept JSONL", 0)
+    status, rows = _archive(con, clean, src, pq, is_raw, keep,
+                            f" (crash NUL run stripped from {hit} line(s))")
+    clean.unlink(missing_ok=True)
+    return (status, rows)
+
+
+def _archive(con, src: Path, original: Path, pq: Path, is_raw: bool, keep: bool,
+             note: str) -> tuple[str, int]:
+    """Archive `src` to `pq`, verify, then delete `original` (which `src` is,
+    or a copy of it minus all-NUL lines)."""
     # raw tapes: explicit fixed schema — inference on a heterogeneous tape has
     # silently DROPPED columns absent from a sample and TIMESTAMP-truncated
     # ts_venue. sample_size=-1 (scan files): full-scan inference for the same
@@ -73,10 +123,16 @@ def archive_one(con, src: Path, day: str, out_dir: Path, keep: bool) -> tuple[st
     reader = (raw_json_reader(src) if is_raw else
               f"read_json_auto('{src}', format='newline_delimited', "
               f"union_by_name=true, sample_size=-1, maximum_object_size=20000000)")
-    con.execute(
-        f"COPY (SELECT * FROM {reader}) "
-        f"TO '{pq}' (FORMAT parquet, COMPRESSION zstd)"
-    )
+    try:
+        con.execute(
+            f"COPY (SELECT * FROM {reader}) "
+            f"TO '{pq}' (FORMAT parquet, COMPRESSION zstd)"
+        )
+    except duckdb.Error as e:
+        # A failed COPY can leave an empty file, which the read layer would
+        # then prefer over the JSONL it failed to replace.
+        pq.unlink(missing_ok=True)
+        return (f"FAILED {type(e).__name__}: {str(e)[:200]} — kept JSONL", 0)
     rows = con.execute(f"SELECT count(*) FROM read_parquet('{pq}')").fetchone()[0]
     lines = line_count(src)
     if rows != lines:
@@ -89,8 +145,8 @@ def archive_one(con, src: Path, day: str, out_dir: Path, keep: bool) -> tuple[st
             return (f"CONTENT-MISMATCH jsonl={d_jl[:16]} parquet={d_pq[:16]} "
                     f"— kept JSONL", 0)
     if not keep:
-        src.unlink()
-    return (f"ok {lines} rows", rows)
+        original.unlink()
+    return (f"ok {lines} rows{note}", rows)
 
 
 def main() -> None:
