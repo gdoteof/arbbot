@@ -145,3 +145,67 @@ def test_content_mismatch_keeps_jsonl(tmp_path):
     assert "CONTENT-MISMATCH" in status and rows == 0
     assert src.exists()
     assert not (out / f"kalshi-{DAY}.parquet").exists()
+
+
+def _splice(src, n, junk):
+    """Insert `junk` as line n+1 of src, as a host crash leaves its unflushed blocks."""
+    lines = src.read_bytes().splitlines(keepends=True)
+    src.write_bytes(b"".join(lines[:n] + [junk] + lines[n:]))
+
+
+def test_all_nul_crash_line_is_dropped_and_the_day_archives(tmp_path):
+    events = make_events()
+    raw = write_day(tmp_path, events)
+    src = raw / f"kalshi-{DAY}.jsonl"
+    _splice(src, 2, b"\x00" * 2958 + b"\n")
+    status, rows, out = archive(tmp_path, src)
+    assert status.startswith("ok 3 rows") and "stripped from 1 line" in status and rows == 3
+    assert not src.exists()
+    assert not (raw / f"kalshi-{DAY}.nul-stripped.jsonl").exists()
+    assert [parse_event(r) for r in iter_day(raw, "kalshi", DAY)] == events
+
+
+def test_nul_inside_a_record_keeps_the_jsonl(tmp_path):
+    raw = write_day(tmp_path, make_events())
+    src = raw / f"kalshi-{DAY}.jsonl"
+    _splice(src, 1, b'{"kind":"delta","venue":"kal\x00\x00\x00\n')  # NULs after data
+    status, rows, out = archive(tmp_path, src)
+    assert status.startswith("NUL-DAMAGED") and rows == 0
+    assert src.exists()
+    assert not (out / f"kalshi-{DAY}.parquet").exists()
+    assert not (raw / f"kalshi-{DAY}.nul-stripped.jsonl").exists()
+
+
+def test_failed_copy_leaves_no_empty_parquet_to_shadow_the_jsonl(tmp_path):
+    """The read layer prefers a parquet over the JSONL, so a 0-byte one left
+    by a failed COPY would hide the day from every reader."""
+    raw = write_day(tmp_path, make_events())
+    src = raw / f"kalshi-{DAY}.jsonl"
+    _splice(src, 1, b"{not json\n")
+    status, rows, out = archive(tmp_path, src)
+    assert status.startswith("FAILED") and rows == 0
+    assert src.exists()
+    assert not (out / f"kalshi-{DAY}.parquet").exists()
+
+
+def test_all_nul_crash_line_is_dropped_from_a_scan_file_too(tmp_path):
+    scan = tmp_path / "scan"
+    scan.mkdir()
+    src = scan / f"opportunities-{DAY}.jsonl"
+    src.write_bytes(b'{"a":1}\n' + b"\x00" * 40 + b'\n{"a":2}\n')
+    status, rows, out = archive(tmp_path, src)
+    assert status.startswith("ok 2 rows") and rows == 2
+    assert not src.exists()
+
+
+def test_nul_run_followed_by_the_next_boots_record_keeps_that_record(tmp_path):
+    """The writer that restarts after a crash may append straight onto the
+    NUL run, with no newline between them."""
+    events = make_events()
+    raw = write_day(tmp_path, events)
+    src = raw / f"kalshi-{DAY}.jsonl"
+    lines = src.read_bytes().splitlines(keepends=True)
+    src.write_bytes(lines[0] + b"\x00" * 2737 + lines[1] + lines[2])
+    status, rows, out = archive(tmp_path, src)
+    assert status.startswith("ok 3 rows") and rows == 3
+    assert [parse_event(r) for r in iter_day(raw, "kalshi", DAY)] == events
