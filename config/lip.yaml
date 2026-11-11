@@ -15,7 +15,12 @@
 # flatten what is held, and it re-fires if the stop file is removed while P&L
 # is still below the stop.
 qty: 200
-cap: 200
+# Inventory, not reward, decides the cap. On the 2026-11-05..11 tape (gas pairs,
+# our own orders taken out of the books) the four markets with the most reward
+# made $14.80/day at cap 100 against $8.96/day at cap 200: the bigger cap earned
+# more reward but held twice the inventory, which sat at the cap and lost more
+# than the extra reward.
+cap: 100
 max_markets: 4
 min_usd_day: 3.0
 loss_stop_usd: 150
