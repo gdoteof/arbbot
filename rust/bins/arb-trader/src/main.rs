@@ -443,7 +443,8 @@ fn load_quoters(registry: &str, rel_prefixes: &[String]) -> (Vec<Quoter>, Market
 }
 
 /// [`load_quoters`], quoting no relationship with a Kalshi leg in `leave`: the
-/// markets `--lip` holds inventory on, which an arb basket must not share.
+/// markets `--lip` quotes or holds inventory on, which an arb basket must not
+/// share.
 fn load_quoters_leaving(
     registry: &str,
     rel_prefixes: &[String],
@@ -495,7 +496,7 @@ fn load_quoters_leaving(
         .filter(|r| {
             let held = r.legs.iter().any(|l| l.venue == "kalshi" && leave.contains(&l.market_id));
             if held {
-                eprintln!("[lip] {} is not quoted: its Kalshi leg is quoted by --lip", r.id);
+                eprintln!("[lip] {} is not quoted: --lip quotes or holds its Kalshi leg", r.id);
             }
             !held
         })
@@ -1327,7 +1328,25 @@ async fn report_undischarged_hedges(
             _ => Err("this run has no Kalshi and PM-US sinks to read".to_string()),
         };
         let rels: Vec<&Rel> = quoters.iter().map(|q| &q.rel).collect();
-        orphan::adopt(&found, &places, &rels, venue.as_ref().map(|(k, p)| (k, p)).map_err(|e| e.as_str()))
+        // A pair whose Kalshi market --lip quotes or holds: the venue's
+        // imbalance there is that inventory, not this hedge's naked leg.
+        let (lip_pairs, adoptable): (Vec<orphan::Undischarged>, Vec<orphan::Undischarged>) =
+            found.iter().cloned().partition(|u| {
+                lip::left_alone(&u.hedge_market)
+                    || places.get(&u.maker_order_id).is_some_and(|e| lip::left_alone(&e.place))
+            });
+        let (adopted, mut refused) =
+            orphan::adopt(&adoptable, &places, &rels, venue.as_ref().map(|(k, p)| (k, p)).map_err(|e| e.as_str()));
+        refused.extend(lip_pairs.iter().map(|u| {
+            format!(
+                "[hedge] NOT ADOPTED {}x {} (order {}): --lip quotes or holds this pair's Kalshi \
+                 market, so the venue's imbalance there is not this hedge's to claim",
+                u.missing(),
+                u.hedge_market,
+                u.maker_order_id
+            )
+        }));
+        (adopted, refused)
     };
     for l in &refused {
         eprintln!("{l}");
@@ -1695,57 +1714,83 @@ fn up_mode(bench: bool, enable_orders: bool, confirm_live: bool) -> &'static str
     }
 }
 
-/// Spawn the maker-exit loop, if either flag asked for it.
+/// What `--lip` may quote, and which Kalshi markets the arb engine must leave
+/// alone.
 ///
-/// It needs BOTH sinks — the Kalshi one rests and cancels the ask, the PM-US one
-/// closes the other leg — and it needs the engine to be publishing, which
-/// `run_cfg` ties to the same flags. Like `--positions-recon`, reaching the sink
-/// pair already means `--enable-orders` and every precondition passed, so there
-/// is no second arming check here that would read as a safety net while being
-/// unreachable.
-/// Read `--lip`'s config and keep only the markets it may quote: none an
-/// open ledger lot holds, since Kalshi nets this inventory with a basket's leg
-/// in the same market. Installs the markets and the PM-US slugs the
-/// reconciliation must leave alone, and returns the config with the
-/// relationship ids per market. `None` without `--lip`, or with nothing left.
-fn prepare_lip(args: &Args) -> Option<(lip::Cfg, std::collections::BTreeMap<String, Vec<String>>)> {
-    let path = args.lip.as_deref()?;
-    let mut cfg = match lip::load(path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("[lip] REFUSED: {e}");
-            return None;
-        }
-    };
-    let records = match ledger::read(&args.ledger) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[lip] REFUSED: the ledger is unreadable ({e}), so no market can be shown free of arb exposure");
-            return None;
-        }
-    };
-    let pairs = positions::pairs_from_registry(&args.registry);
-    let mut rels: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
-    let mut owned_pm = Vec::new();
-    cfg.markets.retain(|m| {
-        let mine: Vec<&positions::Pair> = pairs.iter().filter(|p| p.kalshi == m.market).collect();
-        if let Some(p) = mine.iter().find(|p| !naked_act::open_lots(&records, &p.rel_id).is_empty()) {
-            eprintln!(
-                "[lip] {} REFUSED: {} has open lots in {}; Kalshi would net this inventory with them",
-                m.market, p.rel_id, args.ledger
-            );
-            return false;
-        }
-        rels.insert(m.market.clone(), mine.iter().map(|p| p.rel_id.clone()).collect());
-        owned_pm.extend(mine.iter().map(|p| p.pmus.clone()));
-        true
-    });
-    if cfg.markets.is_empty() {
-        eprintln!("[lip] REFUSED: no configured market is free to quote");
-        return None;
+/// Kalshi nets YES against NO in one market, so this inventory and an arb
+/// basket's leg cannot share a market. Every market the lip log holds
+/// inventory on is left alone on EVERY live run, `--lip` or not, because the
+/// config line that opened it may be gone. Every configured market is left
+/// alone too, except one an open ledger lot holds: that is refused, for the
+/// same reason the other way round. Installs both sets. Returns the config,
+/// with the relationship ids per market (`None` without `--lip`, or with
+/// nothing left to quote), and the left-alone set.
+#[allow(clippy::type_complexity)]
+fn prepare_lip(
+    args: &Args,
+) -> (Option<(lip::Cfg, std::collections::BTreeMap<String, Vec<String>>)>, std::collections::BTreeSet<String>) {
+    let holdings = lip::log_holdings(&args.lip_log);
+    let mut left: std::collections::BTreeSet<String> =
+        holdings.as_ref().map(|h| h.keys().cloned().collect()).unwrap_or_default();
+    for (m, n) in holdings.iter().flatten() {
+        eprintln!("[lip] {m}: {} holds {n:+}, so the arb engine leaves this market alone", args.lip_log);
     }
-    lip::install(cfg.markets.iter().map(|m| m.market.clone()).collect(), owned_pm);
-    Some((cfg, rels))
+    let cfg = args.lip.as_deref().and_then(|path| {
+        let mut cfg = match lip::load(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[lip] REFUSED: {e}");
+                return None;
+            }
+        };
+        let records = match ledger::read(&args.ledger) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "[lip] REFUSED: the ledger is unreadable ({e}), so no market can be shown free of \
+                     arb exposure"
+                );
+                return None;
+            }
+        };
+        let pairs = positions::pairs_from_registry(&args.registry);
+        let mut rels: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+        cfg.markets.retain(|m| {
+            let mine: Vec<&positions::Pair> = pairs.iter().filter(|p| p.kalshi == m.market).collect();
+            if let Some(p) = mine.iter().find(|p| !naked_act::open_lots(&records, &p.rel_id).is_empty()) {
+                eprintln!(
+                    "[lip] {} REFUSED: {} has open lots in {}; Kalshi would net this inventory with them",
+                    m.market, p.rel_id, args.ledger
+                );
+                return false;
+            }
+            rels.insert(m.market.clone(), mine.iter().map(|p| p.rel_id.clone()).collect());
+            true
+        });
+        if cfg.markets.is_empty() {
+            eprintln!("[lip] REFUSED: no configured market is free to quote");
+            return None;
+        }
+        Some((cfg, rels))
+    });
+    if let Some((c, _)) = &cfg {
+        left.extend(c.markets.iter().map(|m| m.market.clone()));
+    }
+    let cfg = match (&holdings, cfg) {
+        (Ok(_), c) => c,
+        (Err(e), c) => {
+            eprintln!(
+                "[lip] {} is UNREADABLE ({e}): what it holds is unknown, so --lip will not run{}, \
+                 and the arb engine is NOT kept off any other market it holds. CHECK BY HAND.",
+                args.lip_log,
+                if c.is_some() { " (its configured markets are still left alone)" } else { "" }
+            );
+            None
+        }
+    };
+    let watched = if cfg.is_some() { left.clone() } else { std::collections::BTreeSet::new() };
+    lip::install(watched, left.clone());
+    (cfg, left)
 }
 
 fn spawn_lip(
@@ -1774,6 +1819,14 @@ fn spawn_lip(
     ));
 }
 
+/// Spawn the maker-exit loop, if either flag asked for it.
+///
+/// It needs BOTH sinks — the Kalshi one rests and cancels the ask, the PM-US one
+/// closes the other leg — and it needs the engine to be publishing, which
+/// `run_cfg` ties to the same flags. Like `--positions-recon`, reaching the sink
+/// pair already means `--enable-orders` and every precondition passed, so there
+/// is no second arming check here that would read as a safety net while being
+/// unreachable.
 fn spawn_maker_exit(
     args: &Args,
     sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
@@ -2369,12 +2422,8 @@ async fn main() {
         8.0
     };
 
-    let lip = (!bench).then(|| prepare_lip(&args)).flatten();
-    let (mut quoters, by_market, rel_meta) = load_quoters_leaving(
-        &args.registry,
-        &args.rel_prefixes,
-        &lip.as_ref().map(|(c, _)| c.markets.iter().map(|m| m.market.clone()).collect()).unwrap_or_default(),
-    );
+    let (lip, lip_left) = if bench { (None, std::collections::BTreeSet::new()) } else { prepare_lip(&args) };
+    let (mut quoters, by_market, rel_meta) = load_quoters_leaving(&args.registry, &args.rel_prefixes, &lip_left);
     let opportunities = args
         .opportunities_out
         .as_deref()

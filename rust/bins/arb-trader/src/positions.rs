@@ -558,10 +558,6 @@ impl Act {
                 read += 1;
             }
         }
-        // `--lip` holds inventory on these pairs' Kalshi legs on purpose: they
-        // are reported like any naked leg and never completed.
-        let lip = crate::lip::owned_pm_slugs();
-        own.claim_rows(lip.iter().map(|s| (s.as_str(), "probe-lip")));
         if read == 0 {
             return Err(format!(
                 "none of the {} research-probe logs could be read, so the ownership \
@@ -973,7 +969,9 @@ async fn cycle(
     // does — its list has no history of dropping rows. A transient bad Kalshi
     // read is caught one layer up instead: guard 3 will not confirm it.
     let kpos = read_net(kalshi, "kalshi").await?;
-    let (confirmed, fresh) = recon.step(&kpos, &ppos, &|_| false);
+    // A pair whose Kalshi market --lip quotes or holds is not an arb position:
+    // its imbalance is that inventory, held on purpose under its own loss stop.
+    let (confirmed, fresh) = recon.step(&kpos, &ppos, &|p| crate::lip::left_alone(&p.kalshi));
     // Published only HERE, past every guard: the gauges are the reading of a
     // snapshot this cycle was willing to believe.
     NAKED.store(confirmed.len() as i64, Ordering::Relaxed);

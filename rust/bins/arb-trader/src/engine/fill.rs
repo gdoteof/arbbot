@@ -603,13 +603,13 @@ impl Engine {
                     // for an ack that cannot come only defers alarming as
                     // unexplained money about a fill whose owner is polling it
                     // and booking it right now.
-                    if is_sidecar_order(oid) {
+                    if is_sidecar_order(oid) || crate::lip::owns_order(oid) {
                         // The owner hedges on THIS frame, not on its next poll.
                         crate::maker_exit::wake_fill(market, oid);
                         crate::lip::wake_fill(market, oid);
                         eprintln!(
                             "[fill] {cum}x on {} {} is order {oid} — placed by THIS PROCESS \
-                             outside the engine (the maker exit, or --positions-recon-act). \
+                             outside the engine (the maker exit, --positions-recon-act, or --lip). \
                              That module polls its own fill and books its own record, so this \
                              frame is neither credited here nor counted as unexplained.",
                             venue.as_str(),

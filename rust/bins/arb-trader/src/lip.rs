@@ -40,13 +40,14 @@
 //! `-loss_stop_usd`. It writes `<log>.STOP` and pulls everything until a human
 //! removes that file.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arb_core::model::Level;
 use arb_venue::gateway::{CancelBy, CancelRequest, PlaceRequest, Side, Tif};
+use arb_venue::VenueError;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -121,7 +122,9 @@ pub fn load(path: &str) -> Result<Cfg, String> {
     if cfg.max_markets == 0 || cfg.markets.is_empty() {
         return Err(format!("{path}: no market may be quoted (max_markets 0 or no markets)"));
     }
-    if !(cfg.loss_stop_usd > 0.0) || !(cfg.min_usd_day >= 0.0) {
+    let positive = |x: f64| x.is_finite() && x > 0.0;
+    let non_negative = |x: f64| x.is_finite() && x >= 0.0;
+    if !positive(cfg.loss_stop_usd) || !non_negative(cfg.min_usd_day) {
         return Err(format!("{path}: loss_stop_usd must be > 0 and min_usd_day >= 0"));
     }
     let mut seen = BTreeSet::new();
@@ -132,7 +135,7 @@ pub fn load(path: &str) -> Result<Cfg, String> {
         if crate::taketake::parse_iso8601_z(&m.until).is_none() {
             return Err(format!("{path}: {} `until` must be YYYY-MM-DDTHH:MM:SSZ", m.market));
         }
-        if !(m.usd_day > 0.0) {
+        if !positive(m.usd_day) {
             return Err(format!("{path}: {} usd_day must be > 0", m.market));
         }
     }
@@ -164,7 +167,7 @@ pub(crate) fn px_str(p: i64) -> String {
 /// One side of a book with our own resting order taken out: `(price, size)`,
 /// best first, in the order the levels arrive in, dropping levels left empty.
 /// `own` is our order on this side: `(price, contracts still resting)`.
-pub(crate) fn others(levels: &[Level], own: Option<(i64, i64)>) -> Vec<(i64, f64)> {
+pub(crate) fn others(levels: &[Level], own: Option<(i64, i64)>) -> Levels {
     levels
         .iter()
         .filter_map(|l| {
@@ -279,19 +282,55 @@ pub(crate) fn want(bids_o: &[(i64, f64)], asks_o: &[(i64, f64)], pos: i64, qty: 
     }
 }
 
-/// Which markets to quote: eligible ones modelling at least `min` (sticky ones
-/// down to `min / STICKY`), best first, at most `max`. A market already quoted
-/// ranks as if it modelled `STICKY` times its value. `cands` is
-/// `(market, modelled usd/day, quoted now)`.
-pub(crate) fn select(cands: &[(String, f64, bool)], min: f64, max: usize) -> BTreeSet<String> {
-    let mut ranked: Vec<(f64, &str)> = cands
-        .iter()
-        .filter(|(_, v, now)| if *now { *v >= min / STICKY } else { *v >= min })
-        .filter(|(_, v, _)| *v > 0.0)
-        .map(|(m, v, now)| (if *now { v * STICKY } else { *v }, m.as_str()))
-        .collect();
-    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(b.1)));
-    ranked.into_iter().take(max).map(|(_, m)| m.to_string()).collect()
+/// One market as [`select`] sees it.
+#[derive(Debug, Clone)]
+pub(crate) struct Cand {
+    pub market: String,
+    /// What its book models for our two orders, USD a day.
+    pub usd_day: f64,
+    /// Quoted on the last pass.
+    pub quoted: bool,
+    /// Holds inventory.
+    pub held: bool,
+    /// Nothing blocks it: no kill, stop, blackout, program end, or missing book.
+    pub open: bool,
+}
+
+/// Which markets to quote, at most `max`.
+///
+/// Every market holding inventory takes a slot first, whether or not it can be
+/// quoted, so inventory is never spread over more than `max` markets: about
+/// `max * cap` contracts at most. Inventory on several strikes of one figure
+/// is one bet, and nothing else here bounds it across markets. A held market is
+/// quoted while it models at least `min / STICKY`. The slots left go to the
+/// best other markets modelling at least `min`, where one already quoted ranks
+/// as if it modelled `STICKY` times its value and stays down to `min / STICKY`.
+pub(crate) fn select(cands: &[Cand], min: f64, max: usize) -> BTreeSet<String> {
+    let passes = |c: &Cand| {
+        let floor = if c.quoted || c.held { min / STICKY } else { min };
+        c.open && c.usd_day > 0.0 && c.usd_day >= floor
+    };
+    let rank = |c: &Cand| if c.quoted { c.usd_day * STICKY } else { c.usd_day };
+    let by_rank = |a: &&Cand, b: &&Cand| {
+        rank(b).partial_cmp(&rank(a)).unwrap_or(std::cmp::Ordering::Equal).then(a.market.cmp(&b.market))
+    };
+    let mut held: Vec<&Cand> = cands.iter().filter(|c| c.held).collect();
+    held.sort_by(by_rank);
+    let mut out = BTreeSet::new();
+    let mut slots = max;
+    for c in held {
+        if slots == 0 {
+            break;
+        }
+        slots -= 1;
+        if passes(c) {
+            out.insert(c.market.clone());
+        }
+    }
+    let mut rest: Vec<&Cand> = cands.iter().filter(|c| !c.held && passes(c)).collect();
+    rest.sort_by(by_rank);
+    out.extend(rest.into_iter().take(slots).map(|c| c.market.clone()));
+    out
 }
 
 /// Should a resting order stay? It must be at the wanted price, must not be
@@ -376,12 +415,31 @@ pub(crate) fn replay(records: &[Value]) -> BTreeMap<String, Book> {
 // The engine's side of the seam
 // ---------------------------------------------------------------------------
 
-/// Trusted Kalshi books of the configured markets: `(bids, asks)`.
-static BOOKS: Mutex<BTreeMap<String, (Vec<Level>, Vec<Level>)>> = Mutex::new(BTreeMap::new());
-/// The configured markets. Set once, before the feed starts.
+/// One market's book: `(bids, asks)`, best first.
+type Sides = (Vec<Level>, Vec<Level>);
+/// One side of a book as `(price, size)`, best first.
+type Levels = Vec<(i64, f64)>;
+/// An entry-blackout window as `maker_exit::read_entry_blackouts` returns it.
+type Window = (String, f64, f64, String);
+
+/// Trusted Kalshi books of the watched markets.
+static BOOKS: Mutex<BTreeMap<String, Sides>> = Mutex::new(BTreeMap::new());
+/// The markets this run's quoter tracks: every configured one, and every one
+/// its log still holds inventory on. Set once before the feed starts, and only
+/// by a `--lip` run.
 static WATCHED: OnceLock<BTreeSet<String>> = OnceLock::new();
-/// The PM-US slugs of every relationship on a configured market.
-static OWNED_PM: OnceLock<Vec<String>> = OnceLock::new();
+/// Kalshi markets the arb engine must leave alone: every market `--lip` quotes
+/// or its log holds inventory on. Set on every live run, `--lip` or not, so the
+/// inventory outlives the config line that opened it.
+static LEFT: OnceLock<BTreeSet<String>> = OnceLock::new();
+/// Venue ids of the orders this module placed, oldest first, for the fill
+/// feed's attribution ([`owns_order`]). Kept here rather than in the engine's
+/// sidecar list, which holds 256 ids: this module's re-quoting would evict the
+/// maker exit's ids from it.
+static OWN_IDS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+/// About a day of re-quoting at a busy pace. A fill on an order older than
+/// that is reported as unattributed, which is the safe way to fail.
+const OWN_IDS_REMEMBERED: usize = 4096;
 /// Market -> venue ids reported filled there since the last pass (empty: the
 /// book moved).
 static DIRTY: Mutex<BTreeMap<String, BTreeSet<String>>> = Mutex::new(BTreeMap::new());
@@ -403,20 +461,52 @@ fn mark(market: &str, filled: Option<&str>) {
     notify().notify_one();
 }
 
-/// Claim `markets` for this module, and name the PM-US slugs whose positions
-/// the reconciliation must leave alone. Called once, before the feed starts.
-pub fn install(markets: BTreeSet<String>, owned_pm: Vec<String>) {
-    let _ = WATCHED.set(markets);
-    let _ = OWNED_PM.set(owned_pm);
+/// Set the markets this run's quoter tracks (empty without `--lip`) and the
+/// markets the arb engine must leave alone. Called once, before the feed starts.
+pub fn install(watched: BTreeSet<String>, left: BTreeSet<String>) {
+    let _ = WATCHED.set(watched);
+    let _ = LEFT.set(left);
 }
 
-/// Is `market` one this module quotes? False on every run without `--lip`.
+/// Is `market` one this module tracks? False on every run without `--lip`.
 pub fn watching(market: &str) -> bool {
     WATCHED.get().is_some_and(|w| w.contains(market))
 }
 
+/// Must the arb engine leave this Kalshi market alone? True for every market
+/// `--lip` quotes or its log holds inventory on: Kalshi would net an arb leg
+/// there against that inventory. False on every run whose log holds nothing,
+/// without `--lip`.
+pub fn left_alone(kalshi_market: &str) -> bool {
+    LEFT.get().is_some_and(|l| l.contains(kalshi_market))
+}
+
+/// Did this module place the venue order `venue_order_id`?
+pub fn owns_order(venue_order_id: &str) -> bool {
+    OWN_IDS.lock().is_ok_and(|g| g.iter().any(|id| id == venue_order_id))
+}
+
+fn note_order(venue_order_id: &str) {
+    if let Ok(mut g) = OWN_IDS.lock() {
+        if g.len() >= OWN_IDS_REMEMBERED {
+            g.pop_front();
+        }
+        g.push_back(venue_order_id.to_owned());
+    }
+}
+
+/// The nonzero net positions the log at `path` holds, by market. A missing
+/// log holds nothing.
+pub fn log_holdings(path: &str) -> Result<BTreeMap<String, i64>, String> {
+    if !std::path::Path::new(path).exists() {
+        return Ok(BTreeMap::new());
+    }
+    let records = crate::ledger::read(path)?;
+    Ok(replay(&records).into_iter().filter(|(_, b)| b.pos != 0).map(|(m, b)| (m, b.pos)).collect())
+}
+
 /// The engine saw `market`'s book move. `None` means it can no longer be
-/// priced from: crossed, or stamped in the future.
+/// priced from: crossed, stamped in the future, or lost to a sequence gap.
 pub fn book_changed(market: &str, book: Option<(&[Level], &[Level])>) {
     if let Ok(mut g) = BOOKS.lock() {
         match book {
@@ -450,11 +540,6 @@ pub fn wake_fill(market: &str, venue_order_id: &str) {
     }
 }
 
-/// PM-US slugs the positions reconciliation must report and never complete.
-pub fn owned_pm_slugs() -> Vec<String> {
-    OWNED_PM.get().cloned().unwrap_or_default()
-}
-
 /// This module's gauges for the engine's stats line, once the loop has run.
 pub fn stats() -> Option<Value> {
     STATS.lock().ok().and_then(|g| g.clone())
@@ -484,7 +569,7 @@ pub struct Wiring {
     pub kill_file: String,
     /// Relationship ids per configured market, for the blackout check.
     pub rels: BTreeMap<String, Vec<String>>,
-    /// Decide and print; never place or cancel.
+    /// Decide and print; never place, cancel, or write the log or stop file.
     pub shadow: bool,
 }
 
@@ -503,12 +588,24 @@ impl Order {
     }
 }
 
+/// A place whose answer never came back. The venue may hold it under an id
+/// this process has not learned.
+struct Lost {
+    bid: bool,
+    req: PlaceRequest,
+    next: Instant,
+    tries: u32,
+}
+
 struct Mkt {
     cfg: MarketCfg,
     until: f64,
     bid: Option<Order>,
     ask: Option<Order>,
+    /// The last place or cancel per side (`[bid, ask]`), and the refusals
+    /// since that side's last success.
     last_touch: [Option<Instant>; 2],
+    fails: [u32; 2],
     book: Book,
     /// The venue position not yet folded into `book`, awaiting a mid to adopt it at.
     unadopted: i64,
@@ -518,6 +615,43 @@ struct Mkt {
     /// (`true` = bid). Nothing new rests on the market until they are settled:
     /// a place sized off a position missing their fills could pass the cap.
     unsettled: Vec<(bool, Order)>,
+    settle_next: Option<Instant>,
+    /// Places whose answer was lost. Nothing new rests on the market while any is.
+    lost: Vec<Lost>,
+    /// Why this market rests nothing for the rest of the process, if it doesn't.
+    refused: Option<String>,
+}
+
+impl Mkt {
+    /// Does this market hold inventory, booked or awaiting adoption?
+    fn held(&self) -> bool {
+        self.book.pos != 0 || self.unadopted != 0
+    }
+}
+
+/// The longest a side waits between attempts while the venue keeps refusing it.
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// How often a cancelled order's final count is re-read while it is owed one.
+const SETTLE_RETRY: Duration = Duration::from_secs(5);
+/// How often, and how many times, the venue's order list is searched for a
+/// place whose answer was lost before the market is given up on. Ten minutes:
+/// far past the list's lag behind a write.
+const LOST_RETRY: Duration = Duration::from_secs(30);
+const LOST_TRIES: u32 = 20;
+
+/// The wait before a side's next place after `fails` refusals in a row:
+/// [`MIN_REQUOTE`], doubling per refusal, at most [`MAX_BACKOFF`]. A halted
+/// market answers every place with the same refusal, and retrying it every
+/// pass would spend the order-path budget the arb engine needs.
+fn backoff(fails: u32) -> Duration {
+    (MIN_REQUOTE * 2u32.pow(fails.min(5))).min(MAX_BACKOFF)
+}
+
+/// Did a place that came back with `e` certainly never rest? Only a venue
+/// answer or a local refusal says so. A transport failure or an unreadable
+/// answer may hide an accepted order.
+fn never_rested(e: &VenueError) -> bool {
+    matches!(e, VenueError::Status { .. } | VenueError::RateLimited { .. } | VenueError::Sign(_) | VenueError::NotWired)
 }
 
 static PLACED: AtomicU64 = AtomicU64::new(0);
@@ -550,10 +684,14 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.map_err(|e| format!("task failed: {e}"))
 }
 
-fn append(path: &str, rec: Value) {
-    if let Err(e) = crate::ledger::append(path, &rec) {
+fn append(w: &Wiring, rec: Value) {
+    if w.shadow {
+        eprintln!("[lip] SHADOW, not logged: {rec}");
+        return;
+    }
+    if let Err(e) = crate::ledger::append(&w.log_path, &rec) {
         ERRORS.fetch_add(1, Ordering::Relaxed);
-        eprintln!("[lip] could not append to {path}: {e} — record was {rec}");
+        eprintln!("[lip] could not append to {}: {e} — record was {rec}", w.log_path);
     }
 }
 
@@ -561,9 +699,12 @@ fn stop_file(log_path: &str) -> String {
     format!("{log_path}.STOP")
 }
 
+fn exists(path: &str) -> bool {
+    std::path::Path::new(path).exists()
+}
+
 pub async fn run(cfg: Cfg, w: Wiring) {
-    let mut mkts: BTreeMap<String, Mkt> = BTreeMap::new();
-    let records = if !std::path::Path::new(&w.log_path).exists() {
+    let records = if !exists(&w.log_path) {
         Vec::new()
     } else {
         match crate::ledger::read(&w.log_path) {
@@ -575,8 +716,8 @@ pub async fn run(cfg: Cfg, w: Wiring) {
         }
     };
     let books = replay(&records);
-    // Venue truth for where each market stands. A gap with the log is
-    // adopted at the first mid, so P&L counts from what is actually held.
+    let history: BTreeSet<&str> = records.iter().filter_map(|r| r.get("market").and_then(Value::as_str)).collect();
+    // Venue truth for where each market stands.
     let venue = loop {
         let k = w.kalshi.clone();
         match blocking(move || k.net_positions().map_err(|e| e.to_string())).await {
@@ -585,37 +726,72 @@ pub async fn run(cfg: Cfg, w: Wiring) {
         }
         tokio::time::sleep(Duration::from_secs(30)).await;
     };
-    for m in &cfg.markets {
-        let book = books.get(&m.market).copied().unwrap_or_default();
-        let held = venue.get(&m.market).copied().unwrap_or(0.0).round() as i64;
+    // The configured markets, then every market the log still holds inventory
+    // on without a config line: tracked, marked and counted by the loss stop,
+    // never quoted.
+    let mut lines: Vec<(MarketCfg, f64)> = cfg
+        .markets
+        .iter()
+        .map(|m| (m.clone(), crate::taketake::parse_iso8601_z(&m.until).unwrap_or(0.0)))
+        .collect();
+    for (name, b) in &books {
+        if b.pos != 0 && !cfg.markets.iter().any(|m| &m.market == name) {
+            lines.push((MarketCfg { market: name.clone(), usd_day: 0.0, until: String::new() }, 0.0));
+        }
+    }
+    let mut mkts: BTreeMap<String, Mkt> = BTreeMap::new();
+    for (mc, until) in lines {
+        let book = books.get(&mc.market).copied().unwrap_or_default();
+        let held = venue.get(&mc.market).copied().unwrap_or(0.0).round() as i64;
+        let (mut unadopted, mut refused) = (0, None);
         if held != book.pos {
-            eprintln!(
-                "[lip] {}: the venue holds {held} where {} accounts for {} — the difference \
-                 is adopted at the first mid",
-                m.market, w.log_path, book.pos
-            );
+            if history.contains(mc.market.as_str()) {
+                // Fills the log missed (a crash between the fill and its
+                // record): adopted at the first mid, so P&L counts from what
+                // is actually held.
+                unadopted = held - book.pos;
+                eprintln!(
+                    "[lip] {}: the venue holds {held} where {} accounts for {} — the difference \
+                     is adopted at the first mid",
+                    mc.market, w.log_path, book.pos
+                );
+            } else {
+                let why = format!(
+                    "the venue holds {held} contract(s) here that {} never booked, so they are \
+                     not this module's to trade against",
+                    w.log_path
+                );
+                eprintln!("[lip] {} REFUSED: {why}. Nothing rests here this run; CHECK BY HAND whose they are.", mc.market);
+                refused = Some(why);
+            }
         }
         mkts.insert(
-            m.market.clone(),
+            mc.market.clone(),
             Mkt {
-                cfg: m.clone(),
-                until: crate::taketake::parse_iso8601_z(&m.until).unwrap_or(0.0),
+                cfg: mc,
+                until,
                 bid: None,
                 ask: None,
                 last_touch: [None, None],
+                fails: [0, 0],
                 book,
-                unadopted: held - book.pos,
+                unadopted,
                 mid: None,
                 modelled: 0.0,
                 unsettled: Vec::new(),
+                settle_next: None,
+                lost: Vec::new(),
+                refused,
             },
         );
     }
     eprintln!(
-        "[lip] {}: {} market(s), {}-lots both sides at the touch, cap {} net, quoting the best {} \
-         modelling >= ${:.2}/day, loss stop ${:.0}. Log {}.",
+        "[lip] {}: {} market(s) ({} configured), {}-lots both sides at the touch, cap {} net, \
+         quoting the best {} modelling >= ${:.2}/day (every market holding inventory takes a \
+         slot), loss stop ${:.0}. Log {}.",
         if w.shadow { "SHADOW" } else { "ARMED" },
         mkts.len(),
+        cfg.markets.len(),
         cfg.qty,
         cfg.cap,
         cfg.max_markets,
@@ -624,8 +800,10 @@ pub async fn run(cfg: Cfg, w: Wiring) {
         w.log_path
     );
     let mut quoted: BTreeSet<String> = BTreeSet::new();
-    let mut windows: Result<Vec<(String, f64, f64, String)>, String> = Ok(Vec::new());
+    let mut windows: Result<Vec<Window>, String> = Ok(Vec::new());
     let mut windows_at: Option<Instant> = None;
+    // A stop this process could not write down, or a shadow run's stop.
+    let mut stop_latched = false;
     let mut wait = Duration::from_secs(1);
     loop {
         let fills = tokio::time::timeout(wait, dirty()).await.unwrap_or_default();
@@ -633,10 +811,8 @@ pub async fn run(cfg: Cfg, w: Wiring) {
             windows = crate::maker_exit::read_entry_blackouts(&w.blackouts_path);
             windows_at = Some(Instant::now());
         }
-        let books: BTreeMap<String, (Vec<Level>, Vec<Level>)> =
-            BOOKS.lock().map(|g| g.clone()).unwrap_or_default();
-        let killed = std::path::Path::new(&w.kill_file).exists();
-        let stopped = std::path::Path::new(&stop_file(&w.log_path)).exists();
+        let books: BTreeMap<String, Sides> = BOOKS.lock().map(|g| g.clone()).unwrap_or_default();
+        let killed = exists(&w.kill_file);
         let now = now_wall();
 
         // Settle fills first, so every decision below sees the position as it is.
@@ -646,18 +822,73 @@ pub async fn run(cfg: Cfg, w: Wiring) {
                 check_fills(m, side, &ids, &w).await;
             }
             settle_cancelled(m, &w).await;
+            resolve_lost(m, &w).await;
         }
 
-        // Which markets may rest at all, and what each would model.
+        // Marks, adoptions, and what each market's book would model.
+        for (name, m) in mkts.iter_mut() {
+            let Some((bids, asks)) = books.get(name) else {
+                m.modelled = 0.0;
+                continue;
+            };
+            if let (Some(b), Some(a)) = (bids.first().and_then(|l| px(&l.price)), asks.first().and_then(|l| px(&l.price))) {
+                m.mid = Some((b + a) / 2);
+            }
+            if let (true, Some(mid)) = (m.unadopted != 0, m.mid) {
+                let n = m.unadopted;
+                m.book.pos += n;
+                m.book.cash_e4 -= mid * n;
+                m.unadopted = 0;
+                append(&w, json!({"ts": now, "event": "adopt", "market": name, "qty": n, "price": px_str(mid)}));
+                eprintln!("[lip] {name}: ADOPTED {n} contract(s) the log did not account for, at mid {}", px_str(mid));
+            }
+            let (bo, ao) = others_of(m, bids, asks, w.shadow);
+            let wt = want(&bo, &ao, m.book.pos, cfg.qty, cfg.cap);
+            m.modelled = modelled_share(&bo, &ao, wt.bid, wt.ask) * m.cfg.usd_day;
+        }
+
+        // The loss stop, over every market's inventory at its last mid, BEFORE
+        // anything is placed on this pass. Removing the stop file resumes only
+        // if P&L is back above the stop; otherwise the next pass writes it again.
+        let pnl: f64 = mkts.values().map(|m| m.mid.map_or(0.0, |mid| m.book.pnl_at(mid))).sum();
+        let mut stopped = stop_latched || (!w.shadow && exists(&stop_file(&w.log_path)));
+        if !stopped && pnl <= -cfg.loss_stop_usd {
+            stopped = true;
+            let why = format!("inventory P&L ${pnl:.2} reached the ${:.0} stop", cfg.loss_stop_usd);
+            if w.shadow {
+                stop_latched = true;
+                eprintln!("[lip] SHADOW LOSS STOP: {why}.");
+            } else {
+                let path = stop_file(&w.log_path);
+                if let Err(e) = std::fs::write(&path, format!("{why}\nremove this file to resume\n")) {
+                    stop_latched = true;
+                    ERRORS.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("[lip] could not write {path} ({e}); stopped until this process exits");
+                }
+                append(&w, json!({"ts": now, "event": "stop", "pnl_usd": pnl}));
+                eprintln!(
+                    "[lip] ### LOSS STOP: {why}. Pulling every quote; {path} holds it until removed. \
+                     What is held stays held."
+                );
+            }
+        }
+
+        // Which markets may rest at all.
         let mut cands = Vec::new();
         let mut why_not: BTreeMap<String, String> = BTreeMap::new();
-        for (name, m) in mkts.iter_mut() {
+        for (name, m) in &mkts {
             let blocked = if killed {
                 Some("kill file".to_string())
             } else if stopped {
                 Some("loss stop".to_string())
+            } else if let Some(r) = &m.refused {
+                Some(r.clone())
+            } else if !m.lost.is_empty() {
+                Some("a place whose answer was lost is being looked for".to_string())
             } else if now >= m.until {
-                Some("program over".to_string())
+                Some(if m.cfg.until.is_empty() { "held, not configured" } else { "program over" }.to_string())
+            } else if !books.contains_key(name) {
+                Some("no trusted book".to_string())
             } else {
                 match &windows {
                     Err(e) => Some(format!("blackout file unreadable: {e}")),
@@ -670,35 +901,15 @@ pub async fn run(cfg: Cfg, w: Wiring) {
                         .map(|r| format!("entry blackout on {r}")),
                 }
             };
-            let Some((bids, asks)) = books.get(name) else {
-                m.modelled = 0.0;
-                why_not.insert(name.clone(), blocked.unwrap_or_else(|| "no trusted book".into()));
-                continue;
-            };
-            let (bo, ao) = others_of(m, bids, asks, w.shadow);
-            if let (Some(b), Some(a)) = (bids.first().and_then(|l| px(&l.price)), asks.first().and_then(|l| px(&l.price))) {
-                m.mid = Some((b + a) / 2);
-            }
-            if m.unadopted != 0 {
-                if let Some(mid) = m.mid {
-                    let n = m.unadopted;
-                    m.book.pos += n;
-                    m.book.cash_e4 -= mid * n;
-                    m.unadopted = 0;
-                    append(
-                        &w.log_path,
-                        json!({"ts": now, "event": "adopt", "market": name, "qty": n, "price": px_str(mid)}),
-                    );
-                    eprintln!("[lip] {name}: ADOPTED {n} contract(s) the log did not account for, at mid {}", px_str(mid));
-                }
-            }
-            let wt = want(&bo, &ao, m.book.pos, cfg.qty, cfg.cap);
-            m.modelled = modelled_share(&bo, &ao, wt.bid, wt.ask) * m.cfg.usd_day;
-            match blocked {
-                Some(b) => {
-                    why_not.insert(name.clone(), b);
-                }
-                None => cands.push((name.clone(), m.modelled, quoted.contains(name))),
+            cands.push(Cand {
+                market: name.clone(),
+                usd_day: m.modelled,
+                quoted: quoted.contains(name),
+                held: m.held(),
+                open: blocked.is_none(),
+            });
+            if let Some(b) = blocked {
+                why_not.insert(name.clone(), b);
             }
         }
         let chosen = select(&cands, cfg.min_usd_day, cfg.max_markets);
@@ -706,13 +917,13 @@ pub async fn run(cfg: Cfg, w: Wiring) {
             eprintln!(
                 "[lip] quoting {:?} (modelled: {})",
                 chosen,
-                cands.iter().map(|(m, v, _)| format!("{m} ${v:.2}")).collect::<Vec<_>>().join(", ")
+                cands.iter().filter(|c| c.open).map(|c| format!("{} ${:.2}", c.market, c.usd_day)).collect::<Vec<_>>().join(", ")
             );
         }
         quoted = chosen;
 
         // Act. Cancel before place, per side.
-        let mut debounced = false;
+        let mut pending = false;
         for (name, m) in mkts.iter_mut() {
             let wt = match (quoted.contains(name), books.get(name)) {
                 (true, Some((bids, asks))) => {
@@ -722,29 +933,19 @@ pub async fn run(cfg: Cfg, w: Wiring) {
                 _ => Want::default(),
             };
             for side in [true, false] {
-                debounced |= act_side(m, side, if side { wt.bid } else { wt.ask }, &w).await;
+                pending |= act_side(m, side, if side { wt.bid } else { wt.ask }, &w).await;
             }
+            pending |= !m.unsettled.is_empty() || !m.lost.is_empty();
         }
 
-        // The loss stop, over every market's inventory at its last mid.
-        let pnl: f64 = mkts.values().map(|m| m.mid.map_or(0.0, |mid| m.book.pnl_at(mid))).sum();
-        if pnl <= -cfg.loss_stop_usd && !stopped {
-            let path = stop_file(&w.log_path);
-            let why = format!("inventory P&L ${pnl:.2} reached the ${:.0} stop", cfg.loss_stop_usd);
-            let _ = std::fs::write(&path, format!("{why}\nremove this file to resume\n"));
-            append(&w.log_path, json!({"ts": now, "event": "stop", "pnl_usd": pnl}));
-            eprintln!("[lip] ### LOSS STOP: {why}. Pulling everything; {path} holds it until removed.");
-            mark(mkts.keys().next().map(String::as_str).unwrap_or(""), None);
-        }
-
-        publish(&mkts, &quoted, &why_not, pnl, stopped || pnl <= -cfg.loss_stop_usd, w.shadow);
-        wait = if debounced { MIN_REQUOTE } else { HEARTBEAT.min(Duration::from_secs(30)) };
+        publish(&mkts, &quoted, &why_not, pnl, stopped, w.shadow);
+        wait = if pending { MIN_REQUOTE } else { Duration::from_secs(30) };
     }
 }
 
 /// Both sides of the book without our own orders in them. A shadow order never
 /// reached the venue, so there is nothing of ours to take out.
-fn others_of(m: &Mkt, bids: &[Level], asks: &[Level], shadow: bool) -> (Vec<(i64, f64)>, Vec<(i64, f64)>) {
+fn others_of(m: &Mkt, bids: &[Level], asks: &[Level], shadow: bool) -> (Levels, Levels) {
     let own = |o: &Option<Order>| if shadow { None } else { o.as_ref().map(|o| (o.price, o.resting())) };
     (others(bids, own(&m.bid)), others(asks, own(&m.ask)))
 }
@@ -752,46 +953,47 @@ fn others_of(m: &Mkt, bids: &[Level], asks: &[Level], shadow: bool) -> (Vec<(i64
 /// Bring one side's fills up to date: on a fill frame naming the order, and
 /// on the heartbeat, which also notices an order that is no longer resting.
 async fn check_fills(m: &mut Mkt, bid: bool, frame_ids: &BTreeSet<String>, w: &Wiring) {
-    let slot = if bid { &mut m.bid } else { &mut m.ask };
-    let Some(o) = slot.as_ref() else { return };
     if w.shadow {
         return;
     }
+    let Some(o) = (if bid { &m.bid } else { &m.ask }).as_ref() else { return };
     let named = frame_ids.contains(&o.venue_id);
     if !named && o.checked.elapsed() < HEARTBEAT {
         return;
     }
-    let k = w.kalshi.clone();
     let id = o.venue_id.clone();
-    // Heartbeat: is it still working? A terminal order reports its final count.
-    let (filled, terminal) = if named {
-        match blocking(move || k.filled_qty(&id).map_err(|e| e.to_string())).await {
-            Ok(Ok(n)) => (n, false),
-            Ok(Err(e)) | Err(e) => {
-                ERRORS.fetch_add(1, Ordering::Relaxed);
-                eprintln!("[lip] {}: fill count unreadable ({e})", m.cfg.market);
-                return;
-            }
-        }
-    } else {
+    // On the heartbeat, first ask whether it is still working: a terminal
+    // order reports its final count.
+    let mut terminal = None;
+    if !named {
+        let (k, id) = (w.kalshi.clone(), id.clone());
         match blocking(move || k.terminal_filled_qty(&id).map_err(|e| e.to_string())).await {
-            Ok(Ok(Some(n))) => (n, true),
-            Ok(Ok(None)) => {
-                if let Some(o) = slot.as_mut() {
-                    o.checked = Instant::now();
-                }
-                return;
-            }
+            Ok(Ok(n)) => terminal = n,
             Ok(Err(e)) | Err(e) => {
                 ERRORS.fetch_add(1, Ordering::Relaxed);
                 eprintln!("[lip] {}: order status unreadable ({e})", m.cfg.market);
                 return;
             }
         }
+    }
+    let filled = match terminal {
+        Some(n) => n,
+        None => {
+            let k = w.kalshi.clone();
+            match blocking(move || k.filled_qty(&id).map_err(|e| e.to_string())).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) | Err(e) => {
+                    ERRORS.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("[lip] {}: fill count unreadable ({e})", m.cfg.market);
+                    return;
+                }
+            }
+        }
     };
     let market = m.cfg.market.clone();
+    let slot = if bid { &mut m.bid } else { &mut m.ask };
     account(&market, &mut m.book, slot, bid, filled, w);
-    if terminal {
+    if terminal.is_some() {
         if let Some(o) = slot.take() {
             eprintln!(
                 "[lip] {market}: {} {} @ {} is no longer resting at the venue ({} filled); re-placing",
@@ -818,7 +1020,7 @@ fn account(market: &str, book: &mut Book, slot: &mut Option<Order>, bid: bool, f
     book.fill(bid, o.price, n, arb_core::fees::kalshi_charges_makers(market));
     FILLED_CT.fetch_add(n as u64, Ordering::Relaxed);
     append(
-        &w.log_path,
+        w,
         json!({
             "ts": now_wall(), "event": "fill", "market": market,
             "side": if bid { "bid" } else { "ask" }, "qty": n, "price": px_str(o.price),
@@ -834,78 +1036,71 @@ fn account(market: &str, book: &mut Book, slot: &mut Option<Order>, bid: bool, f
     );
 }
 
-/// Move one side toward `want`. Returns true when a change was held back by
-/// [`MIN_REQUOTE`], so the caller wakes again soon.
+/// Move one side toward `want`. Returns true when a change is still owed, so
+/// the caller wakes again soon.
 async fn act_side(m: &mut Mkt, bid: bool, want: Option<(i64, i64)>, w: &Wiring) -> bool {
     let i = usize::from(!bid);
     let market = m.cfg.market.clone();
-    let slot_keep = {
-        let slot = if bid { &m.bid } else { &m.ask };
-        slot.as_ref().map(|o| keep((o.price, o.resting()), want))
-    };
-    if slot_keep == Some(true) || (slot_keep.is_none() && want.is_none()) {
-        return false;
-    }
-    if m.last_touch[i].is_some_and(|t| t.elapsed() < MIN_REQUOTE) {
-        return true;
-    }
-    // Something must change. Cancel first: a place without the cancel that
-    // precedes it could double the size resting at the venue.
-    if slot_keep == Some(false) {
+    let side = if bid { "bid" } else { "ask" };
+    let since = |m: &Mkt| m.last_touch[i].map_or(Duration::MAX, |t| t.elapsed());
+    let resting = (if bid { &m.bid } else { &m.ask }).clone();
+    if let Some(o) = &resting {
+        if keep((o.price, o.resting()), want) {
+            return false;
+        }
+        // A pull goes at once. A reprice waits out MIN_REQUOTE, so a flickering
+        // book cannot churn the order. Either waits out the backoff after a refusal.
+        let gap = if want.is_none() && m.fails[i] == 0 { Duration::ZERO } else { backoff(m.fails[i]) };
+        if since(m) < gap {
+            return true;
+        }
         m.last_touch[i] = Some(Instant::now());
-        let o = (if bid { &m.bid } else { &m.ask }).clone().expect("checked above");
-        if !w.shadow {
+        if w.shadow {
+            forget(m, bid);
+        } else {
             let k = w.kalshi.clone();
             let req = CancelRequest { by: CancelBy::VenueId(o.venue_id.clone()), market_slug: None };
-            match blocking(move || k.cancel(&req)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    ERRORS.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[lip] {market}: cancel of {} refused ({e}); keeping it on the books", o.venue_id);
-                    return true;
-                }
-                Err(e) => {
-                    ERRORS.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[lip] {market}: cancel of {} failed ({e}); keeping it on the books", o.venue_id);
-                    return true;
-                }
+            if let Ok(Err(e)) | Err(e) = blocking(move || k.cancel(&req).map_err(|e| e.to_string())).await {
+                m.fails[i] += 1;
+                ERRORS.fetch_add(1, Ordering::Relaxed);
+                eprintln!("[lip] {market}: cancel of {} failed ({e}); it stays on the books", o.venue_id);
+                return true;
             }
-            // A fill can race the cancel: count it before forgetting the order.
-            let k = w.kalshi.clone();
-            let id = o.venue_id.clone();
+            // Gone from the book: its final count is what it filled, including
+            // any fill that raced the cancel.
+            let (k, id) = (w.kalshi.clone(), o.venue_id.clone());
             let before = m.book.pos;
-            match blocking(move || k.filled_qty(&id)).await {
-                Ok(Ok(n)) => {
+            match blocking(move || k.terminal_filled_qty(&id).map_err(|e| e.to_string())).await {
+                Ok(Ok(Some(n))) => {
                     let slot = if bid { &mut m.bid } else { &mut m.ask };
                     account(&market, &mut m.book, slot, bid, n, w);
+                    forget(m, bid);
+                    m.fails[i] = 0;
                     if m.book.pos != before {
-                        // The position moved, so `want` was sized for one we no
-                        // longer hold. The next pass decides again.
-                        forget(m, bid);
+                        // `want` was sized for a position we no longer hold.
                         mark(&market, None);
                         return false;
                     }
                 }
-                _ => {
-                    ERRORS.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "[lip] {market}: could not read {}'s final fill count after cancelling; \
-                         nothing rests here until it is read",
-                        o.venue_id
-                    );
-                    m.unsettled.push((bid, o.clone()));
-                    forget(m, bid);
-                    return true;
-                }
+                Ok(Ok(None)) => return unsettle(m, bid, o.clone(), "the venue still reports it working"),
+                Ok(Err(e)) | Err(e) => return unsettle(m, bid, o.clone(), &e),
             }
         }
-        forget(m, bid);
         // A reprice is ONE change: the replacement goes out now, not a
         // debounce later, so the side is not left empty at the touch.
     }
     let Some((p, q)) = want else { return false };
-    if !m.unsettled.is_empty() {
+    if !m.unsettled.is_empty() || !m.lost.is_empty() {
         return true;
+    }
+    if resting.is_none() && since(m) < backoff(m.fails[i]) {
+        return true;
+    }
+    // The pass read these before its venue calls; a kill or stop since then
+    // must not be answered with a fresh order.
+    if exists(&w.kill_file) || (!w.shadow && exists(&stop_file(&w.log_path))) {
+        mark(&market, None);
+        return false;
     }
     m.last_touch[i] = Some(Instant::now());
     let coid = next_coid();
@@ -921,30 +1116,41 @@ async fn act_side(m: &mut Mkt, bid: bool, want: Option<(i64, i64)>, w: &Wiring) 
     let venue_id = if w.shadow {
         format!("shadow-{coid}")
     } else {
-        let k = w.kalshi.clone();
-        let rq = req.clone();
-        match blocking(move || k.place(&rq)).await {
+        // Inside the shutdown latch, like the executor's places: either the
+        // halt sees this place and waits for it, or this place sees the halt
+        // and is never sent.
+        let Some(inflight) = crate::exec::halt().enter(Some(&req)) else { return false };
+        let (k, rq) = (w.kalshi.clone(), req.clone());
+        let answer = blocking(move || {
+            let r = k.place(&rq);
+            drop(inflight);
+            r
+        })
+        .await;
+        match answer {
             Ok(Ok(id)) => {
-                crate::engine::fill::note_sidecar_order(&id);
+                note_order(&id);
+                m.fails[i] = 0;
                 id
             }
-            Ok(Err(e)) => {
+            Ok(Err(e)) if never_rested(&e) => {
+                m.fails[i] += 1;
                 ERRORS.fetch_add(1, Ordering::Relaxed);
-                eprintln!("[lip] {market}: place {} {q} @ {} refused ({e})", if bid { "bid" } else { "ask" }, px_str(p));
+                eprintln!(
+                    "[lip] {market}: place {side} {q} @ {} refused ({e}); next try in {}s",
+                    px_str(p),
+                    backoff(m.fails[i]).as_secs()
+                );
                 return true;
             }
-            Err(e) => {
-                ERRORS.fetch_add(1, Ordering::Relaxed);
-                eprintln!("[lip] {market}: place task failed ({e})");
-                return true;
-            }
+            Ok(Err(e)) => return lose(m, bid, req, &e.to_string()),
+            Err(e) => return lose(m, bid, req, &e),
         }
     };
     PLACED.fetch_add(1, Ordering::Relaxed);
     eprintln!(
-        "[lip] {}REST {market} {} {q} @ {} — id {venue_id} ({coid}), position {}, modelled ${:.2}/day",
+        "[lip] {}REST {market} {side} {q} @ {} — id {venue_id} ({coid}), position {}, modelled ${:.2}/day",
         if w.shadow { "SHADOW " } else { "" },
-        if bid { "bid" } else { "ask" },
         px_str(p),
         m.book.pos,
         m.modelled
@@ -958,14 +1164,109 @@ async fn act_side(m: &mut Mkt, bid: bool, want: Option<(i64, i64)>, w: &Wiring) 
     false
 }
 
+/// A cancelled order's final count could not be read: hold the market until it is.
+fn unsettle(m: &mut Mkt, bid: bool, o: Order, why: &str) -> bool {
+    ERRORS.fetch_add(1, Ordering::Relaxed);
+    eprintln!(
+        "[lip] {}: {} was cancelled but its final fill count is not readable yet ({why}); \
+         nothing rests here until it is",
+        m.cfg.market, o.venue_id
+    );
+    m.unsettled.push((bid, o));
+    m.settle_next = Some(Instant::now() + SETTLE_RETRY);
+    forget(m, bid);
+    true
+}
+
+/// A place came back without an answer: the venue may hold it.
+fn lose(m: &mut Mkt, bid: bool, req: PlaceRequest, why: &str) -> bool {
+    ERRORS.fetch_add(1, Ordering::Relaxed);
+    eprintln!(
+        "[lip] {}: PLACE DID NOT COMPLETE ({why}) — a {} {} @ {} may be RESTING under \
+         client_order_id {} with an id this process never learned. Nothing more rests on \
+         this market until the venue's order list accounts for it.",
+        req.market,
+        if bid { "bid" } else { "ask" },
+        req.qty,
+        req.price,
+        req.client_order_id
+    );
+    m.lost.push(Lost { bid, req, next: Instant::now() + SETTLE_RETRY, tries: 0 });
+    true
+}
+
+/// Look for each lost place in the venue's order list. A found one becomes
+/// that side's order, and the usual reads count its fills and decide whether
+/// it stays. One never found is given up on, and so is its market.
+async fn resolve_lost(m: &mut Mkt, w: &Wiring) {
+    let mut left = Vec::new();
+    for mut l in std::mem::take(&mut m.lost) {
+        if Instant::now() < l.next {
+            left.push(l);
+            continue;
+        }
+        let (k, rq) = (w.kalshi.clone(), l.req.clone());
+        let found = blocking(move || k.recover_place(&rq, &HashSet::new()).map_err(|e| e.to_string())).await;
+        let side = if l.bid { "bid" } else { "ask" };
+        match found {
+            Ok(Ok(Some(id))) => {
+                note_order(&id);
+                eprintln!(
+                    "[lip] {}: RECOVERED the lost {side} {} as order {id}; its fills are read next pass",
+                    m.cfg.market, l.req.client_order_id
+                );
+                let o = Order {
+                    venue_id: id,
+                    price: px(&l.req.price).unwrap_or(0),
+                    qty: l.req.qty,
+                    filled: 0,
+                    // Due for the heartbeat read at once.
+                    checked: Instant::now().checked_sub(HEARTBEAT).unwrap_or_else(Instant::now),
+                };
+                let slot = if l.bid { &mut m.bid } else { &mut m.ask };
+                if slot.is_none() {
+                    *slot = Some(o);
+                } else {
+                    let why = format!("recovered order {} found its side already resting; CHECK BY HAND", o.venue_id);
+                    eprintln!("[lip] {} GIVEN UP: {why}", m.cfg.market);
+                    m.refused = Some(why);
+                }
+            }
+            other => {
+                l.tries += 1;
+                if l.tries >= LOST_TRIES {
+                    let why = format!(
+                        "the {side} placed as client_order_id {} never appeared in the venue's \
+                         order list ({}); CHECK BY HAND",
+                        l.req.client_order_id,
+                        match other {
+                            Ok(Err(e)) | Err(e) => e,
+                            _ => "no order named".to_string(),
+                        }
+                    );
+                    eprintln!("[lip] {} GIVEN UP: {why}. Nothing rests here for the rest of this process.", m.cfg.market);
+                    m.refused = Some(why);
+                } else {
+                    l.next = Instant::now() + LOST_RETRY;
+                    left.push(l);
+                }
+            }
+        }
+    }
+    m.lost = left;
+}
+
 /// Read the final count of every cancelled order still owed one.
 async fn settle_cancelled(m: &mut Mkt, w: &Wiring) {
+    if m.unsettled.is_empty() || m.settle_next.is_some_and(|t| Instant::now() < t) {
+        return;
+    }
+    m.settle_next = Some(Instant::now() + SETTLE_RETRY);
     let mut left = Vec::new();
     for (bid, o) in std::mem::take(&mut m.unsettled) {
-        let k = w.kalshi.clone();
-        let id = o.venue_id.clone();
-        match blocking(move || k.filled_qty(&id).map_err(|e| e.to_string())).await {
-            Ok(Ok(n)) => {
+        let (k, id) = (w.kalshi.clone(), o.venue_id.clone());
+        match blocking(move || k.terminal_filled_qty(&id).map_err(|e| e.to_string())).await {
+            Ok(Ok(Some(n))) => {
                 let market = m.cfg.market.clone();
                 let mut slot = Some(o);
                 account(&market, &mut m.book, &mut slot, bid, n, w);
@@ -1114,17 +1415,48 @@ mod tests {
         assert!(!keep((9600, 200), None));
     }
 
+    fn names(s: &[&str]) -> BTreeSet<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn cand(m: &str, v: f64, quoted: bool, held: bool, open: bool) -> Cand {
+        Cand { market: m.into(), usd_day: v, quoted, held, open }
+    }
+
     #[test]
     fn selection_takes_the_best_and_holds_what_it_quotes_against_near_ties() {
-        let c = |m: &str, v: f64, now: bool| (m.to_string(), v, now);
+        let c = |m: &str, v: f64, now: bool| cand(m, v, now, false, true);
         let s = select(&[c("A", 5.0, false), c("B", 3.0, false), c("C", 1.0, false)], 2.0, 2);
-        assert_eq!(s, ["A", "B"].iter().map(|x| x.to_string()).collect());
+        assert_eq!(s, names(&["A", "B"]));
         // B is quoted; C models a little better but not STICKY times better.
         let s = select(&[c("A", 5.0, true), c("B", 3.0, true), c("C", 3.5, false)], 2.0, 2);
         assert!(s.contains("B") && !s.contains("C"));
         // A quoted market keeps going down to min/STICKY, a new one does not start.
         assert!(select(&[c("A", 1.7, true)], 2.0, 2).contains("A"));
         assert!(select(&[c("A", 1.7, false)], 2.0, 2).is_empty());
+        // A blocked market is never quoted.
+        assert!(select(&[cand("A", 9.0, true, false, false)], 2.0, 2).is_empty());
+    }
+
+    #[test]
+    fn every_market_holding_inventory_takes_a_slot_quotable_or_not() {
+        let held = |m: &str, v: f64, open: bool| cand(m, v, false, true, open);
+        let new = |m: &str, v: f64| cand(m, v, false, false, true);
+        // A held market that cannot be quoted still takes one of two slots.
+        assert_eq!(select(&[held("H", 0.0, false), new("A", 5.0), new("B", 4.0)], 2.0, 2), names(&["A"]));
+        // A held market that can be quoted is, ahead of a better new one.
+        assert_eq!(select(&[held("H", 1.7, true), new("A", 5.0)], 2.0, 1), names(&["H"]));
+        // As many held markets as slots: no new market starts.
+        assert!(select(&[held("H1", 0.0, false), held("H2", 0.0, false), new("A", 9.0)], 2.0, 2).is_empty());
+    }
+
+    #[test]
+    fn the_backoff_doubles_to_a_minute_and_only_certain_refusals_mean_nothing_rested() {
+        assert_eq!(backoff(0), MIN_REQUOTE);
+        assert_eq!(backoff(1), MIN_REQUOTE * 2);
+        assert_eq!(backoff(9), MAX_BACKOFF);
+        assert!(never_rested(&VenueError::Status { endpoint: "x", status: 409, body: String::new() }));
+        assert!(!never_rested(&VenueError::Transport("timed out".into())));
     }
 
     #[test]

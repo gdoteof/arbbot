@@ -2235,7 +2235,14 @@ impl Engine {
                     ts_venue,
                 ) {
                     Ok(_) => {}
-                    Err(ApplyError::GapDetected { .. }) | Err(ApplyError::NotSynced) => return,
+                    Err(ApplyError::GapDetected { .. }) | Err(ApplyError::NotSynced) => {
+                        // The book is gone until the next snapshot; so are any
+                        // quotes the liquidity-incentive quoter priced off it.
+                        if venue == Venue::Kalshi && crate::lip::watching(&market_id) {
+                            crate::lip::book_changed(&market_id, None);
+                        }
+                        return;
+                    }
                 }
             }
             // Own-order lifecycle events (P4 item 1). Schema, both
@@ -2369,8 +2376,8 @@ impl Engine {
             self.pull_quotes(quoters, "FEED DOWN");
             if self.cfg.maker_exit_view {
                 crate::maker_exit::clear_live_books();
-                crate::lip::clear_books();
             }
+            crate::lip::clear_books();
         }
     }
 
@@ -2620,8 +2627,8 @@ impl Engine {
             self.killed = true;
             if self.cfg.maker_exit_view {
                 crate::maker_exit::clear_live_books();
-                crate::lip::clear_books();
             }
+            crate::lip::clear_books();
             eprintln!(
                 "[engine] KILL switch on ({}) — cancelling all resting quotes",
                 self.cfg.kill_file
