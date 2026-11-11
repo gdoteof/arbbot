@@ -12,9 +12,13 @@
 //! bonuses (`ACTIVITY_TYPE_REFERRAL_BONUS`), fee rebates, goodwill credits.
 //!
 //! A status whose cash effect is not established is REFUSED rather than
-//! guessed. A deposit that has not landed is skipped (it cannot have moved the
-//! balance yet); a withdrawal or a partial refund in any state but complete is
-//! an error, because guessing either way misstates capital.
+//! guessed. PM-US credits a deposit the moment it is made and marks it
+//! COMPLETED a day or more later; until then the row is PENDING and its
+//! transactions carry `advancedAmount`. So a PENDING change advanced in full
+//! has moved the balance and is booked, and one advanced not at all has not and
+//! is skipped. A partial advance, an advanced change later REJECTED (a
+//! clawback, never observed), and a withdrawal or a partial refund in any state
+//! but complete are errors, because guessing either way misstates capital.
 
 use std::collections::BTreeMap;
 
@@ -138,6 +142,22 @@ fn plain_decimal(s: &str) -> bool {
     !int.is_empty() && int.bytes().all(|c| c.is_ascii_digit()) && !frac.is_empty() && frac.bytes().all(|c| c.is_ascii_digit())
 }
 
+/// What PM-US has already credited for a balance change: the sum of its
+/// transactions' `advancedAmount`, zero when none carries one.
+fn advanced(cx: &mut Cx, b: &Value, id: &str) -> Result<D, String> {
+    let mut sum = cx.zero();
+    for t in b["transactions"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
+        if let Some(v) = t["advancedAmount"]["value"].as_str() {
+            if !plain_decimal(v) {
+                return Err(format!("pmus balance change {id}: advancedAmount `{v}` is not a plain decimal"));
+            }
+            let a = cx.parse_exact(v);
+            sum = cx.add(sum, a);
+        }
+    }
+    Ok(sum)
+}
+
 /// The balance-change rows of PM-US activity history. Trade and resolution
 /// rows are ignored here.
 pub fn pmus(cx: &mut Cx, activities: &[Value]) -> Result<Vec<Entry>, String> {
@@ -173,21 +193,30 @@ pub fn pmus(cx: &mut Cx, activities: &[Value]) -> Result<Vec<Entry>, String> {
         if !(deposit || withdrawal || credit) {
             return Err(format!("pmus balance change {id} has unknown type `{kind}`"));
         }
+        let amt = cx.parse_exact(value);
+        let unestablished = |other: &str| {
+            format!(
+                "pmus {kind} {id} has status `{other}`, whose effect on the balance is not \
+                 established; refusing to guess"
+            )
+        };
         match status {
             "ACCOUNT_BALANCE_CHANGE_STATUS_COMPLETED" => {}
             "ACCOUNT_BALANCE_CHANGE_STATUS_PENDING" | "ACCOUNT_BALANCE_CHANGE_STATUS_REJECTED"
                 if !withdrawal =>
             {
-                continue
+                let adv = advanced(cx, b, id)?;
+                let zero = cx.zero();
+                let none = cx.cmp(adv, zero) == std::cmp::Ordering::Equal;
+                let full = cx.cmp(adv, amt) == std::cmp::Ordering::Equal;
+                match (status == "ACCOUNT_BALANCE_CHANGE_STATUS_PENDING", none, full) {
+                    (_, true, _) => continue,
+                    (true, false, true) => {}
+                    _ => return Err(unestablished(&format!("{status}, advanced {adv} of {amt}"))),
+                }
             }
-            other => {
-                return Err(format!(
-                    "pmus {kind} {id} has status `{other}`, whose effect on the balance is not \
-                     established; refusing to guess"
-                ))
-            }
+            other => return Err(unestablished(other)),
         }
-        let amt = cx.parse_exact(value);
         let reason = b["transferReason"].as_str().unwrap_or("");
         let label = kind.trim_start_matches("ACTIVITY_TYPE_").to_ascii_lowercase();
         let memo = if reason.is_empty() || reason == "TRANSFER_REASON_UNSPECIFIED" {
@@ -321,6 +350,32 @@ mod tests {
         let f = flows(&mut cx, &e);
         let t = totals(&mut cx, &f);
         amount(&mut cx, t["kalshi"].0, "429.98");
+    }
+
+    /// PM-US credits a deposit at once and leaves it PENDING for days. Advanced
+    /// in full, it is capital from the moment it was made; not advanced at all,
+    /// it has not landed.
+    #[test]
+    fn a_pending_deposit_advanced_in_full_is_capital_from_its_create_time() {
+        let mut cx = Cx::default();
+        let advanced = |id: &str, status: &str, value: &str, adv: &str| {
+            let mut v = change("ACTIVITY_TYPE_ACCOUNT_DEPOSIT", id, status, value);
+            v["accountBalanceChange"]["transactions"] =
+                json!([{"transactionId": id, "advancedAmount": {"value": adv, "currency": "USD"}}]);
+            v
+        };
+        let e = pmus(&mut cx, &[advanced("A", "PENDING", "100", "100"), advanced("B", "PENDING", "100", "100")]).unwrap();
+        let f = flows(&mut cx, &e);
+        assert_eq!(f[0].ts, 1784639689, "dated when made, not when PM-US marked it complete");
+        let t = totals(&mut cx, &f);
+        amount(&mut cx, t["polymarket_us"].0, "200");
+        // The same row once COMPLETED books the same entry id, so the day does not move.
+        let done = pmus(&mut cx, &[advanced("A", "COMPLETED", "100", "100")]).unwrap();
+        assert_eq!(done[0].id, e[0].id);
+        assert!(pmus(&mut cx, &[advanced("C", "PENDING", "100", "0")]).unwrap().is_empty());
+        assert!(pmus(&mut cx, &[advanced("D", "PENDING", "100", "40")]).is_err(), "a partial advance");
+        assert!(pmus(&mut cx, &[advanced("E", "REJECTED", "100", "100")]).is_err(), "an advance clawed back");
+        assert!(pmus(&mut cx, &[advanced("F", "REJECTED", "100", "0")]).unwrap().is_empty());
     }
 
     /// A deposit that has not landed has not moved the balance; a withdrawal or
