@@ -21,19 +21,26 @@
 //!
 //! WHAT KEEPS IT APART FROM THE ARB ENGINE. Kalshi nets YES against NO in one
 //! market, so this inventory and an arb basket's Kalshi leg cannot share a
-//! market without corrupting each other. The trader therefore does three
-//! things. At boot it refuses any configured market an open ledger lot holds.
-//! It quotes no relationship whose Kalshi leg is configured here. And it tells
-//! the positions reconciliation that those relationships' PM-US slugs are not
-//! its to complete ([`owned_pm_slugs`]). Fills arrive on the engine's
-//! account-wide fill feed as sidecar orders and wake this loop. The count the
-//! venue reports per order is the truth.
+//! market without corrupting each other. At boot the trader refuses any
+//! configured market an open ledger lot holds. It then leaves alone every
+//! market this module quotes or its log holds inventory on ([`left_alone`]).
+//! That holds on every live run, `--lip` or not, because the config line that
+//! opened a position may be gone. "Left alone" means four things:
+//!   * no quoter, so no entries and no take-take;
+//!   * no positions-recon finding, so nothing against the naked limit and
+//!     nothing for recon-act to complete;
+//!   * no boot adoption of a hedge's naked leg there;
+//!   * a venue position the log never booked refuses the market here too.
+//!
+//! Fills arrive on the engine's account-wide fill feed and wake this loop
+//! ([`owns_order`]). The count the venue reports per order is the truth.
 //!
 //! WHAT STOPS IT. A market rests nothing when any of these hold:
 //!   * the kill file;
-//!   * an untrusted or pulled feed (the engine clears the books);
+//!   * an untrusted or pulled feed, or a sequence gap (the engine drops the book);
 //!   * an entry blackout on a relationship the market belongs to;
 //!   * the market's `until`;
+//!   * a place whose answer was lost, until the venue's order list accounts for it;
 //!   * the loss stop.
 //!
 //! The loss stop fires when inventory P&L marked to mid reaches
@@ -64,6 +71,12 @@ const TICK: i64 = 100;
 /// that side. A thin book that flickers would otherwise churn a 200-lot on
 /// every delta, and each replace spends order-path budget.
 const MIN_REQUOTE: Duration = Duration::from_secs(2);
+/// The soonest a resting order is moved to a new price. Touch changes on
+/// these books mostly flicker: on 2026-11-09 the busiest gas market's touch
+/// moved 1,017 times for 2 s or longer but 312 times for 15 s or longer, and
+/// every move followed is one more row of order history (`max_places_day`).
+/// An order a flicker leaves one tick behind still scores, at half weight.
+const REPRICE_HOLD: Duration = Duration::from_secs(15);
 /// How often each resting order is checked at the venue with no fill frame to
 /// prompt it. This is the backstop for an order the venue cancelled, or an
 /// engine sweep pulled, without telling us.
@@ -109,6 +122,13 @@ pub struct Cfg {
     /// Inventory P&L, marked to mid across every market, at which everything
     /// is pulled and the stop file written.
     pub loss_stop_usd: f64,
+    /// Places allowed per UTC day, across every market. Once spent, every quote
+    /// is pulled until the day turns. Every place adds a row to the Kalshi
+    /// order history, which the resting-order sweeps page through and fail
+    /// closed past (`K_ORDERS_MAX_PAGES` in arb-venue). Unbounded re-quoting
+    /// would grow it toward the point where the trader can neither start nor
+    /// sweep clean.
+    pub max_places_day: u64,
     pub markets: Vec<MarketCfg>,
 }
 
@@ -119,8 +139,8 @@ pub fn load(path: &str) -> Result<Cfg, String> {
     if cfg.qty <= 0 || cfg.cap < cfg.qty {
         return Err(format!("{path}: need 0 < qty <= cap, got qty {} cap {}", cfg.qty, cfg.cap));
     }
-    if cfg.max_markets == 0 || cfg.markets.is_empty() {
-        return Err(format!("{path}: no market may be quoted (max_markets 0 or no markets)"));
+    if cfg.max_markets == 0 || cfg.markets.is_empty() || cfg.max_places_day == 0 {
+        return Err(format!("{path}: nothing may be quoted (max_markets 0, max_places_day 0, or no markets)"));
     }
     let positive = |x: f64| x.is_finite() && x > 0.0;
     let non_negative = |x: f64| x.is_finite() && x >= 0.0;
@@ -437,6 +457,9 @@ static LEFT: OnceLock<BTreeSet<String>> = OnceLock::new();
 /// sidecar list, which holds 256 ids: this module's re-quoting would evict the
 /// maker exit's ids from it.
 static OWN_IDS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+/// Venue ids of the orders this module is tracking right now: resting,
+/// recovered, or owed a final count. Never evicted, however long they rest.
+static LIVE_IDS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// About a day of re-quoting at a busy pace. A fill on an order older than
 /// that is reported as unattributed, which is the safe way to fail.
 const OWN_IDS_REMEMBERED: usize = 4096;
@@ -483,7 +506,8 @@ pub fn left_alone(kalshi_market: &str) -> bool {
 
 /// Did this module place the venue order `venue_order_id`?
 pub fn owns_order(venue_order_id: &str) -> bool {
-    OWN_IDS.lock().is_ok_and(|g| g.iter().any(|id| id == venue_order_id))
+    LIVE_IDS.lock().is_ok_and(|g| g.contains(venue_order_id))
+        || OWN_IDS.lock().is_ok_and(|g| g.iter().any(|id| id == venue_order_id))
 }
 
 fn note_order(venue_order_id: &str) {
@@ -493,16 +517,54 @@ fn note_order(venue_order_id: &str) {
         }
         g.push_back(venue_order_id.to_owned());
     }
+    if let Ok(mut g) = LIVE_IDS.lock() {
+        g.insert(venue_order_id.to_owned());
+    }
 }
 
-/// The nonzero net positions the log at `path` holds, by market. A missing
-/// log holds nothing.
-pub fn log_holdings(path: &str) -> Result<BTreeMap<String, i64>, String> {
-    if !std::path::Path::new(path).exists() {
-        return Ok(BTreeMap::new());
+/// The order is done with: its final count is booked.
+fn release_order(venue_order_id: &str) {
+    if let Ok(mut g) = LIVE_IDS.lock() {
+        g.remove(venue_order_id);
     }
-    let records = crate::ledger::read(path)?;
-    Ok(replay(&records).into_iter().filter(|(_, b)| b.pos != 0).map(|(m, b)| (m, b.pos)).collect())
+}
+
+/// What the log at `path` says this module holds.
+#[derive(Debug, Default)]
+pub struct Holdings {
+    /// Nonzero net positions, by market, from every line that parses.
+    pub held: BTreeMap<String, i64>,
+    /// Every market any parsed line names.
+    pub named: BTreeSet<String>,
+    /// Why the log cannot be trusted whole, if it cannot: a line that does not
+    /// parse (a crash mid-append leaves one), or a read failure.
+    pub error: Option<String>,
+}
+
+/// Read the log at `path` line by line, keeping what parses. A missing log
+/// holds nothing.
+pub fn log_holdings(path: &str) -> Holdings {
+    let text = match std::fs::read(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Holdings::default(),
+        Err(e) => return Holdings { error: Some(e.to_string()), ..Holdings::default() },
+    };
+    let mut records = Vec::new();
+    let mut bad = 0usize;
+    for line in String::from_utf8_lossy(&text).lines() {
+        let line = line.trim_matches(|c: char| c == '\0' || c.is_whitespace());
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(v) => records.push(v),
+            Err(_) => bad += 1,
+        }
+    }
+    let named = records.iter().filter_map(|r| r.get("market").and_then(Value::as_str)).map(String::from).collect();
+    let held = replay(&records).into_iter().filter(|(_, b)| b.pos != 0).map(|(m, b)| (m, b.pos)).collect();
+    let error = (bad > 0).then(|| format!("{bad} line(s) do not parse"));
+    Holdings { held, named, error }
 }
 
 /// The engine saw `market`'s book move. `None` means it can no longer be
@@ -616,6 +678,7 @@ struct Mkt {
     /// a place sized off a position missing their fills could pass the cap.
     unsettled: Vec<(bool, Order)>,
     settle_next: Option<Instant>,
+    settle_tries: u32,
     /// Places whose answer was lost. Nothing new rests on the market while any is.
     lost: Vec<Lost>,
     /// Why this market rests nothing for the rest of the process, if it doesn't.
@@ -623,9 +686,12 @@ struct Mkt {
 }
 
 impl Mkt {
-    /// Does this market hold inventory, booked or awaiting adoption?
+    /// Does the venue hold inventory here? The booked position plus what
+    /// awaits adoption is the venue's count at boot. A market that settled
+    /// while the log still shows a position reads as held only until the next
+    /// boot, which sees the venue's zero. Its settlement is not booked here.
     fn held(&self) -> bool {
-        self.book.pos != 0 || self.unadopted != 0
+        self.book.pos + self.unadopted != 0
     }
 }
 
@@ -638,6 +704,11 @@ const SETTLE_RETRY: Duration = Duration::from_secs(5);
 /// far past the list's lag behind a write.
 const LOST_RETRY: Duration = Duration::from_secs(30);
 const LOST_TRIES: u32 = 20;
+/// Past `LOST_TRIES`, or `SETTLE_TRIES` for a final count: the stop file is
+/// written and the read goes on at this pace for the life of the process.
+const SLOW_RETRY: Duration = Duration::from_secs(300);
+/// Five minutes of `SETTLE_RETRY`.
+const SETTLE_TRIES: u32 = 60;
 
 /// The wait before a side's next place after `fails` refusals in a row:
 /// [`MIN_REQUOTE`], doubling per refusal, at most [`MAX_BACKOFF`]. A halted
@@ -650,8 +721,59 @@ fn backoff(fails: u32) -> Duration {
 /// Did a place that came back with `e` certainly never rest? Only a venue
 /// answer or a local refusal says so. A transport failure or an unreadable
 /// answer may hide an accepted order.
+///
+/// A 5xx is not such an answer: a gateway in front of the venue can time out
+/// on a place the venue went on to accept.
 fn never_rested(e: &VenueError) -> bool {
-    matches!(e, VenueError::Status { .. } | VenueError::RateLimited { .. } | VenueError::Sign(_) | VenueError::NotWired)
+    match e {
+        VenueError::Status { status, .. } => *status < 500,
+        VenueError::RateLimited { .. } | VenueError::Sign(_) | VenueError::NotWired => true,
+        _ => false,
+    }
+}
+
+/// Places made today (UTC), and which day that is.
+static PLACES_DAY: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+fn utc_day(now: f64) -> u64 {
+    (now / 86_400.0) as u64
+}
+
+fn places_today(now: f64) -> u64 {
+    PLACES_DAY.lock().map(|g| if g.0 == utc_day(now) { g.1 } else { 0 }).unwrap_or(u64::MAX)
+}
+
+fn count_place(now: f64) {
+    if let Ok(mut g) = PLACES_DAY.lock() {
+        let d = utc_day(now);
+        *g = if g.0 == d { (d, g.1 + 1) } else { (d, 1) };
+    }
+}
+
+/// A stop this process could not write down, or a shadow run's stop: held for
+/// the life of the process.
+static STOP_LATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stop everything: write the stop file, which pulls every quote until a human
+/// removes it.
+fn write_stop(w: &Wiring, why: &str) {
+    if w.shadow {
+        STOP_LATCHED.store(true, Ordering::Relaxed);
+        eprintln!("[lip] SHADOW STOP: {why}");
+        return;
+    }
+    let path = stop_file(&w.log_path);
+    if let Err(e) = std::fs::write(&path, format!("{why}\nremove this file to resume\n")) {
+        STOP_LATCHED.store(true, Ordering::Relaxed);
+        ERRORS.fetch_add(1, Ordering::Relaxed);
+        eprintln!("[lip] could not write {path} ({e}); stopped until this process exits");
+    }
+    append(w, json!({"ts": now_wall(), "event": "stop", "why": why}));
+    eprintln!("[lip] ### STOP: {why}. Pulling every quote; {path} holds it until removed. What is held stays held.");
+}
+
+fn stopped(w: &Wiring) -> bool {
+    STOP_LATCHED.load(Ordering::Relaxed) || (!w.shadow && exists(&stop_file(&w.log_path)))
 }
 
 static PLACED: AtomicU64 = AtomicU64::new(0);
@@ -780,6 +902,7 @@ pub async fn run(cfg: Cfg, w: Wiring) {
                 modelled: 0.0,
                 unsettled: Vec::new(),
                 settle_next: None,
+                settle_tries: 0,
                 lost: Vec::new(),
                 refused,
             },
@@ -802,8 +925,6 @@ pub async fn run(cfg: Cfg, w: Wiring) {
     let mut quoted: BTreeSet<String> = BTreeSet::new();
     let mut windows: Result<Vec<Window>, String> = Ok(Vec::new());
     let mut windows_at: Option<Instant> = None;
-    // A stop this process could not write down, or a shadow run's stop.
-    let mut stop_latched = false;
     let mut wait = Duration::from_secs(1);
     loop {
         let fills = tokio::time::timeout(wait, dirty()).await.unwrap_or_default();
@@ -850,28 +971,13 @@ pub async fn run(cfg: Cfg, w: Wiring) {
         // The loss stop, over every market's inventory at its last mid, BEFORE
         // anything is placed on this pass. Removing the stop file resumes only
         // if P&L is back above the stop; otherwise the next pass writes it again.
+        // A lost place or an unreadable final count can have written it too.
         let pnl: f64 = mkts.values().map(|m| m.mid.map_or(0.0, |mid| m.book.pnl_at(mid))).sum();
-        let mut stopped = stop_latched || (!w.shadow && exists(&stop_file(&w.log_path)));
-        if !stopped && pnl <= -cfg.loss_stop_usd {
-            stopped = true;
-            let why = format!("inventory P&L ${pnl:.2} reached the ${:.0} stop", cfg.loss_stop_usd);
-            if w.shadow {
-                stop_latched = true;
-                eprintln!("[lip] SHADOW LOSS STOP: {why}.");
-            } else {
-                let path = stop_file(&w.log_path);
-                if let Err(e) = std::fs::write(&path, format!("{why}\nremove this file to resume\n")) {
-                    stop_latched = true;
-                    ERRORS.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[lip] could not write {path} ({e}); stopped until this process exits");
-                }
-                append(&w, json!({"ts": now, "event": "stop", "pnl_usd": pnl}));
-                eprintln!(
-                    "[lip] ### LOSS STOP: {why}. Pulling every quote; {path} holds it until removed. \
-                     What is held stays held."
-                );
-            }
+        if !stopped(&w) && pnl <= -cfg.loss_stop_usd {
+            write_stop(&w, &format!("LOSS STOP: inventory P&L ${pnl:.2} reached the ${:.0} stop", cfg.loss_stop_usd));
         }
+        let stopped = stopped(&w);
+        let budget_spent = places_today(now) >= cfg.max_places_day;
 
         // Which markets may rest at all.
         let mut cands = Vec::new();
@@ -880,7 +986,9 @@ pub async fn run(cfg: Cfg, w: Wiring) {
             let blocked = if killed {
                 Some("kill file".to_string())
             } else if stopped {
-                Some("loss stop".to_string())
+                Some("stopped (see the stop file)".to_string())
+            } else if budget_spent {
+                Some(format!("today's {} places are spent", cfg.max_places_day))
             } else if let Some(r) = &m.refused {
                 Some(r.clone())
             } else if !m.lost.is_empty() {
@@ -962,6 +1070,11 @@ async fn check_fills(m: &mut Mkt, bid: bool, frame_ids: &BTreeSet<String>, w: &W
         return;
     }
     let id = o.venue_id.clone();
+    // Due again only at the next heartbeat or frame, whatever the reads below
+    // answer: a failing read must not repeat on every book event.
+    if let Some(o) = (if bid { &mut m.bid } else { &mut m.ask }).as_mut() {
+        o.checked = Instant::now();
+    }
     // On the heartbeat, first ask whether it is still working: a terminal
     // order reports its final count.
     let mut terminal = None;
@@ -995,6 +1108,7 @@ async fn check_fills(m: &mut Mkt, bid: bool, frame_ids: &BTreeSet<String>, w: &W
     account(&market, &mut m.book, slot, bid, filled, w);
     if terminal.is_some() {
         if let Some(o) = slot.take() {
+            release_order(&o.venue_id);
             eprintln!(
                 "[lip] {market}: {} {} @ {} is no longer resting at the venue ({} filled); re-placing",
                 if bid { "bid" } else { "ask" },
@@ -1003,8 +1117,6 @@ async fn check_fills(m: &mut Mkt, bid: bool, frame_ids: &BTreeSet<String>, w: &W
                 o.filled
             );
         }
-    } else if let Some(o) = slot.as_mut() {
-        o.checked = Instant::now();
     }
 }
 
@@ -1048,9 +1160,13 @@ async fn act_side(m: &mut Mkt, bid: bool, want: Option<(i64, i64)>, w: &Wiring) 
         if keep((o.price, o.resting()), want) {
             return false;
         }
-        // A pull goes at once. A reprice waits out MIN_REQUOTE, so a flickering
+        // A pull goes at once. A reprice waits out REPRICE_HOLD, so a flickering
         // book cannot churn the order. Either waits out the backoff after a refusal.
-        let gap = if want.is_none() && m.fails[i] == 0 { Duration::ZERO } else { backoff(m.fails[i]) };
+        let gap = match (want.is_none(), m.fails[i]) {
+            (true, 0) => Duration::ZERO,
+            (true, f) => backoff(f),
+            (false, f) => backoff(f).max(REPRICE_HOLD),
+        };
         if since(m) < gap {
             return true;
         }
@@ -1096,12 +1212,15 @@ async fn act_side(m: &mut Mkt, bid: bool, want: Option<(i64, i64)>, w: &Wiring) 
     if resting.is_none() && since(m) < backoff(m.fails[i]) {
         return true;
     }
-    // The pass read these before its venue calls; a kill or stop since then
-    // must not be answered with a fresh order.
-    if exists(&w.kill_file) || (!w.shadow && exists(&stop_file(&w.log_path))) {
+    // The pass read these before its venue calls, any of which can take
+    // seconds. A kill, a stop or a dropped book since then must not be
+    // answered with a fresh order.
+    let book_gone = !BOOKS.lock().is_ok_and(|g| g.contains_key(&market));
+    if exists(&w.kill_file) || stopped(w) || book_gone {
         mark(&market, None);
         return false;
     }
+    count_place(now_wall());
     m.last_touch[i] = Some(Instant::now());
     let coid = next_coid();
     let req = PlaceRequest {
@@ -1197,7 +1316,8 @@ fn lose(m: &mut Mkt, bid: bool, req: PlaceRequest, why: &str) -> bool {
 
 /// Look for each lost place in the venue's order list. A found one becomes
 /// that side's order, and the usual reads count its fills and decide whether
-/// it stays. One never found is given up on, and so is its market.
+/// it stays. One not found in ten minutes writes the stop file, and the search
+/// goes on every five minutes for the life of the process.
 async fn resolve_lost(m: &mut Mkt, w: &Wiring) {
     let mut left = Vec::new();
     for mut l in std::mem::take(&mut m.lost) {
@@ -1234,22 +1354,27 @@ async fn resolve_lost(m: &mut Mkt, w: &Wiring) {
             }
             other => {
                 l.tries += 1;
-                if l.tries >= LOST_TRIES {
-                    let why = format!(
-                        "the {side} placed as client_order_id {} never appeared in the venue's \
-                         order list ({}); CHECK BY HAND",
-                        l.req.client_order_id,
-                        match other {
-                            Ok(Err(e)) | Err(e) => e,
-                            _ => "no order named".to_string(),
-                        }
+                if l.tries == LOST_TRIES {
+                    // It may still be resting, under an id nothing here knows,
+                    // and its fills would be booked nowhere. Everything stops
+                    // until a human has looked; the search goes on slowly, and
+                    // a find still adopts it so its fills are counted.
+                    write_stop(
+                        w,
+                        &format!(
+                            "{}: the {side} placed as client_order_id {} is not in the venue's \
+                             order list after ten minutes ({}); it may be resting. CHECK BY HAND",
+                            m.cfg.market,
+                            l.req.client_order_id,
+                            match other {
+                                Ok(Err(e)) | Err(e) => e,
+                                _ => "no order named".to_string(),
+                            }
+                        ),
                     );
-                    eprintln!("[lip] {} GIVEN UP: {why}. Nothing rests here for the rest of this process.", m.cfg.market);
-                    m.refused = Some(why);
-                } else {
-                    l.next = Instant::now() + LOST_RETRY;
-                    left.push(l);
                 }
+                l.next = Instant::now() + if l.tries >= LOST_TRIES { SLOW_RETRY } else { LOST_RETRY };
+                left.push(l);
             }
         }
     }
@@ -1261,7 +1386,9 @@ async fn settle_cancelled(m: &mut Mkt, w: &Wiring) {
     if m.unsettled.is_empty() || m.settle_next.is_some_and(|t| Instant::now() < t) {
         return;
     }
-    m.settle_next = Some(Instant::now() + SETTLE_RETRY);
+    m.settle_tries += 1;
+    let slow = m.settle_tries > SETTLE_TRIES;
+    m.settle_next = Some(Instant::now() + if slow { SLOW_RETRY } else { SETTLE_RETRY });
     let mut left = Vec::new();
     for (bid, o) in std::mem::take(&mut m.unsettled) {
         let (k, id) = (w.kalshi.clone(), o.venue_id.clone());
@@ -1270,19 +1397,38 @@ async fn settle_cancelled(m: &mut Mkt, w: &Wiring) {
                 let market = m.cfg.market.clone();
                 let mut slot = Some(o);
                 account(&market, &mut m.book, &mut slot, bid, n, w);
+                if let Some(o) = slot {
+                    release_order(&o.venue_id);
+                }
             }
             _ => left.push((bid, o)),
         }
     }
     m.unsettled = left;
+    if m.unsettled.is_empty() {
+        m.settle_tries = 0;
+    } else if m.settle_tries == SETTLE_TRIES {
+        let ids: Vec<&str> = m.unsettled.iter().map(|(_, o)| o.venue_id.as_str()).collect();
+        write_stop(
+            w,
+            &format!(
+                "{}: the final fill count of cancelled order(s) {ids:?} is still unreadable after \
+                 five minutes, so the position here is unknown; CHECK BY HAND",
+                m.cfg.market
+            ),
+        );
+    }
 }
 
+/// The side's order is off the book. Its id stays pinned while a final count
+/// is still owed on it (`unsettled`).
 fn forget(m: &mut Mkt, bid: bool) {
     CANCELLED.fetch_add(1, Ordering::Relaxed);
-    if bid {
-        m.bid = None;
-    } else {
-        m.ask = None;
+    let o = if bid { m.bid.take() } else { m.ask.take() };
+    if let Some(o) = o {
+        if !m.unsettled.iter().any(|(_, u)| u.venue_id == o.venue_id) {
+            release_order(&o.venue_id);
+        }
     }
 }
 
@@ -1317,6 +1463,7 @@ fn publish(
         "modelled_usd_day": (mkts.values().filter(|m| quoted.contains(&m.cfg.market)).map(|m| m.modelled).sum::<f64>() * 100.0).round() / 100.0,
         "pnl_usd": (pnl * 100.0).round() / 100.0,
         "placed": PLACED.load(Ordering::Relaxed),
+        "places_today": places_today(now_wall()),
         "cancelled": CANCELLED.load(Ordering::Relaxed),
         "filled_ct": FILLED_CT.load(Ordering::Relaxed),
         "errors": ERRORS.load(Ordering::Relaxed),
@@ -1457,6 +1604,30 @@ mod tests {
         assert_eq!(backoff(9), MAX_BACKOFF);
         assert!(never_rested(&VenueError::Status { endpoint: "x", status: 409, body: String::new() }));
         assert!(!never_rested(&VenueError::Transport("timed out".into())));
+        assert!(!never_rested(&VenueError::Status { endpoint: "x", status: 502, body: String::new() }));
+    }
+
+    #[test]
+    fn a_torn_log_still_names_every_market_it_mentions() {
+        let dir = std::env::temp_dir().join(format!("lip-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("lip.jsonl");
+        let ps = p.to_str().unwrap();
+        assert!(log_holdings(ps).held.is_empty() && log_holdings(ps).error.is_none(), "a missing log holds nothing");
+        std::fs::write(
+            &p,
+            concat!(
+                r#"{"event":"fill","market":"KXA-1","side":"bid","qty":5,"price":"0.5000"}"#, "\n",
+                r#"{"event":"fill","market":"KXB-1","side":"bid","qty":5,"price":"0.5000"}"#, "\n",
+                r#"{"event":"fill","market":"KXB-1","side":"ask","qty":5,"price":"0.5200"}"#, "\n",
+                "\0\0\0{\"event\":\"fi", "\n",
+            ),
+        )
+        .unwrap();
+        let h = log_holdings(ps);
+        assert_eq!(h.held, BTreeMap::from([("KXA-1".to_string(), 5)]));
+        assert_eq!(h.named, names(&["KXA-1", "KXB-1"]));
+        assert!(h.error.is_some(), "a torn line is reported, not skipped silently");
     }
 
     #[test]
@@ -1491,7 +1662,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("lip-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("lip.yaml");
-        let ok = "qty: 200\ncap: 200\nmax_markets: 5\nmin_usd_day: 2.0\nloss_stop_usd: 150\nmarkets:\n  - {market: KXA-1, usd_day: 14.29, until: 2026-11-15T05:00:00Z}\n";
+        let ok = "qty: 200\ncap: 200\nmax_markets: 5\nmin_usd_day: 2.0\nloss_stop_usd: 150\nmax_places_day: 600\nmarkets:\n  - {market: KXA-1, usd_day: 14.29, until: 2026-11-15T05:00:00Z}\n";
         std::fs::write(&p, ok).unwrap();
         assert!(load(p.to_str().unwrap()).is_ok());
         for bad in [
@@ -1499,6 +1670,8 @@ mod tests {
             ok.replace("2026-11-15T05:00:00Z", "next week"),
             ok.replace("loss_stop_usd: 150", "loss_stop_usd: 0"),
             ok.replace("max_markets: 5", "max_markets: 0"),
+            ok.replace("max_places_day: 600", "max_places_day: 0"),
+            ok.replace("max_places_day: 600\n", ""),
             format!("{ok}  - {{market: KXA-1, usd_day: 1, until: 2026-11-15T05:00:00Z}}\n"),
             ok.replace("min_usd_day", "min_usd_per_day"),
         ] {

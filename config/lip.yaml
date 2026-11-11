@@ -8,14 +8,21 @@
 # GET /trade-api/v2/incentive_programs?status=active. Programs are weekly:
 # refresh this list when they roll, or quoting stops at `until`.
 #
-# Pilot sizing (2026-11-11): ~$200 rests per market, so 4 markets is ~$800 of
-# Kalshi cash. The loss stop pulls every quote when inventory marked to mid
-# reaches -$150; it does not flatten what is held.
+# A market's two orders hold about qty * (1 - spread) of Kalshi cash while
+# they rest. Every market holding inventory takes one of the max_markets slots,
+# so at most max_markets * cap contracts are ever held. The loss stop pulls
+# every quote when inventory marked to mid reaches -loss_stop_usd; it does not
+# flatten what is held, and it re-fires if the stop file is removed while P&L
+# is still below the stop.
 qty: 200
 cap: 200
 max_markets: 4
 min_usd_day: 3.0
 loss_stop_usd: 150
+# Every place is a row of Kalshi order history, which the resting-order sweeps
+# page through and fail closed past 50,000 rows. The account adds 500-2,000 a
+# day without this (2026-11-06..11); 600 keeps the total under ~2,600 a day.
+max_places_day: 600
 markets:
   - {market: KXAAAGASM-26NOV30-3.70, usd_day: 42.86, until: 2026-11-14T05:00:00Z}
   - {market: KXAAAGASM-26NOV30-3.80, usd_day: 42.86, until: 2026-11-14T05:00:00Z}

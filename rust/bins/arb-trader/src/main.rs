@@ -1730,9 +1730,14 @@ fn prepare_lip(
     args: &Args,
 ) -> (Option<(lip::Cfg, std::collections::BTreeMap<String, Vec<String>>)>, std::collections::BTreeSet<String>) {
     let holdings = lip::log_holdings(&args.lip_log);
-    let mut left: std::collections::BTreeSet<String> =
-        holdings.as_ref().map(|h| h.keys().cloned().collect()).unwrap_or_default();
-    for (m, n) in holdings.iter().flatten() {
+    // A log that cannot be read whole may hide a position, so every market any
+    // readable line names is left alone, held or not.
+    let mut left: std::collections::BTreeSet<String> = if holdings.error.is_some() {
+        holdings.named.clone()
+    } else {
+        holdings.held.keys().cloned().collect()
+    };
+    for (m, n) in &holdings.held {
         eprintln!("[lip] {m}: {} holds {n:+}, so the arb engine leaves this market alone", args.lip_log);
     }
     let cfg = args.lip.as_deref().and_then(|path| {
@@ -1776,14 +1781,15 @@ fn prepare_lip(
     if let Some((c, _)) = &cfg {
         left.extend(c.markets.iter().map(|m| m.market.clone()));
     }
-    let cfg = match (&holdings, cfg) {
-        (Ok(_), c) => c,
-        (Err(e), c) => {
+    let cfg = match (&holdings.error, cfg) {
+        (None, c) => c,
+        (Some(e), _) => {
             eprintln!(
-                "[lip] {} is UNREADABLE ({e}): what it holds is unknown, so --lip will not run{}, \
-                 and the arb engine is NOT kept off any other market it holds. CHECK BY HAND.",
+                "[lip] {} cannot be read whole ({e}): the loss stop would be blind, so --lip will \
+                 not run. The arb engine leaves alone every market a readable line names ({}). \
+                 CHECK BY HAND.",
                 args.lip_log,
-                if c.is_some() { " (its configured markets are still left alone)" } else { "" }
+                left.len()
             );
             None
         }

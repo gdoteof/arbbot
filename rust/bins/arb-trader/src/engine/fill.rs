@@ -776,6 +776,13 @@ impl Engine {
     pub(super) fn unclaimed_tick(&mut self) {
         for id in unclaimed_expired(&self.unclaimed_fills, std::time::Instant::now()) {
             let Some(u) = self.unclaimed_fills.remove(&id) else { continue };
+            // A frame that beat the place's answer: the quoter has learned the
+            // id since it was parked.
+            if crate::lip::owns_order(&id) {
+                crate::lip::wake_fill(&u.market_id, &id);
+                eprintln!("[fill] {}x on {} order {id} — the --lip quoter's, claimed after the grace", u.cum, u.market_id);
+                continue;
+            }
             self.n_unattributed += 1;
             eprintln!(
                 "[fill] UNEXPLAINED {}x on {} {} reported as order {id} — no order_ack \
