@@ -2236,12 +2236,12 @@ mod tests {
         }
     }
 
-    /// A venue that takes every order and cancel, and never fills anything.
+    /// A venue that takes every cancel, with nothing filled.
     struct Quiet;
 
     impl OrderSink for Quiet {
-        fn place(&self, r: &PlaceRequest) -> Result<String, VenueError> {
-            Ok(format!("v-{}", r.client_order_id))
+        fn place(&self, _r: &PlaceRequest) -> Result<String, VenueError> {
+            unreachable!("nothing here is placed at the venue")
         }
         fn cancel(&self, _r: &CancelRequest) -> Result<(), VenueError> {
             Ok(())
@@ -2373,23 +2373,28 @@ mod tests {
         let none = BTreeMap::new();
         let asks = [(9700, 48.0), (9800, 2056.0)];
         let b = [(8800, 151.0), (4600, 1152.0)];
-        act_side(&mut m, true, want(&b, &asks, 0, &SZ).bid, &b, &none, Some(&SZ), &w).await;
-        assert_eq!(resting(&m.bid), Some((4600, 100, 1152.0)));
+        let wanted = want(&b, &asks, 0, &SZ).bid;
+        // Placed just now behind 1,152. Orders are put in the slot by hand:
+        // a place goes through the process-wide shutdown latch, which another
+        // test in this binary leaves on.
+        let placed = |m: &mut Mkt, at: Option<Instant>| {
+            m.bid = Some(Order { venue_id: "B1".into(), price: 4600, qty: 100, filled: 0, checked: Instant::now(), ahead: 1152.0 });
+            m.last_touch[0] = at;
+        };
+        placed(&mut m, Some(Instant::now()));
         // The feed has not caught up: the level reads 100 short, as if this
         // order's size had left it, and under the reference size. Not judged.
         let lagging = [(8800, 51.0), (4600, 1052.0)];
-        assert_eq!(stay((4600, 100), 0.0, want(&b, &asks, 0, &SZ).bid, &lagging, true, 0, &SZ), Stay::Pull);
+        assert_eq!(stay((4600, 100), 0.0, wanted, &lagging, true, 0, &SZ), Stay::Pull);
         let gone = BTreeMap::from([(4600, 1152.0)]);
-        assert!(act_side(&mut m, true, want(&b, &asks, 0, &SZ).bid, &lagging, &gone, Some(&SZ), &w).await);
+        assert!(act_side(&mut m, true, wanted, &lagging, &gone, Some(&SZ), &w).await);
         assert_eq!(resting(&m.bid), Some((4600, 100, 0.0)), "the fall is still counted");
         // A market that may rest nothing pulls it at once all the same.
         act_side(&mut m, true, None, &b, &none, None, &w).await;
         assert_eq!(resting(&m.bid), None);
-        // Once the book has had time to show it, it is judged.
-        m.last_touch[0] = None;
-        act_side(&mut m, true, want(&b, &asks, 0, &SZ).bid, &b, &none, Some(&SZ), &w).await;
-        m.last_touch[0] = Instant::now().checked_sub(MIN_REQUOTE);
-        act_side(&mut m, true, want(&b, &asks, 0, &SZ).bid, &b, &gone, Some(&SZ), &w).await;
+        // Once the book has had time to show it, it is judged, and pulled.
+        placed(&mut m, Instant::now().checked_sub(MIN_REQUOTE));
+        assert!(act_side(&mut m, true, wanted, &b, &gone, Some(&SZ), &w).await);
         assert_eq!(resting(&m.bid), None);
     }
 
