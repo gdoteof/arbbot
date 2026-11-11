@@ -16,7 +16,8 @@
 //! `cap` contracts either way: each order is trimmed to what keeps the position
 //! inside the cap, so the side that would add past it is withdrawn. A
 //! market is quoted only while its book, scored by the rule above with our two
-//! orders in it, models at least `min_usd_day`. At most `max_markets` are
+//! orders in it, models at least `min_usd_day` averaged over about ten minutes
+//! ([`MODEL_TAU_S`]). At most `max_markets` are
 //! quoted at once, the best-modelled ones. The model is the rule applied to the
 //! book we see; Kalshi's payout is the only check on it.
 //!
@@ -34,7 +35,8 @@
 //!   * a venue position the log never booked refuses the market here too.
 //!
 //! Fills arrive on the engine's account-wide fill feed and wake this loop
-//! ([`owns_order`]). The count the venue reports per order is the truth.
+//! ([`owns_order`]). A frame's cumulative count is booked on arrival. The
+//! per-order read, made on the frame and on the heartbeat, can only add to it.
 //!
 //! WHAT STOPS IT. A market rests nothing when any of these hold:
 //!   * the kill file;
@@ -91,6 +93,19 @@ const BLACKOUT_REREAD: Duration = Duration::from_secs(30);
 const STICKY: f64 = 1.25;
 /// Kalshi's maker fee rate, on series that charge makers.
 const MAKER_FEE: f64 = 0.0175;
+/// The time constant, in seconds, of the mean that markets are picked on.
+/// Kalshi pays on each side's share over time. The share on one book swings
+/// with other makers' orders:
+///   * on 2026-11-11, a 144-lot that came and went every ~15 s one tick behind
+///     us moved gas-min 3.75 between $3.34 and $2.16 a day;
+///   * 2,000-lots at the touch of gas-avg 3.70 moved it from $4.93 to $1.80
+///     within a second.
+///
+/// Picked on the instant figure, every swing across `min_usd_day` or
+/// `min_usd_day / STICKY` cancelled and re-placed both orders: 183 places in
+/// one hour, against `max_places_day`. Ten minutes spans dozens of those
+/// swings. A market whose value really falls is still dropped about as fast.
+const MODEL_TAU_S: f64 = 600.0;
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -322,6 +337,34 @@ pub(crate) struct Cand {
 
 /// Which markets to quote, at most `max`.
 ///
+/// A mean over time, each value weighted by how long it held, decaying with
+/// [`MODEL_TAU_S`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Mean {
+    last: f64,
+    mean: f64,
+    at: Option<f64>,
+}
+
+impl Mean {
+    /// `x` holds from wall time `t` on. The previous value held until `t`.
+    pub(crate) fn push(&mut self, x: f64, t: f64) {
+        self.mean = match self.at {
+            None => x,
+            Some(t0) => {
+                let a = 1.0 - (-(t - t0).max(0.0) / MODEL_TAU_S).exp();
+                self.mean + a * (self.last - self.mean)
+            }
+        };
+        self.last = x;
+        self.at = Some(t);
+    }
+
+    pub(crate) fn get(&self) -> f64 {
+        self.mean
+    }
+}
+
 /// Every market holding inventory takes a slot first, whether or not it can be
 /// quoted, so inventory is never spread over more than `max` markets: about
 /// `max * cap` contracts at most. Inventory on several strikes of one figure
@@ -467,9 +510,9 @@ static LIVE_IDS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 /// About a day of re-quoting at a busy pace. A fill on an order older than
 /// that is reported as unattributed, which is the safe way to fail.
 const OWN_IDS_REMEMBERED: usize = 4096;
-/// Market -> venue ids reported filled there since the last pass (empty: the
-/// book moved).
-static DIRTY: Mutex<BTreeMap<String, BTreeSet<String>>> = Mutex::new(BTreeMap::new());
+/// Market -> (venue order id -> the highest cumulative count a fill frame
+/// reported for it) since the last pass. Empty: the book moved.
+static DIRTY: Mutex<BTreeMap<String, BTreeMap<String, i64>>> = Mutex::new(BTreeMap::new());
 /// The latest stats object, for the engine's 60 s line.
 static STATS: Mutex<Option<Value>> = Mutex::new(None);
 
@@ -478,11 +521,12 @@ fn notify() -> &'static tokio::sync::Notify {
     N.get_or_init(tokio::sync::Notify::new)
 }
 
-fn mark(market: &str, filled: Option<&str>) {
+fn mark(market: &str, filled: Option<(&str, i64)>) {
     if let Ok(mut g) = DIRTY.lock() {
         let ids = g.entry(market.to_owned()).or_default();
-        if let Some(id) = filled {
-            ids.insert(id.to_owned());
+        if let Some((id, cum)) = filled {
+            let c = ids.entry(id.to_owned()).or_insert(cum);
+            *c = (*c).max(cum);
         }
     }
     notify().notify_one();
@@ -604,10 +648,11 @@ pub fn clear_books() {
     }
 }
 
-/// A fill frame named an order this module placed.
-pub fn wake_fill(market: &str, venue_order_id: &str) {
+/// A fill frame named an order this module placed: `cum` contracts of it have
+/// filled in all.
+pub fn wake_fill(market: &str, venue_order_id: &str, cum: i64) {
     if watching(market) {
-        mark(market, Some(venue_order_id));
+        mark(market, Some((venue_order_id, cum)));
     }
 }
 
@@ -616,7 +661,7 @@ pub fn stats() -> Option<Value> {
     STATS.lock().ok().and_then(|g| g.clone())
 }
 
-async fn dirty() -> BTreeMap<String, BTreeSet<String>> {
+async fn dirty() -> BTreeMap<String, BTreeMap<String, i64>> {
     loop {
         if let Ok(mut g) = DIRTY.lock() {
             if !g.is_empty() {
@@ -681,7 +726,10 @@ struct Mkt {
     /// The venue position not yet folded into `book`, awaiting a mid to adopt it at.
     unadopted: i64,
     mid: Option<i64>,
+    /// What this market models in $/day, averaged over time ([`Mean`]). It
+    /// picks the markets; the instant figure only feeds it.
     modelled: f64,
+    model: Mean,
     /// Cancelled orders whose final fill count has not been read yet, by side
     /// (`true` = bid). Nothing new rests on the market until they are settled:
     /// a place sized off a position missing their fills could pass the cap.
@@ -909,6 +957,7 @@ pub async fn run(cfg: Cfg, w: Wiring) {
                 unadopted,
                 mid: None,
                 modelled: 0.0,
+                model: Mean::default(),
                 unsettled: Vec::new(),
                 settle_next: None,
                 settle_tries: 0,
@@ -947,9 +996,9 @@ pub async fn run(cfg: Cfg, w: Wiring) {
 
         // Settle fills first, so every decision below sees the position as it is.
         for (name, m) in mkts.iter_mut() {
-            let ids = fills.get(name).cloned().unwrap_or_default();
+            let frames = fills.get(name).cloned().unwrap_or_default();
             for side in [true, false] {
-                check_fills(m, side, &ids, &w).await;
+                check_fills(m, side, &frames, &w).await;
             }
             settle_cancelled(m, &w).await;
             resolve_lost(m, &w).await;
@@ -974,7 +1023,8 @@ pub async fn run(cfg: Cfg, w: Wiring) {
             }
             let (bo, ao) = others_of(m, bids, asks, w.shadow);
             let wt = want(&bo, &ao, m.book.pos, cfg.qty, cfg.cap);
-            m.modelled = modelled_share(&bo, &ao, wt.bid, wt.ask) * m.cfg.usd_day;
+            m.model.push(modelled_share(&bo, &ao, wt.bid, wt.ask) * m.cfg.usd_day, now);
+            m.modelled = m.model.get();
         }
 
         // The loss stop, over every market's inventory at its last mid, BEFORE
@@ -1069,16 +1119,26 @@ fn others_of(m: &Mkt, bids: &[Level], asks: &[Level], shadow: bool) -> (Levels, 
 
 /// Bring one side's fills up to date: on a fill frame naming the order, and
 /// on the heartbeat, which also notices an order that is no longer resting.
-async fn check_fills(m: &mut Mkt, bid: bool, frame_ids: &BTreeSet<String>, w: &Wiring) {
+async fn check_fills(m: &mut Mkt, bid: bool, frames: &BTreeMap<String, i64>, w: &Wiring) {
     if w.shadow {
         return;
     }
     let Some(o) = (if bid { &m.bid } else { &m.ask }).as_ref() else { return };
-    let named = frame_ids.contains(&o.venue_id);
+    let frame = frames.get(&o.venue_id).copied();
+    let named = frame.is_some();
     if !named && o.checked.elapsed() < HEARTBEAT {
         return;
     }
     let id = o.venue_id.clone();
+    // The frame's count is booked before the read, which can lag it: on
+    // 2026-11-11 the reads on four partial-fill frames found nothing new, and
+    // those fills waited ~2 min for the heartbeat. Until a fill is booked, the
+    // order is taken out of its level at its old size, so the level looks
+    // emptier than it is and the order can be pulled from the touch.
+    if let Some(cum) = frame {
+        let market = m.cfg.market.clone();
+        account(&market, &mut m.book, if bid { &mut m.bid } else { &mut m.ask }, bid, cum, w);
+    }
     // Due again only at the next heartbeat or frame, whatever the reads below
     // answer: a failing read must not repeat on every book event.
     if let Some(o) = (if bid { &mut m.bid } else { &mut m.ask }).as_mut() {
@@ -1612,6 +1672,114 @@ mod tests {
         assert_eq!(select(&[held("H", 1.7, true), new("A", 5.0)], 2.0, 1), names(&["H"]));
         // As many held markets as slots: no new market starts.
         assert!(select(&[held("H1", 0.0, false), held("H2", 0.0, false), new("A", 9.0)], 2.0, 2).is_empty());
+    }
+
+    #[test]
+    fn markets_are_picked_on_a_time_mean_that_a_flickering_competitor_cannot_flip() {
+        // Gas-min 3.75 on 2026-11-11: $3.34 a day without a competitor's
+        // 144-lot one tick behind, $2.16 with it, swapping every ~15 s. Quoted,
+        // the market must stay above min / STICKY (2.40 for a 3.00 floor).
+        let mut m = Mean::default();
+        let mut lowest = f64::MAX;
+        for i in 0..240 {
+            m.push(if i % 2 == 0 { 3.34 } else { 2.16 }, i as f64 * 14.5);
+            lowest = lowest.min(m.get());
+            assert!(select(&[cand("A", m.get(), true, false, true)], 3.0, 4).contains("A"), "pass {i}");
+        }
+        assert!((m.get() - 2.75).abs() < 0.05, "settles at the time mean, got {}", m.get());
+        assert!(lowest > 2.6, "never near the floor, got {lowest}");
+        // Unquoted, that mean does not clear the $3 needed to start.
+        assert!(select(&[cand("A", m.get(), false, false, true)], 3.0, 4).is_empty());
+        // A one-second spike barely moves it.
+        let t = 240.0 * 14.5;
+        let before = m.get();
+        m.push(9.0, t);
+        m.push(before, t + 1.0);
+        assert!((m.get() - before).abs() < 0.02);
+        // A real fall to $1 is below the $2.40 floor within fifteen minutes.
+        m.push(1.0, t + 2.0);
+        m.push(1.0, t + 2.0 + 900.0);
+        assert!(m.get() < 2.4, "got {}", m.get());
+        // The first value is taken as it is.
+        let mut f = Mean::default();
+        f.push(4.0, 100.0);
+        assert_eq!(f.get(), 4.0);
+    }
+
+    /// A venue whose per-order read still shows nothing filled.
+    struct StaleReads;
+
+    impl OrderSink for StaleReads {
+        fn place(&self, _r: &PlaceRequest) -> Result<String, VenueError> {
+            unreachable!("check_fills never places")
+        }
+        fn cancel(&self, _r: &CancelRequest) -> Result<(), VenueError> {
+            unreachable!("check_fills never cancels")
+        }
+        fn cancel_all_open(&self) -> Result<(), VenueError> {
+            unreachable!("check_fills never sweeps")
+        }
+        fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+            unreachable!("check_fills never lists orders")
+        }
+        fn filled_qty(&self, _id: &str) -> Result<i64, VenueError> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fill_frame_is_booked_at_once_even_when_the_read_lags_it() {
+        let dir = std::env::temp_dir().join(format!("lip-frame-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("lip.jsonl");
+        let _ = std::fs::remove_file(&log);
+        let w = Wiring {
+            kalshi: Arc::new(StaleReads),
+            log_path: log.to_str().unwrap().to_string(),
+            blackouts_path: String::new(),
+            kill_file: String::new(),
+            rels: BTreeMap::new(),
+            shadow: false,
+        };
+        let order = |id: &str| Order { venue_id: id.into(), price: 8400, qty: 100, filled: 0, checked: Instant::now() };
+        let mut m = Mkt {
+            cfg: MarketCfg { market: "KXA-1".into(), usd_day: 5.0, until: String::new() },
+            until: f64::MAX,
+            bid: Some(order("B1")),
+            ask: Some(order("A1")),
+            last_touch: [None, None],
+            fails: [0, 0],
+            book: Book::default(),
+            unadopted: 0,
+            mid: None,
+            modelled: 0.0,
+            model: Mean::default(),
+            unsettled: Vec::new(),
+            settle_next: None,
+            settle_tries: 0,
+            lost: Vec::new(),
+            refused: None,
+        };
+        let frames = |id: &str, cum: i64| BTreeMap::from([(id.to_string(), cum)]);
+        check_fills(&mut m, true, &frames("B1", 2), &w).await;
+        assert_eq!(m.book.pos, 2, "booked from the frame, though the read says 0");
+        assert_eq!(m.bid.as_ref().unwrap().resting(), 98);
+        // Cumulative: the next frame books only what it adds, and a stale or
+        // repeated frame books nothing.
+        check_fills(&mut m, true, &frames("B1", 12), &w).await;
+        check_fills(&mut m, true, &frames("B1", 12), &w).await;
+        check_fills(&mut m, true, &frames("B1", 5), &w).await;
+        assert_eq!(m.book.pos, 12);
+        // A frame for the other side's order leaves this side alone.
+        check_fills(&mut m, true, &frames("A1", 7), &w).await;
+        assert_eq!(m.book.pos, 12);
+        check_fills(&mut m, false, &frames("A1", 7), &w).await;
+        assert_eq!(m.book.pos, 5);
+        // Never past what the order was for.
+        check_fills(&mut m, true, &frames("B1", 500), &w).await;
+        assert_eq!(m.bid.as_ref().unwrap().resting(), 0);
+        let fills = std::fs::read_to_string(&log).unwrap().lines().count();
+        assert_eq!(fills, 4, "one log record per booking");
     }
 
     #[test]
