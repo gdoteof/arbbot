@@ -1,12 +1,14 @@
 # Kalshi liquidity-incentive quoting (`arb-trader --lip config/lip.yaml`, rust/bins/arb-trader/src/lip.rs).
 #
-# Each market rests a `qty` YES bid and YES ask at the best price other makers
-# show, holds what fills up to `cap` contracts net, and is quoted only while
-# its book (scored by Kalshi's rule, our orders in it) models >= `min_usd_day`.
-# The best `max_markets` are quoted at once. `usd_day` is the program's
-# period_reward / 10000 over its days, and `until` is its end_date, from
-# GET /trade-api/v2/incentive_programs?status=active. Programs are weekly:
-# refresh this list when they roll, or quoting stops at `until`.
+# Each market rests a YES bid and a YES ask of up to `qty`, holds what fills up
+# to `cap` contracts net, and is quoted only while its book (scored by Kalshi's
+# rule, our orders in it) models >= `min_usd_day`. An order that adds to the
+# position joins the reference level other makers already make (the first
+# level where their size adds up to 200), behind them, and one that shrinks it
+# rests at the touch. The best `max_markets` are quoted at once. `usd_day` is
+# the program's period_reward / 10000 over its days, and `until` is its
+# end_date, from GET /trade-api/v2/incentive_programs?status=active. Programs
+# are weekly: refresh this list when they roll, or quoting stops at `until`.
 #
 # A market's two orders hold about qty * (1 - spread) of Kalshi cash while
 # they rest. Every market holding inventory takes one of the max_markets slots,
@@ -21,7 +23,23 @@ qty: 200
 # more reward but held twice the inventory, which sat at the cap and lost more
 # than the extra reward.
 cap: 100
+# The touch, where an order that shrinks the position rests and inventory is
+# marked, is the first level where other makers show this many contracts in
+# all. On the 2026-11-06..10 tape a 1-3 lot order stood 2c or more inside the
+# first 20 contracts for 40-98% of each hour on the gas-min markets.
+min_lead: 20
+# Nothing rests in these daily UTC windows. AAA posts the day's national
+# average between 03:00 and 06:00 ET, and every gas market reprices on it: on
+# each of 2026-11-06..10 the makers with size left the gas-min books at 03:00 ET
+# and came back at 06:00 at a new price.
+quiet_utc: [["08:00", "11:00"]]
 max_markets: 4
+# What an order models joining the reference level is what it keeps, and on the
+# gas books that is rarely this much: replayed over 2026-11-06..10 this floor
+# quoted 0.6 market-hours a day for $0.07/day and no fills. At 2.0 it modelled
+# $1.55/day and lost $5.41/day on 29 fills, and at 1.0 $3.85/day against
+# $18.13/day on 87. The 100-200 lots at the best price that this replaced
+# modelled $2.27/day before the size behind them reacted, on 20 fills.
 min_usd_day: 3.0
 loss_stop_usd: 150
 # Every place is a row of Kalshi order history, which the resting-order sweeps
