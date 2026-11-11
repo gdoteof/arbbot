@@ -491,6 +491,11 @@ pub fn install(watched: BTreeSet<String>, left: BTreeSet<String>) {
     let _ = LEFT.set(left);
 }
 
+/// The markets this module tracks; empty on every run without `--lip`.
+pub fn watched() -> Vec<String> {
+    WATCHED.get().map(|w| w.iter().cloned().collect()).unwrap_or_default()
+}
+
 /// Is `market` one this module tracks? False on every run without `--lip`.
 pub fn watching(market: &str) -> bool {
     WATCHED.get().is_some_and(|w| w.contains(market))

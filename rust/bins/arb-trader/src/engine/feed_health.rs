@@ -344,7 +344,11 @@ impl Engine {
         if t.reason.is_some() && self.feed_reason.is_none() {
             crate::lip::clear_books();
         }
+        let was_down = self.feed_reason.is_some();
         self.feed_reason = t.reason;
+        if was_down && self.feed_reason.is_none() && !self.killed {
+            self.lip_reload_books();
+        }
     }
 }
 
