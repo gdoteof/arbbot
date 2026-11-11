@@ -124,11 +124,13 @@ const BLACKOUT_REREAD: Duration = Duration::from_secs(30);
 const STICKY: f64 = 1.25;
 /// Contracts that make a level the reference level.
 const REF_SIZE: f64 = TARGET / 5.0;
-/// A move toward the other side of the book is made only once the closer
-/// price has been the wanted one for this long without a break: a level that
-/// shows there and is gone seconds later leaves whoever followed it alone at
-/// the new price. An order placed where nothing rests waits this long after
-/// the last place or cancel on its side. Backing away waits [`REPRICE_HOLD`].
+/// A move toward the other side of the book is made only once a closer price
+/// has been wanted for this long without a break ([`Mkt::closer`]): a level
+/// that shows there and is gone seconds later leaves whoever followed it
+/// alone at the new price. An adding order placed where none rests waits this
+/// long after the last place, cancel or whole fill on its side, and so does a
+/// reducing order after it was pulled because nothing could rest there.
+/// Backing away waits [`REPRICE_HOLD`].
 const STEP_IN_HOLD: Duration = Duration::from_secs(60);
 /// A reducing order rests one tick inside the touch when the size ahead of it
 /// there is this many times its own: behind a thousand contracts a 100-lot is
@@ -505,8 +507,9 @@ pub(crate) fn stay(resting: (i64, i64), ahead: f64, want: Option<(i64, i64)>, ow
 }
 
 /// The mark: midway between the two touches. A side whose makers show less
-/// than `min_lead` in all is read at its best price, so a book that thins out
-/// on one side still moves the mark. `None` when a side is empty.
+/// than `min_lead` in all has no touch and is read at its best price, whatever
+/// stands there, so a book that thins out on one side still moves the mark
+/// and the loss stop with it. `None` when a side is empty.
 pub(crate) fn mark_mid(bids_o: &[(i64, f64)], asks_o: &[(i64, f64)], min_lead: i64) -> Option<i64> {
     let at = |side: &[(i64, f64)]| lead(side, min_lead as f64).or(side.first().map(|l| l.0));
     Some((at(bids_o)? + at(asks_o)?) / 2)
@@ -685,11 +688,13 @@ type Window = (String, f64, f64, String);
 /// fallen, added up over every change since the loop last took it (`[bids,
 /// asks]`). The loop looks at the book once a pass. A level that is cancelled
 /// and put back between two passes shows it the same size twice, and the fall
-/// in between is only here.
+/// in between is only here. `gap` says the book was lost, or first seen,
+/// since the loop last took it: what fell while it was away is not known.
 #[derive(Clone, Default)]
 struct Seen {
     sides: Sides,
     drops: [BTreeMap<i64, f64>; 2],
+    gap: bool,
 }
 
 static BOOKS: Mutex<BTreeMap<String, Seen>> = Mutex::new(BTreeMap::new());
@@ -822,13 +827,25 @@ pub fn log_holdings(path: &str) -> Holdings {
     Holdings { held, named, error }
 }
 
+/// The watched books as they stand, with the falls and gaps since the last
+/// call, which starts them over.
+fn take_books() -> BTreeMap<String, Seen> {
+    let Ok(mut g) = BOOKS.lock() else { return BTreeMap::new() };
+    let taken = g.clone();
+    for seen in g.values_mut() {
+        seen.drops = Default::default();
+        seen.gap = false;
+    }
+    taken
+}
+
 /// The engine saw `market`'s book move. `None` means it can no longer be
 /// priced from: crossed, stamped in the future, or lost to a sequence gap.
 pub fn book_changed(market: &str, book: Option<(&[Level], &[Level])>) {
     if let Ok(mut g) = BOOKS.lock() {
         match book {
             Some((b, a)) => {
-                let seen = g.entry(market.to_owned()).or_default();
+                let seen = g.entry(market.to_owned()).or_insert_with(|| Seen { gap: true, ..Seen::default() });
                 for (i, (new, old)) in [(b, &seen.sides.0), (a, &seen.sides.1)].into_iter().enumerate() {
                     let now: BTreeMap<i64, f64> = others(new, None).into_iter().collect();
                     for (p, was) in others(old, None) {
@@ -922,10 +939,12 @@ impl Order {
         self.qty - self.filled
     }
 
-    /// Bring `ahead` up to date with the falls on this order's side since the
-    /// last pass, by price.
-    fn track(&mut self, drops: &BTreeMap<i64, f64>) {
-        self.ahead = (self.ahead - drops.get(&self.price).copied().unwrap_or(0.0)).max(0.0);
+    /// Bring `ahead` up to date with what the feed showed on this order's side
+    /// since the last pass: the falls at its price, or, where the book was
+    /// lost in between, nothing known to be ahead of it any more.
+    fn track(&mut self, seen: &Seen, bid: bool) {
+        let fell = seen.drops[usize::from(!bid)].get(&self.price).copied().unwrap_or(0.0);
+        self.ahead = if seen.gap { 0.0 } else { (self.ahead - fell).max(0.0) };
     }
 }
 
@@ -947,10 +966,17 @@ struct Mkt {
     /// refusals since that side's last success.
     last_touch: [Option<Instant>; 2],
     fails: [u32; 2],
-    /// Per side, a wanted price closer to the other side of the book than the
-    /// resting order, and since when it has been the wanted one without a
-    /// break ([`STEP_IN_HOLD`]).
+    /// Per side, a price closer to the other side of the book than the resting
+    /// order, and since when a price at least that close has been wanted
+    /// without a break ([`STEP_IN_HOLD`]). For an adding order it is the one
+    /// price wanted all that time: a reference level that keeps moving is not
+    /// followed. For a reducing order it is the least close of the prices
+    /// wanted, so a touch that keeps coming closer is followed a hold behind,
+    /// and a level that shows closer still for a moment is not.
     closer: [Option<(i64, Instant)>; 2],
+    /// Per side, when its reducing order was last pulled because nothing could
+    /// rest there ([`STEP_IN_HOLD`]).
+    left: [Option<Instant>; 2],
     book: Book,
     /// The venue position not yet folded into `book`, awaiting a mid to adopt it at.
     unadopted: i64,
@@ -1183,6 +1209,7 @@ pub async fn run(cfg: Cfg, w: Wiring) {
                 last_touch: [None, None],
                 fails: [0, 0],
                 closer: [None, None],
+                left: [None, None],
                 book,
                 unadopted,
                 mid: None,
@@ -1226,14 +1253,7 @@ pub async fn run(cfg: Cfg, w: Wiring) {
             windows = crate::maker_exit::read_entry_blackouts(&w.blackouts_path);
             windows_at = Some(Instant::now());
         }
-        let books: BTreeMap<String, Seen> = BOOKS
-            .lock()
-            .map(|mut g| {
-                let taken = g.clone();
-                g.values_mut().for_each(|seen| seen.drops = Default::default());
-                taken
-            })
-            .unwrap_or_default();
+        let books = take_books();
         let killed = exists(&w.kill_file);
         let now = now_wall();
 
@@ -1241,16 +1261,7 @@ pub async fn run(cfg: Cfg, w: Wiring) {
         for (name, m) in mkts.iter_mut() {
             let frames = fills.get(name).cloned().unwrap_or_default();
             for side in [true, false] {
-                let before = m.book.pos;
-                check_fills(m, side, &frames, &w).await;
-                if m.book.pos != before {
-                    match (if side { &mut m.bid } else { &mut m.ask }).as_mut() {
-                        // Whatever stood ahead of a filled order has traded.
-                        Some(o) if o.resting() > 0 => o.ahead = 0.0,
-                        // Filled whole, mid-sweep: the side waits before it adds again.
-                        _ => m.last_touch[usize::from(!side)] = Some(Instant::now()),
-                    }
-                }
+                settle_fills(m, side, &frames, &w).await;
             }
             settle_cancelled(m, &w).await;
             resolve_lost(m, &w).await;
@@ -1263,12 +1274,16 @@ pub async fn run(cfg: Cfg, w: Wiring) {
                 continue;
             };
             let (bo, ao) = others_of(m, bids, asks, w.shadow);
-            // Marked between the touches, not the best prices: a 1-lot inside
-            // the spread would move the mark, and the loss stop with it.
+            // Marked between the touches where each side has one: a 1-lot
+            // inside the spread would otherwise move the mark, and the loss
+            // stop with it.
             if let Some(mid) = mark_mid(&bo, &ao, cfg.min_lead) {
                 m.mid = Some(mid);
             }
-            if let (true, Some(mid)) = (m.unadopted != 0, m.mid) {
+            // A position is adopted only at a mark both touches make: the
+            // price it is booked at stays in the log.
+            let firm = [&bo, &ao].iter().all(|side| lead(side, cfg.min_lead as f64).is_some());
+            if let (true, true, Some(mid)) = (m.unadopted != 0, firm, m.mid) {
                 let n = m.unadopted;
                 m.book.pos += n;
                 m.book.cash_e4 -= mid * n;
@@ -1361,18 +1376,13 @@ pub async fn run(cfg: Cfg, w: Wiring) {
             } else {
                 None
             };
-            let seen = books.get(name).cloned().unwrap_or_else(|| {
-                // The book was lost, and with it the sight of what left the queue.
-                for o in [m.bid.as_mut(), m.ask.as_mut()].into_iter().flatten() {
-                    o.ahead = 0.0;
-                }
-                Seen::default()
-            });
+            // A lost book takes the sight of what left the queue with it.
+            let seen = books.get(name).cloned().unwrap_or_else(|| Seen { gap: true, ..Seen::default() });
             let (bo, ao) = others_of(m, &seen.sides.0, &seen.sides.1, w.shadow);
             let wt = sz.map_or(Want::default(), |s| want(&bo, &ao, m.book.pos, &s));
             for side in [true, false] {
                 let (wanted, own) = if side { (wt.bid, &bo) } else { (wt.ask, &ao) };
-                pending |= act_side(m, side, wanted, own, &seen.drops[usize::from(!side)], sz.as_ref(), &w).await;
+                pending |= act_side(m, side, wanted, own, &seen, sz.as_ref(), &w).await;
             }
             pending |= !m.unsettled.is_empty() || !m.lost.is_empty();
         }
@@ -1387,6 +1397,22 @@ pub async fn run(cfg: Cfg, w: Wiring) {
 fn others_of(m: &Mkt, bids: &[Level], asks: &[Level], shadow: bool) -> (Levels, Levels) {
     let own = |o: &Option<Order>| if shadow { None } else { o.as_ref().map(|o| (o.price, o.resting())) };
     (others(bids, own(&m.bid)), others(asks, own(&m.ask)))
+}
+
+/// Book one side's fills ([`check_fills`]), and what a fill there says about
+/// the queue.
+async fn settle_fills(m: &mut Mkt, bid: bool, frames: &BTreeMap<String, i64>, w: &Wiring) {
+    let before = m.book.pos;
+    check_fills(m, bid, frames, w).await;
+    if m.book.pos == before {
+        return;
+    }
+    match (if bid { &mut m.bid } else { &mut m.ask }).as_mut() {
+        // Whatever stood ahead of a filled order has traded.
+        Some(o) => o.ahead = 0.0,
+        // Filled whole, mid-sweep: the side waits before it adds again.
+        None => m.last_touch[usize::from(!bid)] = Some(Instant::now()),
+    }
 }
 
 /// Bring one side's fills up to date: on a fill frame naming the order, and
@@ -1447,7 +1473,8 @@ async fn check_fills(m: &mut Mkt, bid: bool, frames: &BTreeMap<String, i64>, w: 
     let market = m.cfg.market.clone();
     let slot = if bid { &mut m.bid } else { &mut m.ask };
     account(&market, &mut m.book, slot, bid, filled, w);
-    if terminal.is_some() {
+    // An order filled whole is as gone as one the venue reports terminal.
+    if terminal.is_some() || slot.as_ref().is_some_and(|o| o.resting() == 0) {
         if let Some(o) = slot.take() {
             release_order(&o.venue_id);
             eprintln!(
@@ -1490,15 +1517,15 @@ fn account(market: &str, book: &mut Book, slot: &mut Option<Order>, bid: bool, f
 }
 
 /// Move one side toward `want`. `own` are the other makers' levels on this
-/// side, `drops` how far each of the side's prices has fallen since the last
-/// pass, and `s` is `None` for a market that may rest nothing. Returns true
-/// when a change is still owed, so the caller wakes again soon.
+/// side, `seen` what the feed has shown of the market since the last pass,
+/// and `s` is `None` for a market that may rest nothing. Returns true when a
+/// change is still owed, so the caller wakes again soon.
 async fn act_side(
     m: &mut Mkt,
     bid: bool,
     want: Option<(i64, i64)>,
     own: &[(i64, f64)],
-    drops: &BTreeMap<i64, f64>,
+    seen: &Seen,
     s: Option<&Sizing>,
     w: &Wiring,
 ) -> bool {
@@ -1510,14 +1537,23 @@ async fn act_side(
     // that order's size taken out of a level it is not in, and reads short.
     let fresh = !w.shadow && since(m) < MIN_REQUOTE;
     if let Some(o) = (if bid { &mut m.bid } else { &mut m.ask }).as_mut() {
-        o.track(drops);
+        o.track(seen, bid);
     }
     let resting = (if bid { &m.bid } else { &m.ask }).clone();
+    // A fill on this side would shrink the position. A fill that changes the
+    // position inside this call ends the call, so this holds to its end.
+    let reducing = if bid { m.book.pos < 0 } else { m.book.pos > 0 };
+    // Nothing is placed on a market while a cancelled or lost order of its
+    // is unaccounted for.
+    let unsettled = !m.unsettled.is_empty() || !m.lost.is_empty();
+    let mut want = want;
     let mut pulled = false;
     let stepping = m.closer[i].take();
     if let Some(o) = &resting {
         let verdict = match s {
             None => Stay::Pull,
+            // Filled whole: nothing of it is left to hold where it is.
+            Some(_) if o.resting() == 0 => Stay::Pull,
             Some(_) if fresh => {
                 m.closer[i] = stepping;
                 return true;
@@ -1526,25 +1562,36 @@ async fn act_side(
         };
         // A pull goes at once. A move away waits out its hold since the side
         // was last touched, so a flickering book cannot churn the order. A
-        // move closer waits until that price has been wanted for its hold
-        // without a break. Each waits out the backoff after a refusal.
+        // move closer waits until a closer price has been wanted for its hold
+        // without a break ([`Mkt::closer`]), and goes to the price that was.
+        // Each waits out the backoff after a refusal.
         let ready = match (verdict, m.fails[i]) {
             (Stay::Keep, _) => return false,
             (Stay::Pull, 0) => true,
             (Stay::Pull, f) => since(m) >= backoff(f),
             (Stay::Reprice { closer: false }, f) => since(m) >= backoff(f).max(REPRICE_HOLD),
             (Stay::Reprice { closer: true }, f) => {
-                let from = stepping.filter(|c| Some(c.0) == want.map(|x| x.0)).map_or_else(Instant::now, |c| c.1);
-                m.closer[i] = want.map(|x| (x.0, from));
-                from.elapsed() >= STEP_IN_HOLD && since(m) >= backoff(f)
+                let clock = want.map(|(wp, _)| match stepping {
+                    Some((cp, from)) if cp == wp => (cp, from),
+                    Some((cp, from)) if reducing => (if bid { cp.min(wp) } else { cp.max(wp) }, from),
+                    _ => (wp, Instant::now()),
+                });
+                m.closer[i] = clock;
+                want = want.zip(clock).map(|((_, q), (p, _))| (p, q));
+                clock.is_some_and(|c| c.1.elapsed() >= STEP_IN_HOLD) && since(m) >= backoff(f)
             }
         };
-        // An order filled whole is one the sweep took, the same as a pull.
-        pulled = verdict == Stay::Pull || o.resting() == 0;
-        if !ready {
+        pulled = verdict == Stay::Pull;
+        // A move is one change, a cancel and the place that replaces it. While
+        // the market is unsettled the place cannot go out, so the order stays
+        // where it is. A pull does not wait.
+        if !ready || unsettled && !pulled {
             return true;
         }
-        m.closer[i] = None;
+        if pulled && want.is_none() && reducing {
+            m.left[i] = Some(Instant::now());
+        }
+        let stepped = m.closer[i].take();
         m.last_touch[i] = Some(Instant::now());
         if w.shadow {
             forget(m, bid);
@@ -1552,6 +1599,8 @@ async fn act_side(
             let k = w.kalshi.clone();
             let req = CancelRequest { by: CancelBy::VenueId(o.venue_id.clone()), market_slug: None };
             if let Ok(Err(e)) | Err(e) = blocking(move || k.cancel(&req).map_err(|e| e.to_string())).await {
+                // A step whose hold is served is still owed.
+                m.closer[i] = stepped;
                 m.fails[i] += 1;
                 ERRORS.fetch_add(1, Ordering::Relaxed);
                 eprintln!("[lip] {market}: cancel of {} failed ({e}); it stays on the books", o.venue_id);
@@ -1577,21 +1626,25 @@ async fn act_side(
                 Ok(Err(e)) | Err(e) => return unsettle(m, bid, o.clone(), &e),
             }
         }
-        // A reprice is ONE change: the replacement goes out now, not a
-        // debounce later, so the side is not left empty.
     }
     let Some((p, q)) = want else { return false };
-    if !m.unsettled.is_empty() || !m.lost.is_empty() {
+    if unsettled {
         return true;
     }
-    // An order placed where nothing rests, and an adding order's return
-    // after a pull or a whole fill, wait until the book has had STEP_IN_HOLD
-    // to settle: an adding order lost what it stood behind, and a side that
-    // comes and goes would otherwise spend a place on every turn. A replace,
-    // and a reducing order pulled for its size, go out in the same pass.
-    let adding = if bid { m.book.pos >= 0 } else { m.book.pos <= 0 };
-    let wait = if resting.is_none() || adding && pulled { backoff(m.fails[i]).max(STEP_IN_HOLD) } else { Duration::ZERO };
-    if since(m) < wait {
+    // Where no order rests, an adding order waits STEP_IN_HOLD since the side
+    // was last touched, and so does one coming back after a pull or a whole
+    // fill: it lost what it stood behind. A reducing order goes back as soon
+    // as the side's refusals allow, so that inventory is not left without a
+    // way out, unless it was pulled because nothing could rest there: a side
+    // that comes and goes must not cost a place on every turn. A move, and a
+    // reducing order pulled for its size, are replaced in the same pass.
+    let wait = match (reducing, resting.is_none()) {
+        (false, gone) if gone || pulled => STEP_IN_HOLD,
+        (true, true) => backoff(m.fails[i]),
+        _ => Duration::ZERO,
+    };
+    let away = reducing && resting.is_none() && m.left[i].is_some_and(|t| t.elapsed() < STEP_IN_HOLD);
+    if since(m) < wait || away {
         return true;
     }
     // The pass read these before its venue calls, any of which can take
@@ -1640,7 +1693,7 @@ async fn act_side(
                 eprintln!(
                     "[lip] {market}: place {side} {q} @ {} refused ({e}); next try in {}s",
                     px_str(p),
-                    backoff(m.fails[i]).as_secs()
+                    if reducing { backoff(m.fails[i]) } else { STEP_IN_HOLD }.as_secs()
                 );
                 return true;
             }
@@ -1936,7 +1989,7 @@ mod tests {
     fn an_adding_order_joins_the_reference_level_others_make_and_never_makes_one() {
         // A thin side: 150 at the best bid, 17 cents of air, then 120.
         let bids = [(8800, 150.0), (7100, 120.0), (7000, 20.0), (6000, 25.0), (3200, 180.0), (2300, 15000.0)];
-        let asks = [(9700, 48.0), (9800, 556.0), (9900, 2000.0)];
+        let asks = [(9700, 40.0), (9800, 556.0), (9900, 2000.0)];
         let w = want(&bids, &asks, 0, &SZ);
         assert_eq!(w, Want { bid: Some((7100, 100)), ask: Some((9800, 100)) });
         // It scores in full there, and the reference level is where it was:
@@ -1957,8 +2010,8 @@ mod tests {
 
     #[test]
     fn an_order_never_fills_past_the_cap() {
-        let b = [(8800, 151.0), (6000, 25.0), (4600, 1152.0)];
-        let a = [(9700, 48.0), (9800, 2056.0)];
+        let b = [(8800, 150.0), (6000, 30.0), (4600, 1100.0)];
+        let a = [(9700, 40.0), (9800, 2000.0)];
         let size = |pos: i64, s: &Sizing| want(&b, &a, pos, s).bid.map(|x| x.1);
         assert_eq!(size(0, &SZ), Some(100));
         assert_eq!(size(60, &SZ), Some(40));
@@ -2011,32 +2064,32 @@ mod tests {
 
     #[test]
     fn an_adding_order_is_pulled_once_too_little_would_fill_before_it() {
-        let bids = [(8800, 151.0), (6100, 13.0), (6000, 25.0), (4600, 1152.0)];
-        let asks = [(9700, 48.0), (9800, 2056.0)];
+        let bids = [(8800, 150.0), (6100, 10.0), (6000, 30.0), (4600, 1100.0)];
+        let asks = [(9700, 40.0), (9800, 2000.0)];
         let st = |r: (i64, i64), ahead: f64, b: &[(i64, f64)], pos: i64| stay(r, ahead, want(b, &asks, pos, &SZ).bid, b, true, pos, &SZ);
-        // Joined at 0.46 behind 1,152: 1,341 contracts fill first.
-        assert_eq!(cover(4600, 1152.0, &bids, true), 1341.0);
-        assert_eq!(st((4600, 100), 1152.0, &bids, 0), Stay::Keep);
-        assert_eq!(st((4600, 49), 1152.0, &bids, 0), Stay::Reprice { closer: false }, "under half is topped up");
-        // The 1,152 left and another 1,152 came: the level reads the same, and
-        // this order is first in it. 189 at better prices is not enough.
+        // Joined at 0.46 behind 1,100: 1,290 contracts fill first.
+        assert_eq!(cover(4600, 1100.0, &bids, true), 1290.0);
+        assert_eq!(st((4600, 100), 1100.0, &bids, 0), Stay::Keep);
+        assert_eq!(st((4600, 49), 1100.0, &bids, 0), Stay::Reprice { closer: false }, "under half is topped up");
+        // The 1,100 left and another 1,100 came: the level reads the same, and
+        // this order is first in it. 190 at better prices is not enough.
         assert_eq!(st((4600, 100), 0.0, &bids, 0), Stay::Pull);
-        assert_eq!(st((4600, 100), 11.0, &bids, 0), Stay::Keep, "189 + 11 is");
+        assert_eq!(st((4600, 100), 10.0, &bids, 0), Stay::Keep, "190 + 10 is");
         // A reference level made ahead of it: followed, if it lasts.
-        let stepped = [(8800, 151.0), (8000, 300.0), (4600, 1152.0)];
-        assert_eq!(st((4600, 100), 1152.0, &stepped, 0), Stay::Reprice { closer: true });
+        let stepped = [(8800, 150.0), (8000, 300.0), (4600, 1100.0)];
+        assert_eq!(st((4600, 100), 1100.0, &stepped, 0), Stay::Reprice { closer: true });
         // The level it joined went, with nothing better to stand behind.
         assert_eq!(st((8000, 100), 300.0, &bids[1..], 0), Stay::Pull);
         // Long 60 leaves room for 40 under the cap, and this order is for
         // 100. Or nothing is wanted.
-        assert_eq!(st((4600, 100), 1152.0, &bids, 60), Stay::Pull);
-        assert_eq!(stay((4600, 100), 1152.0, None, &bids, true, 0, &SZ), Stay::Pull);
+        assert_eq!(st((4600, 100), 1100.0, &bids, 60), Stay::Pull);
+        assert_eq!(stay((4600, 100), 1100.0, None, &bids, true, 0, &SZ), Stay::Pull);
     }
 
     #[test]
     fn a_reducing_order_follows_the_touch_and_never_outgrows_the_position() {
         let bids = [(8200, 26.0), (6000, 25.0), (4500, 1775.0)];
-        let asks = [(9700, 48.0), (9800, 2056.0)];
+        let asks = [(9700, 40.0), (9800, 2000.0)];
         let at = |r: (i64, i64), ahead: f64, a: &[(i64, f64)], pos: i64| stay(r, ahead, want(&bids, a, pos, &ONLY).ask, a, false, pos, &ONLY);
         let st = |r: (i64, i64), a: &[(i64, f64)], pos: i64| at(r, 0.0, a, pos);
         assert_eq!(st((9700, 100), &asks, 100), Stay::Keep, "first in the queue is where it wants to be");
@@ -2048,7 +2101,7 @@ mod tests {
         assert_eq!(st((9800, 100), &asks, 100), Stay::Reprice { closer: true });
         // One tick inside the touch it stays, buried or not.
         assert_eq!(st((9600, 100), &asks, 100), Stay::Keep);
-        let buried = [(9700, 1000.0), (9800, 2056.0)];
+        let buried = [(9700, 1000.0), (9800, 2000.0)];
         assert_eq!(want(&bids, &buried, 100, &ONLY).ask, Some((9600, 100)), "a new order would join the back of the thousand");
         assert_eq!(st((9600, 100), &buried, 100), Stay::Keep);
         // At the touch, it steps inside only while what is AHEAD of it buries
@@ -2059,12 +2112,12 @@ mod tests {
         assert_eq!(at((9700, 100), 150.0, &buried, 100), Stay::Keep);
         assert_eq!(at((9700, 100), 0.0, &buried, 100), Stay::Keep);
         // Nor does what was ahead still count once the level is smaller than it.
-        assert_eq!(at((9700, 100), 1000.0, &[(9700, 300.0), (9800, 2056.0)], 100), Stay::Keep);
+        assert_eq!(at((9700, 100), 1000.0, &[(9700, 300.0), (9800, 2000.0)], 100), Stay::Keep);
         // A 4-lot is buried by any touch, 20 contracts being what makes one.
         // It steps inside once and stays there when the next order joins it.
-        let small = [(9700, 20.0), (9800, 2056.0)];
+        let small = [(9700, 20.0), (9800, 2000.0)];
         assert_eq!(want(&bids, &small, 4, &ONLY).ask, Some((9600, 4)));
-        let joined = [(9600, 200.0), (9700, 20.0), (9800, 2056.0)];
+        let joined = [(9600, 200.0), (9700, 20.0), (9800, 2000.0)];
         assert_eq!(want(&bids, &joined, 4, &ONLY).ask, Some((9500, 4)), "a new order would step in again");
         assert_eq!(at((9600, 4), 0.0, &joined, 4), Stay::Keep, "this one was there first");
     }
@@ -2082,37 +2135,49 @@ mod tests {
 
     #[test]
     fn every_fall_in_the_size_at_an_orders_price_is_taken_to_be_ahead_of_it() {
+        // The one test that takes the books: a take starts every market over.
         let name = "KXA-DROPS";
         let push = |z: Option<&str>| {
-            let bids: Vec<Level> = [Some(lv("0.88", "151")), z.map(|z| lv("0.46", z))].into_iter().flatten().collect();
-            let asks = [lv("0.97", "48")];
+            let bids: Vec<Level> = [Some(lv("0.88", "150")), z.map(|z| lv("0.46", z))].into_iter().flatten().collect();
+            let asks = [lv("0.97", "40")];
             book_changed(name, Some((bids.as_slice(), asks.as_slice())));
         };
-        let take = || std::mem::take(&mut BOOKS.lock().unwrap().get_mut(name).unwrap().drops);
-        push(Some("1152"));
-        let mut o = Order { venue_id: "B1".into(), price: 4600, qty: 100, filled: 0, checked: Instant::now(), ahead: 1152.0 };
+        let take = || take_books().remove(name).unwrap();
+        push(Some("1200"));
+        assert!(take().gap, "first seen: what fell before is not known");
+        let mut o = order(4600, 100, 1200.0);
         push(Some("1500"));
-        o.track(&take()[0]);
-        assert_eq!(o.ahead, 1152.0, "what joins is behind it");
+        o.track(&take(), true);
+        assert_eq!(o.ahead, 1200.0, "what joins is behind it");
         push(Some("1100"));
-        o.track(&take()[0]);
-        assert_eq!(o.ahead, 752.0, "400 left: taken from ahead");
+        let seen = take();
+        o.track(&seen, false);
+        assert_eq!(o.ahead, 1200.0, "a fall on the bids is none on the asks");
+        o.track(&seen, true);
+        assert_eq!(o.ahead, 800.0, "400 left: taken from ahead");
         // The 1,100 are cancelled and put back before the loop looks again.
         // The level reads as it did, and this order is now first in it.
         push(None);
         push(Some("1100"));
-        let drops = take();
-        assert_eq!((drops[0].get(&4600), drops[1].len()), (Some(&1100.0), 0));
-        o.track(&drops[0]);
+        let seen = take();
+        assert_eq!((seen.drops[0].get(&4600), seen.drops[1].len(), seen.gap), (Some(&1100.0), 0, false));
+        o.track(&seen, true);
         assert_eq!(o.ahead, 0.0);
         push(Some("2000"));
-        o.track(&take()[0]);
+        o.track(&take(), true);
         assert_eq!(o.ahead, 0.0, "and nothing that comes later is ahead");
-        // A book that is lost and comes back starts over.
+        assert!(take().drops[0].is_empty(), "a take starts the falls over");
+        // The book is lost and seen again between two looks. What fell while
+        // it was away is not known, so nothing is taken to be ahead any more.
+        o.ahead = 2000.0;
         push(Some("500"));
         book_changed(name, None);
-        push(Some("100"));
-        assert!(take()[0].is_empty());
+        push(Some("2000"));
+        let seen = take();
+        assert!(seen.gap && seen.drops[0].is_empty());
+        o.track(&seen, true);
+        assert_eq!(o.ahead, 0.0);
+        assert!(!take().gap, "and a take starts that over too");
     }
 
     #[test]
@@ -2257,6 +2322,24 @@ mod tests {
         }
     }
 
+    /// A venue that refuses every cancel.
+    struct Stuck;
+
+    impl OrderSink for Stuck {
+        fn place(&self, _r: &PlaceRequest) -> Result<String, VenueError> {
+            unreachable!("nothing here is placed at the venue")
+        }
+        fn cancel(&self, _r: &CancelRequest) -> Result<(), VenueError> {
+            Err(VenueError::Status { endpoint: "kalshi cancel", status: 503, body: String::new() })
+        }
+        fn cancel_all_open(&self) -> Result<(), VenueError> {
+            unreachable!("act_side never sweeps")
+        }
+        fn resting_order_ids(&self) -> Result<Vec<String>, VenueError> {
+            unreachable!("act_side never lists orders")
+        }
+    }
+
     fn wiring(kalshi: Arc<dyn OrderSink>, shadow: bool) -> Wiring {
         Wiring { kalshi, log_path: String::new(), blackouts_path: String::new(), kill_file: String::new(), rels: BTreeMap::new(), shadow }
     }
@@ -2272,6 +2355,7 @@ mod tests {
             last_touch: [None, None],
             fails: [0, 0],
             closer: [None, None],
+            left: [None, None],
             book: Book::default(),
             unadopted: 0,
             mid: None,
@@ -2289,70 +2373,158 @@ mod tests {
         o.as_ref().map(|o| (o.price, o.resting(), o.ahead))
     }
 
+    fn order(price: i64, qty: i64, ahead: f64) -> Order {
+        Order { venue_id: format!("o{price}"), price, qty, filled: 0, checked: Instant::now(), ahead }
+    }
+
+    /// What the feed showed of a market since the last pass: one fall.
+    fn fell(bid: bool, price: i64, by: f64) -> Seen {
+        let mut seen = Seen::default();
+        seen.drops[usize::from(!bid)].insert(price, by);
+        seen
+    }
+
+    fn ago(d: Duration) -> Option<Instant> {
+        Instant::now().checked_sub(d)
+    }
+
     #[tokio::test]
     async fn a_pulled_adding_order_waits_before_it_joins_again_and_a_resized_reducing_one_does_not() {
         let w = wiring(Arc::new(StaleReads), true);
         let mut m = mkt("KXA-REJOIN");
-        let none = BTreeMap::new();
-        let asks = [(9700, 48.0), (9800, 2056.0)];
-        let bids = |z: f64| [(8800, 151.0), (6000, 38.0), (4600, z)];
-        // Joins the 1,152 at 0.46, behind them.
-        let b = bids(1152.0);
+        let none = Seen::default();
+        let asks = [(9700, 40.0), (9800, 2000.0)];
+        let bids = |z: f64| [(8800, 150.0), (6000, 38.0), (4600, z)];
+        // Joins the 1,100 at 0.46, behind them.
+        let b = bids(1100.0);
         act_side(&mut m, true, want(&b, &asks, 0, &SZ).bid, &b, &none, Some(&SZ), &w).await;
-        assert_eq!(resting(&m.bid), Some((4600, 100, 1152.0)));
-        // Another 1,152 join behind it: nothing changes for this order.
-        let b = bids(2304.0);
-        assert!(!act_side(&mut m, true, want(&b, &asks, 0, &SZ).bid, &b, &none, Some(&SZ), &w).await);
-        assert_eq!(resting(&m.bid), Some((4600, 100, 1152.0)));
-        // 1,152 leave and as many come back before the loop looks again. The
+        assert_eq!(resting(&m.bid), Some((4600, 100, 1100.0)));
+        // Another 1,100 join behind it, and 1,100 leave the asks at that
+        // price: nothing changes for this order.
+        let b = bids(2200.0);
+        let bid = want(&b, &asks, 0, &SZ).bid;
+        assert_eq!(bid, Some((4600, 100)));
+        assert!(!act_side(&mut m, true, bid, &b, &none, Some(&SZ), &w).await);
+        assert!(!act_side(&mut m, true, bid, &b, &fell(false, 4600, 1100.0), Some(&SZ), &w).await);
+        assert_eq!(resting(&m.bid), Some((4600, 100, 1100.0)));
+        // 1,100 leave and as many come back before the loop looks again. The
         // level reads as it did and is still the reference level, and this
         // order is now first in it: pulled, and not put back yet.
-        let left = BTreeMap::from([(4600, 1152.0)]);
-        assert_eq!(want(&b, &asks, 0, &SZ).bid, Some((4600, 100)));
-        assert!(act_side(&mut m, true, want(&b, &asks, 0, &SZ).bid, &b, &left, Some(&SZ), &w).await);
-        assert!(act_side(&mut m, true, want(&b, &asks, 0, &SZ).bid, &b, &none, Some(&SZ), &w).await);
+        assert!(act_side(&mut m, true, bid, &b, &fell(true, 4600, 1100.0), Some(&SZ), &w).await);
+        assert!(act_side(&mut m, true, bid, &b, &none, Some(&SZ), &w).await);
         assert_eq!(resting(&m.bid), None);
         // After the hold it joins again, behind what is there now.
-        m.last_touch[0] = Instant::now().checked_sub(STEP_IN_HOLD);
-        act_side(&mut m, true, want(&b, &asks, 0, &SZ).bid, &b, &none, Some(&SZ), &w).await;
-        assert_eq!(resting(&m.bid), Some((4600, 100, 2304.0)));
+        m.last_touch[0] = ago(STEP_IN_HOLD);
+        act_side(&mut m, true, bid, &b, &none, Some(&SZ), &w).await;
+        assert_eq!(resting(&m.bid), Some((4600, 100, 2200.0)));
+        // The book was lost and seen again between two passes: nothing is
+        // known to be ahead of it any more.
+        let lost = Seen { gap: true, ..Seen::default() };
+        assert!(act_side(&mut m, true, bid, &b, &lost, Some(&SZ), &w).await);
+        assert_eq!(resting(&m.bid), None);
         // An order that sells inventory back is resized in the same pass.
         m.book.pos = 100;
         act_side(&mut m, false, want(&b, &asks, 100, &SZ).ask, &asks, &none, Some(&SZ), &w).await;
-        assert_eq!(resting(&m.ask), Some((9700, 100, 48.0)));
+        assert_eq!(resting(&m.ask), Some((9700, 100, 40.0)));
         m.book.pos = 60;
-        act_side(&mut m, false, want(&b, &asks, 60, &SZ).ask, &asks, &none, Some(&SZ), &w).await;
-        assert_eq!(resting(&m.ask), Some((9700, 60, 48.0)));
-        // A market that may rest nothing pulls both, whatever the book says.
-        act_side(&mut m, true, None, &b, &none, None, &w).await;
+        let ask = want(&b, &asks, 60, &SZ).ask;
+        act_side(&mut m, false, ask, &asks, &none, Some(&SZ), &w).await;
+        assert_eq!(resting(&m.ask), Some((9700, 60, 40.0)));
+        // A market that may rest nothing pulls it, whatever the book says.
         act_side(&mut m, false, None, &asks, &none, None, &w).await;
-        assert_eq!((resting(&m.bid), resting(&m.ask)), (None, None));
-        // Where nothing rests, a reducing order waits the hold out too: a side
-        // that comes and goes must not cost a place each time it comes back.
-        assert!(act_side(&mut m, false, want(&b, &asks, 60, &SZ).ask, &asks, &none, Some(&SZ), &w).await);
         assert_eq!(resting(&m.ask), None);
-        m.last_touch[1] = Instant::now().checked_sub(STEP_IN_HOLD);
-        act_side(&mut m, false, want(&b, &asks, 60, &SZ).ask, &asks, &none, Some(&SZ), &w).await;
-        assert_eq!(resting(&m.ask), Some((9700, 60, 48.0)));
+        // It comes back a hold after that, not as soon as the side was last
+        // touched allows: a market that may rest and then may not must not
+        // cost a place on every turn.
+        m.last_touch[1] = ago(STEP_IN_HOLD);
+        assert!(act_side(&mut m, false, ask, &asks, &none, Some(&SZ), &w).await);
+        assert_eq!(resting(&m.ask), None);
+        m.left[1] = ago(STEP_IN_HOLD);
+        act_side(&mut m, false, ask, &asks, &none, Some(&SZ), &w).await;
+        assert_eq!(resting(&m.ask), Some((9700, 60, 40.0)));
+    }
+
+    #[tokio::test]
+    async fn an_exit_goes_back_as_soon_as_it_can_and_moves_only_when_its_replacement_can_follow() {
+        let w = wiring(Arc::new(StaleReads), true);
+        let mut m = mkt("KXA-EXIT");
+        let none = Seen::default();
+        let bids = [(8800, 150.0), (4600, 1100.0)];
+        let asks = [(9700, 40.0), (9800, 2000.0)];
+        let ask = |pos: i64, a: &[(i64, f64)]| want(&bids, a, pos, &SZ).ask;
+        // Flat, the ask adds: it joins the 2,000, is pulled when they turn
+        // over, and waits.
+        act_side(&mut m, false, ask(0, &asks), &asks, &none, Some(&SZ), &w).await;
+        assert_eq!(resting(&m.ask), Some((9800, 100, 2000.0)));
+        assert!(act_side(&mut m, false, ask(0, &asks), &asks, &fell(false, 9800, 2000.0), Some(&SZ), &w).await);
+        assert_eq!(resting(&m.ask), None);
+        // Five seconds on the bid fills. The ask is now the way out and rests
+        // at once: the hold was the adding order's.
+        m.book.pos = 100;
+        m.last_touch[1] = ago(Duration::from_secs(5));
+        act_side(&mut m, false, ask(100, &asks), &asks, &none, Some(&SZ), &w).await;
+        assert_eq!(resting(&m.ask), Some((9700, 100, 40.0)));
+        // The touch backs two cents away. The move waits out its hold.
+        let away = [(9900, 300.0)];
+        let out = ask(100, &away);
+        assert_eq!(out, Some((9900, 100)));
+        m.last_touch[1] = ago(Duration::from_secs(5));
+        assert!(act_side(&mut m, false, out, &away, &none, Some(&SZ), &w).await);
+        assert_eq!(resting(&m.ask), Some((9700, 100, 40.0)));
+        // And it waits for the market's cancelled orders to be accounted for:
+        // until then nothing could be placed where it was cancelled from.
+        m.last_touch[1] = ago(REPRICE_HOLD);
+        m.unsettled.push((true, order(4600, 100, 0.0)));
+        assert!(act_side(&mut m, false, out, &away, &none, Some(&SZ), &w).await);
+        assert_eq!(resting(&m.ask), Some((9700, 100, 40.0)));
+        m.unsettled.clear();
+        act_side(&mut m, false, out, &away, &none, Some(&SZ), &w).await;
+        assert_eq!(resting(&m.ask), Some((9900, 100, 300.0)));
+        // Refused twice, a way out is tried again after that backoff.
+        m.ask = None;
+        m.fails[1] = 2;
+        m.last_touch[1] = ago(Duration::from_secs(5));
+        assert!(act_side(&mut m, false, out, &away, &none, Some(&SZ), &w).await);
+        assert_eq!(resting(&m.ask), None);
+        m.last_touch[1] = ago(backoff(2));
+        act_side(&mut m, false, out, &away, &none, Some(&SZ), &w).await;
+        assert_eq!(resting(&m.ask), Some((9900, 100, 300.0)));
+        m.fails[1] = 0;
+        // A 40-lot filled whole with 100 still held: replaced at once, for
+        // what is held.
+        m.ask = Some(Order { filled: 40, ..order(9900, 40, 0.0) });
+        m.last_touch[1] = Some(Instant::now());
+        act_side(&mut m, false, out, &away, &none, Some(&SZ), &w).await;
+        assert_eq!(resting(&m.ask), Some((9900, 100, 300.0)));
+        // An adding order filled whole is one the sweep took: the side waits.
+        let roomy = Sizing { cap: 300, ..SZ };
+        let bid = want(&bids, &asks, 100, &roomy).bid;
+        assert_eq!(bid, Some((4600, 200)));
+        m.bid = Some(Order { filled: 100, ..order(4600, 100, 1100.0) });
+        assert!(act_side(&mut m, true, bid, &bids, &none, Some(&roomy), &w).await);
+        assert_eq!(resting(&m.bid), None);
+        m.last_touch[0] = ago(STEP_IN_HOLD);
+        act_side(&mut m, true, bid, &bids, &none, Some(&roomy), &w).await;
+        assert_eq!(resting(&m.bid), Some((4600, 200, 1100.0)));
     }
 
     #[tokio::test]
     async fn a_closer_level_is_followed_only_once_it_has_lasted() {
         let w = wiring(Arc::new(StaleReads), true);
         let mut m = mkt("KXA-STEPIN");
-        let none = BTreeMap::new();
-        let asks = [(9700, 48.0), (9800, 2056.0)];
-        let deep = [(8800, 151.0), (4600, 1152.0)];
-        let stepped = [(8800, 151.0), (8000, 300.0), (4600, 1152.0)];
+        let none = Seen::default();
+        let asks = [(9700, 40.0), (9800, 2000.0)];
+        let deep = [(8800, 150.0), (4600, 1100.0)];
+        let stepped = [(8800, 150.0), (8000, 300.0), (4600, 1100.0)];
         let (at_deep, at_stepped) = (want(&deep, &asks, 0, &SZ).bid, want(&stepped, &asks, 0, &SZ).bid);
         assert_eq!((at_deep, at_stepped), (Some((4600, 100)), Some((8000, 100))));
         act_side(&mut m, true, at_deep, &deep, &none, Some(&SZ), &w).await;
-        m.last_touch[0] = Instant::now().checked_sub(STEP_IN_HOLD * 10);
-        assert_eq!(resting(&m.bid), Some((4600, 100, 1152.0)));
+        m.last_touch[0] = ago(STEP_IN_HOLD * 10);
+        assert_eq!(resting(&m.bid), Some((4600, 100, 1100.0)));
         // 300 show at 0.80, the new reference level. The order has rested for
         // ten minutes, and still does not follow at once.
         assert!(act_side(&mut m, true, at_stepped, &stepped, &none, Some(&SZ), &w).await);
-        assert_eq!((resting(&m.bid), m.closer[0].map(|c| c.0)), (Some((4600, 100, 1152.0)), Some(8000)));
+        assert_eq!((resting(&m.bid), m.closer[0].map(|c| c.0)), (Some((4600, 100, 1100.0)), Some(8000)));
         // The 300 go: the clock is forgotten, and starts again when they return.
         assert!(!act_side(&mut m, true, at_deep, &deep, &none, Some(&SZ), &w).await);
         assert_eq!(m.closer[0], None);
@@ -2360,42 +2532,104 @@ mod tests {
         let since = m.closer[0].unwrap().1;
         assert!(act_side(&mut m, true, at_stepped, &stepped, &none, Some(&SZ), &w).await);
         assert_eq!(m.closer[0].unwrap().1, since, "the same wanted price keeps its clock");
-        // A minute on they are still there: joined, behind them.
-        m.closer[0] = Some((8000, Instant::now().checked_sub(STEP_IN_HOLD).unwrap()));
-        act_side(&mut m, true, at_stepped, &stepped, &none, Some(&SZ), &w).await;
-        assert_eq!((resting(&m.bid), m.closer[0]), (Some((8000, 100, 300.0)), None));
+        // A minute on they have moved a cent closer. An adding order joins
+        // only a level that has itself lasted: the hold starts again.
+        let further = [(8800, 150.0), (8100, 300.0), (4600, 1100.0)];
+        let at_further = want(&further, &asks, 0, &SZ).bid;
+        m.closer[0] = Some((8000, ago(STEP_IN_HOLD).unwrap()));
+        assert!(act_side(&mut m, true, at_further, &further, &none, Some(&SZ), &w).await);
+        assert_eq!((resting(&m.bid), m.closer[0].map(|c| c.0)), (Some((4600, 100, 1100.0)), Some(8100)));
+        assert!(m.closer[0].unwrap().1.elapsed() < STEP_IN_HOLD);
+        // A minute after that they are still there: joined, behind them.
+        m.closer[0] = Some((8100, ago(STEP_IN_HOLD).unwrap()));
+        act_side(&mut m, true, at_further, &further, &none, Some(&SZ), &w).await;
+        assert_eq!((resting(&m.bid), m.closer[0]), (Some((8100, 100, 300.0)), None));
+    }
+
+    #[tokio::test]
+    async fn an_exit_follows_a_touch_that_keeps_coming_closer_a_hold_behind() {
+        let w = wiring(Arc::new(StaleReads), true);
+        let mut m = mkt("KXA-WALK");
+        let none = Seen::default();
+        let bids = [(8200, 26.0), (4500, 1775.0)];
+        let ask = |a: &[(i64, f64)]| want(&bids, a, 100, &ONLY).ask;
+        m.book.pos = 100;
+        m.ask = Some(order(9800, 100, 0.0));
+        // The touch comes in to 0.96, and to 0.95 before a minute is up.
+        let (first, second) = ([(9600, 30.0), (9800, 2000.0)], [(9500, 30.0), (9800, 2000.0)]);
+        assert_eq!((ask(&first), ask(&second)), (Some((9600, 100)), Some((9500, 100))));
+        assert!(act_side(&mut m, false, ask(&first), &first, &none, Some(&ONLY), &w).await);
+        let since = m.closer[1].unwrap().1;
+        assert!(act_side(&mut m, false, ask(&second), &second, &none, Some(&ONLY), &w).await);
+        assert_eq!(m.closer[1], Some((9600, since)), "the hold runs on, for the price wanted all through it");
+        // A minute after the first move the order steps to 0.96, where it has
+        // been wanted all that time, and not to 0.95, which is seconds old.
+        m.closer[1] = Some((9600, ago(STEP_IN_HOLD).unwrap()));
+        act_side(&mut m, false, ask(&second), &second, &none, Some(&ONLY), &w).await;
+        assert_eq!((resting(&m.ask), m.closer[1]), (Some((9600, 100, 0.0)), None));
+        // The queue at the touch comes and goes around what buries a 100-lot,
+        // so the wanted price flips between the touch and a cent inside it.
+        // The hold runs through that, and the step is to the touch.
+        m.ask = Some(order(9800, 100, 0.0));
+        m.last_touch[1] = None;
+        let (shallow, buried) = ([(9700, 400.0), (9800, 2000.0)], [(9700, 600.0), (9800, 2000.0)]);
+        assert_eq!((ask(&shallow), ask(&buried)), (Some((9700, 100)), Some((9600, 100))));
+        assert!(act_side(&mut m, false, ask(&shallow), &shallow, &none, Some(&ONLY), &w).await);
+        let since = m.closer[1].unwrap().1;
+        assert!(act_side(&mut m, false, ask(&buried), &buried, &none, Some(&ONLY), &w).await);
+        assert!(act_side(&mut m, false, ask(&shallow), &shallow, &none, Some(&ONLY), &w).await);
+        assert_eq!(m.closer[1], Some((9700, since)));
+        m.closer[1] = Some((9700, ago(STEP_IN_HOLD).unwrap()));
+        act_side(&mut m, false, ask(&buried), &buried, &none, Some(&ONLY), &w).await;
+        assert_eq!((resting(&m.ask), m.closer[1]), (Some((9700, 100, 600.0)), None));
     }
 
     #[tokio::test]
     async fn an_order_the_book_may_not_show_yet_is_not_judged_but_a_block_still_pulls_it() {
         let w = wiring(Arc::new(Quiet), false);
         let mut m = mkt("KXA-FRESH");
-        let none = BTreeMap::new();
-        let asks = [(9700, 48.0), (9800, 2056.0)];
-        let b = [(8800, 151.0), (4600, 1152.0)];
+        let none = Seen::default();
+        let asks = [(9700, 40.0), (9800, 2000.0)];
+        let b = [(8800, 150.0), (4600, 1100.0)];
         let wanted = want(&b, &asks, 0, &SZ).bid;
-        // Placed just now behind 1,152. Orders are put in the slot by hand:
+        // Placed just now behind 1,100. Orders are put in the slot by hand:
         // a place goes through the process-wide shutdown latch, which another
         // test in this binary leaves on.
         let placed = |m: &mut Mkt, at: Option<Instant>| {
-            m.bid = Some(Order { venue_id: "B1".into(), price: 4600, qty: 100, filled: 0, checked: Instant::now(), ahead: 1152.0 });
+            m.bid = Some(order(4600, 100, 1100.0));
             m.last_touch[0] = at;
         };
         placed(&mut m, Some(Instant::now()));
         // The feed has not caught up: the level reads 100 short, as if this
-        // order's size had left it, and under the reference size. Not judged.
-        let lagging = [(8800, 51.0), (4600, 1052.0)];
+        // order's size had left it, and under the reference size. Not judged,
+        // and a hold under way is kept.
+        let lagging = [(8800, 50.0), (4600, 1000.0)];
         assert_eq!(stay((4600, 100), 0.0, wanted, &lagging, true, 0, &SZ), Stay::Pull);
-        let gone = BTreeMap::from([(4600, 1152.0)]);
+        let gone = fell(true, 4600, 1100.0);
+        let hold = Some((8000, Instant::now()));
+        m.closer[0] = hold;
         assert!(act_side(&mut m, true, wanted, &lagging, &gone, Some(&SZ), &w).await);
-        assert_eq!(resting(&m.bid), Some((4600, 100, 0.0)), "the fall is still counted");
+        assert_eq!((resting(&m.bid), m.closer[0]), (Some((4600, 100, 0.0)), hold), "the fall is still counted");
         // A market that may rest nothing pulls it at once all the same.
         act_side(&mut m, true, None, &b, &none, None, &w).await;
         assert_eq!(resting(&m.bid), None);
         // Once the book has had time to show it, it is judged, and pulled.
-        placed(&mut m, Instant::now().checked_sub(MIN_REQUOTE));
+        placed(&mut m, ago(MIN_REQUOTE));
         assert!(act_side(&mut m, true, wanted, &b, &gone, Some(&SZ), &w).await);
         assert_eq!(resting(&m.bid), None);
+    }
+
+    #[tokio::test]
+    async fn a_step_whose_cancel_fails_is_still_owed() {
+        let w = wiring(Arc::new(Stuck), false);
+        let mut m = mkt("KXA-STUCK");
+        let asks = [(9700, 40.0), (9800, 2000.0)];
+        let stepped = [(8800, 150.0), (8000, 300.0), (4600, 1100.0)];
+        m.bid = Some(order(4600, 100, 1100.0));
+        let hold = Some((8000, ago(STEP_IN_HOLD).unwrap()));
+        m.closer[0] = hold;
+        assert!(act_side(&mut m, true, want(&stepped, &asks, 0, &SZ).bid, &stepped, &Seen::default(), Some(&SZ), &w).await);
+        assert_eq!((resting(&m.bid), m.closer[0], m.fails[0]), (Some((4600, 100, 1100.0)), hold, 1));
     }
 
     #[tokio::test]
@@ -2421,6 +2655,7 @@ mod tests {
             last_touch: [None, None],
             fails: [0, 0],
             closer: [None, None],
+            left: [None, None],
             book: Book::default(),
             unadopted: 0,
             mid: None,
@@ -2433,9 +2668,10 @@ mod tests {
             refused: None,
         };
         let frames = |id: &str, cum: i64| BTreeMap::from([(id.to_string(), cum)]);
-        check_fills(&mut m, true, &frames("B1", 2), &w).await;
+        m.bid.as_mut().unwrap().ahead = 500.0;
+        settle_fills(&mut m, true, &frames("B1", 2), &w).await;
         assert_eq!(m.book.pos, 2, "booked from the frame, though the read says 0");
-        assert_eq!(m.bid.as_ref().unwrap().resting(), 98);
+        assert_eq!(resting(&m.bid), Some((8400, 98, 0.0)), "and what stood ahead of it has traded");
         // Cumulative: the next frame books only what it adds, and a stale or
         // repeated frame books nothing.
         check_fills(&mut m, true, &frames("B1", 12), &w).await;
@@ -2447,9 +2683,10 @@ mod tests {
         assert_eq!(m.book.pos, 12);
         check_fills(&mut m, false, &frames("A1", 7), &w).await;
         assert_eq!(m.book.pos, 5);
-        // Never past what the order was for.
-        check_fills(&mut m, true, &frames("B1", 500), &w).await;
-        assert_eq!(m.bid.as_ref().unwrap().resting(), 0);
+        // Never past what the order was for. Filled whole it is gone, and
+        // the side counts as touched.
+        settle_fills(&mut m, true, &frames("B1", 500), &w).await;
+        assert_eq!((m.book.pos, m.bid.is_none(), m.last_touch[0].is_some()), (93, true, true));
         let fills = std::fs::read_to_string(&log).unwrap().lines().count();
         assert_eq!(fills, 4, "one log record per booking");
     }
