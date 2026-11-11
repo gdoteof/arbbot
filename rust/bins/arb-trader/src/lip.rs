@@ -21,6 +21,13 @@
 //! quoted at once, the best-modelled ones. The model is the rule applied to the
 //! book we see; Kalshi's payout is the only check on it.
 //!
+//! A market holding inventory that is not quoted still rests one order: on the
+//! side that shrinks the position, at the same price, sized to the position so
+//! it cannot cross zero ([`reducing`]). That applies whether the market fell
+//! below the floor, lost its slot, or its program ended. The reward decides
+//! whether a market is worth quoting; it does not decide whether held
+//! inventory gets a way out.
+//!
 //! WHAT KEEPS IT APART FROM THE ARB ENGINE. Kalshi nets YES against NO in one
 //! market, so this inventory and an arb basket's Kalshi leg cannot share a
 //! market without corrupting each other. At boot the trader refuses any
@@ -42,9 +49,11 @@
 //!   * the kill file;
 //!   * an untrusted or pulled feed, or a sequence gap (the engine drops the book);
 //!   * an entry blackout on a relationship the market belongs to;
-//!   * the market's `until`;
 //!   * a place whose answer was lost, until the venue's order list accounts for it;
 //!   * the loss stop.
+//!
+//! Past the market's `until`, or once its config line is gone, it is no
+//! longer quoted, but inventory held there still rests its reducing side.
 //!
 //! The loss stop fires when inventory P&L marked to mid reaches
 //! `-loss_stop_usd`. It writes `<log>.STOP` and pulls everything until a human
@@ -119,7 +128,8 @@ pub struct MarketCfg {
     /// The program's pool in USD per day: `period_reward / 10_000` over the
     /// period's days.
     pub usd_day: f64,
-    /// When the program ends, `YYYY-MM-DDTHH:MM:SSZ`. Nothing rests past it.
+    /// When the program ends, `YYYY-MM-DDTHH:MM:SSZ`. Nothing is quoted past
+    /// it; inventory held there still rests the side that shrinks it.
     pub until: String,
 }
 
@@ -333,6 +343,9 @@ pub(crate) struct Cand {
     pub held: bool,
     /// Nothing blocks it: no kill, stop, blackout, program end, or missing book.
     pub open: bool,
+    /// Nothing blocks an order that shrinks the position: `open`, or blocked
+    /// only because the program is over or the config line is gone.
+    pub exits: bool,
 }
 
 /// Which markets to quote, at most `max`.
@@ -398,6 +411,14 @@ pub(crate) fn select(cands: &[Cand], min: f64, max: usize) -> BTreeSet<String> {
     rest.sort_by(by_rank);
     out.extend(rest.into_iter().take(slots).map(|c| c.market.clone()));
     out
+}
+
+/// The held markets [`select`] left out that may still rest an order. Each
+/// rests only the side that shrinks its position, sized to the position:
+/// [`want`] with a cap of zero. Such an order never adds inventory, so it
+/// needs no slot.
+pub(crate) fn reducing(cands: &[Cand], quoted: &BTreeSet<String>) -> BTreeSet<String> {
+    cands.iter().filter(|c| c.held && c.exits && !quoted.contains(&c.market)).map(|c| c.market.clone()).collect()
 }
 
 /// Should a resting order stay? It must be at the wanted price, must not be
@@ -907,7 +928,7 @@ pub async fn run(cfg: Cfg, w: Wiring) {
     };
     // The configured markets, then every market the log still holds inventory
     // on without a config line: tracked, marked and counted by the loss stop,
-    // never quoted.
+    // never quoted, resting only the side that shrinks the position.
     let mut lines: Vec<(MarketCfg, f64)> = cfg
         .markets
         .iter()
@@ -969,7 +990,7 @@ pub async fn run(cfg: Cfg, w: Wiring) {
     eprintln!(
         "[lip] {}: {} market(s) ({} configured), {}-lots both sides at the touch, cap {} net, \
          quoting the best {} modelling >= ${:.2}/day (every market holding inventory takes a \
-         slot), loss stop ${:.0}. Log {}.",
+         slot, and one not quoted rests only its reducing side), loss stop ${:.0}. Log {}.",
         if w.shadow { "SHADOW" } else { "ARMED" },
         mkts.len(),
         cfg.markets.len(),
@@ -981,6 +1002,7 @@ pub async fn run(cfg: Cfg, w: Wiring) {
         w.log_path
     );
     let mut quoted: BTreeSet<String> = BTreeSet::new();
+    let mut reduce: BTreeSet<String> = BTreeSet::new();
     let mut windows: Result<Vec<Window>, String> = Ok(Vec::new());
     let mut windows_at: Option<Instant> = None;
     let mut wait = Duration::from_secs(1);
@@ -1052,8 +1074,6 @@ pub async fn run(cfg: Cfg, w: Wiring) {
                 Some(r.clone())
             } else if !m.lost.is_empty() {
                 Some("a place whose answer was lost is being looked for".to_string())
-            } else if now >= m.until {
-                Some(if m.cfg.until.is_empty() { "held, not configured" } else { "program over" }.to_string())
             } else if !books.contains_key(name) {
                 Some("no trusted book".to_string())
             } else {
@@ -1068,14 +1088,17 @@ pub async fn run(cfg: Cfg, w: Wiring) {
                         .map(|r| format!("entry blackout on {r}")),
                 }
             };
+            let over = (now >= m.until)
+                .then(|| if m.cfg.until.is_empty() { "held, not configured" } else { "program over" }.to_string());
             cands.push(Cand {
                 market: name.clone(),
                 usd_day: m.modelled,
                 quoted: quoted.contains(name),
                 held: m.held(),
-                open: blocked.is_none(),
+                open: blocked.is_none() && over.is_none(),
+                exits: blocked.is_none(),
             });
-            if let Some(b) = blocked {
+            if let Some(b) = blocked.or(over) {
                 why_not.insert(name.clone(), b);
             }
         }
@@ -1087,15 +1110,27 @@ pub async fn run(cfg: Cfg, w: Wiring) {
                 cands.iter().filter(|c| c.open).map(|c| format!("{} ${:.2}", c.market, c.usd_day)).collect::<Vec<_>>().join(", ")
             );
         }
+        let shrink = reducing(&cands, &chosen);
+        if shrink != reduce {
+            eprintln!("[lip] reducing only {shrink:?} (held, not quoted: each rests the side that shrinks its position)");
+        }
         quoted = chosen;
+        reduce = shrink;
 
         // Act. Cancel before place, per side.
         let mut pending = false;
         for (name, m) in mkts.iter_mut() {
-            let wt = match (quoted.contains(name), books.get(name)) {
-                (true, Some((bids, asks))) => {
+            let cap = if quoted.contains(name) {
+                Some(cfg.cap)
+            } else if reduce.contains(name) {
+                Some(0)
+            } else {
+                None
+            };
+            let wt = match (cap, books.get(name)) {
+                (Some(cap), Some((bids, asks))) => {
                     let (bo, ao) = others_of(m, bids, asks, w.shadow);
-                    want(&bo, &ao, m.book.pos, cfg.qty, cfg.cap)
+                    want(&bo, &ao, m.book.pos, cfg.qty, cap)
                 }
                 _ => Want::default(),
             };
@@ -1105,7 +1140,7 @@ pub async fn run(cfg: Cfg, w: Wiring) {
             pending |= !m.unsettled.is_empty() || !m.lost.is_empty();
         }
 
-        publish(&mkts, &quoted, &why_not, pnl, stopped, w.shadow);
+        publish(&mkts, &quoted, &reduce, &why_not, pnl, stopped, w.shadow);
         wait = if pending { MIN_REQUOTE } else { Duration::from_secs(30) };
     }
 }
@@ -1506,6 +1541,7 @@ fn forget(m: &mut Mkt, bid: bool) {
 fn publish(
     mkts: &BTreeMap<String, Mkt>,
     quoted: &BTreeSet<String>,
+    reduce: &BTreeSet<String>,
     why_not: &BTreeMap<String, String>,
     pnl: f64,
     stopped: bool,
@@ -1531,6 +1567,7 @@ fn publish(
         "shadow": shadow,
         "stopped": stopped,
         "quoting": quoted.len(),
+        "reducing": reduce.len(),
         "modelled_usd_day": (mkts.values().filter(|m| quoted.contains(&m.cfg.market)).map(|m| m.modelled).sum::<f64>() * 100.0).round() / 100.0,
         "pnl_usd": (pnl * 100.0).round() / 100.0,
         "placed": PLACED.load(Ordering::Relaxed),
@@ -1644,7 +1681,32 @@ mod tests {
     }
 
     fn cand(m: &str, v: f64, quoted: bool, held: bool, open: bool) -> Cand {
-        Cand { market: m.into(), usd_day: v, quoted, held, open }
+        Cand { market: m.into(), usd_day: v, quoted, held, open, exits: open }
+    }
+
+    #[test]
+    fn held_inventory_left_unquoted_rests_only_the_side_that_shrinks_it() {
+        // A held market whose model fell below the floor used to drop out of
+        // the quoted set and rest nothing, leaving its inventory with no
+        // order to sell it back.
+        let c = [cand("H", 1.37, true, true, true), cand("A", 5.0, false, false, true)];
+        let q = select(&c, 3.0, 4);
+        assert_eq!(q, names(&["A"]));
+        assert_eq!(reducing(&c, &q), names(&["H"]));
+        let (b, a) = ([(8200, 300.0)], [(9200, 500.0)]);
+        assert_eq!(want(&b, &a, 100, 200, 0), Want { bid: None, ask: Some((9200, 100)) }, "long: sell the 100 back, no further");
+        assert_eq!(want(&b, &a, -40, 200, 0), Want { bid: Some((8200, 40)), ask: None }, "short: buy the 40 back");
+        assert_eq!(want(&b, &a, 300, 200, 0).ask, Some((9200, 200)), "never more than qty");
+        assert_eq!(want(&b, &a, 0, 200, 0), Want::default(), "flat: nothing");
+        // Past the program's end, or with no config line, it is not quoted but still reduces.
+        let over = Cand { exits: true, ..cand("H", 9.0, true, true, false) };
+        assert!(select(std::slice::from_ref(&over), 3.0, 4).is_empty());
+        assert_eq!(reducing(std::slice::from_ref(&over), &BTreeSet::new()), names(&["H"]));
+        // A kill, stop, blackout or missing book stops the reducing side too.
+        assert!(reducing(&[cand("H", 9.0, false, true, false)], &BTreeSet::new()).is_empty());
+        // A quoted market already rests both sides; a flat one has nothing to shrink.
+        assert!(reducing(&[cand("H", 9.0, true, true, true)], &names(&["H"])).is_empty());
+        assert!(reducing(&[cand("A", 1.0, false, false, true)], &BTreeSet::new()).is_empty());
     }
 
     #[test]
