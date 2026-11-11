@@ -2022,6 +2022,27 @@ impl Engine {
         v
     }
 
+    /// Hand the liquidity-incentive quoter this Kalshi market's book as the
+    /// engine now holds it, or `None` when it cannot be priced from.
+    pub(super) fn lip_push_book(&self, market_id: &str) {
+        let now_ns = (arb_core::clock::now_secs() as i64).saturating_mul(1_000_000_000);
+        let book = self
+            .books
+            .get(Venue::Kalshi, market_id)
+            .filter(|b| b.actionable_at(now_ns))
+            .map(|b| (b.bids.as_slice(), b.asks.as_slice()));
+        crate::lip::book_changed(market_id, book);
+    }
+
+    /// Hand the quoter every book it watches, after a feed episode or a kill
+    /// cleared them. Otherwise its books refill one market per feed event, and
+    /// a thin book (the kind that pays) can go hours without one.
+    pub(super) fn lip_reload_books(&self) {
+        for m in crate::lip::watched() {
+            self.lip_push_book(&m);
+        }
+    }
+
     /// Time one non-feed select arm, and remember the worst of the window by
     /// NAME.
     ///
@@ -2315,13 +2336,7 @@ impl Engine {
             // The liquidity-incentive quoter, on the event that moved its
             // book. Its markets have no quoter here, so nothing above acted.
             if venue == Venue::Kalshi && crate::lip::watching(&market_id) {
-                let now_ns = (arb_core::clock::now_secs() as i64).saturating_mul(1_000_000_000);
-                let book = self
-                    .books
-                    .get(venue, &market_id)
-                    .filter(|b| b.actionable_at(now_ns))
-                    .map(|b| (b.bids.as_slice(), b.asks.as_slice()));
-                crate::lip::book_changed(&market_id, book);
+                self.lip_push_book(&market_id);
             }
             // ...and the exits, AFTER the entry quoter has already acted on
             // this event. A resting exit is priced against the OTHER venue's
@@ -2652,6 +2667,9 @@ impl Engine {
         } else if !kill_now && self.killed {
             self.killed = false;
             eprintln!("[engine] KILL switch cleared — quoting resumes");
+            if self.feed_reason.is_none() {
+                self.lip_reload_books();
+            }
         }
         if self.killed || self.feed_reason.is_some() {
             self.sweep_owed_venues();
