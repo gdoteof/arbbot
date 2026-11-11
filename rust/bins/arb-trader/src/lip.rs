@@ -13,7 +13,8 @@
 //! WHAT IT DOES. For each configured Kalshi market it rests a `qty` YES bid at
 //! the best bid OTHER makers show and a `qty` YES ask at the best ask they
 //! show. It holds whatever fills, with no hedge. Net inventory is capped at
-//! `cap` contracts either way, by withdrawing the side that would add to it. A
+//! `cap` contracts either way: each order is trimmed to what keeps the position
+//! inside the cap, so the side that would add past it is withdrawn. A
 //! market is quoted only while its book, scored by the rule above with our two
 //! orders in it, models at least `min_usd_day`. At most `max_markets` are
 //! quoted at once, the best-modelled ones. The model is the rule applied to the
@@ -110,7 +111,10 @@ pub struct MarketCfg {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Cfg {
-    /// Contracts per order.
+    /// Contracts per order, before the cap trims it: an order never exceeds what
+    /// keeps the position inside `cap` (see [`want`]). So `qty` may exceed `cap`:
+    /// at qty 200 / cap 100 a flat market rests 100 a side, and one held at +100
+    /// rests a 200 ask, which takes it to no further than -100.
     pub qty: i64,
     /// Largest net position held either way, per market.
     pub cap: i64,
@@ -136,8 +140,8 @@ pub struct Cfg {
 pub fn load(path: &str) -> Result<Cfg, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     let cfg: Cfg = serde_yaml::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
-    if cfg.qty <= 0 || cfg.cap < cfg.qty {
-        return Err(format!("{path}: need 0 < qty <= cap, got qty {} cap {}", cfg.qty, cfg.cap));
+    if cfg.qty <= 0 || cfg.cap <= 0 {
+        return Err(format!("{path}: need qty > 0 and cap > 0, got qty {} cap {}", cfg.qty, cfg.cap));
     }
     if cfg.max_markets == 0 || cfg.markets.is_empty() || cfg.max_places_day == 0 {
         return Err(format!("{path}: nothing may be quoted (max_markets 0, max_places_day 0, or no markets)"));
@@ -1555,6 +1559,12 @@ mod tests {
         assert_eq!(want(&b, &a, 150, 200, 200), Want { bid: Some((9600, 50)), ask: Some((9900, 200)) });
         assert_eq!(want(&b, &a, 200, 200, 200).bid, None, "long at the cap: no more bids");
         assert_eq!(want(&b, &a, -200, 200, 200).ask, None, "short at the cap: no more asks");
+        // qty over cap: flat rests the cap each side; held at the cap, the reducing side rests qty.
+        assert_eq!(want(&b, &a, 0, 200, 100).bid.map(|x| x.1), Some(100));
+        assert_eq!(want(&b, &a, 0, 200, 100).ask.map(|x| x.1), Some(100));
+        assert_eq!(want(&b, &a, 100, 200, 100).bid, None);
+        assert_eq!(want(&b, &a, 100, 200, 100).ask.map(|x| x.1), Some(200), "200 ask from +100 ends at -100");
+        assert_eq!(want(&b, &a, -40, 200, 100).bid.map(|x| x.1), Some(140));
         assert_eq!(want(&[(9900, 1.0)], &a, 0, 200, 200), Want::default(), "crossed: nothing");
         assert_eq!(want(&[], &a, 0, 200, 200).bid, None, "an empty side is not led");
     }
@@ -1672,8 +1682,11 @@ mod tests {
         let ok = "qty: 200\ncap: 200\nmax_markets: 5\nmin_usd_day: 2.0\nloss_stop_usd: 150\nmax_places_day: 600\nmarkets:\n  - {market: KXA-1, usd_day: 14.29, until: 2026-11-15T05:00:00Z}\n";
         std::fs::write(&p, ok).unwrap();
         assert!(load(p.to_str().unwrap()).is_ok());
+        std::fs::write(&p, ok.replace("cap: 200", "cap: 100")).unwrap();
+        assert!(load(p.to_str().unwrap()).is_ok(), "qty over cap is trimmed by want(), not refused");
         for bad in [
-            ok.replace("qty: 200", "qty: 300"),
+            ok.replace("qty: 200", "qty: 0"),
+            ok.replace("cap: 200", "cap: 0"),
             ok.replace("2026-11-15T05:00:00Z", "next week"),
             ok.replace("loss_stop_usd: 150", "loss_stop_usd: 0"),
             ok.replace("max_markets: 5", "max_markets: 0"),
