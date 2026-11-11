@@ -1690,7 +1690,7 @@ impl Engine {
 
     fn summary(&self) -> serde_json::Value {
         let elapsed = self.t_start.elapsed().as_secs_f64();
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "mode": if self.cfg.bench { "bench" } else if self.cfg.armed { "live" } else { "shadow" },
             "events": self.n_ev, "book_events": self.n_book, "intents": self.n_int,
             "take_take_found": self.n_tt, "take_take_bar_apr": self.tt_bar,
@@ -2014,7 +2014,12 @@ impl Engine {
             "exec_hop_latency": self.exec_stats.hop.summary(),
             "elapsed_s": (elapsed * 10.0).round() / 10.0,
             "eps": if elapsed > 0.0 { (self.n_ev as f64 / elapsed) as u64 } else { 0 },
-        })
+        });
+        // Present only on a `--lip` run, so every other run's line is unchanged.
+        if let Some(lip) = crate::lip::stats() {
+            v["lip"] = lip;
+        }
+        v
     }
 
     /// Time one non-feed select arm, and remember the worst of the window by
@@ -2230,7 +2235,14 @@ impl Engine {
                     ts_venue,
                 ) {
                     Ok(_) => {}
-                    Err(ApplyError::GapDetected { .. }) | Err(ApplyError::NotSynced) => return,
+                    Err(ApplyError::GapDetected { .. }) | Err(ApplyError::NotSynced) => {
+                        // The book is gone until the next snapshot; so are any
+                        // quotes the liquidity-incentive quoter priced off it.
+                        if venue == Venue::Kalshi && crate::lip::watching(&market_id) {
+                            crate::lip::book_changed(&market_id, None);
+                        }
+                        return;
+                    }
                 }
             }
             // Own-order lifecycle events (P4 item 1). Schema, both
@@ -2300,6 +2312,17 @@ impl Engine {
                 // to react, which is not minutes.
                 self.take_take_scan(quoters, idxs, now);
             }
+            // The liquidity-incentive quoter, on the event that moved its
+            // book. Its markets have no quoter here, so nothing above acted.
+            if venue == Venue::Kalshi && crate::lip::watching(&market_id) {
+                let now_ns = (arb_core::clock::now_secs() as i64).saturating_mul(1_000_000_000);
+                let book = self
+                    .books
+                    .get(venue, &market_id)
+                    .filter(|b| b.actionable_at(now_ns))
+                    .map(|b| (b.bids.as_slice(), b.asks.as_slice()));
+                crate::lip::book_changed(&market_id, book);
+            }
             // ...and the exits, AFTER the entry quoter has already acted on
             // this event. A resting exit is priced against the OTHER venue's
             // book, so it has to see that book move on the event that moved
@@ -2354,6 +2377,7 @@ impl Engine {
             if self.cfg.maker_exit_view {
                 crate::maker_exit::clear_live_books();
             }
+            crate::lip::clear_books();
         }
     }
 
@@ -2604,6 +2628,7 @@ impl Engine {
             if self.cfg.maker_exit_view {
                 crate::maker_exit::clear_live_books();
             }
+            crate::lip::clear_books();
             eprintln!(
                 "[engine] KILL switch on ({}) — cancelling all resting quotes",
                 self.cfg.kill_file

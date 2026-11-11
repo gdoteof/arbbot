@@ -36,6 +36,7 @@ mod feed;
 mod fills;
 mod hist;
 mod ledger;
+mod lip;
 mod maker_exit;
 mod marks;
 mod naked_act;
@@ -207,6 +208,14 @@ struct Args {
     /// Write the opportunity stream (`crate::opportunities`) into this
     /// directory as `opportunities-<UTC day>.jsonl`. `None` = off, the default.
     opportunities_out: Option<String>,
+    /// `--lip <config>`: quote the configured Kalshi markets for their
+    /// liquidity-incentive pools (`crate::lip`). `None` = off, the default.
+    lip: Option<String>,
+    /// `--lip-shadow`: decide and print, never place. Wins over `--lip`'s
+    /// arming the same way `--maker-exit-shadow` does; it still needs `--lip`.
+    lip_shadow: bool,
+    /// Where `--lip` appends its fills, adoptions and stops.
+    lip_log: String,
 }
 
 /// The floating maker APR bar (Geoff 2026-07-22, card 80ff7987), port of
@@ -292,6 +301,9 @@ fn default_args() -> Args {
         exit_blackouts: "config/exit-blackouts.yaml".into(),
         maker_exit_shadow: false,
         opportunities_out: None,
+        lip: None,
+        lip_shadow: false,
+        lip_log: "data/exec/lip.jsonl".into(),
     }
 }
 
@@ -384,6 +396,9 @@ fn parse_args() -> Args {
             "--maker-exit-take" => a.maker_exit_take = true,
             "--exit-blackouts" => a.exit_blackouts = it.next().unwrap_or_default(),
             "--maker-exit-shadow" => a.maker_exit_shadow = true,
+            "--lip" => a.lip = Some(it.next().expect("--lip value")),
+            "--lip-shadow" => a.lip_shadow = true,
+            "--lip-log" => a.lip_log = it.next().expect("--lip-log value"),
             "--opportunities-out" => {
                 a.opportunities_out = Some(it.next().expect("--opportunities-out value"))
             }
@@ -422,7 +437,19 @@ type MarketIndex = HashMap<(Venue, String), Vec<usize>>;
 /// Relationship id -> (oracle_risk, kind). See `rel_meta` below for why.
 type RelMeta = HashMap<String, (String, String)>;
 
+#[cfg(test)]
 fn load_quoters(registry: &str, rel_prefixes: &[String]) -> (Vec<Quoter>, MarketIndex, RelMeta) {
+    load_quoters_leaving(registry, rel_prefixes, &std::collections::BTreeSet::new())
+}
+
+/// [`load_quoters`], quoting no relationship with a Kalshi leg in `leave`: the
+/// markets `--lip` quotes or holds inventory on, which an arb basket must not
+/// share.
+fn load_quoters_leaving(
+    registry: &str,
+    rel_prefixes: &[String],
+    leave: &std::collections::BTreeSet<String>,
+) -> (Vec<Quoter>, MarketIndex, RelMeta) {
     let reg = arb_registry::Registry::load(registry).expect("read registry");
     // THE GATE: this process QUOTES a relationship only if its registry verdict
     // is `equivalent` or `equivalent-with-caveat` (`Relationship::tradable`).
@@ -465,6 +492,13 @@ fn load_quoters(registry: &str, rel_prefixes: &[String]) -> (Vec<Quoter>, Market
         })
         .filter(|r| {
             rel_prefixes.is_empty() || rel_prefixes.iter().any(|p| r.id.starts_with(p.as_str()))
+        })
+        .filter(|r| {
+            let held = r.legs.iter().any(|l| l.venue == "kalshi" && leave.contains(&l.market_id));
+            if held {
+                eprintln!("[lip] {} is not quoted: --lip quotes or holds its Kalshi leg", r.id);
+            }
+            !held
         })
         .filter_map(|r| {
             Some(Quoter::new(Rel {
@@ -1294,7 +1328,25 @@ async fn report_undischarged_hedges(
             _ => Err("this run has no Kalshi and PM-US sinks to read".to_string()),
         };
         let rels: Vec<&Rel> = quoters.iter().map(|q| &q.rel).collect();
-        orphan::adopt(&found, &places, &rels, venue.as_ref().map(|(k, p)| (k, p)).map_err(|e| e.as_str()))
+        // A pair whose Kalshi market --lip quotes or holds: the venue's
+        // imbalance there is that inventory, not this hedge's naked leg.
+        let (lip_pairs, adoptable): (Vec<orphan::Undischarged>, Vec<orphan::Undischarged>) =
+            found.iter().cloned().partition(|u| {
+                lip::left_alone(&u.hedge_market)
+                    || places.get(&u.maker_order_id).is_some_and(|e| lip::left_alone(&e.place))
+            });
+        let (adopted, mut refused) =
+            orphan::adopt(&adoptable, &places, &rels, venue.as_ref().map(|(k, p)| (k, p)).map_err(|e| e.as_str()));
+        refused.extend(lip_pairs.iter().map(|u| {
+            format!(
+                "[hedge] NOT ADOPTED {}x {} (order {}): --lip quotes or holds this pair's Kalshi \
+                 market, so the venue's imbalance there is not this hedge's to claim",
+                u.missing(),
+                u.hedge_market,
+                u.maker_order_id
+            )
+        }));
+        (adopted, refused)
     };
     for l in &refused {
         eprintln!("{l}");
@@ -1660,6 +1712,117 @@ fn up_mode(bench: bool, enable_orders: bool, confirm_live: bool) -> &'static str
     } else {
         "dry-run"
     }
+}
+
+/// What `--lip` may quote, and which Kalshi markets the arb engine must leave
+/// alone.
+///
+/// Kalshi nets YES against NO in one market, so this inventory and an arb
+/// basket's leg cannot share a market. Every market the lip log holds
+/// inventory on is left alone on EVERY live run, `--lip` or not, because the
+/// config line that opened it may be gone. Every configured market is left
+/// alone too, except one an open ledger lot holds: that is refused, for the
+/// same reason the other way round. Installs both sets. Returns the config,
+/// with the relationship ids per market (`None` without `--lip`, or with
+/// nothing left to quote), and the left-alone set.
+#[allow(clippy::type_complexity)]
+fn prepare_lip(
+    args: &Args,
+) -> (Option<(lip::Cfg, std::collections::BTreeMap<String, Vec<String>>)>, std::collections::BTreeSet<String>) {
+    let holdings = lip::log_holdings(&args.lip_log);
+    // A log that cannot be read whole may hide a position, so every market any
+    // readable line names is left alone, held or not.
+    let mut left: std::collections::BTreeSet<String> = if holdings.error.is_some() {
+        holdings.named.clone()
+    } else {
+        holdings.held.keys().cloned().collect()
+    };
+    for (m, n) in &holdings.held {
+        eprintln!("[lip] {m}: {} holds {n:+}, so the arb engine leaves this market alone", args.lip_log);
+    }
+    let cfg = args.lip.as_deref().and_then(|path| {
+        let mut cfg = match lip::load(path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[lip] REFUSED: {e}");
+                return None;
+            }
+        };
+        let records = match ledger::read(&args.ledger) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "[lip] REFUSED: the ledger is unreadable ({e}), so no market can be shown free of \
+                     arb exposure"
+                );
+                return None;
+            }
+        };
+        let pairs = positions::pairs_from_registry(&args.registry);
+        let mut rels: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+        cfg.markets.retain(|m| {
+            let mine: Vec<&positions::Pair> = pairs.iter().filter(|p| p.kalshi == m.market).collect();
+            if let Some(p) = mine.iter().find(|p| !naked_act::open_lots(&records, &p.rel_id).is_empty()) {
+                eprintln!(
+                    "[lip] {} REFUSED: {} has open lots in {}; Kalshi would net this inventory with them",
+                    m.market, p.rel_id, args.ledger
+                );
+                return false;
+            }
+            rels.insert(m.market.clone(), mine.iter().map(|p| p.rel_id.clone()).collect());
+            true
+        });
+        if cfg.markets.is_empty() {
+            eprintln!("[lip] REFUSED: no configured market is free to quote");
+            return None;
+        }
+        Some((cfg, rels))
+    });
+    if let Some((c, _)) = &cfg {
+        left.extend(c.markets.iter().map(|m| m.market.clone()));
+    }
+    let cfg = match (&holdings.error, cfg) {
+        (None, c) => c,
+        (Some(e), _) => {
+            eprintln!(
+                "[lip] {} cannot be read whole ({e}): the loss stop would be blind, so --lip will \
+                 not run. The arb engine leaves alone every market a readable line names ({}). \
+                 CHECK BY HAND.",
+                args.lip_log,
+                left.len()
+            );
+            None
+        }
+    };
+    let watched = if cfg.is_some() { left.clone() } else { std::collections::BTreeSet::new() };
+    lip::install(watched, left.clone());
+    (cfg, left)
+}
+
+fn spawn_lip(
+    args: &Args,
+    sinks: &HashMap<Venue, std::sync::Arc<dyn sink::OrderSink>>,
+    cfg: lip::Cfg,
+    rels: std::collections::BTreeMap<String, Vec<String>>,
+) {
+    let Some(k) = sinks.get(&Venue::Kalshi) else {
+        eprintln!(
+            "[lip] REFUSED: needs the Kalshi order path (--enable-orders --yes-trade-live), even to \
+             shadow — it reads positions and fill counts through it"
+        );
+        return;
+    };
+    tokio::spawn(lip::run(
+        cfg,
+        lip::Wiring {
+            kalshi: k.clone(),
+            log_path: args.lip_log.clone(),
+            blackouts_path: args.exit_blackouts.clone(),
+            kill_file: args.kill_file.clone(),
+            rels,
+            shadow: args.lip_shadow,
+        },
+    ));
 }
 
 /// Spawn the maker-exit loop, if either flag asked for it.
@@ -2265,7 +2428,8 @@ async fn main() {
         8.0
     };
 
-    let (mut quoters, by_market, rel_meta) = load_quoters(&args.registry, &args.rel_prefixes);
+    let (lip, lip_left) = if bench { (None, std::collections::BTreeSet::new()) } else { prepare_lip(&args) };
+    let (mut quoters, by_market, rel_meta) = load_quoters_leaving(&args.registry, &args.rel_prefixes, &lip_left);
     let opportunities = args
         .opportunities_out
         .as_deref()
@@ -2350,6 +2514,9 @@ async fn main() {
     let armed = !sinks.is_empty();
     spawn_positions_recon(&args, &sinks);
     spawn_maker_exit(&args, &sinks);
+    if let Some((cfg, rels)) = lip {
+        spawn_lip(&args, &sinks, cfg, rels);
+    }
     if let (Some(k), Some(tx)) = (sinks.get(&Venue::Kalshi), tx_acks.as_ref()) {
         let mut markets = std::collections::BTreeSet::new();
         for q in &mut quoters {

@@ -670,6 +670,9 @@ fn ownership_is_decided_by_the_tag_this_stack_mints() {
         // with the engine's `h` hedges, so the sweep has to reach it too — an
         // id the sweep does not recognise is an order a halt leaves resting.
         "n1785300830679",
+        // The liquidity-incentive quoter rests 200-lots on markets the engine
+        // leaves alone; a halt must reach those too.
+        "l1794380000000",
         "rehearse-1785197117443",
         "sweep-1234",
         "m0",
@@ -683,6 +686,7 @@ fn ownership_is_decided_by_the_tag_this_stack_mints() {
         "m17852578-1",   // nor one with anything but digits behind it
         "manual-order",  // a word that merely starts with `m`
         "naked-1",       // nor one that merely starts with `n`
+        "lip-1",         // nor one that merely starts with `l`
         "theirs",
     ] {
         assert!(!is_ours(id), "{id} must never be swept as ours");

@@ -969,7 +969,9 @@ async fn cycle(
     // does — its list has no history of dropping rows. A transient bad Kalshi
     // read is caught one layer up instead: guard 3 will not confirm it.
     let kpos = read_net(kalshi, "kalshi").await?;
-    let (confirmed, fresh) = recon.step(&kpos, &ppos, &|_| false);
+    // A pair whose Kalshi market --lip quotes or holds is not an arb position:
+    // its imbalance is that inventory, held on purpose under its own loss stop.
+    let (confirmed, fresh) = recon.step(&kpos, &ppos, &|p| crate::lip::left_alone(&p.kalshi));
     // Published only HERE, past every guard: the gauges are the reading of a
     // snapshot this cycle was willing to believe.
     NAKED.store(confirmed.len() as i64, Ordering::Relaxed);
