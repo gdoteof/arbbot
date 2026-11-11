@@ -1160,9 +1160,11 @@ async fn act_side(m: &mut Mkt, bid: bool, want: Option<(i64, i64)>, w: &Wiring) 
         if keep((o.price, o.resting()), want) {
             return false;
         }
-        // A pull goes at once. A reprice waits out REPRICE_HOLD, so a flickering
-        // book cannot churn the order. Either waits out the backoff after a refusal.
-        let gap = match (want.is_none(), m.fails[i]) {
+        // A pull goes at once, and so does an order that a full fill would now
+        // take past the cap. A reprice waits out REPRICE_HOLD, so a flickering
+        // book cannot churn the order. Each waits out the backoff after a refusal.
+        let urgent = want.is_none_or(|(_, q)| o.resting() > q);
+        let gap = match (urgent, m.fails[i]) {
             (true, 0) => Duration::ZERO,
             (true, f) => backoff(f),
             (false, f) => backoff(f).max(REPRICE_HOLD),
