@@ -215,6 +215,27 @@ fn kalshi(c: &Client) -> Result<Fetched, String> {
     })
 }
 
+/// Every PM-US activity type that carries an `accountBalanceChange`: the types
+/// arb-ledger's `funding::pmus` books.
+const PMUS_BALANCE_TYPES: [&str; 7] = [
+    "ACTIVITY_TYPE_ACCOUNT_DEPOSIT",
+    "ACTIVITY_TYPE_ACCOUNT_ADVANCED_DEPOSIT",
+    "ACTIVITY_TYPE_ACCOUNT_WITHDRAWAL",
+    "ACTIVITY_TYPE_TRANSFER",
+    "ACTIVITY_TYPE_REFERRAL_BONUS",
+    "ACTIVITY_TYPE_TAKER_FEE_REBATE",
+    "ACTIVITY_TYPE_LIQUIDITY_PROGRAM",
+];
+
+fn balance_query() -> String {
+    let mut q = String::from("limit=100&sortOrder=SORT_ORDER_DESCENDING");
+    for t in PMUS_BALANCE_TYPES {
+        q.push_str("&types=");
+        q.push_str(t);
+    }
+    q
+}
+
 fn pmus(c: &Client, out: &Path) -> Result<Fetched, String> {
     let archived: std::collections::HashSet<String> =
         read_archive(&out.join("pmus_activities.json"))?.iter().filter_map(pmus_activity_key).collect();
@@ -224,13 +245,19 @@ fn pmus(c: &Client, out: &Path) -> Result<Fetched, String> {
         b["balances"].get(0).cloned().ok_or_else(|| "GET /v1/account/balances: no balances[0]".to_string())
     };
     let before = balance(c)?;
-    let activities = c.pages(
+    let mut activities = c.pages(
         "/v1/portfolio/activities",
         "limit=100&sortOrder=SORT_ORDER_DESCENDING",
         "activities",
         "nextCursor",
         Some(&known),
     )?;
+    // `known` ends the walk above at the first page already on disk, but a
+    // balance change turns PENDING -> COMPLETED in place, days later, wherever
+    // it sits. So every balance-change row is re-read each run, with no early
+    // stop (one page today), and the merge's fresh copy wins.
+    let mut changes = c.pages("/v1/portfolio/activities", &balance_query(), "activities", "nextCursor", None)?;
+    activities.append(&mut changes);
     let positions = c.pages("/v1/portfolio/positions", "limit=100", "positions", "nextCursor", None)?;
     let after = balance(c)?;
     Ok(Fetched {
