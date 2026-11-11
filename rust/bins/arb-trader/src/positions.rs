@@ -558,6 +558,10 @@ impl Act {
                 read += 1;
             }
         }
+        // `--lip` holds inventory on these pairs' Kalshi legs on purpose: they
+        // are reported like any naked leg and never completed.
+        let lip = crate::lip::owned_pm_slugs();
+        own.claim_rows(lip.iter().map(|s| (s.as_str(), "probe-lip")));
         if read == 0 {
             return Err(format!(
                 "none of the {} research-probe logs could be read, so the ownership \

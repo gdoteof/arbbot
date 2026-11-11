@@ -1,0 +1,43 @@
+# Kalshi liquidity-incentive quoting (`arb-trader --lip config/lip.yaml`, rust/bins/arb-trader/src/lip.rs).
+#
+# Each market rests a `qty` YES bid and YES ask at the best price other makers
+# show, holds what fills up to `cap` contracts net, and is quoted only while
+# its book (scored by Kalshi's rule, our orders in it) models >= `min_usd_day`.
+# The best `max_markets` are quoted at once. `usd_day` is the program's
+# period_reward / 10000 over its days, and `until` is its end_date, from
+# GET /trade-api/v2/incentive_programs?status=active. Programs are weekly:
+# refresh this list when they roll, or quoting stops at `until`.
+#
+# Pilot sizing (2026-11-11): ~$200 rests per market, so 4 markets is ~$800 of
+# Kalshi cash. The loss stop pulls every quote when inventory marked to mid
+# reaches -$150; it does not flatten what is held.
+qty: 200
+cap: 200
+max_markets: 4
+min_usd_day: 3.0
+loss_stop_usd: 150
+markets:
+  - {market: KXAAAGASM-26NOV30-3.70, usd_day: 42.86, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASM-26NOV30-3.80, usd_day: 42.86, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASM-26NOV30-3.90, usd_day: 42.86, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASM-26NOV30-4.00, usd_day: 42.86, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASM-26NOV30-4.10, usd_day: 42.86, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASM-26NOV30-4.20, usd_day: 42.86, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASM-26NOV30-4.30, usd_day: 42.86, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASM-26NOV30-4.50, usd_day: 42.86, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASM-26NOV30-4.60, usd_day: 42.86, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASMAXM-26NOV30-4.25, usd_day: 14.29, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASMAXM-26NOV30-4.30, usd_day: 14.29, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASMAXM-26NOV30-4.35, usd_day: 14.29, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASMAXM-26NOV30-4.40, usd_day: 14.29, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASMAXM-26NOV30-4.45, usd_day: 14.29, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASMAXM-26NOV30-4.50, usd_day: 14.29, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASMAXM-26NOV30-4.55, usd_day: 14.29, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASMAXM-26NOV30-4.60, usd_day: 14.29, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASMAXM-26NOV30-4.65, usd_day: 14.29, until: 2026-11-14T05:00:00Z}
+  - {market: KXAAAGASMINM-26NOV30-3.70, usd_day: 14.29, until: 2026-11-15T05:00:00Z}
+  - {market: KXAAAGASMINM-26NOV30-3.75, usd_day: 14.29, until: 2026-11-15T05:00:00Z}
+  - {market: KXAAAGASMINM-26NOV30-3.80, usd_day: 14.29, until: 2026-11-15T05:00:00Z}
+  - {market: KXAAAGASMINM-26NOV30-3.85, usd_day: 14.29, until: 2026-11-15T05:00:00Z}
+  - {market: KXAAAGASMINM-26NOV30-3.90, usd_day: 14.29, until: 2026-11-15T05:00:00Z}
+  - {market: KXAAAGASMINM-26NOV30-3.95, usd_day: 14.29, until: 2026-11-15T05:00:00Z}

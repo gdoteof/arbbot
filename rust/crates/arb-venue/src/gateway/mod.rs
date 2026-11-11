@@ -116,6 +116,10 @@ pub enum CancelBy {
 ///     tell them apart, and sharing `h` would make the counter spaces overlap
 ///     (`Engine::id_base` is `wall_now() * 1000`, which is the same clock this
 ///     one draws from);
+///   * `l` + millis — the Kalshi liquidity-incentive quoter (`arb-trader`'s
+///     `lip`, `--lip`). It rests on markets the engine has been told to leave
+///     alone, so a halt that did not sweep it would leave 200-lots resting on a
+///     book nothing is watching;
 ///   * `rehearse-` + millis — [`KalshiGateway::rehearse`];
 ///   * `sweep-` + pid — `arb-order verify`, whose whole purpose is to watch the
 ///     kill sweep cancel a REAL resting order, so it has to be inside the
@@ -123,16 +127,16 @@ pub enum CancelBy {
 ///
 /// Nothing else on this account can collide with them. The retired Python
 /// gateway tags every order `uuid.uuid4().hex` (`exec/kalshi_gateway.py:51`) —
-/// 32 characters drawn from `[0-9a-f]`, and `m`/`h`/`t`/`n`/`r`/`s` are not hex
+/// 32 characters drawn from `[0-9a-f]`, and `m`/`h`/`t`/`n`/`l`/`r`/`s` are not hex
 /// digits, so no id it ever minted can match. The trailing run is required to be
 /// digits for the same reason: it is what the counters actually emit, and it
 /// keeps a bare word that happens to start with `t` from reading as ours.
 pub fn is_ours(client_order_id: &str) -> bool {
     // `continue`, not `return`, on a prefix that matches but whose tail is not a
-    // counter. With today's seven prefixes no id can reach a second arm, but
+    // counter. With today's eight prefixes no id can reach a second arm, but
     // `t` shadows any future `take-…` and the bug would be a SILENTLY NARROWER
     // sweep — the exact class this function exists to prevent.
-    for p in ["m", "h", "t", "n", "x", "rehearse-", "sweep-"] {
+    for p in ["m", "h", "t", "n", "x", "l", "rehearse-", "sweep-"] {
         if let Some(n) = client_order_id.strip_prefix(p) {
             if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) {
                 return true;

@@ -606,6 +606,7 @@ impl Engine {
                     if is_sidecar_order(oid) {
                         // The owner hedges on THIS frame, not on its next poll.
                         crate::maker_exit::wake_fill(market, oid);
+                        crate::lip::wake_fill(market, oid);
                         eprintln!(
                             "[fill] {cum}x on {} {} is order {oid} — placed by THIS PROCESS \
                              outside the engine (the maker exit, or --positions-recon-act). \
