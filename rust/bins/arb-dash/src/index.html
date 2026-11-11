@@ -1226,7 +1226,7 @@ const NEEDS = {
   '/opportunities': () => ({opps:     '/api/opportunities' + location.search}),
   '/pairs':         () => ({pairs:    '/api/pairs'}),
   '/now':           () => ({now:      '/api/now'}),
-  '/trades':        () => ({trades:   '/api/trades'}),
+  '/trades':        () => ({trades:   '/api/trades', rewards: '/api/rewards'}),
   '/exitability':   () => ({exit:     '/api/exitability'}),
   '/live':          () => ({}),
   '/architecture':  () => ({arch:     '/api/architecture'}),
@@ -1417,6 +1417,7 @@ const DRAW = {
     if(!d) return loading(f, 'trades');
     if(d.error) return fail(f, d.error);
     f.append(tradeTotals(d));
+    f.append(rewardPanel(S.data.rewards));
     f.append(tradeRows(d));
     const analysis = $(`<div class="analysis-grid"></div>`);
     analysis.append(venueRolePanel(d));
@@ -1562,6 +1563,71 @@ function tradeTotals(d){
       to the Books statement — different populations, and the PM-US side of that
       statement is plug-dominated. Do not read agreement between the two as a
       check on either.
+    </div></details>
+  </section>`);
+}
+
+/* Reward trading: the Kalshi liquidity-incentive quoter (`--lip`). It keeps its
+   own log and is in neither the ledger above nor the Books statement, so this
+   panel is separate from every total on this page. */
+function rewardPanel(d){
+  const head = `<div><h2>Reward trading &middot; Kalshi LIP</h2><div class="sub">The <code>--lip</code> quoter's own log. Not in the ledger or the Books, and not in any total above.</div></div>`;
+  if(!d) return $(`<section class="wide">${head}<div class="sub">loading…</div></section>`);
+  if(d.error) return $(`<section class="wide">${head}<div class="bad">${esc(d.error)}</div></section>`);
+  const t = d.totals || {}, l = d.live, P = d.positions || [];
+  const when = (x) => x ? new Date(x*1000).toISOString().slice(0,19).replace('T',' ') : '—';
+  const px = (v) => (v===null||v===undefined) ? '—' : Number(v).toFixed(4);
+  const anyMarked = P.some(p => p.pnl_marked_usd!=null);
+  const marked = P.reduce((a,p) => a + (p.pnl_marked_usd==null ? 0 : Number(p.pnl_marked_usd)), 0);
+  const status = d.stop ? `<span class="badge bad" title="${esc(d.stop)}">STOPPED</span>`
+    : !l ? `<span class="badge warn" title="${esc(d.live_error||'')}">not running</span>`
+    : l.stopped ? `<span class="badge bad">STOPPED</span>`
+    : `<span class="badge ok">${l.shadow?'shadow':'armed'}</span>`;
+  const rows = P.map(p => {
+    const vp = p.venue_pos, off = vp!=null && Math.abs(Number(vp)-Number(p.pos)) > 0.5;
+    const resting = (p.resting||[]).filter(Boolean).map(r => `<div>${esc(r)}</div>`).join('') || '<span class="dim">nothing</span>';
+    const state = p.held_by ? `<span class="warn">${esc(p.held_by)}</span>` : (p.resting||[]).some(Boolean) ? '<span class="ok">quoting</span>' : '<span class="dim">idle</span>';
+    return `<tr data-k="lip-${esc(p.market)}">
+      <td><div class="trade-primary">${esc(p.market)}</div><div class="sub">${p.fills} fill${p.fills===1?'':'s'} · ${qtyf(p.contracts)} ct${p.last_fill_ts?' · last '+when(p.last_fill_ts)+' UTC':''}</div></td>
+      <td class="num"><b>${qtyf(p.pos)}</b><div class="sub ${off?'bad':''}" title="Kalshi's own position (arb-venue-sync)">venue ${vp==null?'—':qtyf(vp)}</div></td>
+      <td class="num">${px(p.avg_price)}<div class="sub">avg, YES</div></td>
+      <td class="num ${usdSign(p.pnl_marked_usd)}">${p.pnl_marked_usd==null?'—':'$'+money(p.pnl_marked_usd)}<div class="sub">marked to mid</div></td>
+      <td class="num ${usdSign(p.realized_usd)}">$${money(p.realized_usd)}<div class="sub">${p.venue_fees_usd==null?'':'venue fees $'+money(p.venue_fees_usd)}</div></td>
+      <td>${resting}</td>
+      <td class="num">${p.modelled_usd_day==null?'—':'$'+money(p.modelled_usd_day)}</td>
+      <td>${state}</td>
+    </tr>`;
+  }).join('');
+  const fills = (d.fills||[]).map(x => `<tr data-k="lipf-${esc(String(x.ts))}-${esc(String(x.order))}">
+      <td>${when(x.ts)} UTC</td><td>${esc(x.market)}</td>
+      <td><span class="${x.side==='buy YES'?'ok':'warn'}">${esc(x.side)}</span></td>
+      <td class="num">${qtyf(x.qty)}</td><td class="num">${px(x.price)}</td>
+      <td class="num">${qtyf(x.pos_after)}</td></tr>`).join('');
+  return $(`<section class="wide">
+    <div class="hero-line">${head}<div>${status}${l?` <span class="sub">summary ${d.live_age_s==null?'?':d.live_age_s+'s'} old</span>`:''}</div></div>
+    <div class="metric-grid" style="margin-top:12px">
+      <div class="metric-card"><span>P&amp;L marked to mid</span><b class="${anyMarked?sign(marked):''}">${anyMarked?'$'+money(marked):'—'}</b><div class="sub">the quoter's own mark, fees modelled</div></div>
+      <div class="metric-card"><span>Realized</span><b class="${sign(t.realized_usd)}">$${money(t.realized_usd||0)}</b><div class="sub">bought and sold back, average cost, before fees</div></div>
+      <div class="metric-card"><span>Open</span><b>${qtyf(t.net_contracts||0)} ct</b><div class="sub">across ${t.open_markets||0} market${t.open_markets===1?'':'s'}</div></div>
+      <div class="metric-card"><span>Fills</span><b>${Number(d.fills_total||0).toLocaleString()}</b><div class="sub">${qtyf(t.contracts||0)} contracts${d.adopts?` · ${d.adopts} adopted`:''}</div></div>
+      <div class="metric-card"><span>Quoting now</span><b>${l?Number(l.quoting||0):'—'}</b><div class="sub">${l?`${Number(l.places_today||0)} places today`:esc(d.live_error||'')}</div></div>
+      <div class="metric-card"><span>Modelled reward</span><b>${l?'$'+money(l.modelled_usd_day||0)+'/day':'—'}</b><div class="sub">on the markets quoted now</div></div>
+    </div>
+    <h2 style="margin-top:16px">Positions</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>market</th><th class="num">position</th><th class="num">avg price</th><th class="num">P&amp;L</th>
+        <th class="num">realized</th><th>resting</th><th class="num">modelled $/day</th><th>state</th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="8" class="dim">no reward positions</td></tr>'}</tbody></table></div>
+    <h2 style="margin-top:16px">Fills</h2>
+    <div class="scroll" style="max-height:340px"><table>
+      <thead><tr><th>time</th><th>market</th><th>side</th><th class="num">qty</th><th class="num">price</th><th class="num">position after</th></tr></thead>
+      <tbody>${fills || '<tr><td colspan="6" class="dim">no fills yet</td></tr>'}</tbody></table></div>
+    <details class="audit-note" style="margin-top:10px"><summary>Where these numbers come from</summary><div class="sub">
+      Positions, average prices, realized P&amp;L and fills are folded from <code>${esc(d.log||'')}</code>, on the YES axis: a negative position is short YES, held at Kalshi as NO.
+      <b>Venue</b> is Kalshi's own count from the last arb-venue-sync (${d.venue_age_s==null?'age unknown':Math.round(d.venue_age_s/60)+' min old'}); it is red when it differs from the log by more than half a contract.
+      <b>P&amp;L marked to mid</b>, <b>resting</b>, <b>modelled $/day</b> and <b>state</b> are the quoter's own figures from the armed engine's 60-second summary, shown as they are.
+      The reward itself is not here: Kalshi pays it at the end of each program period, and nothing on disk records it until then.
+      ${d.bad_lines?`<br><b class="warn">${d.bad_lines}</b> log line(s) could not be read.`:''}
     </div></details>
   </section>`);
 }

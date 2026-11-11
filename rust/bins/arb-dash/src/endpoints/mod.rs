@@ -8,6 +8,7 @@ pub mod exitability;
 pub mod now;
 pub mod opportunities;
 pub mod pairs;
+pub mod rewards;
 pub mod trades;
 
 use std::time::UNIX_EPOCH;

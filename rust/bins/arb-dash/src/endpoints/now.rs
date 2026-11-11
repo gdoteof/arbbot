@@ -358,7 +358,7 @@ fn out_path(cmd: &str) -> Option<String> {
 /// Dated from `elapsed_s` (the engine's own uptime at the moment it printed)
 /// plus the process start time, so no journal timestamp has to be parsed and
 /// the age is the engine's clock rather than journald's.
-fn engine_summary(unit: &str, up_s: u64) -> (Option<Value>, Option<u64>, Option<String>) {
+pub(crate) fn engine_summary(unit: &str, up_s: u64) -> (Option<Value>, Option<u64>, Option<String>) {
     let started = now_secs().saturating_sub(up_s);
     let out = std::process::Command::new("journalctl")
         .args(["--user", "-u", unit, "--since", "-15min", "-n", "80", "-o", "cat", "--no-pager"])

@@ -9,7 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::process::exit;
 use std::sync::Arc;
 
-use crate::endpoints::{alerts, books, equity, exitability, now, opportunities, pairs, trades};
+use crate::endpoints::{alerts, books, equity, exitability, now, opportunities, pairs, rewards, trades};
 use crate::{integrity, stream, Args};
 
 const PAGE: &str = include_str!("index.html");
@@ -81,6 +81,7 @@ fn handle(s: TcpStream, a: &Args) {
         }
         "/api/pairs" => respond(s, "200 OK", "application/json", &pairs::list_json(a)),
         "/api/trades" => respond(s, "200 OK", "application/json", &trades::json(a)),
+        "/api/rewards" => respond(s, "200 OK", "application/json", &rewards::json(a)),
         "/api/exitability" => respond(s, "200 OK", "application/json", &exitability::json(a)),
         _ => respond(s, "404 Not Found", "text/plain", "not found"),
     }
