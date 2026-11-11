@@ -606,7 +606,7 @@ impl Engine {
                     if is_sidecar_order(oid) || crate::lip::owns_order(oid) {
                         // The owner hedges on THIS frame, not on its next poll.
                         crate::maker_exit::wake_fill(market, oid);
-                        crate::lip::wake_fill(market, oid);
+                        crate::lip::wake_fill(market, oid, cum);
                         eprintln!(
                             "[fill] {cum}x on {} {} is order {oid} — placed by THIS PROCESS \
                              outside the engine (the maker exit, --positions-recon-act, or --lip). \
@@ -779,7 +779,7 @@ impl Engine {
             // A frame that beat the place's answer: the quoter has learned the
             // id since it was parked.
             if crate::lip::owns_order(&id) {
-                crate::lip::wake_fill(&u.market_id, &id);
+                crate::lip::wake_fill(&u.market_id, &id, u.cum);
                 eprintln!("[fill] {}x on {} order {id} — the --lip quoter's, claimed after the grace", u.cum, u.market_id);
                 continue;
             }
