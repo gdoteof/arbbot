@@ -224,8 +224,21 @@ fn pmus_resolved(body: &Value) -> Option<Resolved> {
     Some(Resolved { yes, at: str_of(m, "endDate").unwrap_or("").to_string() })
 }
 
+/// Waits before each retry of a 429. The trader and recorder share this IP's
+/// Kalshi budget, so a burst of theirs can refuse our one read; a minute of
+/// patience is cheaper than skipping the hour.
+const RETRY_AFTER_429_S: [u64; 4] = [5, 10, 20, 30];
+
 fn get_json(http: &reqwest::blocking::Client, url: &str) -> Result<Value, String> {
-    let r = http.get(url).send().map_err(|e| format!("GET {url}: {e}"))?;
+    let mut r = http.get(url).send().map_err(|e| format!("GET {url}: {e}"))?;
+    for wait in RETRY_AFTER_429_S {
+        if r.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+            break;
+        }
+        eprintln!("[settle] GET {url}: HTTP 429, retrying in {wait}s");
+        std::thread::sleep(std::time::Duration::from_secs(wait));
+        r = http.get(url).send().map_err(|e| format!("GET {url}: {e}"))?;
+    }
     let status = r.status();
     let body = r.text().map_err(|e| format!("GET {url}: {e}"))?;
     if !status.is_success() {
