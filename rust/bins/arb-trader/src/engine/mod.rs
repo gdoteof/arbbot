@@ -3534,10 +3534,14 @@ mod feed_wiring_tests {
     }
 
     /// A marks file that yields a real blended bar (~4.7%/yr), generated at `t`.
+    /// The bar is read against the wall clock, so the position resolves a fixed
+    /// 156 days after `t`: a fixed calendar date makes the bar climb as that
+    /// date nears, until it outbids the crossings these tests expect to fire.
     fn marks_at(t: f64) -> String {
         format!(
-            r#"{{"generated_at":"{}","positions":[{{"cost_usd":100.0,"locked_profit_usd":2.0,"resolves_by":"2026-12-31"}}]}}"#,
-            iso_z(t)
+            r#"{{"generated_at":"{}","positions":[{{"cost_usd":100.0,"locked_profit_usd":2.0,"resolves_by":"{}"}}]}}"#,
+            iso_z(t),
+            crate::taketake::today_iso(t + 156.0 * 86_400.0)
         )
     }
 
