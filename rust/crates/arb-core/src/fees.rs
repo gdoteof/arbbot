@@ -96,6 +96,7 @@ pub const KALSHI_FREE_MAKER_SERIES: &[&str] = &[
     "KXBTCMAXY",
     "KXBTCY",
     "KXCAWEALTHTAX",
+    "KXCHICAGOMAYOR",
     "KXCMA",
     "KXCPICORE",
     "KXCPICOREYOY",
@@ -103,6 +104,10 @@ pub const KALSHI_FREE_MAKER_SERIES: &[&str] = &[
     "KXF1",
     "KXFLPROPERTYTAX",
     "KXFRENCHPRES",
+    "KXGAMEAWARDS",
+    "KXGGNOM",
+    "KXGGWINNER",
+    "KXGOOGLESEARCH",
     "KXGPT",
     "KXGRAMAOTY",
     "KXGRAMBNA",
@@ -155,10 +160,18 @@ pub const KALSHI_FREE_MAKER_SERIES: &[&str] = &[
     "KXSENMAJ",
     "KXSENMIN",
     "KXSPEAKER120",
+    "KXTAIPEIMAYOR",
     "KXTIME",
+    "KXTOPALBUMSPOTIFY",
+    "KXTOPALBUMSPOTIFYRUNNERUP",
+    "KXTOPALBUMSPOTIFYUSA",
     "KXTOPARTIST",
+    "KXTOPARTISTRUNNERUP",
+    "KXTOPARTISTRUNNERUPUSA",
     "KXTOPARTISTUSA",
+    "KXTOPSONGRUNNERUPUSA",
     "KXTOPSONGSPOTIFY",
+    "KXTOPSONGSPOTIFYRUNNERUP",
     "KXTOPSONGSPOTIFYUSA",
     "KXTSLA",
     "KXUSAIRANAGREEMENT",
@@ -379,6 +392,11 @@ mod tests {
         assert!(!kalshi_charges_makers("KXAAAGASMINM-26NOV30-3.90"));
         assert!(!kalshi_charges_makers("KXAAAGASMIN-26DEC31-3.60"));
         assert!(!kalshi_charges_makers("KXBTCY-27JAN0100-B77500"));
+        assert!(!kalshi_charges_makers("KXGGWINNER-DRA27-BOL"));
+        // The Spotify runner-up series share a stem with the #1 series and are
+        // listed in their own right.
+        assert!(!kalshi_charges_makers("KXTOPSONGSPOTIFYRUNNERUP-26-END"));
+        assert!(kalshi_series_fee_known("KXTOPALBUMSPOTIFYUSA-26-MOR"));
         for s in KALSHI_MAKER_FEE_SERIES {
             assert!(!KALSHI_FREE_MAKER_SERIES.contains(s), "{s} is on both lists");
             assert!(!s.contains('-'), "{s} is a ticker, not a series");
