@@ -176,6 +176,23 @@ const RULES: &[(&str, &str, bool)] = &[
     ("xvus-bbalbum-26", "2026-12-27", true),
     ("xvus-gsearch-26", "2026-12-10", true),
     ("xvus-bestai-26nov", "2026-12-01", true),
+    // The November BLS releases (Employment Situation 12-04, CPI 12-10, both
+    // 08:30 ET) are dated on the release day, as above. Evening and next-day
+    // reveals are dated the day after: The Game Awards 12-10, Golden Globe
+    // nominations 12-07, the Globes 2027-01-10. Elections take the midterm
+    // rows' three days for the count: Taipei 11-28, Louisiana's House seats
+    // 12-12. Chicago is dated off the April runoff, which a field this wide
+    // makes likely; an outright first-round win on 2027-02-23 settles sooner,
+    // so the date can only understate APR.
+    ("xvus-cpi-26nov", "2026-12-10", true),
+    ("xvus-nfp-26nov", "2026-12-04", true),
+    ("xvus-u3-26nov", "2026-12-04", true),
+    ("xvus-tga-26", "2026-12-11", true),
+    ("xvus-globesnom-27", "2026-12-08", true),
+    ("xvus-globes-27", "2027-01-11", true),
+    ("xvus-taipei-26", "2026-12-01", true),
+    ("xvus-lahouse-26", "2026-12-15", true),
+    ("xvus-chimayor-27", "2027-04-09", true),
     // November 3 midterms. Both venues settle on media calls (Kalshi at 4 of 8
     // designated sources, PM-US on tertiary-source consensus), so the hold is
     // days, not the January swearing-in Kalshi's expiry reads as. Dated three
@@ -423,6 +440,32 @@ mod tests {
         assert_eq!(resolve_date("xvus-gashi-26-gt4p6"), Some(("2027-01-01", false)));
         assert_eq!(resolve_date("xvus-bestai-26dec-anthropic"), Some(("2027-01-05", true)));
         assert_eq!(resolve_date("xvus-oscars-bestactor-27-mattdamon"), Some(("2027-03-16", true)));
+    }
+
+    /// Every family onboarded 2026-11-20 is dated, and the families it extends
+    /// (Spotify, Google Year in Search, TIME) keep their existing rows.
+    #[test]
+    fn the_late_november_families_resolve() {
+        for (id, date) in [
+            ("xvus-cpi-26nov-yoy-gt3p6", "2026-12-10"),
+            ("xvus-cpi-26nov-coremom-gt0p2", "2026-12-10"),
+            ("xvus-nfp-26nov-gt50k", "2026-12-04"),
+            ("xvus-u3-26nov-gt4p0", "2026-12-04"),
+            ("xvus-tga-26-goty-gtavi", "2026-12-11"),
+            ("xvus-globesnom-27-picmc-wildhorsenine", "2026-12-08"),
+            ("xvus-globes-27-picdra-labolanegra", "2027-01-11"),
+            ("xvus-taipei-26-chiangwanan", "2026-12-01"),
+            ("xvus-lahouse-26-la06-r", "2026-12-15"),
+            ("xvus-chimayor-27-alexigiannoulias", "2027-04-09"),
+            ("xvus-spotify-26-album2-global-arirang", "2026-12-03"),
+            ("xvus-gsearch-26-movie-obsession", "2026-12-10"),
+            ("xvus-time-poty-26-lionelmessi", "2026-12-09"),
+        ] {
+            assert_eq!(resolve_date(id), Some((date, true)), "{id}");
+        }
+        // The October releases keep their own dates beside the November rows.
+        assert_eq!(resolve_date("xvus-cpi-26oct-mom-gt0p3"), Some(("2026-11-10", true)));
+        assert_eq!(resolve_date("xvus-u3-26oct-gt3p9"), Some(("2026-11-06", true)));
     }
 
     /// Vermont's statewide rows must win over the general midterm row, and the

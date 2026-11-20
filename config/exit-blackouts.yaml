@@ -346,3 +346,56 @@
   from: 2026-12-20T05:00:00Z   # 2026-12-20 00:00 ET
   why: Billboard reveals the Billboard 200 dated 12-26, the last chart counted
   entries: true
+
+# The November BLS releases, the late-2026 award shows and three elections.
+# Taipei's polls open 08:00 local on 11-28, so its row starts at 00:00 Taipei
+# time. Chicago's first round decides the race only if someone takes a
+# majority, so that row reopens the family; the April runoff row is the one
+# that resolves it. Golden Globe nominations settle a non-nominee's winner
+# market No, so the winner family is closed over the nomination reveal too.
+- family: cpi-26nov
+  from: 2026-12-10T05:00:00Z   # 2026-12-10 00:00 ET
+  why: BLS November CPI release 2026-12-10 08:30 ET; Kalshi closes 08:25-08:29 ET
+  entries: true
+- family: nfp-26nov
+  from: 2026-12-04T05:00:00Z   # 2026-12-04 00:00 ET
+  why: BLS November Employment Situation release 2026-12-04 08:30 ET; Kalshi closes 08:29 ET
+  entries: true
+- family: u3-26nov
+  from: 2026-12-04T05:00:00Z   # 2026-12-04 00:00 ET
+  why: BLS November Employment Situation release 2026-12-04 08:30 ET; Kalshi closes 08:29 ET
+  entries: true
+- family: taipei-26
+  from: 2026-11-27T16:00:00Z   # 2026-11-28 00:00 Taipei
+  why: Taipei mayoral election 2026-11-28, polls 08:00-16:00 local, count the same evening
+  entries: true
+- family: globesnom-27
+  from: 2026-12-07T05:00:00Z   # 2026-12-07 00:00 ET
+  why: 84th Golden Globe nominations announced 2026-12-07
+  entries: true
+- family: globes-27
+  from: 2026-12-07T05:00:00Z   # 2026-12-07 00:00 ET
+  until: 2026-12-09T05:00:00Z
+  why: 84th Golden Globe nominations 2026-12-07; a pick left off cannot win
+  entries: true
+- family: tga-26
+  from: 2026-12-10T05:00:00Z   # 2026-12-10 00:00 ET
+  why: The Game Awards 2026, live 2026-12-10 evening ET
+  entries: true
+- family: lahouse-26
+  from: 2026-12-12T05:00:00Z   # 2026-12-12 00:00 ET
+  why: Louisiana LA-05 and LA-06 House elections 2026-12-12, polls close 20:00 CT
+  entries: true
+- family: globes-27
+  from: 2027-01-10T05:00:00Z   # 2027-01-10 00:00 ET
+  why: 84th Golden Globe Awards 2027-01-10
+  entries: true
+- family: chimayor-27
+  from: 2027-02-23T05:00:00Z   # 2027-02-23 00:00 ET
+  until: 2027-02-25T05:00:00Z
+  why: Chicago mayoral first round 2027-02-23; a majority decides it, otherwise the top two go to an April runoff
+  entries: true
+- family: chimayor-27
+  from: 2027-04-06T04:00:00Z   # 2027-04-06 00:00 EDT
+  why: Chicago mayoral runoff 2027-04-06
+  entries: true
