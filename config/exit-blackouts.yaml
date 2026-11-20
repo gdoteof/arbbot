@@ -350,8 +350,8 @@
 # The November BLS releases, the late-2026 award shows and three elections.
 # Taipei's polls open 08:00 local on 11-28, so its row starts at 00:00 Taipei
 # time. Chicago's first round decides the race only if someone takes a
-# majority, so that row reopens the family; the April runoff row is the one
-# that resolves it. Golden Globe nominations settle a non-nominee's winner
+# majority, so that row reopens the family once the count is certified; the
+# April runoff row is the one that resolves it. Golden Globe nominations settle a non-nominee's winner
 # market No, so the winner family is closed over the nomination reveal too.
 - family: cpi-26nov
   from: 2026-12-10T05:00:00Z   # 2026-12-10 00:00 ET
@@ -392,8 +392,8 @@
   entries: true
 - family: chimayor-27
   from: 2027-02-23T05:00:00Z   # 2027-02-23 00:00 ET
-  until: 2027-02-25T05:00:00Z
-  why: Chicago mayoral first round 2027-02-23; a majority decides it, otherwise the top two go to an April runoff
+  until: 2027-03-17T04:00:00Z
+  why: Chicago mayoral first round 2027-02-23; late mail ballots keep a near-majority open until certification (Kalshi's runoff-qualifier market runs to 03-17)
   entries: true
 - family: chimayor-27
   from: 2027-04-06T04:00:00Z   # 2027-04-06 00:00 EDT
