@@ -832,11 +832,14 @@ impl Engine {
                 if tt.detect_only { "DETECT ONLY (places nothing)" } else { "ARMED" },
                 bar.describe(),
                 match (tt_bar, bar.tradable()) {
-                    (Some(held), Some(marks)) if held > marks => {
-                        format!(", held at {held}%/yr by --min-apr")
-                    }
-                    (Some(held), Some(marks)) if held < marks => {
+                    (Some(held), Some(marks))
+                        if held < marks
+                            && Some(held) == cfg.apr.as_ref().and_then(|a| a.max_apr) =>
+                    {
                         format!(", capped at {held}%/yr by --max-apr")
+                    }
+                    (Some(held), Some(marks)) if held != marks => {
+                        format!(", held at {held}%/yr by --min-apr")
                     }
                     _ => String::new(),
                 },

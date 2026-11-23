@@ -3570,6 +3570,28 @@ relationships:
         );
     }
 
+    /// `--max-apr` reaches the engine's APR config beside `--min-apr`. The
+    /// engine tests set the ceiling on `AprCfg` directly, so without this a
+    /// dropped field would leave the flag parsed and inert.
+    #[test]
+    fn the_apr_ceiling_reaches_the_engine() {
+        let d = scratch("ceiling");
+        let exec = d.join("exec.yaml");
+        std::fs::write(&exec, "bankroll_usd: 980\nper_class_cap: 0.35\n").unwrap();
+        let rv = risk::RiskView::load(
+            exec.to_str().unwrap(),
+            "/nonexistent/topics.yaml",
+            Vec::new(),
+            HashMap::new(),
+        );
+        let mut a = args(&d);
+        a.min_apr = Some(50.0);
+        a.max_apr = Some(125.0);
+        let (mut quoters, _, _) = load_quoters(&a.registry, &[]);
+        let apr = install_policy(&a, &mut quoters, Some(&rv)).apr.expect("a risk view refreshes");
+        assert_eq!((apr.min_apr, apr.max_apr), (Some(50.0), Some(125.0)));
+    }
+
     /// bench/replay pins a decision digest against a fixed tape, and the
     /// floating hurdle cannot be pinned by one: it rides on a utilization the
     /// tape does not contain. `risk: None` IS bench here — same condition, one
