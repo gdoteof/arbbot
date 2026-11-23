@@ -140,6 +140,10 @@ struct Args {
     /// is also the floor under the take-take bar (`engine::bar_in_force`), so
     /// no entry of either kind is taken below it.
     min_apr: Option<f64>,
+    /// Ceiling, %/yr, on the blended book APR the take-take bar reads from the
+    /// marks, and so on the maker hurdle that follows it. `None` = no ceiling.
+    /// `--min-apr` still floors the result (`engine::bar_in_force`).
+    max_apr: Option<f64>,
     /// The day the hold is measured FROM, `YYYY-MM-DD`. Defaults to today UTC,
     /// re-derived on every refresh; pin it to make a bench replay
     /// reproducible, because the hurdle shrinks as the resolve date nears.
@@ -289,6 +293,7 @@ fn default_args() -> Args {
         marks: "data/exec/marks.json".into(),
         marks_out: None,
         min_apr: None, // float with utilization; see `apr_bar`
+        max_apr: None,
         apr_asof: None,
         toxgate: None,
         suppress: Vec::new(),
@@ -378,6 +383,9 @@ fn parse_args() -> Args {
             "--marks-out" => a.marks_out = Some(it.next().expect("--marks-out value")),
             "--min-apr" => {
                 a.min_apr = Some(it.next().expect("pct").parse().expect("float"))
+            }
+            "--max-apr" => {
+                a.max_apr = Some(it.next().expect("pct").parse().expect("float"))
             }
             "--apr-asof" => a.apr_asof = it.next(),
             "--toxgate" => a.toxgate = it.next(),
@@ -1016,6 +1024,7 @@ fn install_policy(args: &Args, quoters: &mut [Quoter], risk: Option<&risk::RiskV
     // is still reported, because an explicit `--min-apr` works in bench.
     let apr = risk.is_some().then(|| engine::AprCfg {
         min_apr: args.min_apr,
+        max_apr: args.max_apr,
         asof: args.apr_asof.clone(),
     });
     let apr_installed = (bar, asof);
