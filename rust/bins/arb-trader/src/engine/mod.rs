@@ -240,6 +240,9 @@ pub struct MarksOut {
 pub struct AprCfg {
     /// Explicit `--min-apr`, or None to float with capital utilization.
     pub min_apr: Option<f64>,
+    /// Explicit `--max-apr`: a ceiling on the blended book APR the marks
+    /// support, or None for no ceiling. See [`bar_in_force`].
+    pub max_apr: Option<f64>,
     /// Explicit `--apr-asof`, or None for "today", re-derived each refresh so
     /// the hurdle follows the calendar across a multi-day run.
     pub asof: Option<String>,
@@ -271,9 +274,17 @@ fn read_bar(path: &str) -> crate::taketake::Bar {
 /// explicit `--min-apr`, which is the operator's hurdle for EVERY entry and not
 /// only the resting ones. A floor, not a substitute — a bar the marks refuse
 /// stays refused.
+///
+/// An explicit `--max-apr` caps the marks' figure first. The blended book APR
+/// ratchets upward on a static book, because held lots age toward resolution
+/// and the long-dated entries that would dilute it are refused. The floor is
+/// applied last, so if the two flags cross, the higher bar wins.
 fn bar_in_force(bar: &crate::taketake::Bar, apr: Option<&AprCfg>) -> Option<f64> {
     let floor = apr.and_then(|a| a.min_apr);
-    bar.tradable().map(|b| floor.map_or(b, |f| b.max(f)))
+    let ceiling = apr.and_then(|a| a.max_apr);
+    bar.tradable()
+        .map(|b| ceiling.map_or(b, |c| b.min(c)))
+        .map(|b| floor.map_or(b, |f| b.max(f)))
 }
 
 pub(crate) fn levels_of(v: Option<&serde_json::Value>) -> Option<Vec<Level>> {
@@ -821,7 +832,13 @@ impl Engine {
                 if tt.detect_only { "DETECT ONLY (places nothing)" } else { "ARMED" },
                 bar.describe(),
                 match (tt_bar, bar.tradable()) {
-                    (Some(held), Some(marks)) if held > marks => {
+                    (Some(held), Some(marks))
+                        if held < marks
+                            && Some(held) == cfg.apr.as_ref().and_then(|a| a.max_apr) =>
+                    {
+                        format!(", capped at {held}%/yr by --max-apr")
+                    }
+                    (Some(held), Some(marks)) if held != marks => {
                         format!(", held at {held}%/yr by --min-apr")
                     }
                     _ => String::new(),
@@ -4882,7 +4899,7 @@ mod apr_refresh_tests {
     fn engine_with(risk: Arc<crate::risk::RiskView>, quoters: &mut [Quoter]) -> Engine {
         let mut cfg = test_cfg();
         let (bar, asof, _) = crate::apply_apr(quoters, None, Some("2026-07-29"), Some(&risk));
-        cfg.apr = Some(AprCfg { min_apr: None, asof: Some("2026-07-29".into()) });
+        cfg.apr = Some(AprCfg { min_apr: None, max_apr: None, asof: Some("2026-07-29".into()) });
         cfg.apr_installed = (bar, asof);
         cfg.risk = Some(risk);
         test_engine(cfg)
@@ -4893,7 +4910,7 @@ mod apr_refresh_tests {
     #[test]
     fn an_explicit_minimum_floors_the_take_take_bar() {
         use crate::taketake::Bar;
-        let min = |min_apr| AprCfg { min_apr, asof: None };
+        let min = |min_apr| AprCfg { min_apr, max_apr: None, asof: None };
         let fresh = |apr| Bar::Fresh { apr, age_s: 1.0 };
         assert_eq!(bar_in_force(&fresh(40.9), Some(&min(Some(50.0)))), Some(50.0));
         assert_eq!(bar_in_force(&fresh(63.0), Some(&min(Some(50.0)))), Some(63.0));
@@ -4901,6 +4918,23 @@ mod apr_refresh_tests {
         assert_eq!(bar_in_force(&fresh(40.9), None), Some(40.9));
         let refused = Bar::Untrusted { why: "stale".into() };
         assert_eq!(bar_in_force(&refused, Some(&min(Some(50.0)))), None);
+    }
+
+    /// `--max-apr` caps what the marks support, the floor still holds under
+    /// it, crossed flags keep the higher bar, and a refused bar stays refused.
+    #[test]
+    fn an_explicit_maximum_caps_the_take_take_bar_above_the_floor() {
+        use crate::taketake::Bar;
+        let cfg = |min_apr, max_apr| AprCfg { min_apr, max_apr, asof: None };
+        let fresh = |apr| Bar::Fresh { apr, age_s: 1.0 };
+        let both = cfg(Some(50.0), Some(125.0));
+        assert_eq!(bar_in_force(&fresh(272.6), Some(&both)), Some(125.0));
+        assert_eq!(bar_in_force(&fresh(90.0), Some(&both)), Some(90.0));
+        assert_eq!(bar_in_force(&fresh(40.9), Some(&both)), Some(50.0));
+        assert_eq!(bar_in_force(&fresh(272.6), Some(&cfg(None, Some(125.0)))), Some(125.0));
+        assert_eq!(bar_in_force(&fresh(272.6), Some(&cfg(Some(150.0), Some(125.0)))), Some(150.0));
+        let refused = Bar::Untrusted { why: "stale".into() };
+        assert_eq!(bar_in_force(&refused, Some(&both)), None);
     }
 
     /// A taker hurdle can exceed the utilization ceiling, and can fall again.
@@ -4957,6 +4991,46 @@ mod apr_refresh_tests {
             assert_eq!(crate::maker_exit::engine_view().unwrap().apr_bar, eng.apr_bar,
                 "exit must receive a changed bar in the same refresh, not a minute later");
         }
+        crate::maker_exit::reset_view();
+    }
+
+    /// `--max-apr` caps the marks' blended figure for take-take, the maker
+    /// hurdle and the exit view alike. A cap that bound only one of them would
+    /// leave the others on the ratcheted bar.
+    #[test]
+    fn a_ceiling_caps_the_marks_bar_for_take_take_makers_and_exits() {
+        let _g = crate::maker_exit::test_serial();
+        crate::maker_exit::reset_view();
+        let (mut quoters, _) = quoter_and_books();
+        let mut eng = engine_with(idle_risk(), &mut quoters);
+        eng.cfg.maker_exit_view = true;
+        let dir = std::env::temp_dir().join(format!("apr-ceiling-marks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("marks.json");
+        eng.cfg.take_take = Some(TakeTake {
+            max_ct_per_rel: 50, max_clip: 5, detect_only: true, cooldown_s: 60.0,
+            marks_path: path.to_string_lossy().into_owned(),
+        });
+        let now = wall_now();
+        let s = (now as i64).rem_euclid(86_400);
+        let stamp = format!("{}T{:02}:{:02}:{:02}Z", crate::taketake::today_iso(now),
+            s / 3600, (s % 3600) / 60, s % 60);
+        // A one-day horizon with $1 profit on $100 cost yields 365.25% APR.
+        let marks = serde_json::json!({"generated_at": stamp, "positions": [{
+            "cost_usd": 100.0, "locked_profit_usd": 1.0,
+            "resolves_by": crate::taketake::today_iso(now),
+        }]}).to_string();
+        std::fs::write(&path, &marks).unwrap();
+
+        eng.cfg.apr.as_mut().unwrap().min_apr = Some(50.0);
+        eng.stats_tick(&mut quoters);
+        assert!((eng.apr_bar - 365.25).abs() < 1e-9, "uncapped: {}", eng.apr_bar);
+
+        eng.cfg.apr.as_mut().unwrap().max_apr = Some(125.0);
+        eng.stats_tick(&mut quoters);
+        assert_eq!(eng.tt_bar, Some(125.0), "take-take bar");
+        assert_eq!(eng.apr_bar, 125.0, "maker hurdle");
+        assert_eq!(crate::maker_exit::engine_view().unwrap().apr_bar, 125.0, "exit view");
         crate::maker_exit::reset_view();
     }
 
