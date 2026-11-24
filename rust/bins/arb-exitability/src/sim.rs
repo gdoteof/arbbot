@@ -36,9 +36,9 @@ pub const KALSHI_TAKER: f64 = 0.07;
 /// What a rest pays on the series Kalshi flags (`fees::kalshi_charges_makers`);
 /// `simulate` takes the pair's coefficient, 0 elsewhere.
 pub const KALSHI_MAKER: f64 = 0.0175;
-/// PM-US's exchange-wide taker coefficient since 2026-09-19 (`fees.rs`).
-/// Applied to the whole window; before that date it was 0.06, so earlier exits
-/// read slightly harder than they were.
+/// The PM-US taker coefficient our account is charged (`fees.rs`). Applied to
+/// the whole window; from 2026-11-06 to 11-18 we were charged 0.095, so exits
+/// in those days read slightly easier than they were.
 pub const PMUS_TAKER: f64 = 0.0695;
 pub const TICK: f64 = 0.01;
 /// Below this lock an entry is not worth simulating: the engine's own floor.

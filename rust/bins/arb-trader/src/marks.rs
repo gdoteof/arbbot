@@ -354,8 +354,8 @@ fn top(cx: &mut Cx, books: &BookBuilder, venue: Venue, market: &str, now: f64) -
 /// the real round trip by 1.3-3.3x (card b83b0449).
 ///
 /// PM-US uses the schedule's taker coefficient, 0.0695 rounded to the cent per
-/// order — what every market object reports today; the per-market
-/// `feeCoefficient` is not in hand on the exit path.
+/// order — what our account is charged. The markets' own `feeCoefficient`
+/// (0.095) is not our rate.
 fn exit_fees_usd(cx: &mut Cx, fees: &FeeSchedule, k_yes: D, p_yes: D, qty: D) -> D {
     let k = leg_fee(cx, fees, Venue::Kalshi, Role::Taker, k_yes, qty, "default", None);
     let p = leg_fee(cx, fees, Venue::PolymarketUs, Role::Taker, p_yes, qty, "default", None);

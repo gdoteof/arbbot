@@ -12,9 +12,10 @@
 //!     Our fills agree: 83 charged maker fills, all on the flagged series; 144
 //!     free ones, none on them.
 //!   * PM-US: taker `0.0695 * size * p * (1 - p)` per order, rounded half-even
-//!     to the cent (404 of 420 taker fills since 2026-09-19; it was 0.06 before,
-//!     405 of 425). Makers pay nothing; the small rebates seen until 2026-10-17
-//!     are not modelled.
+//!     to the cent: what our account is charged (`docs/venue-quirks.md` has the
+//!     history, including 0.095 from 2026-11-06 to 11-18). The markets'
+//!     `feeCoefficient` field reads 0.095 and is not our rate. Makers pay
+//!     nothing; the small rebates seen until 2026-10-17 are not modelled.
 //!   * Polymarket intl: the per-category taker table of the old Python
 //!     `curves.py`, unchanged and unverified here.
 
@@ -105,6 +106,7 @@ pub const KALSHI_FREE_MAKER_SERIES: &[&str] = &[
     "KXFLPROPERTYTAX",
     "KXFRENCHPRES",
     "KXGAMEAWARDS",
+    "KXGAMEAWARDSBGD",
     "KXGGNOM",
     "KXGGWINNER",
     "KXGOOGLESEARCH",
@@ -416,14 +418,20 @@ mod tests {
         assert_eq!(fee6(&mut cx, &pm, Venue::Kalshi, Role::Maker, "0.72", 4), "0.014200");
     }
 
-    /// `commissionNotionalCollected` on taker executions since 2026-09-19:
-    /// 0.0695 x size x p(1-p), rounded half-even to the cent, per order.
+    /// `commissionNotionalCollected` on our taker orders: 0.0695 x size x
+    /// p(1-p), rounded half-even to the cent, per order.
     #[test]
     fn pmus_taker_is_0695_rounded_to_the_cent() {
         let mut cx = Cx::default();
         let s = FeeSchedule::new(&mut cx);
         // 2 @ 0.81 (Brazil, 2026-10-24): raw 0.0213930 → 0.02
         assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.81", 2), "0.020000");
+        // Our IOCs of 2026-11-23, where 0.095 would have charged 1.14, 0.20 and
+        // 0.05: 50 @ 0.40 raw 0.834 → 0.83; 12 @ 0.78 raw 0.143114 → 0.14;
+        // 6 @ 0.09 raw 0.034152 → 0.03.
+        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.40", 50), "0.830000");
+        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.78", 12), "0.140000");
+        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.09", 6), "0.030000");
         // 1 @ 0.50: raw 0.017375 → 0.02; the old 0.06 unrounded said 0.015
         assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.50", 1), "0.020000");
         // 1 @ 0.03: raw 0.00202245 → 0.00

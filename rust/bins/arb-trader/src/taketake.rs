@@ -43,10 +43,10 @@ use arb_core::scan::{feasible_min_payoff, Cx, Rel, Side, D};
 /// Kept as a floor deliberately. Correcting an UNDERSTATED fee is this fix's
 /// mandate; loosening what fires at the tails is not, and `max(real, floor)`
 /// is the only shape that can never charge less than reality. It also stands
-/// in for two costs `detect` genuinely cannot see: PM-US's per-market
-/// `feeCoefficient` (the schedule's 0.0695 is the coefficient every market has
-/// reported since 2026-09-19, and `taker_coef_override` is never populated in
-/// this workspace), and a clip that walks past the touch it was sized against.
+/// in for two costs `detect` genuinely cannot see: a move in PM-US's taker
+/// rate (the schedule's 0.0695 is what our account is charged, the
+/// markets' `feeCoefficient` field reads 0.095, and our account paid 0.095 from
+/// 2026-11-06 to 11-18), and a clip that walks past the touch it was sized against.
 const FEE_CT: &str = "0.02";
 
 /// The fee curves, built once. A `FeeSchedule` is a constant coefficient
