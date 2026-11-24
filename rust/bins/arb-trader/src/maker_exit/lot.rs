@@ -1434,10 +1434,12 @@ mod tests {
             pieces.iter().map(|(_, o)| o.qty).collect::<Vec<_>>(),
             vec![1, 3]
         );
-        let group = group_hedge_limit(&mut cx, &fees, &active, 6, &view("0.20")).unwrap();
+        // At PM-US's 0.095 taker fee the most the older lot's close may pay is
+        // 0.19, so the book sits there.
+        let group = group_hedge_limit(&mut cx, &fees, &active, 6, &view("0.19")).unwrap();
         let group = cx.parse(&group).unwrap();
         for (_, part) in allocate(active.members(), 0, 6).unwrap() {
-            let price = hedge_limit(&mut cx, &fees, &part, part.qty, &view("0.20")).unwrap();
+            let price = hedge_limit(&mut cx, &fees, &part, part.qty, &view("0.19")).unwrap();
             let price = cx.parse(&price).unwrap();
             assert_ne!(cx.cmp(group, price), Ordering::Greater);
         }

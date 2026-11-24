@@ -226,11 +226,11 @@ double-entry books. Together they make the Kalshi account reconcile to
 - **Current handling:** `src/arbbot/exec/main.py:82-84` (pre-divides by filled qty before the generic `* filled`).
 - **Port requirement:** Treat PM commission as an order-level total; divide by quantity before any per-contract math.
 
-### `pmus-taker-coefficient-0695-rounded-to-the-cent`
+### `pmus-taker-coefficient-rounded-to-the-cent`
 - **Venue:** polymarket_us
-- **What the API does:** a taker execution's `commissionNotionalCollected` is `feeCoefficient × size × p × (1 − p)` for the order, rounded half-even to the cent. The coefficient was 0.06 until 2026-09-18 (405 of 425 taker fills fit) and has been 0.0695 since 2026-09-19 (404 of 420; the rest are prorated partial fills). Every market object reports `feeCoefficient: 0.0695`. Passive executions carried small negative commissions (rebates, ≤1c) until 2026-10-17 and zero since.
-- **Failure it caused:** the schedule's 0.06, unrounded, understated the taker leg by up to a cent on small orders; a 1-lot at 0.50 is charged 2c, not 1.5c.
-- **Current handling:** `fees.rs` uses 0.0695 and `Cx::quantize_cent_even`; makers are modelled at zero (the rebate is not).
+- **What the API does:** a taker execution's `commissionNotionalCollected` is `feeCoefficient × size × p × (1 − p)` for the order, rounded half-even to the cent. The coefficient was 0.06 until 2026-09-18 (405 of 425 taker fills fit), 0.0695 from 2026-09-19 (404 of 420; the rest are prorated partial fills), and has been 0.095 since 2026-11-06 ~18:57Z (319 of 341 to 2026-11-24). Every market object reports `feeCoefficient: 0.095`. The venue announced none of these changes; each was found in the fills. Passive executions carried small negative commissions (rebates, ≤1c) until 2026-10-17 and zero since.
+- **Failure it caused:** the schedule's 0.06, unrounded, understated the taker leg by up to a cent on small orders; a 1-lot at 0.50 is charged 2c, not 1.5c. From 2026-11-06 to 11-24 the model's 0.0695 understated every PM-US taker leg by about 27% (37% of the modelled fee).
+- **Current handling:** `fees.rs` uses 0.095 and `Cx::quantize_cent_even`; makers are modelled at zero (the rebate is not).
 - **Port requirement:** Read the coefficient off the market where it is in hand (`taker_coef_override`), and round the order's commission to the cent.
 
 ### `pmus-ioc-fill-report-lag`

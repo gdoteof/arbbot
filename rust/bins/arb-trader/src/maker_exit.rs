@@ -781,10 +781,10 @@ impl Debounce {
 /// Gross of fees the two single-maker shapes differ by exactly
 /// `kalshi_spread - pmus_spread`: resting captures the spread on the venue you
 /// rest at and crossing pays it on the venue you cross. Fees tilt it a further
-/// 0.017*p*(1-p) toward PM-US on the series where Kalshi charges makers
-/// 0.0175 (`fees::KALSHI_MAKER_FEE_SERIES`): 0.0175 + 0.0695 against the 0.07
+/// 0.0425*p*(1-p) toward PM-US on the series where Kalshi charges makers
+/// 0.0175 (`fees::KALSHI_MAKER_FEE_SERIES`): 0.0175 + 0.095 against the 0.07
 /// Kalshi taker and free PM-US maker of the mirror; where Kalshi makers are
-/// free the tilt runs 0.0005*p*(1-p) the other way. So the rule is "rest where the spread is wider", and on this
+/// free the tilt is still 0.025*p*(1-p) toward PM-US. So the rule is "rest where the spread is wider", and on this
 /// book that is overwhelmingly PM-US.
 ///
 /// On the TOB tape for the eleven pairs this engine holds (`data/tob`,
@@ -5083,7 +5083,8 @@ mod tests {
             "the price the IOC actually paid, not the rest's 0.20: {rec}"
         );
         assert_eq!(rec["maker_exit_planned_lock_ct"], "0.025704", "the placement plan: {rec}");
-        assert_eq!(rec["maker_exit_lock_ct"], "-0.041880", "recomputed from the supplied fills: {rec}");
+        // PM-US's taker fee on 5 @ 0.22 is round(0.08151) = 0.08, 1.6c/ct.
+        assert_eq!(rec["maker_exit_lock_ct"], "-0.045880", "recomputed from the supplied fills: {rec}");
         assert!(
             rec["note"].as_str().expect("a note").contains("CROSSED"),
             "and the note describes what happened: {rec}"

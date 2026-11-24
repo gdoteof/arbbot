@@ -2910,9 +2910,10 @@ mod sell_back_tests {
     #[test]
     fn a_pmus_entry_prices_its_own_venues_fees() {
         let e = entry(Venue::PolymarketUs, BookSide::Ask, "0.30", Role::Maker);
-        // 10 x 0.02 = 0.20 gross, fees 0 + round(0.140112) = 0.14, net 0.06 >= 0.05
-        assert!(ok(&e, "0.28", 10));
-        assert!(!ok(&e, "0.29", 10));
+        // 10 x 0.03 = 0.30 gross, fees 0 + round(0.187245) = 0.19, net 0.11 >= 0.05;
+        // at 0.28 round(0.19152) = 0.19 leaves 0.01 of the 0.20 gross
+        assert!(ok(&e, "0.27", 10));
+        assert!(!ok(&e, "0.28", 10));
     }
 
     #[test]
