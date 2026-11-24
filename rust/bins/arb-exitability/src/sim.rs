@@ -36,10 +36,10 @@ pub const KALSHI_TAKER: f64 = 0.07;
 /// What a rest pays on the series Kalshi flags (`fees::kalshi_charges_makers`);
 /// `simulate` takes the pair's coefficient, 0 elsewhere.
 pub const KALSHI_MAKER: f64 = 0.0175;
-/// PM-US's exchange-wide taker coefficient since 2026-11-06 (`fees.rs`).
-/// Applied to the whole window; it was 0.0695 from 2026-09-19 and 0.06 before
-/// that, so earlier exits read harder than they were.
-pub const PMUS_TAKER: f64 = 0.095;
+/// PM-US's exchange-wide taker coefficient since 2026-09-19 (`fees.rs`).
+/// Applied to the whole window; before that date it was 0.06, so earlier exits
+/// read slightly harder than they were.
+pub const PMUS_TAKER: f64 = 0.0695;
 pub const TICK: f64 = 0.01;
 /// Below this lock an entry is not worth simulating: the engine's own floor.
 pub const MIN_LOCK: f64 = 0.005;
@@ -412,28 +412,27 @@ mod tests {
     }
 
     /// Kalshi cheap against PM-US: a Kalshi YES bid fills at minute 1 for a
-    /// ~6c lock. At minute 4 the basis half-closes, so crossing out sells for
-    /// ~0.98: under par, but its tick-worse price (~0.959) clears cost + 0.5c
-    /// and a 0.95 hold value, so the engine takes it. Par only arrives at
-    /// minute 7.
+    /// ~7c lock. At minute 4 the basis half-closes, so crossing out sells for
+    /// ~0.965: under par, but its tick-worse price clears cost + 0.5c and a 0.94
+    /// hold value, so the engine takes it. Par only arrives at minute 7.
     #[test]
     fn an_entry_exits_when_the_engine_would_not_when_par_comes() {
         let n = 10;
         let (mut k, p) = flat(n, (0.40, 0.45), (0.50, 0.52));
         k.lo[1] = 0.41; // a seller hits our 0.41 bid
         for t in 4..7 {
-            (k.bid[t], k.ask[t]) = (0.54, 0.56);
+            (k.bid[t], k.ask[t]) = (0.52, 0.54);
         }
         for t in 7..n {
             (k.bid[t], k.ask[t]) = (0.60, 0.62);
         }
-        let s = simulate(&k, &p, KALSHI_MAKER, n, n, |_| 0.95);
+        let s = simulate(&k, &p, KALSHI_MAKER, n, n, |_| 0.94);
         let e: Vec<&Entry> = s.entries.iter().filter(|e| e.dir == Dir::KYes).collect();
         assert_eq!(e.len(), 1);
         assert_eq!(e[0].t, 1);
         assert_eq!(e[0].shape, Shape::RestKalshi);
         let lock = 1.0 - e[0].cost;
-        assert!(lock > 0.06 && lock < 0.07, "0.41 + 0.50 plus fees: {lock}");
+        assert!(lock > 0.06 && lock < 0.08, "0.41 + 0.50 plus fees: {lock}");
         let x = e[0].chances_cross[0];
         assert_eq!(x.minutes, 3, "the half-closed basis is a cross the engine takes");
         assert!(x.proceeds > 0.95 && x.proceeds < 1.0, "under par: {}", x.proceeds);
@@ -441,7 +440,7 @@ mod tests {
         assert_eq!(e[0].chances[0].minutes, 3);
         assert_eq!(e[0].chances_par[0].minutes, 6, "0.60 + 0.48 - fees clears par at minute 7");
         assert_eq!(e[0].watched, n - 2);
-        assert!(!e[0].cost_bound, "0.938 + 0.5c is under the 0.95 hold value, which is the floor");
+        assert!(!e[0].cost_bound, "0.93 + 0.5c is under the 0.94 hold value, which is the floor");
         assert!(simulate(&k, &p, KALSHI_MAKER, n, n, |_| 0.9).entries[0].cost_bound, "and over a 0.90 one");
         // With resolution tomorrow holding is worth $1, and nothing short of par is worth selling for.
         let s = simulate(&k, &p, KALSHI_MAKER, n, n, |_| 1.0);

@@ -353,7 +353,7 @@ fn top(cx: &mut Cx, books: &BookBuilder, venue: Venue, market: &str, now: f64) -
 /// close. This replaces a flat $0.01/ct Kalshi-only assumption that understated
 /// the real round trip by 1.3-3.3x (card b83b0449).
 ///
-/// PM-US uses the schedule's taker coefficient, 0.095 rounded to the cent per
+/// PM-US uses the schedule's taker coefficient, 0.0695 rounded to the cent per
 /// order — what every market object reports today; the per-market
 /// `feeCoefficient` is not in hand on the exit path.
 fn exit_fees_usd(cx: &mut Cx, fees: &FeeSchedule, k_yes: D, p_yes: D, qty: D) -> D {
@@ -376,8 +376,8 @@ fn maker_exit_fees_usd(cx: &mut Cx, fees: &FeeSchedule, k_yes: D, p_yes: D, qty:
 /// nothing) and the Kalshi leg crosses as a TAKER (0.07, four times its maker
 /// coefficient). Gross of fees the two shapes differ by
 /// `kalshi_spread - pmus_spread`; this is the term that tilts the tie, by
-/// `0.0425 * p * (1 - p)` toward PM-US on Kalshi's maker-fee series (0.0175 +
-/// 0.095 against 0.07) and `0.025 * p * (1 - p)` toward PM-US elsewhere.
+/// `0.017 * p * (1 - p)` toward PM-US on Kalshi's maker-fee series (0.0175 +
+/// 0.0695 against 0.07) and `0.0005 * p * (1 - p)` toward Kalshi elsewhere.
 fn mirror_exit_fees_usd(cx: &mut Cx, fees: &FeeSchedule, k_yes: D, p_yes: D, qty: D) -> D {
     let k = leg_fee(cx, fees, Venue::Kalshi, Role::Taker, k_yes, qty, "default", None);
     let p = leg_fee(cx, fees, Venue::PolymarketUs, Role::Maker, p_yes, qty, "default", None);
@@ -1229,7 +1229,7 @@ mod tests {
         assert_eq!(row.resolves_by.as_deref(), Some("2026-10-09"), "the curated table wins");
         assert!(row.resolves_estimated, "and it flags itself a guess");
         // Both taker curves, exactly: Kalshi ceils 0.07*0.05*0.95 to $0.0034,
-        // PM-US rounds 0.095*0.09*0.91 to $0.01, off a 0.96/ct liquidation.
+        // PM-US rounds 0.0695*0.09*0.91 to $0.01, off a 0.96/ct liquidation.
         // (The Python writer, on the cent-ceiling 0.06 schedule, printed
         // 0.945086 here; the venues charge what this row says.)
         assert_eq!(row.liq_value_usd, Some(0.9466));
@@ -1530,15 +1530,15 @@ mod tests {
 
         // Short YES at 0.34 costs 0.66 plus ceil4(0.0175*0.34*0.66*5) = $0.0197
         // maker ("K" is on neither series list, so it is charged); long YES at
-        // 0.30 costs 0.30 plus round(0.095*0.30*0.70*5) = $0.10 taker. $4.9197
+        // 0.30 costs 0.30 plus round(0.0695*0.30*0.70*5) = $0.07 taker. $4.8897
         // over five contracts. The SAME formula as the standard basket: exactly
         // one leg of a two-sided basket pays the dollar either way round.
-        assert_eq!(row.cost_usd, 4.9197);
-        assert_eq!(row.locked_profit_usd, 0.0803);
+        assert_eq!(row.cost_usd, 4.8897);
+        assert_eq!(row.locked_profit_usd, 0.1103);
         // Liquidated the inverted way: sell the Kalshi NO at 1 - 0.36, sell the
         // PM YES at its bid. Read as standard it would have been 0.32 + (1 -
         // 0.34) = 0.98/ct instead.
-        assert_eq!(row.liq_value_usd, Some(4.5193), "(1 - k_ask) + p_bid, less both taker fees");
+        assert_eq!(row.liq_value_usd, Some(4.5493), "(1 - k_ask) + p_bid, less both taker fees");
         assert_eq!(row.reverse_edge_c, Some(-6.0), "p_bid - k_ask, not k_bid - p_ask");
         assert_eq!(row.maker_exit_direction.as_deref(), Some("inverse"));
         assert!(row.maker_exit_ct.flatten().is_some(), "inverse inventory is priceable");
@@ -1666,7 +1666,7 @@ mod tests {
         let row = compute_row(&mut cx, &fees, &inv, kb, ka, pb, pa, now, None);
         // Sell the Kalshi NO at 1 - 0.08 = 0.92, sell the PM YES at 0.40.
         // 1.32/ct gross, less ceil4(0.07*0.08*0.92) = 0.0052 Kalshi taker and
-        // round(0.095*0.40*0.60) = 0.02 PM-US taker. Both legs' fees are priced
+        // round(0.0695*0.40*0.60) = 0.02 PM-US taker. Both legs' fees are priced
         // off the YES price of the leg being closed, whichever side we close.
         assert_eq!(row.liq_value_usd, Some(1.2948));
         assert_eq!(row.reverse_edge_c, Some(32.0), "p_bid - k_ask, not k_bid - p_ask");

@@ -1181,8 +1181,8 @@ pub fn decide(
 /// So the leg restates the vouching leg VERBATIM — its `yes_price` and its
 /// `role` — rather than the cost derived from it. Both, or neither: a reader
 /// recovers the basis as `(1 - yes_price) + fee(role)`, and PM-US charges takers
-/// `0.095·p·(1-p)` (to the cent per order) and makers nothing, which at p=0.12
-/// is about 1.0c/ct — more than the 0.5c/ct floor this module trades against.
+/// `0.0695·p·(1-p)` (to the cent per order) and makers nothing, which at p=0.12
+/// is about 0.73c/ct — more than the 0.5c/ct floor this module trades against.
 /// Emitting `1 - basis` under a
 /// `taker` role would therefore have booked a profitable completion as a loss.
 ///

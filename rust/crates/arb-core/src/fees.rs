@@ -11,11 +11,10 @@
 //!     (`GET /trade-api/v2/series/{series}` → `fee_type`), zero on the rest.
 //!     Our fills agree: 83 charged maker fills, all on the flagged series; 144
 //!     free ones, none on them.
-//!   * PM-US: taker `0.095 * size * p * (1 - p)` per order, rounded half-even
-//!     to the cent (319 of 341 taker executions from 2026-11-06 18:57Z to
-//!     11-24; every market's `feeCoefficient` reads 0.095). It was 0.0695 from
-//!     2026-09-19 (787 of 822) and 0.06 before that. Makers pay nothing; the
-//!     small rebates seen until 2026-10-17 are not modelled.
+//!   * PM-US: taker `0.0695 * size * p * (1 - p)` per order, rounded half-even
+//!     to the cent (404 of 420 taker fills since 2026-09-19; it was 0.06 before,
+//!     405 of 425). Makers pay nothing; the small rebates seen until 2026-10-17
+//!     are not modelled.
 //!   * Polymarket intl: the per-category taker table of the old Python
 //!     `curves.py`, unchanged and unverified here.
 
@@ -106,7 +105,6 @@ pub const KALSHI_FREE_MAKER_SERIES: &[&str] = &[
     "KXFLPROPERTYTAX",
     "KXFRENCHPRES",
     "KXGAMEAWARDS",
-    "KXGAMEAWARDSBGD",
     "KXGGNOM",
     "KXGGWINNER",
     "KXGOOGLESEARCH",
@@ -245,7 +243,7 @@ impl FeeSchedule {
         FeeSchedule {
             kalshi_taker_coef: d("0.07"),
             kalshi_maker_coef: d("0.0175"),
-            pmus_taker_coef: d("0.095"),
+            pmus_taker_coef: d("0.0695"),
             intl,
             intl_default: d("0.04"),
             zero: d("0"),
@@ -418,30 +416,23 @@ mod tests {
         assert_eq!(fee6(&mut cx, &pm, Venue::Kalshi, Role::Maker, "0.72", 4), "0.014200");
     }
 
-    /// `commissionNotionalCollected` on taker executions since 2026-11-06:
-    /// 0.095 x size x p(1-p), rounded half-even to the cent, per order. The
-    /// first three cases are real executions from our PM-US activity (two are
-    /// the taker side of a counterparty that hit our rest), and the old 0.0695
-    /// prices each of them about a quarter low.
+    /// `commissionNotionalCollected` on taker executions since 2026-09-19:
+    /// 0.0695 x size x p(1-p), rounded half-even to the cent, per order.
     #[test]
-    fn pmus_taker_is_095_rounded_to_the_cent() {
+    fn pmus_taker_is_0695_rounded_to_the_cent() {
         let mut cx = Cx::default();
         let s = FeeSchedule::new(&mut cx);
-        // 34 @ 0.13 (TIME, 2026-11-24): raw 0.365313 → 0.37 charged (0.0695: 0.27)
-        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.13", 34), "0.370000");
-        // 50 @ 0.33 (Year in Search, 2026-11-23): raw 1.050225 → 1.05 charged (0.0695: 0.77)
-        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.33", 50), "1.050000");
-        // 50 @ 0.12 (Grammy noms, 2026-11-15): raw 0.5016 → 0.50 charged (0.0695: 0.37)
-        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.12", 50), "0.500000");
-        // 1 @ 0.50: raw 0.02375 → 0.02
+        // 2 @ 0.81 (Brazil, 2026-10-24): raw 0.0213930 → 0.02
+        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.81", 2), "0.020000");
+        // 1 @ 0.50: raw 0.017375 → 0.02; the old 0.06 unrounded said 0.015
         assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.50", 1), "0.020000");
-        // 1 @ 0.03: raw 0.0027645 → 0.00
+        // 1 @ 0.03: raw 0.00202245 → 0.00
         assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.03", 1), "0.000000");
         assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Maker, "0.50", 10), "0.000000");
         // The cent rounding makes the per-contract fee non-monotone in the
-        // clip: 2 @ 0.50 pay 0.05 (2.5c/ct), 3 pay 0.07 (2.33c/ct).
-        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.50", 2), "0.050000");
-        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.50", 3), "0.070000");
+        // clip: 2 @ 0.50 pay 0.03 (1.5c/ct), 3 pay 0.05 (1.67c/ct).
+        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.50", 2), "0.030000");
+        assert_eq!(fee6(&mut cx, &s, Venue::PolymarketUs, Role::Taker, "0.50", 3), "0.050000");
         // A per-market coefficient rounds the same way.
         let p = cx.parse_exact("0.50");
         let n = cx.from_i64(2);
