@@ -22,9 +22,9 @@
 //! Where a field means something different:
 //!
 //!   * `fees` charges every PM-US leg the schedule's 0.0695 coefficient, which
-//!     is what every market object reports today. The Python scanner used the
-//!     venue's per-market `feeCoefficient` where its tag catalog reported one
-//!     (0.06 in its day), so a market's edge can differ from its records — and,
+//!     is what our account is charged. The Python scanner used the venue's
+//!     per-market `feeCoefficient` where its tag catalog reported one (0.06 in
+//!     its day), so a market's edge can differ from its records — and,
 //!     since a basket is halved only until its edge turns positive, `size` can
 //!     differ as well.
 //!   * `max_hold_close_time` is always null: there is no market catalog here.
