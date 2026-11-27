@@ -1511,6 +1511,10 @@ impl RiskView {
         // cap refuses is re-priced at what the event will still take, exactly
         // like one the topic budget refuses.
         //
+        // And the relationship's own tail cap, for the same reason: a clip
+        // larger than what is left under it was refused whole, so the last
+        // clip's worth of every relationship's cap could never be used.
+        //
         // The room is what this order's branch can grow before the event's
         // tail passes the cap, or passes where it already stands if that is
         // higher.
@@ -1521,11 +1525,13 @@ impl RiskView {
             None => s.max(i),
         };
         let event_room = (event_cap.max(tail_before) - others - grows).floor().max(0.0) as i64;
+        let rel_room = d.max_notional.parse::<f64>().map_or(0, |h| h.floor().max(0.0) as i64);
         let topic_headroom = Some(
             d.topic_headroom
                 .as_deref()
                 .and_then(|h| h.parse::<f64>().ok())
-                .map_or(event_room, |h| (h.floor().max(0.0) as i64).min(event_room)),
+                .map_or(event_room, |h| (h.floor().max(0.0) as i64).min(event_room))
+                .min(rel_room),
         );
         (RiskVerdict { allowed: d.allowed, reasons: d.reasons, topic_headroom }, dir)
     }
@@ -2995,6 +3001,25 @@ mod tests {
         assert_eq!(d.topic_headroom, Some(22));
     }
 
+    /// The relationship's own tail cap is a line to stop adding at, like the
+    /// topic's and the event's, so the room under it is what a refused clip is
+    /// told it may shrink to. A medium relationship caps at 150: holding 100,
+    /// a clip of 87 is refused and 50 is what still fits.
+    #[test]
+    fn the_room_under_the_relationships_tail_cap_is_what_a_refused_clip_may_shrink_to() {
+        let v = view_with_configs(
+            &wide_exec(),
+            "/nonexistent/topics.yaml",
+            vec![("kalshi", "1000"), ("polymarket_us", "1000")],
+            "medium",
+        );
+        v.record_open("r1", "cross-venue-equivalent", 100.0);
+        let d = v.check(&rel("r1"), Venue::Kalshi, 87, Some(("K", BookSide::Bid)));
+        assert!(d.reasons.iter().any(|r| r.contains("per-relationship tail cap")), "{:?}", d.reasons);
+        assert_eq!(d.topic_headroom, Some(50));
+        assert!(v.check(&rel("r1"), Venue::Kalshi, 50, Some(("K", BookSide::Bid))).allowed);
+    }
+
     /// The topic budget reads fills: two clips rest on a budget with room for
     /// one, and it stops adding once one of them has filled.
     #[test]
@@ -3037,25 +3062,25 @@ mod tests {
 
     /// Resting quotes spend the global cap, even though no relationship's own
     /// tail cap counts them, but only up to [`RESTING_BURST_CT`]: four resting
-    /// 150-lots count as 450, so a fifth still rests, and a filled book adds in
-    /// full on top of the burst. $1,400 bankroll x 0.50.
+    /// 100-lots count as 300, so a fifth still rests, and a filled book adds in
+    /// full on top of the burst. $980 bankroll x 0.50.
     #[test]
     fn resting_quotes_spend_the_global_cap_only_up_to_the_burst() {
-        let exec = write_exec("rest-global", "bankroll_usd: 1400\nper_class_cap: 5\n");
+        let exec = write_exec("rest-global", "bankroll_usd: 980\nper_class_cap: 5\n");
         let rels = ["r1", "r2", "r3", "r4", "r5", "r6"];
         let v = view_topics_low_on(exec.to_str().unwrap(), "/nonexistent/topics.yaml", &rels);
         for r in &rels[..5] {
-            assert!(v.check(&rel(r), Venue::Kalshi, 150, Some(("K", BookSide::Bid))).allowed, "{r}");
+            assert!(v.check(&rel(r), Venue::Kalshi, 100, Some(("K", BookSide::Bid))).allowed, "{r}");
         }
-        v.record_open("f1", "cross-venue-equivalent", 125.0);
-        v.record_open("f2", "cross-venue-equivalent", 125.0);
-        let d = v.check(&rel("r6"), Venue::Kalshi, 150, Some(("K", BookSide::Bid)));
-        assert!(d.reasons.iter().any(|r| r.contains("global cap: 700+150")), "{:?}", d.reasons);
+        v.record_open("f1", "cross-venue-equivalent", 50.0);
+        v.record_open("f2", "cross-venue-equivalent", 50.0);
+        let d = v.check(&rel("r6"), Venue::Kalshi, 100, Some(("K", BookSide::Bid)));
+        assert!(d.reasons.iter().any(|r| r.contains("global cap: 400+100")), "{:?}", d.reasons);
     }
 
     /// A resting quote's hedge charges that venue's cash up to the same burst,
-    /// not cumulatively, while a fill's hedge counts in full: on $600 of PM-US
-    /// cash, six 150-lots hedged there all rest (150 + 450 <= 600), and one
+    /// not cumulatively, while a fill's hedge counts in full: on $400 of PM-US
+    /// cash, six 100-lots hedged there all rest (100 + 300 <= 400), and one
     /// 10-lot fill's hedge on top refuses the seventh.
     #[test]
     fn resting_hedges_charge_the_hedge_venue_only_up_to_the_burst() {
@@ -3069,18 +3094,18 @@ mod tests {
             "/nonexistent/topics.yaml",
             vec![
                 ("kalshi".to_string(), "1000".to_string()),
-                ("polymarket_us".to_string(), "600".to_string()),
+                ("polymarket_us".to_string(), "400".to_string()),
             ],
             o,
         );
         for r in &rels[..6] {
-            let d = v.check(&rel(r), Venue::Kalshi, 150, Some(("K", BookSide::Bid)));
+            let d = v.check(&rel(r), Venue::Kalshi, 100, Some(("K", BookSide::Bid)));
             assert!(d.allowed, "{r}: {:?}", d.reasons);
         }
         v.charge_hedge(Venue::PolymarketUs, 10.0);
-        let d = v.check(&rel("r7"), Venue::Kalshi, 150, Some(("K", BookSide::Bid)));
+        let d = v.check(&rel("r7"), Venue::Kalshi, 100, Some(("K", BookSide::Bid)));
         assert!(
-            d.reasons.iter().any(|r| r == "insufficient polymarket_us balance: 610 > 600"),
+            d.reasons.iter().any(|r| r == "insufficient polymarket_us balance: 410 > 400"),
             "{:?}",
             d.reasons
         );

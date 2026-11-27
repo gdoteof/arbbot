@@ -83,19 +83,17 @@ ROOT="$(git rev-parse --show-toplevel)"
 # deleting it restores each one byte for byte; no place, cancel or hedge line
 # differs. Counts unchanged at 31714/189/138.
 #
-# Re-pinned 2026-11-27 for the clip ceiling in dollars at risk on one leg
-# (CLIP_RISK_USD 50, MAX_CLIP 150) in place of 50 contracts. `--out` on both
+# Re-pinned 2026-11-27 for the clip ceiling in dollars: CLIP_RISK_USD 50 on
+# the dearer leg of the basket, in place of 50 contracts. `--out` on both
 # binaries, the tape's places by clip size:
 #
 #   50 ct   {3-24: 20, 25-49: 6, 50: 163}
-#   $50     {3-24: 20, 25-49: 6, 50: 1, 51-99: 91, 100-149: 4, 150: 66}
+#   $50     {3-24: 20, 25-49: 6, 50: 1, 51-74: 161, 75-99: 1}
 #
-# Of the 185 places both runs make at the same instant none changes price and
-# none gets smaller; 159 get larger. One UNRWA bid that the old run repriced in
-# place is resting 150 when its hedge touch falls to 125, so it is pulled and
-# re-posted smaller instead: one place and one cancel fewer. 31714/189/138 ->
-# 31713/188/137.
-BASELINE_SHA=75cb2af0c34ec360e8daa5c009e5f3686a089dcfcf9bf317341e7a0bc31bb173
+# No intent changes market, side, instant, kind or price: 162 of the 189
+# places are larger, none is smaller, and nothing else differs. Counts
+# unchanged at 31714/189/138.
+BASELINE_SHA=594d116fe6d4bb7be95ac6c5d2255e1c566c2c0aa74402d53ac35e9ace5cae6c
 # Re-pinned 2026-08-23 by the same #82 bisect as the baseline above: this stage
 # moved with it, 38978b34/31485/15/6 -> 02c9a582/31487/16/7. One extra place and
 # one extra cancel, from the same adaptive clip — the hurdle refuses all but a
@@ -112,8 +110,8 @@ BASELINE_SHA=75cb2af0c34ec360e8daa5c009e5f3686a089dcfcf9bf317341e7a0bc31bb173
 # line: the same proof over 31489 lines (31464 skips), counts unchanged.
 #
 # Re-pinned 2026-11-27 with the baseline above, for the dollar ceiling: 14 of
-# the 17 places are larger, no price or instant moves, counts unchanged.
-APR_SHA=942862efff4829089b770624a41a6a721e7e09fd353d48beb3b09d1cd389115f
+# the 17 places are larger and nothing else differs, counts unchanged.
+APR_SHA=4fa14ddc03e69fbb689bf10a8d851312476b3419166efdae2a8ae4bfa6adf39e
 fail=0
 skip_digest=0
 allow_change=0
@@ -508,7 +506,7 @@ elif [ "$skip_digest" = 1 ]; then
   suffix=" (DIGESTS SKIPPED)"
 else
 echo "--- 5/6 real-tape digest ---"
-  digest_stage DIGEST "$BASELINE_SHA" "31713 / 188 / 137"
+  digest_stage DIGEST "$BASELINE_SHA" "31714 / 189 / 138"
 
 # --- 6/6 The SAME tape with the maker APR hurdle turned on.
 #

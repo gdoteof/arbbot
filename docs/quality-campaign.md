@@ -56,10 +56,10 @@ The `sha256` field of that summary line MUST equal the baseline:
 
 | field | baseline | where it came from |
 |---|---|---|
-| `sha256` | `75cb2af0c34ec360e8daa5c009e5f3686a089dcfcf9bf317341e7a0bc31bb173` | re-pinned 2026-11-27 for the clip ceiling in dollars at risk (`CLIP_RISK_USD` 50, `MAX_CLIP` 150): 159 of 185 places larger, no price moved (was `c8d49e68…` from the pair on every skip line, `eed3f124…` from `MAX_CLIP` 25 -> 50, `434305e4…` from the 2026-09-18 unsafe-quote cancellation, before that `214d4e94…` from #82's adaptive clip) |
-| `intents` | 31713 | same |
-| `would_place` | 188 | same |
-| `would_cancel` | 137 | same |
+| `sha256` | `594d116fe6d4bb7be95ac6c5d2255e1c566c2c0aa74402d53ac35e9ace5cae6c` | re-pinned 2026-11-27 for the clip ceiling in dollars on the dearer leg (`CLIP_RISK_USD` 50): 162 of 189 places larger, nothing else moved (was `c8d49e68…` from the pair on every skip line, `eed3f124…` from `MAX_CLIP` 25 -> 50, `434305e4…` from the 2026-09-18 unsafe-quote cancellation, before that `214d4e94…` from #82's adaptive clip) |
+| `intents` | 31714 | same |
+| `would_place` | 189 | same |
+| `would_cancel` | 138 | same |
 | `book_events` | 675950 | property of the tape; identical in both gates |
 | wall time | ~4 s | 2026-07-29, production box, `nice -n 19` |
 
@@ -148,7 +148,7 @@ when a refactor changes what the engine decides rather than whether it crashes.
 
 | field | baseline | where it came from |
 |---|---|---|
-| `sha256` | `942862efff4829089b770624a41a6a721e7e09fd353d48beb3b09d1cd389115f` | re-pinned 2026-11-27 for the clip ceiling in dollars at risk: 14 of 17 places larger, counts unchanged (was `9378efd6…` from the pair on every skip line, `2ae6a85e…` from `MAX_CLIP` 25 -> 50, `02c9a582…` from #82's adaptive clip, `38978b34…` from #65, before that `2d330021…` from #22) |
+| `sha256` | `4fa14ddc03e69fbb689bf10a8d851312476b3419166efdae2a8ae4bfa6adf39e` | re-pinned 2026-11-27 for the clip ceiling in dollars on the dearer leg: 14 of 17 places larger, nothing else moved (was `9378efd6…` from the pair on every skip line, `2ae6a85e…` from `MAX_CLIP` 25 -> 50, `02c9a582…` from #82's adaptive clip, `38978b34…` from #65, before that `2d330021…` from #22) |
 | `intents` | 31489 | same |
 | `would_place` | 17 | same |
 | `would_cancel` | 8 | same |
