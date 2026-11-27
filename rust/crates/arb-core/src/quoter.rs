@@ -934,7 +934,6 @@ impl Quoter {
                 // under the flat clip, and deliberately not a resize behind the
                 // requote throttle. The next book event re-posts smaller.
                 //
-                //
                 // Only the hedge is re-asked. The quote's own leg was inside
                 // the dollar ceiling when it was sized and its price has not
                 // moved since; the leg it would take at the hedge has to cost
@@ -2637,8 +2636,8 @@ mod clip_sizing_tests {
     /// THE CEILING IS DOLLARS ON ONE LEG, NOT CONTRACTS. Either leg of a clip
     /// can be left alone and lose what it cost, and the hedge price says what
     /// the dearer one costs: itself, or one minus itself. So an even-money
-    /// pair rests [`MAX_CLIP`], and a pair priced near either end rests the 50
-    /// the contract ceiling used to give everything.
+    /// pair rests [`MAX_CLIP`], and a pair priced near either end rests little
+    /// more than the 50 the contract ceiling used to give everything.
     #[test]
     fn a_deep_hedge_rests_what_the_risk_budget_buys_of_the_dearer_leg() {
         assert_eq!(deep_bid_count("0.50", "0.24"), Some(MAX_CLIP));
@@ -2711,6 +2710,63 @@ mod clip_sizing_tests {
         k_bid_at(&mut bb, "0.45", "500");
         let mut intents = Vec::new();
         q.on_book(&mut cx, &fees, &bb, 101.0, &mut oid, &mut intents);
+        assert!(cancel_on(&intents, "P").is_some(), "{intents:?}");
+    }
+
+    /// A quote sized exactly to the ceiling is AT it, not over it: the book
+    /// it was sized on, seen again, leaves the 100 at 0.50 resting.
+    #[test]
+    fn a_quote_sized_to_the_ceiling_is_not_pulled_by_the_book_it_was_sized_on() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        k_bid_at(&mut bb, "0.50", "500");
+        pm_bid(&mut bb, "0.24", 2, 2_000_000_000);
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(place_on(&intents, "P").map(|p| p.count), Some(MAX_CLIP));
+
+        let mut intents = Vec::new();
+        q.on_book(&mut cx, &fees, &bb, 101.0, &mut oid, &mut intents);
+        assert!(
+            place_on(&intents, "P").is_none() && cancel_on(&intents, "P").is_none(),
+            "{intents:?}"
+        );
+    }
+
+    /// The ASK's hedge BUYS at the Kalshi ask, so that price is what its leg
+    /// costs: 100 resting are left alone when it falls to 0.40, and pulled
+    /// when it rises to 0.55 and the leg would cost $55.
+    #[test]
+    fn a_resting_ask_is_pulled_by_what_its_hedge_leg_would_cost() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        let k_ask = |bb: &mut BookBuilder, px: &str| {
+            bb.apply_snapshot(
+                Venue::Kalshi, "K", vec![lvl("0.01", "1")],
+                vec![lvl(px, "500")], 9, 9_000_000_000, None,
+            )
+        };
+        k_ask(&mut bb, "0.50");
+        bb.apply_snapshot(
+            Venue::PolymarketUs, "P", vec![lvl("0.01", "1")],
+            vec![lvl("0.90", "500")], 2, 2_000_000_000, None,
+        );
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(
+            place_on(&intents, "P").map(|p| (p.side, p.count)),
+            Some((BookSide::Ask, MAX_CLIP))
+        );
+
+        k_ask(&mut bb, "0.40");
+        let mut intents = Vec::new();
+        q.on_book(&mut cx, &fees, &bb, 101.0, &mut oid, &mut intents);
+        assert!(
+            place_on(&intents, "P").is_none() && cancel_on(&intents, "P").is_none(),
+            "{intents:?}"
+        );
+
+        k_ask(&mut bb, "0.55");
+        let mut intents = Vec::new();
+        q.on_book(&mut cx, &fees, &bb, 102.0, &mut oid, &mut intents);
         assert!(cancel_on(&intents, "P").is_some(), "{intents:?}");
     }
 }
