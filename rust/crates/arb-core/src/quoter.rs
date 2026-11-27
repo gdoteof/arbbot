@@ -266,19 +266,27 @@ struct RestingQuote {
 /// what replaces the old gate: below it the hedge cannot cover a fill and the
 /// side is not quoted at all.
 ///
-/// `MAX_CLIP` is a LEGGING bound, not a capital one. Between a maker fill and
-/// the hedge IOC landing (~40-70ms observed) we are one-legged for the whole
-/// clip, so this caps that exposure at 10x the old one. Raising it wants
-/// `hedges_naked` watched, not just headroom.
+/// The ceiling is a LEGGING bound, not a capital one, and it is in DOLLARS.
+/// Between a maker fill and the hedge IOC landing (~40-70ms observed) we are
+/// one-legged for the whole clip, and a hedge that never lands leaves a leg
+/// that can lose everything it cost: its price for a bid, one minus its price
+/// for an ask. A clip may put `CLIP_RISK_USD` at that risk and no more, so a
+/// bid near 0.10 rests several times the contracts an ask near 0.10 does. It
+/// is the unit the naked limit is already measured in, and it is also what
+/// the resting order costs in venue cash.
 ///
-/// 50, not 25, from the ledger: 14 of the 118 maker-hedge fills between
-/// 2026-09-24 and 10-08 filled the whole 25-lot clip, and in 12 of them the
-/// tape shows 50 or more contracts traded at or through our price within
-/// the 30s before the fill and the 2s after. A 50 clip would have filled up to
-/// 293 more contracts on 1,030. The clip is still the hedge touch's size
-/// whenever that is smaller, so this changes only books with a deep hedge.
+/// $50 is what the 50-contract ceiling this replaced could lose at a price of
+/// 1.00, so no clip risks more than the largest one did under it. Under that
+/// ceiling every fill that took a whole clip took it in a single fill, with
+/// the hedge touch deeper than the clip at that moment.
+///
+/// `MAX_CLIP` bounds the contracts on top of that, for what the dollars do not
+/// measure: the capital one fill commits across both legs, and the size a
+/// sell-back has to get out of. Raising either wants `hedges_naked` watched,
+/// not just headroom.
 pub const MIN_CLIP: i64 = 3;
-pub const MAX_CLIP: i64 = 50;
+pub const MAX_CLIP: i64 = 150;
+pub const CLIP_RISK_USD: i64 = 50;
 
 pub struct Quoter {
     price_grids: HashMap<String, Option<PriceGrid>>,
@@ -689,19 +697,23 @@ impl Quoter {
         None
     }
 
-    /// The largest clip this side may rest, given what the HEDGE leg's touch
-    /// can absorb right now. `None` = do not quote this side at all.
+    /// The HEDGE leg's touch for a quote on `side` of leg `i`: its size, and
+    /// what one contract of the quoted leg can lose if that hedge never lands.
     ///
     /// Top of book only, because that is what the hedge IOC actually takes:
     /// counting depth we would have to walk through prices a hedge we would
     /// not want at that price.
-    fn hedge_clip(
+    ///
+    /// The loss is read off the hedge price, which is known before the quote
+    /// is priced and overstates it: a bid that locks anything rests below the
+    /// bid it would sell into, and an ask above the ask it would buy from.
+    fn hedge_touch(
         &self,
         cx: &mut Cx,
         books: &BookBuilder,
         i: usize,
         side: BookSide,
-    ) -> Option<i64> {
+    ) -> Option<(D, D)> {
         let hedge_leg = &self.rel.legs[1 - i];
         let b = books.get(hedge_leg.venue, &hedge_leg.market_id)?;
         let lvl = match side {
@@ -709,16 +721,48 @@ impl Quoter {
             BookSide::Ask => b.asks.first(),
         }?;
         let sz = cx.parse(&lvl.size)?;
-        // Walked DOWN through the decimal context rather than converted to an
-        // integer, so the comparison is the same exact-decimal one the old
-        // gate made and no float rounding decides a size.
-        for k in (MIN_CLIP..=MAX_CLIP).rev() {
-            let want = cx.from_i64(k);
-            if cx.cmp(sz, want) != Ordering::Less {
-                return Some(k);
+        let px = cx.parse(&lvl.price)?;
+        let at_risk = match side {
+            BookSide::Bid => px,
+            BookSide::Ask => cx.one_minus(px),
+        };
+        Some((sz, at_risk))
+    }
+
+    /// The largest clip this side may rest: what the hedge touch can absorb
+    /// right now, and no more than puts [`CLIP_RISK_USD`] on one leg. `None` =
+    /// do not quote this side at all.
+    fn hedge_clip(
+        &self,
+        cx: &mut Cx,
+        books: &BookBuilder,
+        i: usize,
+        side: BookSide,
+    ) -> Option<i64> {
+        let (sz, at_risk) = self.hedge_touch(cx, books, i, side)?;
+        let budget = cx.from_i64(CLIP_RISK_USD);
+        // Compared through the decimal context rather than converted to an
+        // integer, so no float rounding decides a size.
+        let mut fits = |k: i64| {
+            let k = cx.from_i64(k);
+            let risked = cx.mul(k, at_risk);
+            cx.cmp(sz, k) != Ordering::Less && cx.cmp(risked, budget) != Ordering::Greater
+        };
+        if !fits(MIN_CLIP) {
+            return None;
+        }
+        // Both conditions only get harder as the clip grows, so the largest
+        // one that fits can be bisected for.
+        let (mut lo, mut hi) = (MIN_CLIP, MAX_CLIP);
+        while lo < hi {
+            let mid = lo + (hi - lo + 1) / 2;
+            if fits(mid) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
             }
         }
-        None
+        Some(lo)
     }
 
     /// Emit price exactly like Python str(Decimal) of the quantized value.
@@ -890,8 +934,18 @@ impl Quoter {
                 // the same answer the old binary gate gave when the touch fell
                 // under the flat clip, and deliberately not a resize behind the
                 // requote throttle. The next book event re-posts smaller.
-                if let (Some(c), Some(curq)) = (clip, self.resting.get(&key)) {
-                    if curq.count > c {
+                //
+                // Depth alone decides it. The dollar ceiling was met when the
+                // quote was sized, against a hedge price that overstated what
+                // it risks, and the quote's own price has not moved since: a
+                // hedge price drifting the other way is no reason to give up
+                // the queue position.
+                if let Some(count) = self.resting.get(&key).map(|curq| curq.count) {
+                    let absorbs = self.hedge_touch(cx, books, i, side).is_some_and(|(sz, _)| {
+                        let count = cx.from_i64(count);
+                        cx.cmp(sz, count) != Ordering::Less
+                    });
+                    if !absorbs {
                         target = None;
                     }
                 }
@@ -2468,11 +2522,20 @@ mod clip_sizing_tests {
     /// the PM BID means selling into the Kalshi BID if it fills, so that is
     /// the touch the clip is sized from — `size` is the only thing varied.
     fn k_bid(bb: &mut BookBuilder, size: &str) {
+        k_bid_at(bb, "0.60", size);
+    }
+
+    fn k_bid_at(bb: &mut BookBuilder, px: &str, size: &str) {
         bb.apply_snapshot(
-            Venue::Kalshi, "K", vec![lvl("0.60", size)],
+            Venue::Kalshi, "K", vec![lvl(px, size)],
             vec![lvl("0.99", "1")], 9, 9_000_000_000, None,
         );
     }
+
+    /// What [`CLIP_RISK_USD`] buys of a leg that can lose 0.60 a contract,
+    /// which is what `k_bid` makes of the PM bid: 83 of them risk $49.80 and
+    /// one more would risk $50.40.
+    const AT_60C: i64 = 83;
 
     /// The clip that gets placed on P against a Kalshi bid of `size`.
     fn placed_count(size: &str) -> Option<i64> {
@@ -2484,13 +2547,13 @@ mod clip_sizing_tests {
         place_on(&intents, "P").map(|p| p.count)
     }
 
-    /// THE CHANGE. A deep hedge used to rest 5 and now rests [`MAX_CLIP`]; a
+    /// THE CHANGE. A deep hedge used to rest 5 and now rests the ceiling; a
     /// shallow one rests exactly what the touch holds instead of being refused
     /// or oversized. Measured on the live book, the Kalshi touch has a median
     /// of 21 contracts, so the flat 5 was leaving most of it unused.
     #[test]
     fn the_clip_is_sized_to_the_hedge_touch() {
-        assert_eq!(placed_count("500"), Some(MAX_CLIP), "a deep hedge takes the ceiling");
+        assert_eq!(placed_count("500"), Some(AT_60C), "a deep hedge takes the ceiling");
         assert_eq!(placed_count("25"), Some(25), "exactly the ceiling");
         assert_eq!(placed_count("12"), Some(12), "sized to the touch, not to 5");
         assert_eq!(placed_count("7"), Some(7));
@@ -2518,7 +2581,7 @@ mod clip_sizing_tests {
         pm_bid(&mut bb, "0.24", 2, 2_000_000_000);
         let (mut oid, mut intents) = (0u64, Vec::new());
         q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
-        assert_eq!(place_on(&intents, "P").map(|p| p.count), Some(MAX_CLIP));
+        assert_eq!(place_on(&intents, "P").map(|p| p.count), Some(AT_60C));
 
         // The hedge touch collapses to 8 while we rest 25.
         k_bid(&mut bb, "8");
@@ -2549,6 +2612,78 @@ mod clip_sizing_tests {
         assert!(
             place_on(&intents, "P").is_none() && cancel_on(&intents, "P").is_none(),
             "a deeper hedge is not a reason to requote: {intents:?}"
+        );
+    }
+
+    /// The clip placed on P's bid against a 500-deep Kalshi bid at `hedge`,
+    /// with the PM bid we quote inside at `pm`.
+    fn deep_bid_count(hedge: &str, pm: &str) -> Option<i64> {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        k_bid_at(&mut bb, hedge, "500");
+        pm_bid(&mut bb, pm, 2, 2_000_000_000);
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        place_on(&intents, "P").map(|p| p.count)
+    }
+
+    /// THE CEILING IS DOLLARS ON ONE LEG, NOT CONTRACTS. A bid that fills and
+    /// is never hedged can lose its price, so the cheaper the leg the more of
+    /// it [`CLIP_RISK_USD`] covers, up to [`MAX_CLIP`]; and a leg priced near
+    /// 1.00 gets the 50 the contract ceiling used to give everything.
+    #[test]
+    fn a_deep_hedge_rests_what_the_risk_budget_buys_of_that_leg() {
+        assert_eq!(deep_bid_count("0.10", "0.03"), Some(MAX_CLIP), "500 would fit the budget");
+        assert_eq!(deep_bid_count("0.40", "0.24"), Some(125));
+        assert_eq!(deep_bid_count("0.60", "0.24"), Some(AT_60C));
+        assert_eq!(deep_bid_count("0.97", "0.24"), Some(51));
+    }
+
+    /// An ASK that fills unhedged is short, and loses one minus its price.
+    /// Quoting the PM ask means buying the Kalshi ask if it fills: against a
+    /// Kalshi ask of 0.40 a contract can lose 0.60, the same as the bid above
+    /// at a hedge of 0.60, and against 0.10 it can lose 0.90.
+    #[test]
+    fn an_ask_is_sized_by_what_a_short_can_lose() {
+        let ask_count = |hedge: &str| {
+            let (mut cx, fees, mut bb, mut q) = fixture();
+            bb.apply_snapshot(
+                Venue::Kalshi, "K", vec![lvl("0.01", "1")],
+                vec![lvl(hedge, "500")], 9, 9_000_000_000, None,
+            );
+            bb.apply_snapshot(
+                Venue::PolymarketUs, "P", vec![lvl("0.01", "1")],
+                vec![lvl("0.90", "500")], 2, 2_000_000_000, None,
+            );
+            let (mut oid, mut intents) = (0u64, Vec::new());
+            q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+            let p = place_on(&intents, "P").expect("the ask is quoted");
+            assert_eq!(p.side, BookSide::Ask);
+            p.count
+        };
+        assert_eq!(ask_count("0.40"), AT_60C);
+        assert_eq!(ask_count("0.10"), 55, "55 x 0.90 is $49.50");
+    }
+
+    /// The ceiling is met when a quote is SIZED. A hedge price that then moves
+    /// so the same contracts would no longer fit is not a legging exposure —
+    /// the quote still rests at its own price and the hedge still covers all
+    /// of it — and pulling it would trade the queue position for nothing.
+    #[test]
+    fn a_hedge_price_moving_under_a_resting_quote_does_not_pull_it() {
+        let (mut cx, fees, mut bb, mut q) = fixture();
+        k_bid_at(&mut bb, "0.40", "500");
+        pm_bid(&mut bb, "0.24", 2, 2_000_000_000);
+        let (mut oid, mut intents) = (0u64, Vec::new());
+        q.on_book(&mut cx, &fees, &bb, 100.0, &mut oid, &mut intents);
+        assert_eq!(place_on(&intents, "P").map(|p| p.count), Some(125));
+
+        // At 0.60 a new quote would be sized to 83; the 125 resting stays.
+        k_bid_at(&mut bb, "0.60", "500");
+        let mut intents = Vec::new();
+        q.on_book(&mut cx, &fees, &bb, 101.0, &mut oid, &mut intents);
+        assert!(
+            place_on(&intents, "P").is_none() && cancel_on(&intents, "P").is_none(),
+            "{intents:?}"
         );
     }
 }
@@ -2970,20 +3105,21 @@ mod queue_priority_tests {
 
         assert!(q.on_fill(&order, 30, 110.0));
         k(&mut bb, "0.60", 3);
-        pm(&mut bb, vec![lvl("0.25", "40"), lvl("0.20", "3")], 2, 130_000_000_000);
+        let level = (rests(&q, BookSide::Bid) + 20).to_string();
+        pm(&mut bb, vec![lvl("0.25", &level), lvl("0.20", "3")], 2, 130_000_000_000);
         assert_eq!(bid_target(&q, &mut cx, &fees, &bb), "0.25", "stepped off the front");
     }
 
     /// Partly filled, the quote still leads whatever queued behind it. 40 lots
-    /// join behind our 50 and 45 of ours fill: the level shows 45, under the 50
+    /// join behind our 83 and 78 of ours fill: the level shows 45, under the 83
     /// we placed, and against that the quote would read as alone and retreat.
     /// Against the 5 still resting it leads 40.
     #[test]
     fn a_partly_filled_quote_still_holds_the_front_of_its_queue() {
         let (mut cx, fees, mut bb, mut q, mut oid) = resting_at_25();
-        assert_eq!(rests(&q, BookSide::Bid), 50, "the fixture's clip moved");
+        assert_eq!(rests(&q, BookSide::Bid), 83, "the fixture's clip moved");
         let order = q.resting[&(1, BookSide::Bid)].order_id.clone();
-        assert!(q.on_fill(&order, 45, 120.0));
+        assert!(q.on_fill(&order, 78, 120.0));
         assert_eq!(rests(&q, BookSide::Bid), 5);
 
         let mut intents = Vec::new();

@@ -82,7 +82,20 @@ ROOT="$(git rev-parse --show-toplevel)"
 # binaries gives the same 31714 lines, all 31464 skip lines carry the key, and
 # deleting it restores each one byte for byte; no place, cancel or hedge line
 # differs. Counts unchanged at 31714/189/138.
-BASELINE_SHA=c8d49e68b7ea0854a6c6c015ff8debd24485462df388693cf0ee93497a2bc1ac
+#
+# Re-pinned 2026-11-27 for the clip ceiling in dollars at risk on one leg
+# (CLIP_RISK_USD 50, MAX_CLIP 150) in place of 50 contracts. `--out` on both
+# binaries, the tape's places by clip size:
+#
+#   50 ct   {3-24: 20, 25-49: 6, 50: 163}
+#   $50     {3-24: 20, 25-49: 6, 50: 1, 51-99: 91, 100-149: 4, 150: 66}
+#
+# Of the 185 places both runs make at the same instant none changes price and
+# none gets smaller; 159 get larger. One UNRWA bid that the old run repriced in
+# place is resting 150 when its hedge touch falls to 125, so it is pulled and
+# re-posted smaller instead: one place and one cancel fewer. 31714/189/138 ->
+# 31713/188/137.
+BASELINE_SHA=75cb2af0c34ec360e8daa5c009e5f3686a089dcfcf9bf317341e7a0bc31bb173
 # Re-pinned 2026-08-23 by the same #82 bisect as the baseline above: this stage
 # moved with it, 38978b34/31485/15/6 -> 02c9a582/31487/16/7. One extra place and
 # one extra cancel, from the same adaptive clip — the hurdle refuses all but a
@@ -97,7 +110,10 @@ BASELINE_SHA=c8d49e68b7ea0854a6c6c015ff8debd24485462df388693cf0ee93497a2bc1ac
 #
 # Re-pinned 2026-10-24 with the baseline above, for the pair on every skip
 # line: the same proof over 31489 lines (31464 skips), counts unchanged.
-APR_SHA=9378efd67c81d38c9e3958be8a93a71c62475845be6715b20dffd797cce476f3
+#
+# Re-pinned 2026-11-27 with the baseline above, for the dollar ceiling: 14 of
+# the 17 places are larger, no price or instant moves, counts unchanged.
+APR_SHA=942862efff4829089b770624a41a6a721e7e09fd353d48beb3b09d1cd389115f
 fail=0
 skip_digest=0
 allow_change=0
@@ -492,7 +508,7 @@ elif [ "$skip_digest" = 1 ]; then
   suffix=" (DIGESTS SKIPPED)"
 else
 echo "--- 5/6 real-tape digest ---"
-  digest_stage DIGEST "$BASELINE_SHA" "31714 / 189 / 138"
+  digest_stage DIGEST "$BASELINE_SHA" "31713 / 188 / 137"
 
 # --- 6/6 The SAME tape with the maker APR hurdle turned on.
 #
