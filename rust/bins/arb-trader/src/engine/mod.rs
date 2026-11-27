@@ -4715,7 +4715,8 @@ mod fill_pull_tests {
     }
 
     /// Three relationships, each resting its PM-US bid: `m1` on A, `m2` on B and
-    /// `m3` on C, whose topic is not the one A and B share.
+    /// `m3` on C, whose topic is not the one A and B share. Each Kalshi bid is
+    /// 50 deep, and that hedge is what sizes the three quotes at 50.
     fn resting(budget: u32) -> Rig {
         let rv = risk(budget);
         let mut quoters = vec![
@@ -4743,15 +4744,15 @@ mod fill_pull_tests {
         cfg.risk = Some(rv.clone());
         let mut eng = test_engine(cfg);
         eng.out = Some(std::io::BufWriter::new(std::fs::File::create(&intents).unwrap()));
-        for (venue, market, bid) in [
-            ("kalshi", "KA", "0.60"),
-            ("polymarket_us", "PA", "0.30"),
-            ("kalshi", "KB", "0.60"),
-            ("polymarket_us", "PB", "0.30"),
-            ("kalshi", "KC", "0.60"),
-            ("polymarket_us", "PC", "0.30"),
+        for (venue, market, bid, size) in [
+            ("kalshi", "KA", "0.60", "50"),
+            ("polymarket_us", "PA", "0.30", "500"),
+            ("kalshi", "KB", "0.60", "50"),
+            ("polymarket_us", "PB", "0.30", "500"),
+            ("kalshi", "KC", "0.60", "50"),
+            ("polymarket_us", "PC", "0.30", "500"),
         ] {
-            eng.on_feed(snapshot(venue, market, bid), 0, &mut quoters, &by_market);
+            eng.on_feed(snapshot(venue, market, bid, size), 0, &mut quoters, &by_market);
         }
         assert_eq!(rv.reserved_ct(), 150.0, "three 50-lots rest");
         Rig { eng, quoters, by_market, rv, intents }
@@ -4781,11 +4782,11 @@ mod fill_pull_tests {
         }
     }
 
-    fn snapshot(venue: &str, market: &str, bid: &str) -> FeedMsg {
+    fn snapshot(venue: &str, market: &str, bid: &str, size: &str) -> FeedMsg {
         FeedMsg {
             line: serde_json::json!({
                 "kind": "snapshot", "venue": venue, "market_id": market,
-                "bids": [{"price": bid, "size": "500"}],
+                "bids": [{"price": bid, "size": size}],
                 "asks": [{"price": "0.99", "size": "1"}],
                 "seq": 1, "ts_local_ns": 1_000_000_000i64})
             .to_string(),

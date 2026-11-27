@@ -82,7 +82,18 @@ ROOT="$(git rev-parse --show-toplevel)"
 # binaries gives the same 31714 lines, all 31464 skip lines carry the key, and
 # deleting it restores each one byte for byte; no place, cancel or hedge line
 # differs. Counts unchanged at 31714/189/138.
-BASELINE_SHA=c8d49e68b7ea0854a6c6c015ff8debd24485462df388693cf0ee93497a2bc1ac
+#
+# Re-pinned 2026-11-27 for the clip ceiling in dollars: CLIP_RISK_USD 50 on
+# the dearer leg of the basket, in place of 50 contracts. `--out` on both
+# binaries, the tape's places by clip size:
+#
+#   50 ct   {3-24: 20, 25-49: 6, 50: 163}
+#   $50     {3-24: 20, 25-49: 6, 50: 1, 51-74: 161, 75-99: 1}
+#
+# No intent changes market, side, instant, kind or price: 162 of the 189
+# places are larger, none is smaller, and nothing else differs. Counts
+# unchanged at 31714/189/138.
+BASELINE_SHA=594d116fe6d4bb7be95ac6c5d2255e1c566c2c0aa74402d53ac35e9ace5cae6c
 # Re-pinned 2026-08-23 by the same #82 bisect as the baseline above: this stage
 # moved with it, 38978b34/31485/15/6 -> 02c9a582/31487/16/7. One extra place and
 # one extra cancel, from the same adaptive clip — the hurdle refuses all but a
@@ -97,7 +108,10 @@ BASELINE_SHA=c8d49e68b7ea0854a6c6c015ff8debd24485462df388693cf0ee93497a2bc1ac
 #
 # Re-pinned 2026-10-24 with the baseline above, for the pair on every skip
 # line: the same proof over 31489 lines (31464 skips), counts unchanged.
-APR_SHA=9378efd67c81d38c9e3958be8a93a71c62475845be6715b20dffd797cce476f3
+#
+# Re-pinned 2026-11-27 with the baseline above, for the dollar ceiling: 14 of
+# the 17 places are larger and nothing else differs, counts unchanged.
+APR_SHA=4fa14ddc03e69fbb689bf10a8d851312476b3419166efdae2a8ae4bfa6adf39e
 fail=0
 skip_digest=0
 allow_change=0
